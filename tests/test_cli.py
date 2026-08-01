@@ -164,3 +164,11 @@ def test_report_on_a_missing_run():
 
 def test_main_returns_an_exit_code():
     assert main(["memory", "stats", "--db", "/tmp/adbagent-cli-test.db"]) == 0
+
+
+def test_model_image_cli_and_env_precedence(monkeypatch, tmp_path):
+    monkeypatch.setenv("ADBAGENT_MODEL_IMAGE", "vision-from-env")
+    assert build_config(parse(["run", "g"])).llm.model_image == "vision-from-env"
+
+    cfg = build_config(parse(["run", "g", "--model-image", "vision-from-cli"]))
+    assert cfg.llm.model_image == "vision-from-cli"

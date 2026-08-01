@@ -36,6 +36,9 @@ class LLMConfig:
     #: Cheaper model used for bounded side-calls (JSON repair, completion judging).
     #: Falls back to `model` when empty.
     model_small: str = ""
+    #: Multimodal model used when a screenshot is provided.
+    #: Falls back to `model` when empty.
+    model_image: str = ""
     temperature: float = 0.0
     max_tokens: int = 1500
     #: Client-side request throttle. Fireworks free accounts are capped at 10 RPM;
@@ -48,6 +51,9 @@ class LLMConfig:
 
     def small(self) -> str:
         return self.model_small or self.model
+
+    def image(self) -> str:
+        return self.model_image or self.model
 
 
 @dataclass
@@ -144,6 +150,7 @@ class Config:
 _ENV_MAP = {
     "ADBAGENT_MODEL": "llm.model",
     "ADBAGENT_MODEL_SMALL": "llm.model_small",
+    "ADBAGENT_MODEL_IMAGE": "llm.model_image",
     "ADBAGENT_PROVIDER": "llm.provider",
     "ADBAGENT_BASE_URL": "llm.base_url",
     "ADBAGENT_RPM": "llm.rpm",

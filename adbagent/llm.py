@@ -379,6 +379,7 @@ class LLMClient:
 
         self.model = qualify(self.provider, cfg.llm.model)
         self.model_small = qualify(self.provider, cfg.llm.small())
+        self.model_image = qualify(self.provider, cfg.llm.image())
         self.ledger = Ledger()
         self.limiter = shared_limiter(self.provider.name, cfg.llm.rpm)
         self._client = OpenAI(
@@ -532,7 +533,8 @@ class LLMClient:
             {"role": "user", "content": prompts.history_block(history)},
             {"role": "user", "content": content},
         ]
-        return self.structured(messages, AgentAction, purpose="decide")
+        target = self.model_image if screenshot else self.model
+        return self.structured(messages, AgentAction, model=target, purpose="decide")
 
     def judge(self, *, goal: str, rendered: str, history: Sequence[str],
               screenshot: Optional[bytes] = None) -> "Verdict":
@@ -546,7 +548,8 @@ class LLMClient:
             {"role": "system", "content": prompts.JUDGE_SYSTEM},
             {"role": "user", "content": content},
         ]
-        return self.structured(messages, Verdict, model=self.model_small,
+        target = self.model_image if screenshot else self.model_small
+        return self.structured(messages, Verdict, model=target,
                                max_tokens=400, purpose="judge")
 
 
