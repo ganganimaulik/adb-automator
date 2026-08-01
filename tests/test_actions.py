@@ -223,3 +223,10 @@ def test_failed_postcondition_is_hard_failure():
 
 def test_wait_always_succeeds():
     assert verify(act(action="wait"), BASE, BASE).grade == "success"
+
+
+def test_describe_untruncated_text():
+    long_msg = "Bumble matches checked: 5 matches visible — K, Z, A, D, and R (all Date matches), with recent conversation previews shown on the Chats screen."
+    action = act(action="done", text=long_msg)
+    assert action.describe() == f"done {long_msg}"
+

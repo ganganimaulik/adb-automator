@@ -146,7 +146,7 @@ class AgentAction(BaseModel):
         if self.action == "input_text" and self.text is not None:
             bits.append(f"{self.text!r}")
         elif self.action in ("open_app", "done", "fail", "ask_user") and self.text:
-            bits.append(self.text[:60])
+            bits.append(self.text)
         if self.key:
             bits.append(self.key)
         if self.direction:
