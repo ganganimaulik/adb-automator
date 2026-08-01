@@ -416,6 +416,13 @@ def intent_key(goal: str) -> str:
     return hashlib.blake2b(normalised.encode("utf-8"), digest_size=8).hexdigest()
 
 
+def _to_sqlite_int(val: int) -> int:
+    """Ensure 64-bit integer fits into SQLite signed 64-bit INTEGER bounds."""
+    if val >= (1 << 63):
+        return val - (1 << 64)
+    return val
+
+
 class Memory:
     """SQLite-backed store of learned steps."""
 
@@ -589,7 +596,7 @@ class Memory:
             " required_tokens, forbidden_tokens, next_skeleton_id, alt_successors,"
             " state, version, created_at, updated_at) "
             "VALUES(?,?,?,?,?,'step',?,?,?,?,?,?,'[]','probation',?,?,?)",
-            (screen.package, screen.skeleton_id, screen.simhash, intent_id, visit,
+            (screen.package, screen.skeleton_id, _to_sqlite_int(screen.simhash), intent_id, visit,
              anchor.model_dump_json() if anchor else None,
              action.model_dump_json(),
              postcondition.model_dump_json() if postcondition else None,

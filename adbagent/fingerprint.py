@@ -345,6 +345,8 @@ def simhash(screen: Screen) -> int:
     for bit, value in enumerate(vector):
         if value > 0:
             out |= 1 << bit
+    if out >= (1 << 63):
+        out -= 1 << 64
     return out
 
 

@@ -347,3 +347,24 @@ def test_summary_and_listing(mem):
 def test_intent_key_ignores_trivial_rewording():
     assert intent_key("Turn on Wi-Fi") == intent_key("turn on   wi-fi")
     assert intent_key("Turn on Wi-Fi") != intent_key("Turn off Wi-Fi")
+
+
+def test_simhash_large_int_sqlite_compatibility(mem):
+    """Test that a screen with simhash >= 2**63 does not overflow SQLite INTEGER."""
+    screen_copy = s(X.settings_screen())
+    screen_copy.simhash = 2**63 + 12345  # Unsigned 64-bit int exceeding SQLite signed max
+    el = next(e for e in screen_copy.elements if e.resource_id == "action_bar_title")
+    step = mem.record(
+        screen=screen_copy,
+        intent_id="i",
+        visit=0,
+        action=act(action="tap", target=Target(index=el.index)),
+        element=el,
+        postcondition=None,
+        after=s(X.detail_screen()),
+        run_id="run1",
+    )
+    assert step.id > 0
+    fetched = mem.get(step.id)
+    assert fetched is not None
+
