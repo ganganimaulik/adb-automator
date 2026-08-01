@@ -59,6 +59,7 @@ def test_dangerous_commands_are_refused(command):
     "getprop ro.build.version.sdk",
     "ime set com.google.android.inputmethod.latin/.LatinIME",
     "svc power stayon false",
+    "svc power stayon true",
     "pkill -f com.wetest.uia2.Main",
 ])
 def test_ordinary_commands_are_allowed(command):

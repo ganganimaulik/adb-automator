@@ -261,6 +261,7 @@ class Device:
         self._snapshot_state()
         if self.cfg.device.disable_animations:
             self._set_animations("0")
+        self._keep_screen_awake()
         return self
 
     def close(self) -> None:
@@ -347,6 +348,26 @@ class Device:
             self.shell(
                 f"settings put system screen_off_timeout "
                 f"{self._restore.screen_off_timeout}", timeout=10)
+
+    def _keep_screen_awake(self) -> None:
+        """Prevent the device screen from sleeping during a run.
+
+        Two complementary mechanisms:
+        * ``svc power stayon true`` tells Android to keep the screen on
+          while *any* power source is connected (USB, AC, or wireless).
+        * A long ``screen_off_timeout`` (30 min) acts as a safety net for
+          wirelessly-connected devices where the charging state may not
+          apply.
+
+        Both settings are restored by :meth:`close`.
+        """
+        # stayon bypasses the blocklist via adb_device.shell(), matching
+        # the restore path in close().
+        self._safe(lambda: self.u2.adb_device.shell(
+            "svc power stayon true", timeout=10))
+        self._safe(lambda: self.shell(
+            "settings put system screen_off_timeout 1800000", timeout=10))
+        log.info("screen keep-awake enabled")
 
     @staticmethod
     def _safe(fn: Callable[[], T]) -> Optional[T]:
