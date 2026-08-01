@@ -71,12 +71,13 @@ def test_cli_flags_win_over_the_config_file(tmp_path):
 
 
 def test_config_file_wins_over_environment(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("ADBAGENT_MODEL", "from-env")
     path = tmp_path / "config.json"
     path.write_text(json.dumps({"llm": {"model": "from-file"}}))
     assert build_config(parse(["run", "g", "-c", str(path)])).llm.model == "from-file"
 
-    monkeypatch.setenv("ADBAGENT_MODEL", "from-env")
+    path.unlink()
     assert build_config(parse(["run", "g"])).llm.model == "from-env"
 
 
@@ -167,6 +168,7 @@ def test_main_returns_an_exit_code():
 
 
 def test_model_image_cli_and_env_precedence(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("ADBAGENT_MODEL_IMAGE", "vision-from-env")
     assert build_config(parse(["run", "g"])).llm.model_image == "vision-from-env"
 
