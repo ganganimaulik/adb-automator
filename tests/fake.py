@@ -180,6 +180,7 @@ class FakeLLM:
         self.judge_result = judge_result
         self.model = "fake/model"
         self.model_small = "fake/model-small"
+        self.model_image = "fake/model-image"
         self.ledger = Ledger()
         self.seen_screenshots = 0
         self.notes: List[str] = []
@@ -188,10 +189,11 @@ class FakeLLM:
                package: str = "", screenshot: Optional[bytes] = None,
                note: str = "") -> AgentAction:
         self.calls += 1
+        model_used = self.model_image if screenshot else self.model
         if screenshot:
             self.seen_screenshots += 1
         self.notes.append(note)
-        self.ledger.record(Call(model=self.model, prompt_tokens=1000,
+        self.ledger.record(Call(model=model_used, prompt_tokens=1000,
                                 completion_tokens=50))
         return self.policy(self.dev.observe(), self)
 

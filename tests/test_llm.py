@@ -184,3 +184,15 @@ def test_image_part_is_a_data_uri():
 
 def test_text_part():
     assert text_part("hi") == {"type": "text", "text": "hi"}
+
+
+def test_llm_config_model_fallbacks():
+    from adbagent.config import LLMConfig
+
+    cfg = LLMConfig(model="main-model")
+    assert cfg.small() == "main-model"
+    assert cfg.image() == "main-model"
+
+    cfg_custom = LLMConfig(model="main-model", model_small="small-model", model_image="vision-model")
+    assert cfg_custom.small() == "small-model"
+    assert cfg_custom.image() == "vision-model"

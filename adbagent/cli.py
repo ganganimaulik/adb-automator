@@ -79,6 +79,7 @@ def setup_logging(verbosity: int) -> None:
 OVERRIDES = {
     "model": "llm.model",
     "model_small": "llm.model_small",
+    "model_image": "llm.model_image",
     "provider": "llm.provider",
     "rpm": "llm.rpm",
     "device": "device.serial",
@@ -185,6 +186,10 @@ def cmd_doctor(args) -> int:
         problems += 1
     if cfg.llm.model:
         out.ok(f"model {cfg.llm.model}")
+        if cfg.llm.model_small:
+            out.ok(f"small model {cfg.llm.model_small}")
+        if cfg.llm.model_image:
+            out.ok(f"vision model {cfg.llm.model_image}")
     else:
         out.warn("no model chosen -- run: adbagent models")
         problems += 1
@@ -571,6 +576,8 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", help="model id")
     parser.add_argument("--model-small", dest="model_small",
                         help="cheaper model for judging and repair")
+    parser.add_argument("--model-image", dest="model_image",
+                        help="model for vision calls with screenshots")
     parser.add_argument("--rpm", type=int, help="client-side request throttle")
     parser.add_argument("--db", help="path to the memory database")
 
