@@ -20,7 +20,7 @@
   },
 
   "memory": {
-    "db": "~/.local/share/adbagent/memory.db",
+    "db": "memory.db",
     "enabled": true,
     "t_sim": 6,
     "t_strict": 3,

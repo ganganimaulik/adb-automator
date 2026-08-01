@@ -75,7 +75,7 @@ class DeviceConfig:
 
 @dataclass
 class MemoryConfig:
-    db: str = "~/.local/share/adbagent/memory.db"
+    db: str = "memory.db"
     enabled: bool = True
     #: SimHash Hamming distance ceiling within a skeleton bucket (out of 64).
     t_sim: int = 6

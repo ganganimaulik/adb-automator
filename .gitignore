@@ -49,6 +49,7 @@ venv.bak/
 runs/
 config.json
 *.log
+memory.db*
 
 # Operating System & IDE Files
 .DS_Store
