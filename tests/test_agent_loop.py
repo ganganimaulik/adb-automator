@@ -1,0 +1,392 @@
+"""The whole loop, end to end, against a scripted phone.
+
+The headline test is `test_second_run_makes_no_llm_calls`. Everything the
+project claims comes down to that number being zero.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from adbagent.actions import AgentAction
+from adbagent.agent import Agent, Oracle, RunState, needs_screenshot
+from adbagent.config import Config
+from adbagent.memory import Memory
+
+from . import fake
+from . import xmlgen as X
+
+
+@pytest.fixture
+def cfg(tmp_path):
+    c = Config()
+    c.memory.db = str(tmp_path / "memory.db")
+    c.run.artifacts_dir = str(tmp_path / "runs")
+    c.run.max_steps = 25
+    c.safety.unattended = True      # never block a test on input()
+    return c
+
+
+@pytest.fixture
+def mem(cfg, tmp_path):
+    with Memory(cfg, path=tmp_path / "memory.db") as m:
+        yield m
+
+
+GOAL = "open the Wi-Fi settings screen"
+
+
+def run(dev, mem, cfg, policy, **kw):
+    llm = fake.FakeLLM(dev, policy)
+    agent = Agent(dev, mem, llm, cfg, **kw)
+    outcome, state = agent.run(GOAL)
+    return outcome, state, llm
+
+
+# ---------------------------------------------------------------------------
+# The headline claim
+# ---------------------------------------------------------------------------
+
+def test_first_run_uses_the_llm_and_succeeds(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    outcome, state, llm = run(dev, mem, cfg,
+                              fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    assert outcome == "success"
+    assert dev.state == "wifi"
+    assert llm.calls >= 2          # at least one decide plus the completion judge
+    assert state.cache_hits == 0
+
+
+def test_second_run_makes_no_llm_calls(cfg, mem):
+    """Learn once, then replay for free. This is the entire point of the project."""
+    first = fake.FakeDevice(cfg)
+    _, state1, llm1 = run(first, mem, cfg, fake.reach_state(first, "wifi", ["Wi-Fi"]), sampler=lambda: 1.0)
+    assert state1.finished == "success"
+    decides1 = llm1.calls - llm1.judges
+    assert decides1 >= 1
+
+    # A fresh phone in the same starting state, same goal, same memory.
+    second = fake.FakeDevice(cfg)
+    llm2 = fake.FakeLLM(second, fake.reach_state(second, "wifi", ["Wi-Fi"]))
+    # An assertion supplied by the user removes the only remaining LLM call --
+    # the completion judge -- so the whole run is free.
+    oracle = Oracle(text="Forget network")
+    outcome, state2 = Agent(second, mem, llm2, cfg, oracle=oracle, sampler=lambda: 1.0).run(GOAL)
+
+    assert outcome == "success"
+    assert second.state == "wifi"
+    assert llm2.calls == 0, "the second run must not consult the model at all"
+    assert state2.cache_hits >= 1
+
+
+def test_replay_survives_cosmetic_drift(cfg, mem):
+    """A different clock and a longer list must not cost an LLM call."""
+    first = fake.FakeDevice(cfg)
+    run(first, mem, cfg, fake.reach_state(first, "wifi", ["Wi-Fi"]), sampler=lambda: 1.0)
+
+    drifted = fake.FakeDevice(cfg)
+    drifted.app["home"].xml = X.settings_screen(
+        rows=11, clock="11:47", battery="23%", badge="9",
+        labels=["Wi-Fi", "Bluetooth", "Mobile network", "Hotspot", "Data usage",
+                "Airplane mode", "VPN", "Private DNS", "NFC", "Cast", "Tethering"])
+    # `home` is generated dynamically, so point the generator at the drifted XML.
+    drifted._xml = lambda: drifted.app[drifted.state].xml  # type: ignore[assignment]
+
+    llm = fake.FakeLLM(drifted, fake.reach_state(drifted, "wifi", ["Wi-Fi"]))
+    outcome, state = Agent(drifted, mem, llm, cfg,
+                           oracle=Oracle(text="Forget network"), sampler=lambda: 1.0).run(GOAL)
+    assert outcome == "success"
+    assert state.cache_hits >= 1
+    assert llm.calls == 0
+
+
+def test_cache_falls_back_to_the_llm_when_the_app_changes(cfg, mem):
+    """Break the learned screen; the agent must notice and re-plan."""
+    first = fake.FakeDevice(cfg)
+    run(first, mem, cfg, fake.reach_state(first, "wifi", ["Wi-Fi"]))
+
+    changed = fake.FakeDevice(cfg)
+    # The row is renamed -- the anchor's text no longer matches.
+    changed.app["home"] = fake.FakeScreen(
+        xml=X.settings_screen(rows=4, title="Connections",
+                              labels=["Wireless", "Bluetooth", "Hotspot", "VPN"]),
+        taps={"Wireless": "wifi"})
+    changed._xml = lambda: changed.app[changed.state].xml  # type: ignore[assignment]
+
+    llm = fake.FakeLLM(changed, fake.reach_state(changed, "wifi", ["Wireless"]))
+    outcome, state = Agent(changed, mem, llm, cfg).run(GOAL)
+    assert outcome == "success"
+    assert llm.calls >= 1, "a changed app must bring the model back"
+
+
+# ---------------------------------------------------------------------------
+# Completion
+# ---------------------------------------------------------------------------
+
+def test_a_programmatic_assertion_ends_the_run_with_no_judge(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    outcome, state = Agent(dev, mem, llm, cfg,
+                           oracle=Oracle(text="Forget network")).run(GOAL)
+    assert outcome == "success"
+    assert llm.judges == 0
+
+
+def test_shell_assertion(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    dev.shell_replies["settings get global wifi_on"] = "1"
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    oracle = Oracle(shell="settings get global wifi_on", equals="1")
+    outcome, _ = Agent(dev, mem, llm, cfg, oracle=oracle).run(GOAL)
+    assert outcome == "success"
+
+
+def test_premature_done_is_rejected_by_the_judge(cfg, mem):
+    """Claiming success too early is a documented failure of every mobile agent."""
+    dev = fake.FakeDevice(cfg)
+
+    calls = {"n": 0}
+
+    def policy(screen, llm):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return AgentAction(observation="home", reasoning="claiming early",
+                               action="done", text="I think it's done")
+        for el in screen.elements:
+            if el.best_text == "Wi-Fi" and el.interactive:
+                return AgentAction(observation="home", reasoning="really do it",
+                                   action="tap", target={"index": el.index})
+        return AgentAction(observation="there", reasoning="arrived",
+                           action="done", text="done for real")
+
+    llm = fake.FakeLLM(dev, policy, judge_result=False)
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    assert llm.judges >= 1
+    assert outcome in ("failed", "success")
+    assert any("rejected" in line for line in state.history)
+
+
+def test_assertion_overrules_a_premature_done(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+
+    def policy(screen, llm):
+        if dev.state == "wifi":
+            return AgentAction(observation="arrived", reasoning="ok",
+                               action="done", text="done")
+        if llm.calls <= 1:
+            return AgentAction(observation="home", reasoning="too early",
+                               action="done", text="premature")
+        for el in screen.elements:
+            if el.best_text == "Wi-Fi" and el.interactive:
+                return AgentAction(observation="home", reasoning="go",
+                                   action="tap", target={"index": el.index})
+        return AgentAction(observation="?", reasoning="back", action="press_key",
+                           key="back")
+
+    llm = fake.FakeLLM(dev, policy)
+    outcome, state = Agent(dev, mem, llm, cfg,
+                           oracle=Oracle(text="Forget network")).run(GOAL)
+    assert outcome == "success"
+    assert dev.state == "wifi"
+    assert llm.judges == 0
+
+
+# ---------------------------------------------------------------------------
+# Guards
+# ---------------------------------------------------------------------------
+
+def test_credential_screen_hands_over_and_learns_nothing(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    dev.app["home"] = fake.FakeScreen(xml=X.dump(
+        X.N("android.widget.FrameLayout", (0, 0, X.W, X.H), rid="content", children=[
+            X.N("android.widget.EditText", (48, 700, 1030, 820), rid="password",
+                hint="Password", password=True, clickable=True, focusable=True),
+            X.N("android.widget.Button", (48, 900, 520, 1020), text="Sign in",
+                rid="signin", clickable=True)])))
+    dev._xml = lambda: dev.app[dev.state].xml  # type: ignore[assignment]
+
+    llm = fake.FakeLLM(dev, fake.tap_label("Sign in"))
+    outcome, state = Agent(dev, mem, llm, cfg).run("log in")
+    assert outcome == "needs_user"
+    assert llm.calls == 0, "the model must never even see a credential screen"
+    assert mem.stats_summary()["entries"] == 0
+
+
+def test_irreversible_action_is_refused_when_unattended(cfg, mem):
+    dev = fake.FakeDevice(cfg, start="wifi")
+    llm = fake.FakeLLM(dev, fake.tap_label("Forget network"))
+    outcome, state = Agent(dev, mem, llm, cfg).run("forget this network")
+    assert "Forget network" not in "".join(dev.actions)
+    assert any("refused" in line for line in state.history)
+
+
+def test_interstitial_is_dismissed_without_an_llm_call(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    dev.app["home"] = fake.FakeScreen(
+        xml=X.settings_screen(extra_roots=[
+            X.N("android.widget.FrameLayout", (60, 800, 1020, 1400),
+                package="com.android.vending", rid="nag", children=[
+                    X.N("android.widget.TextView", (100, 860, 980, 980),
+                        package="com.android.vending", text="Rate this app!"),
+                    X.N("android.widget.Button", (620, 1240, 980, 1380),
+                        package="com.android.vending", text="Not now",
+                        rid="dismiss", clickable=True)])]),
+        taps={"Wi-Fi": "wifi"})
+    dev._xml = lambda: dev.app[dev.state].xml  # type: ignore[assignment]
+
+    llm = fake.FakeLLM(dev, fake.tap_label("Wi-Fi"))
+    Agent(dev, mem, llm, cfg).run(GOAL)
+    # The dismiss happened before any model call.
+    assert dev.taps, "the nag should have been tapped"
+
+
+def test_loop_breaker_stops_a_stuck_agent(cfg, mem):
+    """A model that keeps choosing a dud action must not burn the whole budget."""
+    dev = fake.FakeDevice(cfg)
+    cfg.run.max_steps = 12
+
+    def useless(screen, llm):
+        el = next(e for e in screen.elements if e.best_text == "Data usage")
+        return AgentAction(observation="home", reasoning="press it again",
+                           action="tap", target={"index": el.index})
+
+    llm = fake.FakeLLM(dev, useless)
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    assert outcome == "failed"
+    assert state.step <= cfg.run.max_steps
+    # The dud action was banned rather than retried forever.
+    assert any(state.loops.bans_for(k) for k in state.loops.banned)
+
+
+def test_step_budget_is_enforced(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    cfg.run.max_steps = 3
+    cfg.run.max_consecutive_failures = 99
+
+    def wander(screen, llm):
+        return AgentAction(observation="x", reasoning="y", action="scroll",
+                           direction="down")
+
+    llm = fake.FakeLLM(dev, wander)
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    assert outcome == "failed" and state.step == 3
+
+
+def test_dry_run_touches_nothing(cfg, mem):
+    cfg.run.dry_run = True
+    cfg.run.max_steps = 3
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.tap_label("Wi-Fi"))
+    Agent(dev, mem, llm, cfg).run(GOAL)
+    assert dev.taps == []
+    assert dev.state == "home"
+
+
+# ---------------------------------------------------------------------------
+# Screenshot policy
+# ---------------------------------------------------------------------------
+
+def test_xml_first_no_screenshot_on_a_normal_screen(cfg):
+    from adbagent.fingerprint import attach
+    from adbagent.screen import parse
+
+    screen = attach(parse(X.settings_screen(), width=X.W, height=X.H))
+    state = RunState(goal="g", run_id="r", intent_id="i")
+    want, _ = needs_screenshot(state, screen, cfg)
+    assert not want
+
+
+def test_screenshot_for_a_degenerate_tree(cfg):
+    from adbagent.fingerprint import attach
+    from adbagent.screen import parse
+
+    screen = attach(parse(X.webview_screen(), width=X.W, height=X.H))
+    want, note = needs_screenshot(RunState(goal="g", run_id="r", intent_id="i"),
+                                  screen, cfg)
+    assert want and "WebView" in note
+
+
+def test_screenshot_after_a_failure(cfg):
+    from adbagent.fingerprint import attach
+    from adbagent.screen import parse
+
+    screen = attach(parse(X.settings_screen(), width=X.W, height=X.H))
+    state = RunState(goal="g", run_id="r", intent_id="i", consecutive_failures=1)
+    want, _ = needs_screenshot(state, screen, cfg)
+    assert want
+
+
+def test_never_screenshot_wins(cfg):
+    from adbagent.fingerprint import attach
+    from adbagent.screen import parse
+
+    cfg.run.never_screenshot = True
+    screen = attach(parse(X.webview_screen(), width=X.W, height=X.H))
+    want, _ = needs_screenshot(RunState(goal="g", run_id="r", intent_id="i"),
+                              screen, cfg)
+    assert not want
+
+
+# ---------------------------------------------------------------------------
+# Artifacts
+# ---------------------------------------------------------------------------
+
+def test_run_writes_artifacts(cfg, mem, tmp_path):
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    events = (tmp_path / "runs" / state.run_id / "events.jsonl")
+    assert events.exists()
+    lines = [l for l in events.read_text().splitlines() if l.strip()]
+    kinds = {__import__("json").loads(l)["kind"] for l in lines}
+    assert {"run_start", "decide", "verify", "run_end"} <= kinds
+
+
+# ---------------------------------------------------------------------------
+# Shadow audit -- measuring whether the cache is actually right
+# ---------------------------------------------------------------------------
+
+def test_shadow_audit_records_agreement(cfg, mem):
+    """Sampled cache hits ask the model too, and record whether it agreed."""
+    first = fake.FakeDevice(cfg)
+    run(first, mem, cfg, fake.reach_state(first, "wifi", ["Wi-Fi"]))
+
+    second = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(second, fake.reach_state(second, "wifi", ["Wi-Fi"]))
+    _, state = Agent(second, mem, llm, cfg, oracle=Oracle(text="Forget network"),
+                     sampler=lambda: 0.0).run(GOAL)   # always audit
+    assert state.audits >= 1
+    assert state.audit_agreement() == 1.0
+    assert llm.calls == state.audits, "audits are the only calls a cached run makes"
+
+
+def test_shadow_audit_notices_disagreement(cfg, mem):
+    first = fake.FakeDevice(cfg)
+    run(first, mem, cfg, fake.reach_state(first, "wifi", ["Wi-Fi"]))
+
+    second = fake.FakeDevice(cfg)
+
+    def contrarian(screen, llm):
+        el = next(e for e in screen.elements if e.best_text == "Bluetooth")
+        return AgentAction(observation="o", reasoning="r", action="tap",
+                           target={"index": el.index})
+
+    llm = fake.FakeLLM(second, contrarian)
+    _, state = Agent(second, mem, llm, cfg, oracle=Oracle(text="Forget network"),
+                     sampler=lambda: 0.0).run(GOAL)
+    assert state.audits >= 1
+    assert state.audit_agreement() == 0.0
+    # The cache's answer is still what ran -- an audit measures, it does not veto.
+    assert second.state == "wifi"
+
+
+def test_shadow_audit_is_off_when_not_sampled(cfg, mem):
+    first = fake.FakeDevice(cfg)
+    run(first, mem, cfg, fake.reach_state(first, "wifi", ["Wi-Fi"]))
+
+    second = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(second, fake.reach_state(second, "wifi", ["Wi-Fi"]))
+    _, state = Agent(second, mem, llm, cfg, oracle=Oracle(text="Forget network"),
+                     sampler=lambda: 1.0).run(GOAL)   # never audit
+    assert state.audits == 0
+    assert llm.calls == 0

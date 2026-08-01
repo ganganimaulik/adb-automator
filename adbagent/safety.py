@@ -1,0 +1,266 @@
+"""Guardrails: scope, credentials, irreversible actions, loops, explore mode.
+
+Ordered by how much damage the thing being prevented would do.
+
+1. **Credentials.** The agent never types a password, PIN, one-time code or card
+   number. It detects those screens, stops, and hands control to the person. The
+   screen is not written to artifacts and not learned.
+2. **Irreversible actions.** Sending, buying, deleting, posting. These need a
+   human yes, and they can never be replayed from cache -- the token that names
+   them is stored as forbidden, so a cached step that would tap one is refused
+   before it runs.
+3. **Scope.** The run can be pinned to one package; anything else is an escape
+   to be corrected, not explored.
+4. **Loops.** The dominant failure mode in every published mobile agent: the
+   model revisits the same screen forever and burns the step budget.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
+
+from .actions import AgentAction, resolve_target
+from .config import Config
+from .fingerprint import DESTRUCTIVE_TEXT
+from .screen import Element, Screen
+
+log = logging.getLogger("adbagent.safety")
+
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+
+SENSITIVE_TEXT = re.compile(
+    r"\b(password|passcode|passphrase|\bpin\b|cvv|cvc|security code|"
+    r"card number|credit card|debit card|expiry|expiration date|"
+    r"one[- ]time (?:code|password)|\botp\b|verification code|2fa|"
+    r"two[- ]factor|authenticator|billing address|bank account|"
+    r"sort code|routing number|iban|social security|ssn)\b",
+    re.I,
+)
+
+SENSITIVE_PACKAGES = (
+    "com.google.android.gms.auth",
+    "com.android.settings.password",
+)
+
+
+@dataclass
+class SensitiveFinding:
+    reason: str
+    element: Optional[Element] = None
+
+
+def sensitive_screen(screen: Screen) -> Optional[SensitiveFinding]:
+    """Detect a screen the agent must not touch."""
+    for el in screen.elements:
+        if el.password:
+            return SensitiveFinding("a password field is focused on this screen", el)
+    for el in screen.elements:
+        if el.editable:
+            context = " ".join(filter(None, (el.best_text, el.hint, el.resource_id)))
+            if SENSITIVE_TEXT.search(context):
+                return SensitiveFinding(
+                    f"an input field asks for {context.strip()!r}", el)
+    for package in SENSITIVE_PACKAGES:
+        if package in screen.packages:
+            return SensitiveFinding(f"a credential flow ({package}) is on screen")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Irreversible actions
+# ---------------------------------------------------------------------------
+
+def irreversible(action: AgentAction, screen: Screen) -> Optional[str]:
+    """The label of the control being pressed, when pressing it cannot be undone."""
+    if action.action not in ("tap", "long_press"):
+        return None
+    if action.target is None:
+        return None
+    element = resolve_target(action.target, screen)
+    if element is None:
+        return None
+    label = element.best_text
+    if label and DESTRUCTIVE_TEXT.search(label):
+        return label
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Interstitials
+# ---------------------------------------------------------------------------
+
+#: Buttons that only ever dismiss noise -- rating nags, feature tours, "what's
+#: new" cards. Deliberately excludes "Allow", "Accept" and "Agree": granting a
+#: permission or accepting terms is a decision, not noise, so it goes to the
+#: model (and to the user, if it is irreversible) rather than being auto-tapped.
+DISMISS_LABELS = re.compile(
+    r"^\s*(?:no thanks|not now|maybe later|later|skip|skip for now|dismiss|"
+    r"got it|ok, got it|close|no, thanks|remind me later|don't show again|"
+    r"continue|next)\s*$",
+    re.I,
+)
+
+INTERSTITIAL_PACKAGES = {
+    "com.android.vending",          # Play Store rating nags
+    "com.google.android.gms",
+}
+
+
+def find_interstitial(screen: Screen, target_package: str = "") -> Optional[Element]:
+    """A dismiss button on a dialog that is in the way but not part of the task."""
+    if not screen.has_system_dialog() and not any(
+            p in INTERSTITIAL_PACKAGES for p in screen.packages):
+        # Also allow in-app nags, but only when the label is unambiguous noise.
+        candidates = [el for el in screen.actionable
+                      if DISMISS_LABELS.match(el.best_text or "")]
+        return candidates[0] if len(candidates) == 1 else None
+
+    for el in screen.actionable:
+        if el.package == target_package:
+            continue
+        if DISMISS_LABELS.match(el.best_text or ""):
+            return el
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Scope
+# ---------------------------------------------------------------------------
+
+def in_scope(screen: Screen, cfg: Config) -> bool:
+    allowed = cfg.allowed_packages()
+    if not allowed:
+        return True
+    if not screen.package:
+        return True
+    return screen.package in allowed
+
+
+# ---------------------------------------------------------------------------
+# Loop detection
+# ---------------------------------------------------------------------------
+
+REPEAT_HINT_AT = 3
+FORCE_BACK_AT = 5
+WINDOW = 8
+
+
+@dataclass
+class LoopDetector:
+    """Ring buffer of recent screens, plus a per-screen ban list.
+
+    Roughly four fifths of failures in the published baselines are navigation
+    loops eating the step budget, so this is not an optional nicety.
+    """
+
+    history: List[Tuple[str, str]] = field(default_factory=list)
+    banned: Dict[str, Set[str]] = field(default_factory=dict)
+
+    def record(self, exact_id: str, signature: str) -> None:
+        self.history.append((exact_id, signature))
+        del self.history[:-WINDOW]
+
+    def repeats(self, exact_id: str) -> int:
+        return sum(1 for seen, _ in self.history if seen == exact_id)
+
+    def hint(self, exact_id: str) -> Optional[str]:
+        n = self.repeats(exact_id)
+        if n >= REPEAT_HINT_AT:
+            return (f"You have now seen this exact screen {n} times. Whatever you "
+                    f"have been trying is not working -- do something different, "
+                    f"or go back.")
+        return None
+
+    def should_force_back(self, exact_id: str) -> bool:
+        return self.repeats(exact_id) >= FORCE_BACK_AT
+
+    def oscillating(self) -> bool:
+        """A repeating 2- or 3-step cycle, e.g. open -> back -> open -> back."""
+        ids = [h for h, _ in self.history]
+        for period in (2, 3):
+            if len(ids) >= period * 2:
+                tail = ids[-period * 2:]
+                if tail[:period] == tail[period:]:
+                    return True
+        return False
+
+    def ban(self, skeleton_id: str, signature: str) -> None:
+        log.info("banning %s on this screen for the rest of the run", signature)
+        self.banned.setdefault(skeleton_id, set()).add(signature)
+
+    def bans_for(self, skeleton_id: str) -> Set[str]:
+        return self.banned.get(skeleton_id, set())
+
+
+# ---------------------------------------------------------------------------
+# Explore mode
+# ---------------------------------------------------------------------------
+
+#: Explore may press these; anything else needs the user's blessing.
+def is_read_only(action: AgentAction, screen: Screen) -> Tuple[bool, str]:
+    """Would this action only navigate, or could it change something?
+
+    Explore mode runs on a real, logged-in phone. Every published system that
+    explored by tapping freely reported sending messages, deleting data or
+    spending money by accident, so the default here is to refuse anything that
+    is not plainly navigational.
+    """
+    if action.action in ("scroll", "wait", "done", "fail", "ask_user"):
+        return True, ""
+    if action.action == "press_key":
+        if action.key in ("back", "home", "recent"):
+            return True, ""
+        return False, f"key {action.key} may commit something"
+    if action.action == "input_text":
+        return False, "typing can submit a form or send a message"
+    if action.action == "open_app":
+        return True, ""
+    if action.action == "long_press":
+        return False, "long press usually opens a destructive context menu"
+    if action.action != "tap":
+        return False, f"{action.action} is not a navigation action"
+
+    if action.target is None:
+        return False, "no target"
+    element = resolve_target(action.target, screen)
+    if element is None:
+        return False, "target not on screen"
+
+    label = element.best_text
+    if label and DESTRUCTIVE_TEXT.search(label):
+        return False, f"{label!r} names an irreversible action"
+    if element.checkable:
+        return False, "toggling a setting changes state"
+    if element.editable:
+        return False, "focusing a text field leads to typing"
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Confirmation
+# ---------------------------------------------------------------------------
+
+class Aborted(RuntimeError):
+    """The user declined, or a confirmation was needed and none was possible."""
+
+
+def confirm(prompt: str, cfg: Config) -> bool:
+    """Ask the person. Unattended runs refuse rather than guess."""
+    if cfg.safety.allow_destructive:
+        log.warning("proceeding without confirmation (--allow-destructive): %s",
+                    prompt)
+        return True
+    if cfg.safety.unattended:
+        log.error("refusing in unattended mode: %s", prompt)
+        return False
+    try:
+        answer = input(f"\n  {prompt}\n  Proceed? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("y", "yes")
