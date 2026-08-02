@@ -196,6 +196,28 @@ def test_live_reporter_displays_llm_reasoning(capsys):
     assert "Reasoning: Tap element #5 to open Wi-Fi settings" in captured
 
 
+def test_live_reporter_displays_screenshot_indicator(capsys):
+    from adbagent.actions import AgentAction
+    from adbagent.cli import Out, _live_reporter
+    from unittest.mock import MagicMock
+
+    out = Out(quiet=False)
+    reporter = _live_reporter(out)
+
+    action = AgentAction(
+        observation="Screen",
+        reasoning="Tap element",
+        action="tap",
+        target={"index": 2}
+    )
+    state = MagicMock(step=1)
+
+    reporter("step", state=state, action=action, source="llm", screenshot=True)
+    captured = capsys.readouterr().out
+    assert "LLM" in captured
+    assert "+img" in captured
+
+
 def test_report_on_a_missing_run():
     assert cmd_report(parse(["report", "/nonexistent/run"])) == 1
 

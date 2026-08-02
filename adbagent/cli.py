@@ -448,8 +448,10 @@ def _live_reporter(out: Out):
         state = kw["state"]
         action = kw["action"]
         source = kw["source"]
+        screenshot = kw.get("screenshot", False)
         tag = out.green("CACHE") if source == "cache" else out.cyan(" LLM ")
-        out.say(f"  {state.step:>3} [{tag}] {action.describe()}")
+        shot = " +img" if screenshot else ""
+        out.say(f"  {state.step:>3} [{tag}]{shot} {action.describe()}")
         if source == "llm":
             if getattr(action, "observation", None):
                 out.say(out.dim(f"        Obs:       {action.observation}"))
