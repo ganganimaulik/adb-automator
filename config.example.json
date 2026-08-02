@@ -33,10 +33,10 @@
   "safety": {
     "package_allowlist": [],
     "budget_usd": 2.0,
-    "max_actions_per_minute": 60,
     "allow_destructive": false,
     "unattended": false
   },
+
 
   "run": {
     "max_steps": 60,

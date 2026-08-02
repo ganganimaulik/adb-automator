@@ -81,6 +81,15 @@ def test_config_file_wins_over_environment(monkeypatch, tmp_path):
     assert build_config(parse(["run", "g"])).llm.model == "from-env"
 
 
+def test_empty_config_string_does_not_overwrite_env_var(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ANDROID_SERIAL", "192.168.1.50:5555")
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"device": {"serial": ""}}))
+    assert build_config(parse(["run", "g", "-c", str(path)])).device.serial == "192.168.1.50:5555"
+
+
+
 def test_app_flag_pins_the_package_allowlist():
     cfg = build_config(parse(["explore", "--app", "com.android.settings"]))
     allowed = cfg.allowed_packages()
