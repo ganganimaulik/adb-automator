@@ -141,9 +141,9 @@ def find_interstitial(screen: Screen, target_package: str = "") -> Optional[Elem
 # Loop detection
 # ---------------------------------------------------------------------------
 
-REPEAT_HINT_AT = 3
-FORCE_BACK_AT = 5
-WINDOW = 8
+REPEAT_HINT_AT = 6
+FORCE_BACK_AT = 9
+WINDOW = 20
 
 _SCROLL_OPPOSITES = {"up": "down", "down": "up", "left": "right", "right": "left"}
 
@@ -209,19 +209,24 @@ class LoopDetector:
         return self.consecutive_backs >= self._BACK_LOOP_CAP
 
     def oscillating(self) -> bool:
-        """A repeating 2- or 3-step cycle, e.g. open -> back -> open -> back.
+        """A repeating 2- or 3-step cycle that has persisted for 4+ full
+        repetitions, e.g. [A,B,A,B,A,B,A,B].
 
         Ignores patterns that consist entirely of forced-back entries,
         because those are a symptom of *this* guard firing repeatedly,
         not of the agent misbehaving.
         """
+        MIN_REPS = 5  # cycle must repeat this many times
         # Filter out forced-back entries to check for real oscillation.
         real = [(h, s) for h, s in self.history if s != "forced-back"]
         ids = [h for h, _ in real]
         for period in (2, 3):
-            if len(ids) >= period * 2:
-                tail = ids[-period * 2:]
-                if tail[:period] == tail[period:]:
+            needed = period * MIN_REPS
+            if len(ids) >= needed:
+                tail = ids[-needed:]
+                cycle = tail[:period]
+                if all(tail[i * period:(i + 1) * period] == cycle
+                       for i in range(1, MIN_REPS)):
                     return True
         return False
 

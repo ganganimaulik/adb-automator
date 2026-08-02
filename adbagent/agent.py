@@ -344,11 +344,31 @@ class Agent:
                             state.loops.ban(screen.skeleton_id, sig)
 
             if state.loops.should_force_back(screen.exact_id) or state.loops.oscillating():
-                log.warning("step %d: stuck in a loop; going back", state.step)
-                rec.event("loop_break", exact_id=screen.exact_id)
-                self.dev.press("back")
-                state.loops.record(screen.exact_id, "forced-back")
-                continue
+                if state.loops.in_back_loop():
+                    # Pressing back repeatedly is not helping; let the LLM
+                    # try a different approach this turn.
+                    log.warning("step %d: back-loop detected (%d consecutive "
+                                "backs); falling through to LLM",
+                                state.step, state.loops.consecutive_backs)
+                    rec.event("back_loop_escape", exact_id=screen.exact_id,
+                              consecutive_backs=state.loops.consecutive_backs)
+                    extra = ("Pressing back repeatedly has not helped. You MUST "
+                             "try a completely different approach — tap a "
+                             "different element, scroll, use search, or report "
+                             "done/fail.")
+                    hint = f"{hint} {extra}" if hint else extra
+                    state.loops.consecutive_backs = 0
+                    # Ban the back action on this screen so the cache does not
+                    # replay it either.
+                    state.loops.ban(screen.skeleton_id, "forced-back")
+                else:
+                    log.warning("step %d: stuck in a loop; going back",
+                                state.step)
+                    rec.event("loop_break", exact_id=screen.exact_id)
+                    self.dev.press("back")
+                    state.loops.record(screen.exact_id, "forced-back")
+                    state.loops.consecutive_backs += 1
+                    continue
 
             # ---- 3. cache lookup (no LLM) -------------------------------
             # Check if we're revisiting via back navigation
@@ -575,6 +595,7 @@ class Agent:
             if outcome.ok:
                 state.consecutive_failures = 0
                 state.last_failure = ""
+                state.loops.consecutive_backs = 0
             if outcome.grade == "no_change":
                 state.loops.ban(screen.skeleton_id, action.signature())
                 if action.action == "scroll":
