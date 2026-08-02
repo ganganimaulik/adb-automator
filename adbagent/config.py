@@ -115,6 +115,9 @@ class RunConfig:
     always_screenshot: bool = False
     never_screenshot: bool = False
     dry_run: bool = False
+    #: Maximum characters retained in the agent scratchpad. The scratchpad lets
+    #: the agent accumulate data (messages, search results, etc.) across turns.
+    scratchpad_max_chars: int = 50_000
 
 
 @dataclass

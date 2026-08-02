@@ -107,6 +107,12 @@ class AgentAction(BaseModel):
         None, description="For scroll: which way the content should move.")
     confidence: Literal["high", "low"] = Field(
         "high", description="Use 'low' when unsure; you will be shown a screenshot.")
+    notes: Optional[str] = Field(
+        None,
+        description="Data collection scratchpad. See DATA COLLECTION above.")
+    progress: Optional[str] = Field(
+        None,
+        description="Multi-step progress tracker. See PROGRESS TRACKING above.")
 
     @model_validator(mode="after")
     def _check_arguments(self) -> "AgentAction":

@@ -515,7 +515,8 @@ class LLMClient:
 
     def decide(self, *, goal: str, rendered: str, history: Sequence[str],
                width: int, height: int, package: str = "",
-               screenshot: Optional[bytes] = None, note: str = ""):
+               screenshot: Optional[bytes] = None, note: str = "",
+               scratchpad: str = "", progress: str = ""):
         from . import prompts
         from .actions import AgentAction
 
@@ -532,7 +533,8 @@ class LLMClient:
             {"role": "user",
              "content": prompts.device_profile(width, height, package)},
             {"role": "user", "content": prompts.goal_block(goal)},
-            {"role": "user", "content": prompts.history_block(history)},
+            {"role": "user", "content": prompts.history_block(history, scratchpad,
+                                                              progress)},
             {"role": "user", "content": content},
         ]
         target = self.model_image if screenshot else self.model
@@ -540,11 +542,13 @@ class LLMClient:
 
     def judge(self, *, goal: str, rendered: str, history: Sequence[str],
               screenshot: Optional[bytes] = None,
-              max_tokens: int = 0) -> "Verdict":
+              max_tokens: int = 0, scratchpad: str = "",
+              progress: str = "") -> "Verdict":
         from . import prompts
 
         content: List[Dict[str, Any]] = [
-            text_part(prompts.judge_user(goal, history, rendered))]
+            text_part(prompts.judge_user(goal, history, rendered, scratchpad,
+                                        progress))]
         if screenshot:
             content.append(image_part(screenshot))
         messages = [
