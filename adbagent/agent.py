@@ -324,7 +324,7 @@ class Agent:
             source = "llm"
 
             # Track scroll direction globally (survives interleaved taps).
-            if action.action == "scroll" and action.direction:
+            if action.action in ("scroll", "swipe") and action.direction:
                 state.loops.record_scroll(action.direction)
 
             # Last-resort guard: if the LLM was given full scroll context
@@ -332,7 +332,7 @@ class Agent:
             # Now also triggers on direction reversals (>=5), not just
             # strict consecutive oscillation.
             scroll_blocked = False
-            if action.action == "scroll":
+            if action.action in ("scroll", "swipe"):
                 if state.loops.scroll_oscillating():
                     scroll_blocked = True
                 elif (state.loops.direction_reversals() >= 5
@@ -480,13 +480,14 @@ class Agent:
                 state.loops.consecutive_backs = 0
             if outcome.grade == "no_change":
                 state.loops.ban(screen.skeleton_id, action.signature())
-                if action.action == "scroll":
+                if action.action in ("scroll", "swipe"):
                     h_dir = action.direction in ("left", "right")
                     axis = "horizontal" if h_dir else "vertical"
+                    act_name = "Swiping" if action.action == "swipe" else "Scrolling"
                     state.last_failure = (
-                        f"Scrolling {action.direction} did not reveal new "
+                        f"{act_name} {action.direction} did not reveal new "
                         f"content \u2014 you have reached the end of the "
-                        f"{axis} scrollable area. Do not scroll "
+                        f"{axis} scrollable area. Do not {action.action} "
                         f"{action.direction} again here.")
 
             state.loops.record(screen.exact_id, action.signature())

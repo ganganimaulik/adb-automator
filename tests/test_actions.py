@@ -330,3 +330,56 @@ def test_vertical_scroller_shows_scrollable_flag():
     rendered = render_element(scroller)
     assert "scrollable" in rendered
     assert "scrollable-h" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Swipe action & Photo swiping
+# ---------------------------------------------------------------------------
+
+def test_swipe_action_validation():
+    a = act(action="swipe", direction="left", scroll_amount=1.5, duration=0.15)
+    assert a.action == "swipe"
+    assert a.direction == "left"
+    assert a.duration == 0.15
+
+    with pytest.raises(ValidationError):
+        act(action="swipe")  # no direction
+
+
+def test_swipe_and_scroll_execution_target_bounds():
+    from tests.fake import FakeDevice
+    from adbagent.actions import execute
+    
+    dev = FakeDevice()
+    screen = s(X.settings_screen())
+    
+    # Target element #1 (whether scrollable or not)
+    action_swipe = act(action="swipe", target=Target(index=1), direction="left")
+    execute(dev, action_swipe, screen)
+    assert any("scroll(left)" in act for act in dev.actions)
+
+    action_scroll = act(action="scroll", target=Target(index=1), direction="right")
+    execute(dev, action_scroll, screen)
+    assert any("scroll(right)" in act for act in dev.actions)
+
+
+def test_textless_photo_screen_scroll_changed():
+    """Screens without text inside scrollers (e.g. photo galleries) verify change on exact_id delta."""
+    xml_photo_1 = """
+    <hierarchy rotation="0">
+      <node index="0" text="" content-desc="Photo 1" resource-id="com.whatsapp:id/photo" class="android.widget.ImageView" package="com.whatsapp" bounds="[0,0][1080,1920]" enabled="true" clickable="true" scrollable="false" />
+    </hierarchy>
+    """
+    xml_photo_2 = """
+    <hierarchy rotation="0">
+      <node index="0" text="" content-desc="Photo 2" resource-id="com.whatsapp:id/photo2" class="android.widget.ImageView" package="com.whatsapp" bounds="[0,0][1080,1920]" enabled="true" clickable="true" scrollable="false" />
+    </hierarchy>
+    """
+    before = s(xml_photo_1)
+    after = s(xml_photo_2)
+    assert before.exact_id != after.exact_id
+    
+    action = act(action="swipe", direction="left")
+    outcome = verify(action, before, after)
+    assert outcome.grade != "no_change"
+

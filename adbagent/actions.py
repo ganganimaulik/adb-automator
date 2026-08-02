@@ -31,7 +31,7 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle only matters for typing
 log = logging.getLogger("adbagent.actions")
 
 ActionName = Literal[
-    "tap", "long_press", "input_text", "press_key", "scroll",
+    "tap", "long_press", "input_text", "press_key", "scroll", "swipe",
     "open_app", "wait", "ask_user", "done", "fail",
 ]
 
@@ -131,12 +131,13 @@ class AgentAction(BaseModel):
                     "ask_user: the question. done/fail: a one-line summary.")
     key: Optional[KeyName] = Field(None, description="For press_key.")
     direction: Optional[ScrollDir] = Field(
-        None, description="For scroll: which way the content should move.")
+        None, description="For scroll and swipe: which direction to move content or gesture ('down', 'up', 'left', 'right').")
     scroll_amount: float = Field(
-        1, description="For scroll: how many screenfuls to scroll (0.5 for half-page, "
-                       "1 for one page, up to 5). Use higher values to move quickly "
-                       "through long content like chat history.",
+        1, description="For scroll/swipe: distance or scale multiplier (0.25 for quarter page/small swipe, 1 for full page/swipe, up to 5).",
         ge=0.25, le=5)
+    duration: Optional[float] = Field(
+        None, description="For swipe/scroll: gesture duration in seconds (e.g. 0.15 for fast flick, 0.5 for scroll).",
+        ge=0.05, le=3.0)
     confidence: Literal["high", "low"] = Field(
         "high", description="Use 'low' when unsure; you will be shown a screenshot.")
     notes: Optional[str] = Field(
@@ -155,8 +156,8 @@ class AgentAction(BaseModel):
             raise ValueError("input_text requires text")
         if self.action == "press_key" and self.key is None:
             raise ValueError("press_key requires key")
-        if self.action == "scroll" and self.direction is None:
-            raise ValueError("scroll requires direction")
+        if self.action in ("scroll", "swipe") and self.direction is None:
+            raise ValueError(f"{self.action} requires direction")
         if self.action == "open_app" and not self.text:
             raise ValueError("open_app requires the package name in text")
         if self.action == "ask_user" and not self.text:
@@ -310,33 +311,36 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
         dev.input_text(action.text or "", clear=True)
     elif action.action == "press_key":
         dev.press(action.key or "back")
-    elif action.action == "scroll":
+    elif action.action in ("scroll", "swipe"):
         box = None
-        if element is not None and element.scrollable:
+        if element is not None:
             box = element.bounds
-            # Remap wrong-axis directions so the LLM doesn't waste steps.
+            # Only remap vertical->horizontal if element is explicitly horizontal and direction is up/down
             if element.is_horizontal and action.direction in ("up", "down"):
                 remapped = "left" if action.direction == "up" else "right"
                 log.warning("remapping scroll %s -> %s for horizontal scroller",
                             action.direction, remapped)
                 action = action.model_copy(update={"direction": remapped})
-            elif not element.is_horizontal and action.direction in ("left", "right"):
-                remapped = "up" if action.direction == "left" else "down"
-                log.warning("remapping scroll %s -> %s for vertical scroller",
-                            action.direction, remapped)
-                action = action.model_copy(update={"direction": remapped})
         amount = max(0.25, min(action.scroll_amount, 5.0))
-        base_scale = 0.6
-        full_scrolls = int(amount)
-        remainder = amount - full_scrolls
-        import time
-        for i in range(full_scrolls):
-            dev.scroll(action.direction or "down", scale=base_scale, box=box)
-            if i < full_scrolls - 1 or remainder > 0:
-                time.sleep(0.15)
-        if remainder >= 0.1:
-            dev.scroll(action.direction or "down",
-                       scale=round(base_scale * remainder, 2), box=box)
+        if action.action == "swipe":
+            # Fast flick swipe: default duration 0.15s, single gesture with wider default scale 0.8
+            duration = action.duration if action.duration is not None else 0.15
+            scale = min(0.95, max(0.2, 0.8 * amount))
+            dev.scroll(action.direction or "left", scale=scale, box=box, duration=duration)
+        else:
+            # Scroll action: default duration 0.5s for steady list scrolling
+            duration = action.duration if action.duration is not None else 0.5
+            base_scale = 0.6
+            full_scrolls = int(amount)
+            remainder = amount - full_scrolls
+            import time
+            for i in range(full_scrolls):
+                dev.scroll(action.direction or "down", scale=base_scale, box=box, duration=duration)
+                if i < full_scrolls - 1 or remainder > 0:
+                    time.sleep(0.15)
+            if remainder >= 0.1:
+                dev.scroll(action.direction or "down",
+                           scale=round(base_scale * remainder, 2), box=box, duration=duration)
     elif action.action == "open_app":
         dev.open_app((action.text or "").strip())
     elif action.action == "wait":
@@ -491,10 +495,8 @@ def _scroll_changed(before: Screen, after: Screen) -> bool:
         dist = hamming(after.simhash, before.simhash)
         if dist <= 2:
             # Chrome barely changed.  Did the scroller content actually move?
-            if not before_texts and not after_texts:
-                return False  # No scroller content; chrome-only change.
-            if before_texts == after_texts:
-                return False  # Scroller content is identical.
+            if before_texts and after_texts and before_texts == after_texts:
+                return False  # Scroller content is present and identical.
 
     # Signal 3: scroller content overlap.
     if before_texts and after_texts:
@@ -515,12 +517,10 @@ def verify(action: AgentAction, before: Screen, after: Screen,
 
     condition = post or synthesise_postcondition(action, None)
 
-    # Scroll that didn't move = end of list, not a hard failure.  Grading it
-    # ``no_change`` causes the direction to be banned on this screen and gives
-    # the LLM a clear "end of list" signal instead of a confusing hard_fail.
-    if action.action == "scroll" and not _scroll_changed(before, after):
+    # Scroll/swipe that didn't move = end of list or edge of gallery, not a hard failure.
+    if action.action in ("scroll", "swipe") and not _scroll_changed(before, after):
         return VerifyOutcome(grade="no_change",
-                             reason="scrolling did not reveal new content")
+                             reason=f"{action.action}ing did not reveal new content")
 
     # Checked before the generic postcondition, because "nothing happened at
     # all" is both the most common silent failure and a more actionable

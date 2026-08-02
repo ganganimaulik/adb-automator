@@ -118,3 +118,39 @@ def test_press_key_vocabulary_matches_the_server():
     assert {"back", "home", "enter", "recent", "delete"} <= PRESS_KEYS
     assert "escape" not in PRESS_KEYS
     assert "tab" not in PRESS_KEYS
+
+
+def test_device_scroll_gesture_directions_and_duration():
+    class DummyU2:
+        def __init__(self):
+            self.calls = []
+        def swipe_ext(self, gesture_dir, **kwargs):
+            self.calls.append((gesture_dir, kwargs))
+
+    class DummyConfig:
+        class DeviceConfig:
+            watchdog_s = 5.0
+        device = DeviceConfig()
+
+    from adbagent.device import Device
+    d = Device.__new__(Device)
+    d._d = DummyU2()
+    d._act = lambda fn, what: fn()
+    d.cfg = DummyConfig()
+
+    # Direction left -> gesture left (swipe right-to-left)
+    d.scroll("left", scale=0.8, duration=0.15)
+    assert d._d.calls[-1] == ("left", {"scale": 0.8, "duration": 0.15})
+
+    # Direction right -> gesture right (swipe left-to-right)
+    d.scroll("right", scale=0.8, duration=0.15)
+    assert d._d.calls[-1] == ("right", {"scale": 0.8, "duration": 0.15})
+
+    # Direction down -> gesture up (scroll down)
+    d.scroll("down", scale=0.6)
+    assert d._d.calls[-1] == ("up", {"scale": 0.6})
+
+    # Direction up -> gesture down (scroll up)
+    d.scroll("up", scale=0.6)
+    assert d._d.calls[-1] == ("down", {"scale": 0.6})
+
