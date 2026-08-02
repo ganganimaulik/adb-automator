@@ -84,6 +84,15 @@ class RunState:
     audits_agreed: int = 0
     started_at: float = field(default_factory=time.monotonic)
     finished: Optional[Outcome] = None
+    #: Running scratchpad for data-collection goals.  The LLM writes into the
+    #: ``notes`` field of its action; we append here and feed it back each turn
+    #: so it knows what it has already captured.
+    scratchpad: List[str] = field(default_factory=list)
+    scratchpad_chars: int = 0
+    #: Progress tracker for multi-step goals.  The LLM writes into the
+    #: ``progress`` field; we keep the last few entries and feed them back.
+    progress_log: List[str] = field(default_factory=list)
+    progress_chars: int = 0
 
     @property
     def elapsed(self) -> float:
@@ -326,7 +335,9 @@ class Agent:
                 action = self.llm.decide(                      ### LLM ###
                     goal=state.goal, rendered=render(screen), history=state.history,
                     width=screen.width, height=screen.height, package=screen.package,
-                    screenshot=screenshot, note=notes)
+                    screenshot=screenshot, note=notes,
+                    scratchpad="\n".join(state.scratchpad),
+                    progress="\n".join(state.progress_log))
                 state.llm_calls += 1
                 state.want_screenshot = action.confidence == "low"
                 source = "llm"
@@ -351,6 +362,32 @@ class Agent:
                     del state.history[:-12]
                     self._maybe_give_up(state)
                     continue
+
+            # -- accumulate scratchpad notes --------------------------------
+            if getattr(action, "notes", None):
+                cap = cfg.run.scratchpad_max_chars
+                note_text = action.notes.strip()
+                if state.scratchpad_chars + len(note_text) > cap:
+                    # Trim to fit within the budget.
+                    room = max(0, cap - state.scratchpad_chars)
+                    if room > 0:
+                        note_text = note_text[:room]
+                    else:
+                        note_text = ""
+                if note_text:
+                    state.scratchpad.append(note_text)
+                    state.scratchpad_chars += len(note_text)
+
+            # -- accumulate progress ----------------------------------------
+            if getattr(action, "progress", None):
+                prog_text = action.progress.strip()
+                if prog_text:
+                    state.progress_log.append(prog_text)
+                    state.progress_chars += len(prog_text)
+                    # Keep only the most recent entries to stay bounded.
+                    while len(state.progress_log) > 5:
+                        removed = state.progress_log.pop(0)
+                        state.progress_chars -= len(removed)
 
             rec.event("decide", step=state.step, source=source,
                       skeleton=screen.skeleton_id, action=action.model_dump(),
@@ -516,7 +553,9 @@ class Agent:
 
         shot = self.dev.screenshot()
         verdict = self.llm.judge(goal=state.goal, rendered=render(screen),  ### LLM ###
-                                 history=state.history, screenshot=shot)
+                                 history=state.history, screenshot=shot,
+                                 scratchpad="\n".join(state.scratchpad),
+                                 progress="\n".join(state.progress_log))
         state.llm_calls += 1
         rec.event("judge", satisfied=verdict.satisfied, evidence=verdict.evidence)
         if verdict.satisfied:

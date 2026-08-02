@@ -400,6 +400,13 @@ def cmd_run(args) -> int:
             spent = llm.ledger.total_usd - spent_before
             tilde = "~" if llm.ledger.estimated else ""
             out.say()
+            if state.scratchpad:
+                out.say()
+                out.say(out.bold("  ── Collected Data ──"))
+                out.say()
+                for chunk in state.scratchpad:
+                    out.say(f"  {chunk}")
+                out.say()
             out.say(f"  {colour(outcome.upper())}  "
                     f"{state.step} steps, {state.llm_calls} LLM calls "
                     f"({state.cache_rate():.0%} from cache), "
