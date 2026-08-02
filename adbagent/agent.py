@@ -198,23 +198,21 @@ class Agent:
 
     def _shadow_audit(self, state: RunState, screen: Screen,
                       entry: CachedStep, cached: AgentAction,
-                      rec: Recorder) -> None:
+                      rec: Recorder) -> Tuple[bool, Optional[AgentAction]]:
         """Occasionally ask the model anyway, and record whether it agreed.
 
-        We still execute the cache's answer -- this measures the cache, it does
-        not second-guess it. Without this the trust states are an assumption;
-        with it, disagreement over recent audits is the cache's measured
-        precision, and a persistently high rate means the fingerprint is too
-        loose.
+        If the model disagrees with the cache, the cached entry is demoted (marked
+        as a soft failure) and the model's proposed action is returned to override
+        the stale cache entry.
         """
         if self.llm is None:
-            return
+            return True, None
         rate = trust.shadow_audit_rate(
             entry.state, self.cfg.memory.shadow_audit_probation,
             self.cfg.memory.shadow_audit_active,
             self.cfg.memory.shadow_audit_trusted)
         if rate <= 0 or self.sampler() >= rate:
-            return
+            return True, None
         try:
             proposed = self.llm.decide(                        ### LLM (audit only)
                 goal=state.goal, rendered=render(screen), history=state.history,
@@ -222,7 +220,7 @@ class Agent:
                 step=state.step, recorder=rec, purpose="shadow_audit")
         except (LLMError, BudgetExceeded) as exc:
             log.debug("shadow audit skipped: %s", exc)
-            return
+            return True, None
         state.llm_calls += 1
         agreed = proposed.signature() == cached.signature()
         state.audits += 1
@@ -231,8 +229,13 @@ class Agent:
         else:
             log.warning("shadow audit DISAGREES on %s: cache says %s, model says %s",
                         entry.describe(), cached.describe(), proposed.describe())
+            self.mem.mark(entry, "soft_fail", state.run_id, "shadow audit disagreement")
         rec.event("shadow_audit", entry_id=entry.id, agreed=agreed,
-                  cached=cached.describe(), proposed=proposed.describe())
+                  cached=cached.describe(), proposed=proposed.describe(),
+                  overridden=not agreed)
+        if agreed:
+            return True, None
+        return False, proposed
 
     # -- public ------------------------------------------------------------
 
@@ -370,7 +373,10 @@ class Agent:
             prev_skeleton = state.prev_skeleton_id
             entry, action, source = self._from_cache(state, screen, prev_skeleton)
             if entry is not None and action is not None:
-                self._shadow_audit(state, screen, entry, action, rec)
+                agreed, proposed = self._shadow_audit(state, screen, entry, action, rec)
+                if not agreed and proposed is not None:
+                    action = proposed
+                    source = "llm"
 
             # ---- 4. ask the model, but only if we must ------------------
             screenshot: Optional[bytes] = None
