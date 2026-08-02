@@ -158,6 +158,11 @@ class LoopDetector:
 
     history: List[Tuple[str, str]] = field(default_factory=list)
     banned: Dict[str, Set[str]] = field(default_factory=dict)
+    #: Every scroll direction across the entire run, not cleared by taps.
+    #: Used to detect direction reversals even when taps break the
+    #: consecutive-scroll counter.
+    scroll_dir_log: List[str] = field(default_factory=list)
+    total_scroll_count: int = 0
 
     def record(self, exact_id: str, signature: str) -> None:
         self.history.append((exact_id, signature))
@@ -226,6 +231,72 @@ class LoopDetector:
             for i in range(1, len(tail))
         )
 
+    def record_scroll(self, direction: str) -> None:
+        """Track a scroll direction across the entire run.
+
+        Unlike ``_consecutive_scroll_dirs()`` which breaks on any non-scroll
+        action, this persists through taps and other actions so we can detect
+        direction reversals even when taps (like "Go to most recent message")
+        are interleaved.
+        """
+        self.scroll_dir_log.append(direction)
+        self.total_scroll_count += 1
+
+    def direction_reversals(self) -> int:
+        """Count how many times the scroll direction has flipped.
+
+        A reversal is any transition from one vertical direction to its
+        opposite (up→down or down→up), or horizontal (left→right, right→left).
+        Consecutive scrolls in the same direction count as one "run".
+        """
+        if len(self.scroll_dir_log) < 2:
+            return 0
+        reversals = 0
+        prev = self.scroll_dir_log[0]
+        for d in self.scroll_dir_log[1:]:
+            if d != prev and d == _SCROLL_OPPOSITES.get(prev, ""):
+                reversals += 1
+            if d != prev:
+                prev = d
+        return reversals
+
+    def scroll_direction_hint(self) -> Optional[str]:
+        """Warning when the agent keeps reversing scroll direction.
+
+        Returns ``None`` when there are fewer than 3 reversals.  Otherwise
+        returns a strongly-worded hint that tells the model to commit to one
+        direction and stop undoing its progress.
+        """
+        reversals = self.direction_reversals()
+        if reversals < 3:
+            return None
+
+        recent = " → ".join(self.scroll_dir_log[-8:])
+        parts = [
+            f"WARNING: You have reversed your scroll direction {reversals} "
+            f"times during this task. Your scroll history: {recent}.",
+            "Each time you scroll in one direction and then reverse (or tap "
+            "a button like 'Go to most recent message'), you UNDO all your "
+            "scrolling progress and have to start over.",
+        ]
+        if reversals >= 5:
+            parts.append(
+                "You MUST stop reversing now. Commit to one direction: if you "
+                "are looking for OLDER content, keep scrolling UP consistently. "
+                "If you are looking for RECENT content, keep scrolling DOWN. "
+                "Do NOT tap any 'jump to bottom' or 'go to recent' buttons "
+                "while searching upward. If you cannot find what you need "
+                "after scrolling consistently in one direction, report done "
+                "with what you have or report fail."
+            )
+        else:
+            parts.append(
+                "Commit to one direction. If searching for older content, "
+                "scroll UP consistently. Do NOT tap 'Go to most recent "
+                "message' or similar buttons — this undoes your progress."
+            )
+        return " ".join(parts)
+
     def scroll_context(self) -> Optional[str]:
         """Rich situational context about scrolling patterns for the LLM.
 
@@ -233,53 +304,62 @@ class LoopDetector:
         a multi-sentence description that tells the model *exactly* what it
         has been doing so it can course-correct on its own.
         """
+        # Start with direction reversal context (survives interleaved taps).
+        reversal_hint = self.scroll_direction_hint()
+
         dirs = self._consecutive_scroll_dirs()
-        if len(dirs) < 3:
+        if len(dirs) < 6 and reversal_hint is None:
             return None
 
-        n = len(dirs)
-        counts: Dict[str, int] = {}
-        for d in dirs:
-            counts[d] = counts.get(d, 0) + 1
-        breakdown = ", ".join(f"{c}x {d}" for d, c in counts.items())
+        parts: List[str] = []
 
-        # Determine axis for user-facing messages.
-        h_dirs = counts.get("left", 0) + counts.get("right", 0)
-        v_dirs = counts.get("up", 0) + counts.get("down", 0)
-        if h_dirs > v_dirs:
-            axis_label = "horizontally"
-        elif v_dirs > h_dirs:
-            axis_label = "vertically"
-        else:
-            axis_label = "in multiple directions"
+        if len(dirs) >= 6:
+            n = len(dirs)
+            counts: Dict[str, int] = {}
+            for d in dirs:
+                counts[d] = counts.get(d, 0) + 1
+            breakdown = ", ".join(f"{c}x {d}" for d, c in counts.items())
 
-        parts: List[str] = [
-            f"You have scrolled {n} times consecutively {axis_label} ({breakdown}).",
-        ]
+            # Determine axis for user-facing messages.
+            h_dirs = counts.get("left", 0) + counts.get("right", 0)
+            v_dirs = counts.get("up", 0) + counts.get("down", 0)
+            if h_dirs > v_dirs:
+                axis_label = "horizontally"
+            elif v_dirs > h_dirs:
+                axis_label = "vertically"
+            else:
+                axis_label = "in multiple directions"
 
-        if self.scroll_oscillating():
-            # Show the actual recent pattern so the LLM can see it plainly.
-            recent = " → ".join(dirs[-6:])
             parts.append(
-                f"Your recent scroll pattern is: {recent}. "
-                f"You are alternating between opposite directions, which "
-                f"means you are re-reading content you already saw."
-            )
-            parts.append(
-                "You must stop scrolling now. Either you have already seen "
-                "all the content and should report 'done' with a summary of "
-                "what you found, or the information is not here and you "
-                "should try a different approach (e.g. search, go back) or "
-                "report 'fail'."
-            )
-        elif n >= 5:
-            parts.append(
-                "You have been scrolling for a while. Consider whether you "
-                "have already seen the content you need, or whether a "
-                "different approach (search, filter, etc.) would be faster."
-            )
+                f"You have scrolled {n} times consecutively {axis_label} ({breakdown}).")
 
-        return " ".join(parts)
+            if self.scroll_oscillating():
+                recent = " → ".join(dirs[-6:])
+                parts.append(
+                    f"Your recent scroll pattern is: {recent}. "
+                    f"You are alternating between opposite directions, which "
+                    f"means you are re-reading content you already saw."
+                )
+                parts.append(
+                    "You must stop scrolling now. Either you have already seen "
+                    "all the content and should report 'done' with a summary of "
+                    "what you found, or the information is not here and you "
+                    "should try a different approach (e.g. search, go back) or "
+                    "report 'fail'."
+                )
+            elif n >= 12:
+                parts.append(
+                    "You have been scrolling for a while without finding what "
+                    "you need. If you are confident the content is further in "
+                    "this direction, keep going. Otherwise consider whether "
+                    "you have covered enough."
+                )
+
+        # Append reversal hint (fires even when consecutive count is low).
+        if reversal_hint:
+            parts.append(reversal_hint)
+
+        return " ".join(parts) if parts else None
 
     def ban(self, skeleton_id: str, signature: str) -> None:
         log.info("banning %s on this screen for the rest of the run", signature)

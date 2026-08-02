@@ -133,6 +133,11 @@ class AgentAction(BaseModel):
     key: Optional[KeyName] = Field(None, description="For press_key.")
     direction: Optional[ScrollDir] = Field(
         None, description="For scroll: which way the content should move.")
+    scroll_amount: float = Field(
+        1, description="For scroll: how many screenfuls to scroll (0.5 for half-page, "
+                       "1 for one page, up to 5). Use higher values to move quickly "
+                       "through long content like chat history.",
+        ge=0.25, le=5)
     confidence: Literal["high", "low"] = Field(
         "high", description="Use 'low' when unsure; you will be shown a screenshot.")
     notes: Optional[str] = Field(
@@ -265,7 +270,18 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
                 log.warning("remapping scroll %s -> %s for vertical scroller",
                             action.direction, remapped)
                 action = action.model_copy(update={"direction": remapped})
-        dev.scroll(action.direction or "down", box=box)
+        amount = max(0.25, min(action.scroll_amount, 5.0))
+        base_scale = 0.6
+        full_scrolls = int(amount)
+        remainder = amount - full_scrolls
+        import time
+        for i in range(full_scrolls):
+            dev.scroll(action.direction or "down", scale=base_scale, box=box)
+            if i < full_scrolls - 1 or remainder > 0:
+                time.sleep(0.15)
+        if remainder >= 0.1:
+            dev.scroll(action.direction or "down",
+                       scale=round(base_scale * remainder, 2), box=box)
     elif action.action == "open_app":
         dev.open_app((action.text or "").strip())
     elif action.action == "wait":
