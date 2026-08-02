@@ -360,24 +360,10 @@ class Agent:
             # -- accumulate scratchpad notes --------------------------------
             if getattr(action, "notes", None):
                 cap = cfg.run.scratchpad_max_chars
-                note_text = action.notes.strip()
-                if state.scratchpad_chars + len(note_text) > cap:
-                    # Trim to fit within the budget.
-                    room = max(0, cap - state.scratchpad_chars)
-                    if room > 0:
-                        note_text = note_text[:room]
-                    else:
-                        note_text = ""
+                note_text = action.notes.strip()[:cap]
                 if note_text:
-                    # Detect cumulative updates: if the new note contains
-                    # the last entry, the LLM rewrote a full summary.
-                    # Replace instead of append to avoid repetition.
-                    if (state.scratchpad and
-                            state.scratchpad[-1] in note_text):
-                        old = state.scratchpad.pop()
-                        state.scratchpad_chars -= len(old)
-                    state.scratchpad.append(note_text)
-                    state.scratchpad_chars += len(note_text)
+                    state.scratchpad = [note_text]
+                    state.scratchpad_chars = len(note_text)
 
             # -- accumulate progress ----------------------------------------
             if getattr(action, "progress", None):

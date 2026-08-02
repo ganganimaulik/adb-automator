@@ -61,10 +61,13 @@ on the next turn.
 DATA COLLECTION
 When the goal asks you to read, collect, extract or report information that \
 spans more than one screenful (chat history, search results, long lists), \
-use the `notes` field on EVERY turn to write down what you see. Your notes \
-are saved across turns and will be included in the final output. This is \
-critical -- you cannot see previous screens, so if you do not write it down \
-now, the data is lost. When you are done collecting, set action to "done" and \
+use the `notes` field on EVERY turn to write down the COMPLETE collected \
+state so far. Only your latest `notes` value is kept -- previous ones are \
+replaced -- so each note must be self-contained with ALL items collected \
+across all turns. You cannot see previous screens, so if you do not include \
+an item in your latest notes, it is lost.
+
+When you are done collecting, set action to "done" and \
 put your final summary in `text`.
 
 PROGRESS TRACKING
@@ -123,8 +126,8 @@ def history_block(history: Sequence[str], scratchpad: str = "",
     else:
         parts.append("HISTORY (oldest first):\n" + "\n".join(history))
     if scratchpad:
-        parts.append("YOUR SCRATCHPAD (data you have collected so far -- do not "
-                     "repeat what is already here, only add NEW items):\n" + scratchpad)
+        parts.append("YOUR SCRATCHPAD (your latest collected data -- update this "
+                     "with the complete list including any new items):\n" + scratchpad)
     if progress:
         parts.append("YOUR PROGRESS (your working memory of completed and "
                      "remaining sub-steps):\n" + progress)
