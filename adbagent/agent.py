@@ -220,6 +220,7 @@ class Agent:
 
     def _loop(self, state: RunState, rec: Recorder) -> None:
         cfg = self.cfg
+        screen: Optional[Screen] = None
         while state.finished is None:
             if state.step >= cfg.run.max_steps:
                 log.error("step budget (%d) exhausted", cfg.run.max_steps)
@@ -232,13 +233,14 @@ class Agent:
             state.step += 1
 
             # ---- 1. perceive (no LLM) -----------------------------------
-            try:
-                screen = self.dev.observe()
-            except (DeviceTimeout, DeviceLost) as exc:
-                if not self._recover_device(state, exc):
-                    state.finished = "aborted"
-                    return
-                continue
+            if screen is None:
+                try:
+                    screen = self.dev.observe()
+                except (DeviceTimeout, DeviceLost) as exc:
+                    if not self._recover_device(state, exc):
+                        state.finished = "aborted"
+                        return
+                    continue
             self.mem.note_screen(screen)
             self._last_package = screen.package
 
@@ -262,6 +264,7 @@ class Agent:
                          interstitial.best_text)
                 rec.event("dismiss", label=interstitial.best_text)
                 self.dev.tap(*interstitial.center)
+                screen = None
                 continue
 
             hint = state.loops.hint(screen.exact_id)
@@ -301,6 +304,7 @@ class Agent:
                     self.dev.press("back")
                     state.loops.record(screen.exact_id, "forced-back")
                     state.loops.consecutive_backs += 1
+                    screen = None
                     continue
 
             # ---- 3. visit tracking --------------------------------------
@@ -423,6 +427,7 @@ class Agent:
             if action.is_terminal:
                 state.finished = self._terminal(state, screen, action, rec)
                 if state.finished is None:
+                    screen = None
                     continue
                 return
 
@@ -507,6 +512,7 @@ class Agent:
             del state.history[:-12]  # keep the prompt bounded
 
             self._maybe_give_up(state)
+            screen = after
 
     # -- terminal actions --------------------------------------------------
 
