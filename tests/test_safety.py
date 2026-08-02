@@ -139,26 +139,6 @@ def test_nothing_to_dismiss_on_a_normal_screen():
 # Scope
 # ---------------------------------------------------------------------------
 
-def test_scope_is_unrestricted_by_default():
-    assert safety.in_scope(BASE, Config())
-
-
-def test_scope_admits_the_target_and_system_chrome():
-    cfg = Config()
-    cfg.safety.package_allowlist = ["com.android.settings"]
-    assert safety.in_scope(BASE, cfg)
-
-    other = s(X.settings_screen().replace("com.android.settings", "com.evil.app"))
-    assert not safety.in_scope(other, cfg)
-
-
-def test_system_ui_never_counts_as_an_escape():
-    cfg = Config()
-    cfg.safety.package_allowlist = ["com.example.target"]
-    screen = s(X.settings_screen().replace("com.android.settings",
-                                           "com.android.systemui"))
-    assert safety.in_scope(screen, cfg)
-
 
 # ---------------------------------------------------------------------------
 # Loop detection

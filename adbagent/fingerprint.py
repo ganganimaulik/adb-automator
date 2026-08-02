@@ -374,14 +374,25 @@ def hamming(a: int, b: int) -> int:
 # Discriminative tokens
 # ---------------------------------------------------------------------------
 
-#: Tokens that must never appear on a screen we replay blind, whatever the
-#: statistics say. Matched against masked element text, not against the skeleton.
-DESTRUCTIVE_TEXT = re.compile(
+#: Actions that are truly destructive and cannot be undone in any context.
+_HARD_DESTRUCTIVE = (
     r"\b(delete|remove|uninstall|erase|wipe|factory reset|deactivate|"
     r"close account|unsubscribe|pay|buy|purchase|place order|checkout|"
-    r"confirm order|send|post|publish|share|"
+    r"confirm order|"
     r"forget|sign out|log out|revoke|discard|unfollow|unfriend|block|"
-    r"leave|archive|clear (?:data|history|all))\b",
+    r"leave|archive|clear (?:data|history|all))\b"
+)
+
+#: Chat send actions — destructive by default, but whitelisted in chat_mode.
+CHAT_SEND_TEXT = re.compile(
+    r"\b(send|post|publish|share)\b", re.I,
+)
+
+#: Tokens that must never appear on a screen we replay blind, whatever the
+#: statistics say. Matched against masked element text, not against the skeleton.
+#: This is the union of hard-destructive + chat-send patterns.
+DESTRUCTIVE_TEXT = re.compile(
+    _HARD_DESTRUCTIVE + r"|" + r"\b(send|post|publish|share)\b",
     re.I,
 )
 

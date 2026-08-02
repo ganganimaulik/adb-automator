@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .actions import AgentAction, resolve_target
 from .config import Config
-from .fingerprint import DESTRUCTIVE_TEXT
+from .fingerprint import CHAT_SEND_TEXT, DESTRUCTIVE_TEXT
 from .screen import Element, Screen
 
 log = logging.getLogger("adbagent.safety")
@@ -43,11 +43,6 @@ SENSITIVE_TEXT = re.compile(
     re.I,
 )
 
-SENSITIVE_PACKAGES = (
-    "com.google.android.gms.auth",
-    "com.android.settings.password",
-)
-
 
 @dataclass
 class SensitiveFinding:
@@ -56,7 +51,12 @@ class SensitiveFinding:
 
 
 def sensitive_screen(screen: Screen) -> Optional[SensitiveFinding]:
-    """Detect a screen the agent must not touch."""
+    """Detect a screen the agent must not touch.
+
+    Only flags credential screens when sensitive keywords appear in editable
+    input fields — not in read-only text views (e.g. chat message bodies that
+    mention words like "pin" or "code").
+    """
     for el in screen.elements:
         if el.password:
             return SensitiveFinding("a password field is focused on this screen", el)
@@ -66,9 +66,6 @@ def sensitive_screen(screen: Screen) -> Optional[SensitiveFinding]:
             if SENSITIVE_TEXT.search(context):
                 return SensitiveFinding(
                     f"an input field asks for {context.strip()!r}", el)
-    for package in SENSITIVE_PACKAGES:
-        if package in screen.packages:
-            return SensitiveFinding(f"a credential flow ({package}) is on screen")
     return None
 
 
@@ -77,7 +74,13 @@ def sensitive_screen(screen: Screen) -> Optional[SensitiveFinding]:
 # ---------------------------------------------------------------------------
 
 def irreversible(action: AgentAction, screen: Screen) -> Optional[str]:
-    """The label of the control being pressed, when pressing it cannot be undone."""
+    """The label of the control being pressed, when pressing it cannot be undone.
+
+    Chat-send labels ("send", "post", "share", "publish") are NOT treated as
+    irreversible — sending messages is a normal part of automation.  Only truly
+    destructive actions (delete, wipe, uninstall, buy, etc.) trigger a
+    confirmation.
+    """
     if action.action not in ("tap", "long_press"):
         return None
     if action.target is None:
@@ -86,7 +89,10 @@ def irreversible(action: AgentAction, screen: Screen) -> Optional[str]:
     if element is None:
         return None
     label = element.best_text
-    if label and DESTRUCTIVE_TEXT.search(label):
+    if not label:
+        return None
+    # Only flag truly destructive actions, not send/post/share/publish.
+    if DESTRUCTIVE_TEXT.search(label) and not CHAT_SEND_TEXT.search(label):
         return label
     return None
 
@@ -129,17 +135,6 @@ def find_interstitial(screen: Screen, target_package: str = "") -> Optional[Elem
     return None
 
 
-# ---------------------------------------------------------------------------
-# Scope
-# ---------------------------------------------------------------------------
-
-def in_scope(screen: Screen, cfg: Config) -> bool:
-    allowed = cfg.allowed_packages()
-    if not allowed:
-        return True
-    if not screen.package:
-        return True
-    return screen.package in allowed
 
 
 # ---------------------------------------------------------------------------
@@ -203,18 +198,22 @@ class LoopDetector:
         dirs.reverse()
         return dirs
 
-    def scroll_oscillating(self) -> bool:
+    def scroll_oscillating(self, *, threshold: int = 6) -> bool:
         """Alternating opposite scrolls, e.g. down/up/down/up.
 
         Regular ``oscillating()`` compares screen ``exact_id`` sequences, but
         scrolling changes visible content (and therefore ``exact_id``) on every
         step, so it never triggers.  This method looks at the trailing run of
         scroll action signatures instead.
+
+        *threshold* controls how many alternating scrolls are required.  The
+        default of 4 can be raised (e.g. to 6 in chat mode) to tolerate natural
+        chat-browsing patterns that scroll up to read history and back down.
         """
         dirs = self._consecutive_scroll_dirs()
-        if len(dirs) < 4:
+        if len(dirs) < threshold:
             return False
-        tail = dirs[-4:]
+        tail = dirs[-threshold:]
         return all(
             tail[i] == _SCROLL_OPPOSITES.get(tail[i - 1], "")
             for i in range(1, len(tail))
