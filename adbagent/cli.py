@@ -244,6 +244,7 @@ def cmd_devices(args) -> int:
 
 def cmd_pair(args) -> int:
     from . import device as devmod
+    from .config import save_device_serial
 
     out = Out()
     code = args.code or input("  Pairing code shown on the phone: ").strip()
@@ -270,8 +271,37 @@ def cmd_pair(args) -> int:
     except Exception as exc:  # noqa: BLE001
         out.bad(str(exc))
         return 1
+
+    # Persist the serial so subsequent commands find the device automatically.
+    cfg_path = save_device_serial(connect_to, getattr(args, "config", None))
+    out.say(f"  saved device serial {out.bold(connect_to)} to {cfg_path}")
+
     out.say(out.green("  Connected. Note the port changes whenever Wireless "
                       "debugging is toggled."))
+    return 0
+
+
+def cmd_pair_qr(args) -> int:
+    from . import device as devmod
+    from .config import save_device_serial
+
+    out = Out()
+    out.say(out.bold("  Scan this QR code on your phone:"))
+    out.say("  Phone → Developer Options → Wireless Debugging → "
+            "Pair device with QR code")
+    out.say()
+
+    try:
+        serial = devmod.pair_qr(timeout=args.timeout)
+    except Exception as exc:  # noqa: BLE001
+        out.bad(str(exc))
+        return 1
+
+    # Persist the serial so subsequent commands find the device automatically.
+    cfg_path = save_device_serial(serial, getattr(args, "config", None))
+    out.say(f"  saved device serial {out.bold(serial)} to {cfg_path}")
+
+    out.say(out.green("  Connected and saved."))
     return 0
 
 
@@ -311,6 +341,69 @@ def cmd_models(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# auto-pair when no device is connected
+# ---------------------------------------------------------------------------
+
+def _ensure_device(args, cfg, out: Out) -> None:
+    """If no device is reachable, run QR pairing automatically.
+
+    Modifies ``cfg.device.serial`` in place so the caller's ``Device(cfg)``
+    picks up the newly-paired serial.
+    """
+    from . import device as devmod
+    from .config import save_device_serial
+
+    serial = getattr(args, "device", None) or cfg.device.serial
+
+    # USB serial — nothing we can do but hand it to Device and let it error.
+    if serial and ":" not in serial:
+        return
+
+    # Wireless serial in config — try reconnecting.
+    if serial and ":" in serial:
+        try:
+            devmod.connect_wireless(serial, timeout=5)
+            return  # still reachable
+        except Exception:  # noqa: BLE001
+            out.warn(f"could not reach {serial}, looking for alternatives…")
+            # Fall through — do NOT check list_devices() here because the
+            # stale serial still appears in the list as "offline".
+
+    else:
+        # No serial at all — maybe a USB device is already plugged in.
+        if devmod.list_devices():
+            return
+
+    # Try mDNS discovery first (fast, no user interaction).
+    candidates = devmod.mdns_candidates()
+    if candidates:
+        addr = candidates[0]
+        try:
+            devmod.connect_wireless(addr)
+            cfg.device.serial = addr
+            out.ok(f"auto-connected to {addr} (mDNS)")
+            save_device_serial(addr, getattr(args, "config", None))
+            return
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Last resort: interactive QR pairing.
+    out.say()
+    out.say(out.yellow("  No device connected."))
+    out.say(out.bold("  Starting QR pairing — scan with your phone:"))
+    out.say("  Phone → Developer Options → Wireless Debugging → "
+            "Pair device with QR code")
+    out.say()
+
+    serial = devmod.pair_qr(timeout=120)
+    cfg.device.serial = serial
+    cfg_path = save_device_serial(serial, getattr(args, "config", None))
+    out.ok(f"paired and connected to {serial}")
+    out.say(f"  saved to {cfg_path}")
+    out.say()
+
+
+# ---------------------------------------------------------------------------
 # dump
 # ---------------------------------------------------------------------------
 
@@ -320,6 +413,7 @@ def cmd_dump(args) -> int:
 
     out = Out()
     cfg = build_config(args)
+    _ensure_device(args, cfg, out)
     with Device(cfg, args.device or "") as dev:
         screen = dev.observe()
         if args.detail is not None:
@@ -356,6 +450,11 @@ def _live_reporter(out: Out):
         source = kw["source"]
         tag = out.green("CACHE") if source == "cache" else out.cyan(" LLM ")
         out.say(f"  {state.step:>3} [{tag}] {action.describe()}")
+        if source == "llm":
+            if getattr(action, "observation", None):
+                out.say(out.dim(f"        Obs:       {action.observation}"))
+            if getattr(action, "reasoning", None):
+                out.say(out.dim(f"        Reasoning: {action.reasoning}"))
     return report
 
 
@@ -370,6 +469,8 @@ def cmd_run(args) -> int:
     if not cfg.llm.model:
         out.bad("no model chosen. Run `adbagent models` and pass --model.")
         return 1
+
+    _ensure_device(args, cfg, out)
 
     oracle = Oracle(shell=args.assert_shell or "", equals=args.assert_equals or "",
                     text=args.assert_text or "")
@@ -445,6 +546,7 @@ def cmd_explore(args) -> int:
 
     out.say(out.dim("  Explore is read-only: it navigates and scrolls, but never "
                     "types and never presses anything that changes state."))
+    _ensure_device(args, cfg, out)
     with Device(cfg, args.device or "") as dev, Memory(cfg) as mem:
         llm = LLMClient(cfg, run_id=f"explore-{int(time.time())}")
         result = explore(dev, mem, llm, cfg, package=args.app or "",
@@ -560,6 +662,11 @@ def cmd_report(args) -> int:
             shot = " +img" if event.get("screenshot") else ""
             out.say(f"  {event.get('step', 0):>3} [{tag}]{shot} "
                     f"{action.get('action')} {action.get('target') or ''}")
+            if event.get("source") == "llm":
+                if action.get("observation"):
+                    out.say(out.dim(f"        Obs:       {action.get('observation')}"))
+                if action.get("reasoning"):
+                    out.say(out.dim(f"        Reasoning: {action.get('reasoning')}"))
         elif event["kind"] == "verify":
             out.say(f"      -> {event.get('grade')} {event.get('reason') or ''}")
         elif event["kind"] in ("dismiss", "refused", "loop_break", "sensitive",
@@ -619,6 +726,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--connect", help="ip:port from the Wireless debugging screen")
     _add_common(p)
     p.set_defaults(func=cmd_pair)
+
+    p = sub.add_parser("pair-qr",
+                       help="pair by displaying a QR code to scan on the phone")
+    p.add_argument("--timeout", type=int, default=120,
+                   help="seconds to wait for the phone to scan (default 120)")
+    _add_common(p)
+    p.set_defaults(func=cmd_pair_qr)
 
     p = sub.add_parser("models", help="list models you can choose from")
     p.add_argument("--vision", action="store_true", help="only multimodal models")

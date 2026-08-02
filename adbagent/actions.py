@@ -348,6 +348,13 @@ def verify(action: AgentAction, before: Screen, after: Screen,
 
     condition = post or synthesise_postcondition(action, None)
 
+    # Scroll that didn't move = end of list, not a hard failure.  Grading it
+    # ``no_change`` causes the direction to be banned on this screen and gives
+    # the LLM a clear "end of list" signal instead of a confusing hard_fail.
+    if action.action == "scroll" and after.exact_id == before.exact_id:
+        return VerifyOutcome(grade="no_change",
+                             reason="scrolling did not reveal new content")
+
     # Checked before the generic postcondition, because "nothing happened at
     # all" is both the most common silent failure and a more actionable
     # diagnosis than a bare condition failure -- it is what feeds the per-run

@@ -154,7 +154,9 @@ def test_report_reads_a_run(tmp_path, capsys):
     (run_dir / "events.jsonl").write_text("\n".join(json.dumps(e) for e in [
         {"t": 1, "kind": "run_start", "goal": "turn on wifi", "model": "m"},
         {"t": 2, "kind": "decide", "step": 1, "source": "llm",
-         "action": {"action": "tap", "target": {"index": 3}}},
+         "action": {"action": "tap", "target": {"index": 3},
+                    "observation": "Settings list screen",
+                    "reasoning": "Tapping Wi-Fi settings element"}},
         {"t": 3, "kind": "verify", "step": 1, "grade": "success", "reason": ""},
         {"t": 4, "kind": "decide", "step": 2, "source": "cache",
          "action": {"action": "done"}},
@@ -166,6 +168,32 @@ def test_report_reads_a_run(tmp_path, capsys):
     assert "turn on wifi" in out
     assert "CACHE" in out and "LLM" in out
     assert "SUCCESS" in out and "0.0031" in out
+    assert "Obs:       Settings list screen" in out
+    assert "Reasoning: Tapping Wi-Fi settings element" in out
+
+
+def test_live_reporter_displays_llm_reasoning(capsys):
+    from adbagent.actions import AgentAction
+    from adbagent.cli import Out, _live_reporter
+    from unittest.mock import MagicMock
+
+    out = Out(quiet=False)
+    reporter = _live_reporter(out)
+
+    action = AgentAction(
+        observation="Main settings screen",
+        reasoning="Tap element #5 to open Wi-Fi settings",
+        action="tap",
+        target={"index": 5}
+    )
+    state = MagicMock(step=1)
+
+    reporter("step", state=state, action=action, source="llm")
+    captured = capsys.readouterr().out
+    assert "LLM" in captured
+    assert "tap #5" in captured
+    assert "Obs:       Main settings screen" in captured
+    assert "Reasoning: Tap element #5 to open Wi-Fi settings" in captured
 
 
 def test_report_on_a_missing_run():

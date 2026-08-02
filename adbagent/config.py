@@ -279,3 +279,32 @@ class LoadedConfig:
     config: Config
     path: Optional[Path]
     warnings: List[str]
+
+
+def save_device_serial(serial: str,
+                       config_path: Optional[str] = None) -> Path:
+    """Persist `device.serial` into the config file after a successful pairing.
+
+    Reads the existing JSON (if any), sets ``device.serial``, and writes it
+    back, preserving every other key the user has configured.  If no config
+    file exists yet, one is created in the current directory.
+    """
+    path = find_config_file(config_path)
+    if path is None:
+        path = Path.cwd() / DEFAULT_CONFIG_NAMES[0]
+
+    # Read existing content (or start fresh).
+    data: Dict[str, Any] = {}
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+    if not isinstance(data, dict):
+        data = {}
+
+    # Update only the serial key.
+    data.setdefault("device", {})["serial"] = serial
+
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return path

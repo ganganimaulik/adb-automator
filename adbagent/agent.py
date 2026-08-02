@@ -369,6 +369,13 @@ class Agent:
                     else:
                         note_text = ""
                 if note_text:
+                    # Detect cumulative updates: if the new note contains
+                    # the last entry, the LLM rewrote a full summary.
+                    # Replace instead of append to avoid repetition.
+                    if (state.scratchpad and
+                            state.scratchpad[-1] in note_text):
+                        old = state.scratchpad.pop()
+                        state.scratchpad_chars -= len(old)
                     state.scratchpad.append(note_text)
                     state.scratchpad_chars += len(note_text)
 
@@ -466,6 +473,12 @@ class Agent:
                 state.last_failure = ""
             if outcome.grade == "no_change":
                 state.loops.ban(screen.skeleton_id, action.signature())
+                if action.action == "scroll":
+                    state.last_failure = (
+                        f"Scrolling {action.direction} did not reveal new "
+                        f"content \u2014 you have reached the end of the "
+                        f"scrollable area in that direction. Do not scroll "
+                        f"{action.direction} again here.")
 
             state.loops.record(screen.exact_id, action.signature())
             state.history.append(

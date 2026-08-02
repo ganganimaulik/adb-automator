@@ -204,6 +204,136 @@ def mdns_candidates() -> List[str]:
     return found
 
 
+# ---------------------------------------------------------------------------
+# QR-code pairing
+# ---------------------------------------------------------------------------
+
+class _ConnectListener:
+    """mDNS listener that captures the first ``_adb-tls-connect._tcp`` service."""
+
+    def __init__(self) -> None:
+        self.address: Optional[str] = None
+        self._event = threading.Event()
+
+    def add_service(self, zc: "zeroconf.Zeroconf", type_: str, name: str) -> None:
+        info = zc.get_service_info(type_, name)
+        if info and info.parsed_addresses() and info.port:
+            self.address = f"{info.parsed_addresses()[0]}:{info.port}"
+            self._event.set()
+
+    def remove_service(self, zc: "zeroconf.Zeroconf", type_: str, name: str) -> None:
+        pass  # not relevant
+
+    def update_service(self, zc: "zeroconf.Zeroconf", type_: str, name: str) -> None:
+        pass  # not relevant
+
+    def wait(self, timeout: float) -> Optional[str]:
+        self._event.wait(timeout)
+        return self.address
+
+
+def pair_qr(timeout: float = 120.0,
+            on_qr: Optional[Callable[[str], None]] = None) -> str:
+    """Pair with a phone by displaying a QR code in the terminal.
+
+    The flow:
+      1. Generate a random password and service name.
+      2. Advertise an ``_adb-tls-pairing._tcp`` mDNS service.
+      3. Render a QR code that encodes ``WIFI:T:ADB;S:<name>;P:<password>;;``.
+      4. Wait for the phone to pair (it discovers the pairing port via mDNS).
+      5. Discover the ``_adb-tls-connect._tcp`` service that appears after pairing.
+      6. ``adb connect`` to the device.
+
+    Returns the connected device serial (``ip:port``).
+    """
+    import secrets
+    import socket
+
+    import qrcode
+    import qrcode.constants
+    import zeroconf as zc_mod
+
+    # 1. Generate credentials.
+    password = secrets.token_hex(6)  # 12-char hex string
+    hostname = socket.gethostname().split(".")[0][:16] or "adbagent"
+    service_name = f"{hostname}_adb-tls-pairing"
+    qr_payload = f"WIFI:T:ADB;S:{service_name};P:{password};;"
+
+    # 2. Render QR code to stdout (text mode, no image viewer needed).
+    if on_qr:
+        on_qr(qr_payload)
+    else:
+        qr = qrcode.QRCode(
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=1,
+            border=2,
+        )
+        qr.add_data(qr_payload)
+        qr.make(fit=True)
+        qr.print_tty()
+
+    # 3. Advertise the pairing service over mDNS so the phone can find us.
+    #    We bind to port 5555 as a placeholder — ``adb pair`` actually runs its
+    #    own TLS server on a random port. The phone resolves the *real* pairing
+    #    endpoint via the adb server's own mDNS advertisement that ``adb pair``
+    #    triggers.
+    local_ip = _get_local_ip()
+    zeroconf_inst = zc_mod.Zeroconf()
+
+    pairing_info = zc_mod.ServiceInfo(
+        "_adb-tls-pairing._tcp.local.",
+        f"{service_name}._adb-tls-pairing._tcp.local.",
+        addresses=[socket.inet_aton(local_ip)],
+        port=5555,
+        properties={"password": password},
+    )
+    zeroconf_inst.register_service(pairing_info)
+
+    # 4. Also start browsing for the connect service that appears after pairing.
+    listener = _ConnectListener()
+    browser = zc_mod.ServiceBrowser(
+        zeroconf_inst, "_adb-tls-connect._tcp.local.", listener)
+
+    try:
+        # 5. Wait for the phone to discover us and connect.
+        connect_addr = listener.wait(timeout)
+
+        # If mDNS browsing didn't catch it, fall back to adb mdns services.
+        if not connect_addr:
+            candidates = mdns_candidates()
+            if candidates:
+                connect_addr = candidates[0]
+
+        if not connect_addr:
+            raise RuntimeError(
+                "Timed out waiting for the phone to scan the QR code. "
+                "Make sure Wireless Debugging is enabled and both devices "
+                "are on the same network.")
+
+        # 6. Connect.
+        msg = connect_wireless(connect_addr)
+        log.info("connected: %s", msg)
+        return connect_addr
+
+    finally:
+        browser.cancel()
+        zeroconf_inst.unregister_service(pairing_info)
+        zeroconf_inst.close()
+
+
+def _get_local_ip() -> str:
+    """Best-effort detection of the machine's LAN IP address."""
+    import socket as _socket
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:  # noqa: BLE001
+        return "127.0.0.1"
+
+
 def list_devices() -> List[adbutils.AdbDevice]:
     return adbutils.adb.device_list()
 

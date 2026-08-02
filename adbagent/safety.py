@@ -175,7 +175,14 @@ class LoopDetector:
         return None
 
     def should_force_back(self, exact_id: str) -> bool:
-        return self.repeats(exact_id) >= FORCE_BACK_AT
+        # Don't count repeated scrolls on the same screen as a navigation
+        # loop.  Scroll stalls mean end-of-list, not that the agent is stuck
+        # bouncing between screens.
+        non_scroll = sum(
+            1 for eid, sig in self.history
+            if eid == exact_id and not sig.startswith("scroll/")
+        )
+        return non_scroll >= FORCE_BACK_AT
 
     def oscillating(self) -> bool:
         """A repeating 2- or 3-step cycle, e.g. open -> back -> open -> back."""
