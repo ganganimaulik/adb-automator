@@ -120,12 +120,13 @@ def test_press_key_vocabulary_matches_the_server():
     assert "tab" not in PRESS_KEYS
 
 
-def test_device_scroll_gesture_directions_and_duration():
+def test_device_scroll_gesture_directions_and_duration(capsys):
     class DummyU2:
         def __init__(self):
             self.calls = []
-        def swipe_ext(self, gesture_dir, **kwargs):
-            self.calls.append((gesture_dir, kwargs))
+
+        def swipe_ext(self, gesture, **kw):
+            self.calls.append((gesture, kw))
 
     class DummyConfig:
         class DeviceConfig:
@@ -154,3 +155,6 @@ def test_device_scroll_gesture_directions_and_duration():
     d.scroll("up", scale=0.6)
     assert d._d.calls[-1] == ("down", {"scale": 0.6})
 
+    captured = capsys.readouterr()
+    assert "Scrolling left (scale=0.8, duration=0.15s)" in captured.out
+    assert "Scrolling down (scale=0.6)" in captured.out

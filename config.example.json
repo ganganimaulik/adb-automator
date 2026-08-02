@@ -33,7 +33,7 @@
 
 
   "run": {
-    "max_steps": 60,
+    "max_steps": 250,
     "max_consecutive_failures": 4,
     "max_wall_clock_s": 1800,
     "artifacts_dir": "runs",

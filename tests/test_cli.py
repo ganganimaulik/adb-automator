@@ -209,3 +209,35 @@ def test_max_tokens_cli_and_env_precedence(monkeypatch, tmp_path):
 
     cfg = build_config(parse(["run", "g", "--max-tokens", "4000"]))
     assert cfg.llm.max_tokens == 4000
+
+
+def test_live_reporter_terminal_output(capsys):
+    from adbagent.cli import Out, _live_reporter
+    from adbagent.actions import AgentAction, Target
+    from types import SimpleNamespace
+
+    out = Out()
+    reporter = _live_reporter(out, max_steps=20)
+
+    state = SimpleNamespace(step=3)
+    action = AgentAction(
+        observation="Settings screen",
+        reasoning="Looking for dark mode",
+        action="tap",
+        target=Target(index=1),
+        confidence="low",
+        progress="Step 2 of 5 done",
+    )
+
+    reporter("step", state=state, action=action, screenshot=True)
+    reporter("loop_warning", message="step 3: stuck in a loop; going back")
+    reporter("safety_warning", message="step 3: irreversible action 'delete' in com.example")
+
+    captured = capsys.readouterr()
+    assert "[ 3/20] +img tap" in captured.out
+    assert "(confidence: low)" in captured.out
+    assert "Obs:       Settings screen" in captured.out
+    assert "Reasoning: Looking for dark mode" in captured.out
+    assert "Progress:  Step 2 of 5 done" in captured.out
+    assert "[Loop Warning] step 3: stuck in a loop; going back" in captured.out
+    assert "[Safety Warning] step 3: irreversible action 'delete' in com.example" in captured.out
