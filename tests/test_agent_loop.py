@@ -376,8 +376,14 @@ def test_shadow_audit_notices_disagreement(cfg, mem):
                      sampler=lambda: 0.0).run(GOAL)
     assert state.audits >= 1
     assert state.audit_agreement() == 0.0
-    # The cache's answer is still what ran -- an audit measures, it does not veto.
-    assert second.state == "wifi"
+    # Disagreement demotes the stale cache entry and executes the model's proposed action.
+    assert second.state == "bluetooth"
+    cached_entries = mem.entries()
+    assert len(cached_entries) >= 1
+    audited_entry = cached_entries[0]
+    outcomes = [r[0] for r in mem.db.execute(
+        "SELECT grade FROM entry_outcome WHERE entry_id=?", (audited_entry.id,)).fetchall()]
+    assert "soft_fail" in outcomes
 
 
 def test_shadow_audit_is_off_when_not_sampled(cfg, mem):
