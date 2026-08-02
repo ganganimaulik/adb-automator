@@ -188,7 +188,7 @@ class FakeLLM:
     def decide(self, *, goal: str, rendered: str, history, width: int, height: int,
                package: str = "", screenshot: Optional[bytes] = None,
                note: str = "", scratchpad: str = "",
-               progress: str = "") -> AgentAction:
+               progress: str = "", **kwargs) -> AgentAction:
         self.calls += 1
         model_used = self.model_image if screenshot else self.model
         if screenshot:
@@ -201,7 +201,7 @@ class FakeLLM:
     def judge(self, *, goal: str, rendered: str, history,
               screenshot: Optional[bytes] = None,
               scratchpad: str = "",
-              progress: str = "") -> Verdict:
+              progress: str = "", **kwargs) -> Verdict:
         self.judges += 1
         self.calls += 1
         return Verdict(satisfied=self.judge_result,

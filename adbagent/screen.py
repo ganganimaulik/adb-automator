@@ -373,7 +373,7 @@ def _absorb_labels(nodes: Sequence[Element]) -> None:
                 parts.append(piece)
             stack.extend(child.children)
         if parts:
-            el.label = " ".join(parts)[:120]
+            el.label = " ".join(parts)
 
 
 def _absorbed_by_ancestor(el: Element) -> bool:
@@ -440,10 +440,8 @@ def _collapse_identical_siblings(elements: List[Element]) -> List[Element]:
 # Rendering
 # ---------------------------------------------------------------------------
 
-def _quote(s: str, limit: int = 64) -> str:
+def _quote(s: str) -> str:
     s = " ".join(s.split())
-    if len(s) > limit:
-        s = s[: limit - 1] + "…"
     return f'"{s}"'
 
 

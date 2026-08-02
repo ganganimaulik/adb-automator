@@ -256,7 +256,7 @@ def test_left_right_not_oscillating_when_too_few():
 
 def test_scroll_context_mentions_horizontal_axis():
     loops = safety.LoopDetector()
-    for _ in range(4):
+    for _ in range(7):
         loops.record("screen-x", "scroll/right")
     ctx = loops.scroll_context()
     assert ctx is not None
@@ -265,7 +265,7 @@ def test_scroll_context_mentions_horizontal_axis():
 
 def test_scroll_context_mentions_vertical_axis():
     loops = safety.LoopDetector()
-    for _ in range(4):
+    for _ in range(7):
         loops.record("screen-x", "scroll/down")
     ctx = loops.scroll_context()
     assert ctx is not None

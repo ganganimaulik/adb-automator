@@ -390,3 +390,22 @@ def test_shadow_audit_is_off_when_not_sampled(cfg, mem):
                      sampler=lambda: 1.0).run(GOAL)   # never audit
     assert state.audits == 0
     assert llm.calls == 0
+
+
+def test_recorder_dump_messages(cfg, tmp_path):
+    from adbagent.agent import Recorder
+    rec = Recorder(cfg, "run_test_123")
+    msgs = [
+        {"role": "system", "content": "sys prompt"},
+        {"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,ABCDEF"}}]}
+    ]
+    path_str = rec.dump_messages(1, msgs, purpose="decide")
+    from pathlib import Path
+    import json
+    p = Path(path_str)
+    assert p.exists()
+    assert p.name == "step_001_decide_messages.json"
+    data = json.loads(p.read_text())
+    assert data[0]["content"] == "sys prompt"
+    assert "base64 image payload" in data[1]["content"][1]["image_url"]["url"]
+    rec.close()

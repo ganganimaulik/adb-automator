@@ -126,6 +126,29 @@ class Recorder:
         path.write_bytes(data)
         return str(path)
 
+    def dump_messages(self, step: int, messages: List[Dict[str, Any]], purpose: str = "decide") -> str:
+        """Dump step prompt messages to a formatted JSON file in the run directory."""
+        filename = f"step_{step:03d}_{purpose}_messages.json"
+        cleaned_messages = []
+        for msg in messages:
+            msg_copy = dict(msg)
+            if isinstance(msg_copy.get("content"), list):
+                new_content = []
+                for item in msg_copy["content"]:
+                    if isinstance(item, dict) and item.get("type") == "image_url":
+                        url_str = item.get("image_url", {}).get("url", "")
+                        new_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"[base64 image payload: {len(url_str)} chars]"}
+                        })
+                    else:
+                        new_content.append(item)
+                msg_copy["content"] = new_content
+            cleaned_messages.append(msg_copy)
+
+        content_bytes = json.dumps(cleaned_messages, indent=2, ensure_ascii=False).encode("utf-8")
+        return self.blob(filename, content_bytes)
+
     def close(self) -> None:
         try:
             self.events.close()
@@ -195,7 +218,8 @@ class Agent:
         try:
             proposed = self.llm.decide(                        ### LLM (audit only)
                 goal=state.goal, rendered=render(screen), history=state.history,
-                width=screen.width, height=screen.height, package=screen.package)
+                width=screen.width, height=screen.height, package=screen.package,
+                step=state.step, recorder=rec, purpose="shadow_audit")
         except (LLMError, BudgetExceeded) as exc:
             log.debug("shadow audit skipped: %s", exc)
             return
@@ -310,7 +334,8 @@ class Agent:
             if scroll_ctx:
                 hint = scroll_ctx
                 # Also ban cached scroll replays so only the LLM decides.
-                if state.loops.scroll_oscillating():
+                if (state.loops.scroll_oscillating()
+                        or state.loops.direction_reversals() >= 5):
                     for _, sig in state.loops.history:
                         if sig.startswith("scroll/"):
                             state.loops.ban(screen.skeleton_id, sig)
@@ -363,14 +388,35 @@ class Agent:
                     width=screen.width, height=screen.height, package=screen.package,
                     screenshot=screenshot, note=notes,
                     scratchpad="\n".join(state.scratchpad),
-                    progress="\n".join(state.progress_log))
+                    progress="\n".join(state.progress_log),
+                    step=state.step, recorder=rec)
                 state.llm_calls += 1
                 state.want_screenshot = action.confidence == "low"
                 source = "llm"
 
+            # Track scroll direction globally (survives interleaved taps).
+            if action.action == "scroll" and action.direction:
+                state.loops.record_scroll(action.direction)
+
             # Last-resort guard: if the LLM was given full scroll context
             # multiple times and still insists on scrolling, reject it.
-            if action.action == "scroll" and state.loops.scroll_oscillating():
+            # Now also triggers on direction reversals (>=5), not just
+            # strict consecutive oscillation.
+            scroll_blocked = False
+            if action.action == "scroll":
+                if state.loops.scroll_oscillating():
+                    scroll_blocked = True
+                elif (state.loops.direction_reversals() >= 5
+                      and action.direction
+                      and len(state.loops.scroll_dir_log) >= 2):
+                    # Check if this scroll would be yet another reversal.
+                    prev_dir = state.loops.scroll_dir_log[-2] if len(
+                        state.loops.scroll_dir_log) >= 2 else ""
+                    from .safety import _SCROLL_OPPOSITES
+                    if action.direction == _SCROLL_OPPOSITES.get(prev_dir, ""):
+                        scroll_blocked = True
+
+            if scroll_blocked:
                 state.scroll_warnings += 1
                 if state.scroll_warnings >= 3:
                     log.warning("step %d: rejecting scroll after %d warnings",
@@ -379,12 +425,13 @@ class Agent:
                               action=action.describe())
                     state.last_failure = (
                         "scrolling was blocked because you have been "
-                        "alternating up and down despite being told to stop. "
-                        "Do something else or report done/fail.")
+                        "alternating directions or reversing despite being "
+                        "told to stop. Commit to one direction, do something "
+                        "else, or report done/fail.")
                     state.consecutive_failures += 1
                     state.history.append(
                         f"{state.step}. {action.describe()} -> rejected "
-                        f"(scroll oscillation, warning #{state.scroll_warnings})")
+                        f"(scroll reversal, warning #{state.scroll_warnings})")
                     del state.history[:-12]
                     self._maybe_give_up(state)
                     continue
@@ -394,6 +441,13 @@ class Agent:
                 cap = cfg.run.scratchpad_max_chars
                 note_text = action.notes.strip()[:cap]
                 if note_text:
+                    # Append scroll position context so the LLM has spatial
+                    # memory even if it forgets to include it in its notes.
+                    if state.loops.total_scroll_count > 0:
+                        scroll_info = (f"\n[Scroll stats: {state.loops.total_scroll_count} "
+                                       f"scroll(s) so far, {state.loops.direction_reversals()} "
+                                       f"direction reversal(s)]")
+                        note_text = note_text + scroll_info
                     state.scratchpad = [note_text]
                     state.scratchpad_chars = len(note_text)
 
@@ -627,7 +681,8 @@ class Agent:
         verdict = self.llm.judge(goal=state.goal, rendered=render(screen),  ### LLM ###
                                  history=state.history, screenshot=shot,
                                  scratchpad="\n".join(state.scratchpad),
-                                 progress="\n".join(state.progress_log))
+                                 progress="\n".join(state.progress_log),
+                                 step=state.step, recorder=rec)
         state.llm_calls += 1
         rec.event("judge", satisfied=verdict.satisfied, evidence=verdict.evidence)
         if verdict.satisfied:
@@ -690,57 +745,62 @@ def explore(dev: Device, mem: Memory, llm: LLMClient, cfg: Config,
         dev.open_app(package)
         time.sleep(1.0)
 
-    blocked: List[str] = []
-    while len(seen) < max_screens and state.step < cfg.run.max_steps:
-        state.step += 1
-        screen = dev.observe()
-        mem.note_screen(screen)
-        seen.add(screen.skeleton_id)
+    rec = Recorder(cfg, state.run_id)
+    try:
+        blocked: List[str] = []
+        while len(seen) < max_screens and state.step < cfg.run.max_steps:
+            state.step += 1
+            screen = dev.observe()
+            mem.note_screen(screen)
+            seen.add(screen.skeleton_id)
 
-        if safety.sensitive_screen(screen) is not None:
-            log.info("skipping a credential screen")
-            dev.press("back")
-            continue
-        if package and screen.package and screen.package != package:
-            dev.press("back")
-            continue
-
-        want, note = needs_screenshot(state, screen, cfg)
-        action = llm.decide(
-            goal=EXPLORE_GOAL, rendered=render(screen), history=state.history,
-            width=screen.width, height=screen.height, package=screen.package,
-            screenshot=dev.screenshot() if want else None,
-            note=" ".join(filter(None, (note, state.loops.hint(screen.exact_id)))))
-        state.llm_calls += 1
-
-        if action.action in ("done", "fail"):
-            break
-
-        ok, why = safety.is_read_only(action, screen)
-        if not ok:
-            message = (f"Explore wants to {action.describe()} in {screen.package}, "
-                       f"which is not read-only ({why}).")
-            if not safety.confirm(message, cfg):
-                blocked.append(f"{action.describe()}: {why}")
-                state.history.append(
-                    f"{state.step}. skipped {action.describe()} -- not read-only. "
-                    f"Go back and try a different part of the app.")
-                del state.history[:-12]
+            if safety.sensitive_screen(screen) is not None:
+                log.info("skipping a credential screen")
+                dev.press("back")
+                continue
+            if package and screen.package and screen.package != package:
                 dev.press("back")
                 continue
 
-        try:
-            execute(dev, action, screen)
-        except (ActionError, ValueError) as exc:
-            state.history.append(f"{state.step}. {action.describe()} failed: {exc}")
-            continue
+            want, note = needs_screenshot(state, screen, cfg)
+            action = llm.decide(
+                goal=EXPLORE_GOAL, rendered=render(screen), history=state.history,
+                width=screen.width, height=screen.height, package=screen.package,
+                screenshot=dev.screenshot() if want else None,
+                note=" ".join(filter(None, (note, state.loops.hint(screen.exact_id)))),
+                step=state.step, recorder=rec, purpose="explore")
+            state.llm_calls += 1
 
-        after = dev.observe(settle=True)
-        mem.note_transition(screen, after, action)
-        state.loops.record(screen.exact_id, action.signature())
-        state.history.append(f"{state.step}. {action.describe()} -> "
-                             f"{'new screen' if after.skeleton_id not in seen else 'seen before'}")
-        del state.history[:-12]
+            if action.action in ("done", "fail"):
+                break
+
+            ok, why = safety.is_read_only(action, screen)
+            if not ok:
+                message = (f"Explore wants to {action.describe()} in {screen.package}, "
+                           f"which is not read-only ({why}).")
+                if not safety.confirm(message, cfg):
+                    blocked.append(f"{action.describe()}: {why}")
+                    state.history.append(
+                        f"{state.step}. skipped {action.describe()} -- not read-only. "
+                        f"Go back and try a different part of the app.")
+                    del state.history[:-12]
+                    dev.press("back")
+                    continue
+
+            try:
+                execute(dev, action, screen)
+            except (ActionError, ValueError) as exc:
+                state.history.append(f"{state.step}. {action.describe()} failed: {exc}")
+                continue
+
+            after = dev.observe(settle=True)
+            mem.note_transition(screen, after, action)
+            state.loops.record(screen.exact_id, action.signature())
+            state.history.append(f"{state.step}. {action.describe()} -> "
+                                 f"{'new screen' if after.skeleton_id not in seen else 'seen before'}")
+            del state.history[:-12]
+    finally:
+        rec.close()
 
     mem.end_run(state.run_id, "success", state.step, state.llm_calls, 0,
                 llm.ledger.total_usd)
