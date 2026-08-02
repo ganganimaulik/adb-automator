@@ -146,22 +146,23 @@ def test_nothing_to_dismiss_on_a_normal_screen():
 
 def test_repeats_produce_a_hint_then_a_forced_back():
     loops = safety.LoopDetector()
-    for _ in range(2):
+    for _ in range(5):
         loops.record("screen-a", "tap/#1")
     assert loops.hint("screen-a") is None
 
     loops.record("screen-a", "tap/#1")
-    assert "3 times" in (loops.hint("screen-a") or "")
+    assert "6 times" in (loops.hint("screen-a") or "")
     assert not loops.should_force_back("screen-a")
 
-    for _ in range(2):
+    for _ in range(3):
         loops.record("screen-a", "tap/#1")
     assert loops.should_force_back("screen-a")
 
 
 def test_oscillation_between_two_screens_is_detected():
     loops = safety.LoopDetector()
-    for _ in range(2):
+    # Needs 5 full repetitions of the 2-step cycle
+    for _ in range(5):
         loops.record("a", "tap")
         loops.record("b", "back")
     assert loops.oscillating()
@@ -172,6 +173,13 @@ def test_a_normal_walk_is_not_oscillation():
     for name in "abcdef":
         loops.record(name, "tap")
     assert not loops.oscillating()
+
+    # Two repetitions of a cycle should NOT be enough anymore
+    loops2 = safety.LoopDetector()
+    for _ in range(2):
+        loops2.record("a", "tap")
+        loops2.record("b", "back")
+    assert not loops2.oscillating()
 
 
 def test_bans_are_per_screen():
