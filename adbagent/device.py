@@ -125,12 +125,39 @@ def patch_socket_timeout() -> None:
     log.debug("patched AdbHTTPConnection.connect to honour timeouts")
 
 
+def _is_connection_error(exc: BaseException) -> bool:
+    """True when *exc* signals the device / u2-server socket has gone away.
+
+    We deliberately test by class-name rather than importing every possible
+    module, because the actual exception can come from ``http.client``,
+    ``urllib3``, ``requests``, ``adbutils``, or ``uiautomator2`` depending on
+    what was in-flight when the link dropped.
+    """
+    cls_name = type(exc).__name__
+    # http.client.RemoteDisconnected  ("Remote end closed connection …")
+    # requests.ConnectionError / urllib3.ConnectionError / builtins
+    # ConnectionResetError / ConnectionRefusedError / BrokenPipeError
+    if isinstance(exc, (ConnectionError, OSError)):
+        return True
+    if cls_name in ("RemoteDisconnected", "ProtocolError",
+                    "ConnectionClosedError", "AdbError"):
+        return True
+    # Some libraries chain the real cause as __cause__
+    if exc.__cause__ is not None and _is_connection_error(exc.__cause__):
+        return True
+    return False
+
+
 def _guard(fn: Callable[[], T], timeout: float, what: str) -> T:
     """Run `fn` with a wall-clock ceiling.
 
     Belt and braces alongside the socket patch: a device that stops responding
     mid-transfer should surface as an error we can recover from, not as a hang.
     The worker is a daemon thread, so an orphan cannot keep the process alive.
+
+    Connection-level exceptions (``RemoteDisconnected``, ``ConnectionError``,
+    etc.) are wrapped into :class:`DeviceLost` so the recovery ladder in
+    :meth:`Agent._loop` can handle them instead of crashing.
     """
     box: List = []
     error: List[BaseException] = []
@@ -147,7 +174,12 @@ def _guard(fn: Callable[[], T], timeout: float, what: str) -> T:
     if thread.is_alive():
         raise DeviceTimeout(f"{what} exceeded {timeout:.0f}s")
     if error:
-        raise error[0]
+        exc = error[0]
+        if _is_connection_error(exc):
+            raise DeviceLost(
+                f"{what}: connection lost ({type(exc).__name__}: {exc})"
+            ) from exc
+        raise exc
     return box[0]
 
 

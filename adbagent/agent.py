@@ -262,7 +262,13 @@ class Agent:
             state.step += 1
 
             # ---- 1. perceive (no LLM) -----------------------------------
-            screen = self.dev.observe()
+            try:
+                screen = self.dev.observe()
+            except (DeviceTimeout, DeviceLost) as exc:
+                if not self._recover_device(state, exc):
+                    state.finished = "aborted"
+                    return
+                continue
             self.mem.note_screen(screen)
 
             # A programmatic assertion is the cheapest and most reliable way to
@@ -423,7 +429,13 @@ class Agent:
                 continue
 
             # ---- 7. verify (no LLM) -------------------------------------
-            after = self.dev.observe(settle=True)
+            try:
+                after = self.dev.observe(settle=True)
+            except (DeviceTimeout, DeviceLost) as exc:
+                if not self._recover_device(state, exc):
+                    state.finished = "aborted"
+                    return
+                continue
             post = (entry.postcondition if entry is not None
                     else synthesise_postcondition(action, element))
             expected = entry.next_skeleton_id if entry is not None else ""
