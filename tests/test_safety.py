@@ -232,3 +232,41 @@ def test_enter_key_is_not_read_only():
     """Enter submits forms."""
     ok, _ = safety.is_read_only(act(action="press_key", key="enter"), BASE)
     assert not ok
+
+
+# ---------------------------------------------------------------------------
+# Horizontal scroll oscillation
+# ---------------------------------------------------------------------------
+
+def test_left_right_oscillation_is_detected():
+    """Alternating left/right scrolls should trigger scroll_oscillating."""
+    loops = safety.LoopDetector()
+    for _ in range(3):
+        loops.record("screen-x", "scroll/left")
+        loops.record("screen-x", "scroll/right")
+    assert loops.scroll_oscillating()
+
+
+def test_left_right_not_oscillating_when_too_few():
+    loops = safety.LoopDetector()
+    loops.record("screen-x", "scroll/left")
+    loops.record("screen-x", "scroll/right")
+    assert not loops.scroll_oscillating()
+
+
+def test_scroll_context_mentions_horizontal_axis():
+    loops = safety.LoopDetector()
+    for _ in range(4):
+        loops.record("screen-x", "scroll/right")
+    ctx = loops.scroll_context()
+    assert ctx is not None
+    assert "horizontally" in ctx
+
+
+def test_scroll_context_mentions_vertical_axis():
+    loops = safety.LoopDetector()
+    for _ in range(4):
+        loops.record("screen-x", "scroll/down")
+    ctx = loops.scroll_context()
+    assert ctx is not None
+    assert "vertically" in ctx

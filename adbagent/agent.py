@@ -474,10 +474,12 @@ class Agent:
             if outcome.grade == "no_change":
                 state.loops.ban(screen.skeleton_id, action.signature())
                 if action.action == "scroll":
+                    h_dir = action.direction in ("left", "right")
+                    axis = "horizontal" if h_dir else "vertical"
                     state.last_failure = (
                         f"Scrolling {action.direction} did not reveal new "
                         f"content \u2014 you have reached the end of the "
-                        f"scrollable area in that direction. Do not scroll "
+                        f"{axis} scrollable area. Do not scroll "
                         f"{action.direction} again here.")
 
             state.loops.record(screen.exact_id, action.signature())
@@ -515,9 +517,19 @@ class Agent:
     def _scroll_to_find(self, entry: CachedStep, screen: Screen
                         ) -> Optional[AgentAction]:
         """The element is in a list that has moved. Look for it before giving up."""
+        # Determine scroll direction from the scroller's orientation.
+        direction = "down"
+        if entry.anchor is not None and entry.anchor.scroller_rid:
+            from .fingerprint import rid_norm
+            for el in screen.elements:
+                if (el.scrollable
+                        and rid_norm(el.resource_id) == entry.anchor.scroller_rid
+                        and el.is_horizontal):
+                    direction = "right"
+                    break
         previous = screen.exact_id
         for attempt in range(4):
-            self.dev.scroll("down")
+            self.dev.scroll(direction)
             current = self.dev.observe(settle=True)
             if current.exact_id == previous:
                 return None  # the list did not move; it is not there

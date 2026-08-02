@@ -37,7 +37,8 @@ THE ACTIONS
 - long_press      press and hold.
 - input_text      type into a field. Give the target and the text.
 - press_key       back, home, enter, recent, delete, search, menu.
-- scroll          move the content. "down" reveals what is below.
+- scroll          move the content. "down" reveals what is below; "right" reveals \
+what is to the right. Use left/right for horizontal scrollers (carousels, tabs).
 - open_app        launch a package by name, e.g. com.android.settings.
 - wait            let a slow screen finish loading.
 - ask_user        stop and ask the person for something only they can supply.

@@ -226,3 +226,25 @@ def test_count_capping_makes_list_length_irrelevant():
     a = screen(X.settings_screen(rows=7))
     b = screen(X.settings_screen(rows=30))
     assert a.tokens == b.tokens
+
+
+# ---------------------------------------------------------------------------
+# Horizontal scroller ordinals
+# ---------------------------------------------------------------------------
+
+def test_horizontal_scroller_ordinals_sort_by_x():
+    """Items in a horizontal scroller should get f/m/l based on X position.
+
+    A horizontally-scrolled carousel should produce the same skeleton_id as
+    the unscrolled version, just like vertical scrolling does for lists.
+    """
+    a = screen(X.horizontal_scroll_screen(scroll=0))
+    b = screen(X.horizontal_scroll_screen(scroll=200))
+    assert a.skeleton_id == b.skeleton_id
+
+
+def test_horizontal_scroll_matches_identity():
+    """Horizontal scroll should not change simhash significantly."""
+    a = screen(X.horizontal_scroll_screen(scroll=0))
+    b = screen(X.horizontal_scroll_screen(scroll=200))
+    assert fp.hamming(a.simhash, b.simhash) <= T_SIM

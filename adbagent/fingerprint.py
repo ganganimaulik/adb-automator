@@ -182,30 +182,40 @@ def _quantise(el: Element, width: int, height: int) -> Tuple[int, int]:
     return gx, gy
 
 
-def _scroller_ordinals(elements: Sequence[Element]) -> Dict[int, str]:
-    """For each element inside a scroller, an ordinal in {f, m, l}.
+def _scroller_ordinals(elements: Sequence[Element]) -> Dict[int, Tuple[str, bool]]:
+    """For each element inside a scroller, an ordinal and axis flag.
 
-    Position inside a scrolling list is meaningless for identity -- the list
-    scrolls -- but "is it the first or last row" is stable enough to keep some
-    signal.
+    Returns ``{id(el): (ordinal, is_horizontal)}`` where ordinal is one of
+    ``f`` / ``m`` / ``l``.  Position inside a scrolling list is meaningless
+    for identity -- the list scrolls -- but "is it the first or last item" is
+    stable enough to keep some signal.  Horizontal scrollers sort by X,
+    vertical by Y.
     """
     groups: Dict[int, List[Element]] = {}
+    scroller_map: Dict[int, Element] = {}
     for el in elements:
         scroller = el.scroller()
         if scroller is None:
             continue
-        groups.setdefault(id(scroller), []).append(el)
+        sid = id(scroller)
+        groups.setdefault(sid, []).append(el)
+        scroller_map[sid] = scroller
 
-    out: Dict[int, str] = {}
-    for members in groups.values():
-        ordered = sorted(members, key=lambda e: (e.bounds[1], e.bounds[0]))
+    out: Dict[int, Tuple[str, bool]] = {}
+    for sid, members in groups.items():
+        scroller = scroller_map[sid]
+        horiz = scroller.is_horizontal
+        if horiz:
+            ordered = sorted(members, key=lambda e: (e.bounds[0], e.bounds[1]))
+        else:
+            ordered = sorted(members, key=lambda e: (e.bounds[1], e.bounds[0]))
         for i, el in enumerate(ordered):
             if i == 0:
-                out[id(el)] = "f"
+                out[id(el)] = ("f", horiz)
             elif i == len(ordered) - 1:
-                out[id(el)] = "l"
+                out[id(el)] = ("l", horiz)
             else:
-                out[id(el)] = "m"
+                out[id(el)] = ("m", horiz)
     return out
 
 
@@ -237,12 +247,24 @@ def skeleton_tokens(screen: Screen) -> Tuple[str, ...]:
         gx, gy = _quantise(el, width, height)
         gw = round(el.width / width * GRID_W) if width else 0
         in_scroller = id(el) in ordinals
-        ypos = "s" + ordinals[id(el)] if in_scroller else str(gy)
+        if in_scroller:
+            ordinal, is_horiz = ordinals[id(el)]
+            if is_horiz:
+                # Horizontal scroller: X drifts, Y is stable.
+                xpos = "s" + ordinal
+                ypos = str(gy)
+            else:
+                # Vertical scroller: Y drifts, X is stable.
+                xpos = str(gx)
+                ypos = "s" + ordinal
+        else:
+            xpos = str(gx)
+            ypos = str(gy)
         # `selected` on chrome -- a tab, a segmented control -- IS the screen's
         # identity: tab A and tab B are otherwise byte-identical structures.
         # Inside a scroller it is mere row highlighting, so it is ignored there.
         flags = _flags(el) + ("S" if el.selected and not in_scroller else "-")
-        token = f"{class_eq(el.cls)}|{rid_norm(el.resource_id)}|{flags}|{gx}|{ypos}|{gw}"
+        token = f"{class_eq(el.cls)}|{rid_norm(el.resource_id)}|{flags}|{xpos}|{ypos}|{gw}"
         # A collapsed run of identical siblings still contributes several copies,
         # bounded by the same cap as everything else.
         for _ in range(min(el.repeat, REPEAT_CAP)):

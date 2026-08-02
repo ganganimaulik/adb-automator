@@ -337,10 +337,17 @@ def resolve_anchor(anchor: Anchor, screen: Screen, *, threshold: float,
                           f"ambiguous: {top_score:.2f} vs {runner_up:.2f}")
 
     if anchor.scroller_rid:
-        # Inside a scroller, vertical position is meaningless -- the list moved.
-        if not _within(anchor, top, screen, check_y=False):
-            return Resolution(None, top_score, runner_up, "moved horizontally")
-    elif not _within(anchor, top, screen, check_y=True):
+        # Inside a scroller, the position along the scroll axis is meaningless.
+        horiz = _is_horizontal_scroller(anchor.scroller_rid, screen)
+        if horiz:
+            # Horizontal scroller: X position drifts, Y should be stable.
+            if not _within(anchor, top, screen, check_x=False):
+                return Resolution(None, top_score, runner_up, "moved vertically")
+        else:
+            # Vertical scroller: Y position drifts, X should be stable.
+            if not _within(anchor, top, screen, check_y=False):
+                return Resolution(None, top_score, runner_up, "moved horizontally")
+    elif not _within(anchor, top, screen):
         if top_score < 0.70:
             return Resolution(None, top_score, runner_up,
                               "moved a long way and the match is weak")
@@ -352,12 +359,21 @@ def resolve_anchor(anchor: Anchor, screen: Screen, *, threshold: float,
     return Resolution(top, top_score, runner_up)
 
 
-def _within(anchor: Anchor, el: Element, screen: Screen, check_y: bool,
+def _is_horizontal_scroller(scroller_rid: str, screen: Screen) -> bool:
+    """Check if a scroller with this resource-id is horizontal on screen."""
+    for el in screen.elements:
+        if el.scrollable and rid_norm(el.resource_id) == scroller_rid:
+            return el.is_horizontal
+    return False
+
+
+def _within(anchor: Anchor, el: Element, screen: Screen,
+            check_x: bool = True, check_y: bool = True,
             tolerance: float = 0.15) -> bool:
     ax = anchor.bounds_frac[0] + anchor.bounds_frac[2] / 2
     ay = anchor.bounds_frac[1] + anchor.bounds_frac[3] / 2
     cx, cy = el.center
-    if abs(cx / (screen.width or 1) - ax) > tolerance:
+    if check_x and abs(cx / (screen.width or 1) - ax) > tolerance:
         return False
     if check_y and abs(cy / (screen.height or 1) - ay) > tolerance:
         return False

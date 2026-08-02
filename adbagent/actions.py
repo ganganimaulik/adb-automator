@@ -226,6 +226,17 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
         box = None
         if element is not None and element.scrollable:
             box = element.bounds
+            # Remap wrong-axis directions so the LLM doesn't waste steps.
+            if element.is_horizontal and action.direction in ("up", "down"):
+                remapped = "left" if action.direction == "up" else "right"
+                log.warning("remapping scroll %s -> %s for horizontal scroller",
+                            action.direction, remapped)
+                action = action.model_copy(update={"direction": remapped})
+            elif not element.is_horizontal and action.direction in ("left", "right"):
+                remapped = "up" if action.direction == "left" else "down"
+                log.warning("remapping scroll %s -> %s for vertical scroller",
+                            action.direction, remapped)
+                action = action.model_copy(update={"direction": remapped})
         dev.scroll(action.direction or "down", box=box)
     elif action.action == "open_app":
         dev.open_app((action.text or "").strip())
@@ -339,6 +350,63 @@ def check_postcondition(post: Postcondition, before: Screen,
     return True, ""
 
 
+# ---------------------------------------------------------------------------
+# Multi-signal scroll-changed detection
+# ---------------------------------------------------------------------------
+
+def _scroller_texts(screen: Screen) -> frozenset:
+    """Collect text from elements inside scrollable containers."""
+    return frozenset(
+        el.best_text.strip()
+        for el in screen.elements
+        if el.scroller() is not None and el.best_text.strip()
+    )
+
+
+def _scroll_changed(before: Screen, after: Screen) -> bool:
+    """Multi-signal check for whether a scroll actually revealed new content.
+
+    Three signals, cheapest first:
+
+    1. **exact_id identity** -- the hierarchy hash is byte-identical, so nothing
+       changed at all.
+    2. **skeleton + simhash proximity + scroller content** -- the exact_id *did*
+       change (e.g. a toggle flipped, an animation frame) but the skeleton is
+       identical, the simhash moved by at most 2 bits, **and** the text inside
+       scrollable containers is unchanged.  The screen is *effectively* the same.
+    3. **Scroller-child text overlap** -- ≥ 90 % of the text-bearing elements
+       inside scrollable containers are identical in both dumps.  This catches
+       the case where the hierarchy drifted more but the user is seeing the
+       same list content.
+    """
+    # Signal 1: byte-identical hierarchy.
+    if after.exact_id == before.exact_id:
+        return False
+
+    before_texts = _scroller_texts(before)
+    after_texts = _scroller_texts(after)
+
+    # Signal 2: near-identical chrome change + scroller content unchanged.
+    if after.skeleton_id == before.skeleton_id:
+        from .fingerprint import hamming
+        dist = hamming(after.simhash, before.simhash)
+        if dist <= 2:
+            # Chrome barely changed.  Did the scroller content actually move?
+            if not before_texts and not after_texts:
+                return False  # No scroller content; chrome-only change.
+            if before_texts == after_texts:
+                return False  # Scroller content is identical.
+
+    # Signal 3: scroller content overlap.
+    if before_texts and after_texts:
+        overlap = before_texts & after_texts
+        total = max(len(before_texts), len(after_texts))
+        if total and len(overlap) / total >= 0.90:
+            return False
+
+    return True
+
+
 def verify(action: AgentAction, before: Screen, after: Screen,
            post: Optional[Postcondition] = None,
            expected_skeleton: Optional[str] = None) -> VerifyOutcome:
@@ -351,7 +419,7 @@ def verify(action: AgentAction, before: Screen, after: Screen,
     # Scroll that didn't move = end of list, not a hard failure.  Grading it
     # ``no_change`` causes the direction to be banned on this screen and gives
     # the LLM a clear "end of list" signal instead of a confusing hard_fail.
-    if action.action == "scroll" and after.exact_id == before.exact_id:
+    if action.action == "scroll" and not _scroll_changed(before, after):
         return VerifyOutcome(grade="no_change",
                              reason="scrolling did not reveal new content")
 

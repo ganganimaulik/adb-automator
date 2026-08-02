@@ -243,8 +243,18 @@ class LoopDetector:
             counts[d] = counts.get(d, 0) + 1
         breakdown = ", ".join(f"{c}x {d}" for d, c in counts.items())
 
+        # Determine axis for user-facing messages.
+        h_dirs = counts.get("left", 0) + counts.get("right", 0)
+        v_dirs = counts.get("up", 0) + counts.get("down", 0)
+        if h_dirs > v_dirs:
+            axis_label = "horizontally"
+        elif v_dirs > h_dirs:
+            axis_label = "vertically"
+        else:
+            axis_label = "in multiple directions"
+
         parts: List[str] = [
-            f"You have scrolled {n} times consecutively ({breakdown}).",
+            f"You have scrolled {n} times consecutively {axis_label} ({breakdown}).",
         ]
 
         if self.scroll_oscillating():
