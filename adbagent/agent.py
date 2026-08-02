@@ -89,6 +89,8 @@ class RunState:
     #: so it knows what it has already captured.
     scratchpad: List[str] = field(default_factory=list)
     scratchpad_chars: int = 0
+    prev_skeleton_id: str = ""
+    nav_stack: List[str] = field(default_factory=list)
     #: Progress tracker for multi-step goals.  The LLM writes into the
     #: ``progress`` field; we keep the last few entries and feed them back.
     progress_log: List[str] = field(default_factory=list)
@@ -238,6 +240,12 @@ class Agent:
             usd = self.llm.ledger.total_usd if self.llm else 0.0
             self.mem.end_run(run_id, outcome, state.step, state.llm_calls,
                              state.cache_hits, usd)
+            try:
+                screen_pkg = getattr(self, '_last_package', '')
+                if screen_pkg:
+                    self.mem.update_app_tuning(screen_pkg)
+            except Exception:  # noqa: BLE001
+                pass
             recorder.event("run_end", outcome=outcome, steps=state.step,
                            llm_calls=state.llm_calls, cache_hits=state.cache_hits,
                            audits=state.audits, audit_agreement=state.audit_agreement(),
@@ -270,6 +278,7 @@ class Agent:
                     return
                 continue
             self.mem.note_screen(screen)
+            self._last_package = screen.package
 
             # A programmatic assertion is the cheapest and most reliable way to
             # know we are done, so it is checked before anything else happens.
@@ -314,10 +323,27 @@ class Agent:
                 continue
 
             # ---- 3. cache lookup (no LLM) -------------------------------
+            # Check if we're revisiting via back navigation
+            if (state.nav_stack and screen.skeleton_id in state.nav_stack
+                    and screen.skeleton_id != state.nav_stack[-1]):
+                # Back-navigation landed on a previously visited screen.
+                # Pop the stack and rewind the visit counter so the cache
+                # uses the original visit ordinal.
+                idx = len(state.nav_stack) - 1 - state.nav_stack[::-1].index(screen.skeleton_id)
+                state.nav_stack = state.nav_stack[:idx + 1]
+                v = state.visits.get(screen.skeleton_id, 1)
+                if v > 0:
+                    state.visits[screen.skeleton_id] = v - 1
+
             visit = state.visits.get(screen.skeleton_id, 0)
             state.visits[screen.skeleton_id] = visit + 1
 
-            entry, action, source = self._from_cache(state, screen)
+            # Update navigation stack
+            if not state.nav_stack or state.nav_stack[-1] != screen.skeleton_id:
+                state.nav_stack.append(screen.skeleton_id)
+
+            prev_skeleton = state.prev_skeleton_id
+            entry, action, source = self._from_cache(state, screen, prev_skeleton)
             if entry is not None and action is not None:
                 self._shadow_audit(state, screen, entry, action, rec)
 
@@ -460,11 +486,15 @@ class Agent:
             elif outcome.ok:
                 self.mem.record(screen=screen, intent_id=state.intent_id, visit=visit,
                                 action=action, element=element, postcondition=post,
-                                after=after, run_id=state.run_id)
+                                after=after, run_id=state.run_id,
+                                prev_skeleton_id=prev_skeleton)
             else:
                 state.consecutive_failures += 1
                 state.last_failure = f"{action.describe()} failed: {outcome.reason}"
                 state.want_screenshot = True
+                if source == "llm":
+                    self.mem.record_dead_end(screen, state.intent_id,
+                                             action.signature(), outcome.reason)
 
             if outcome.ok:
                 state.consecutive_failures = 0
@@ -486,16 +516,18 @@ class Agent:
                 + (f" ({outcome.reason})" if outcome.reason else ""))
             del state.history[:-12]  # keep the prompt bounded
 
+            state.prev_skeleton_id = screen.skeleton_id
             self._maybe_give_up(state)
 
     # -- cache -------------------------------------------------------------
 
-    def _from_cache(self, state: RunState, screen: Screen
+    def _from_cache(self, state: RunState, screen: Screen, prev_skeleton_id: str = ""
                     ) -> Tuple[Optional[CachedStep], Optional[AgentAction], str]:
         from .fingerprint import destructive_tokens
 
         entry = self.mem.lookup(
             screen, state.intent_id, state.visits[screen.skeleton_id] - 1,
+            prev_skeleton_id=prev_skeleton_id,
             forbidden_now=destructive_tokens(screen),
             banned_signatures=list(state.loops.bans_for(screen.skeleton_id)))
         if entry is None:
@@ -525,19 +557,42 @@ class Agent:
                         and el.is_horizontal):
                     direction = "right"
                     break
-        previous = screen.exact_id
-        for attempt in range(4):
-            self.dev.scroll(direction)
-            current = self.dev.observe(settle=True)
-            if current.exact_id == previous:
-                return None  # the list did not move; it is not there
-            previous = current.exact_id
-            if current.skeleton_id != entry.skeleton_id:
-                return None  # we scrolled off the screen entirely
-            action = self.mem.rehydrate(entry, current, minor_deviation=True)
-            if action is not None:
-                log.info("found it after %d scroll(s)", attempt + 1)
-                return action
+        opposite = "up" if direction == "down" else "left"
+
+        def search_dir(d: str, current_screen: Screen) -> Tuple[Optional[AgentAction], int]:
+            previous = current_screen.exact_id
+            for attempt in range(4):
+                self.dev.scroll(d)
+                current = self.dev.observe(settle=True)
+                if current.exact_id == previous:
+                    return None, attempt + 1
+                previous = current.exact_id
+                if current.skeleton_id != entry.skeleton_id:
+                    return None, attempt + 1
+                act = self.mem.rehydrate(entry, current, minor_deviation=True)
+                if act is not None:
+                    return act, attempt + 1
+            return None, 4
+
+        # 1. Try primary direction
+        action, scrolls = search_dir(direction, screen)
+        if action is not None:
+            log.info("found it after %d scroll(s)", scrolls)
+            return action
+
+        # 2. Scroll back to original position
+        for _ in range(scrolls):
+            self.dev.scroll(opposite)
+        
+        if scrolls > 0:
+            screen = self.dev.observe(settle=True)
+
+        # 3. Try opposite direction
+        action, opp_scrolls = search_dir(opposite, screen)
+        if action is not None:
+            log.info("found it after %d scroll(s) in opposite direction", opp_scrolls)
+            return action
+
         return None
 
     # -- terminal actions --------------------------------------------------

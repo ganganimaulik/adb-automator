@@ -368,3 +368,174 @@ def test_simhash_large_int_sqlite_compatibility(mem):
     fetched = mem.get(step.id)
     assert fetched is not None
 
+
+# ---------------------------------------------------------------------------
+# Predecessor-aware lookup (Change 2)
+# ---------------------------------------------------------------------------
+
+def test_predecessor_aware_lookup_prefers_matching_predecessor(mem):
+    """Entries with matching prev_skeleton_id should be preferred."""
+    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
+    after = s(X.detail_screen())
+
+    # Record two entries for the same screen with different predecessors.
+    mem.record(screen=BASE, intent_id="i", visit=0,
+               action=act(action="tap", target=Target(index=el.index), text="first"),
+               element=el, postcondition=Postcondition(kind="screen_changed"),
+               after=after, run_id="r1", prev_skeleton_id="predecessor_A")
+
+    mem.record(screen=BASE, intent_id="i", visit=0,
+               action=act(action="tap", target=Target(index=el.index), text="second"),
+               element=el, postcondition=Postcondition(kind="screen_changed"),
+               after=after, run_id="r2", prev_skeleton_id="predecessor_B")
+
+    # Lookup with predecessor_B should prefer the second entry.
+    hit = mem.lookup(BASE, "i", 0, prev_skeleton_id="predecessor_B")
+    assert hit is not None
+    assert hit.prev_skeleton_id == "predecessor_B"
+
+
+def test_predecessor_lookup_falls_back_gracefully(mem):
+    """Entries without prev_skeleton_id still match when no predecessor is given."""
+    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
+    learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
+          s(X.detail_screen()))
+    # No prev_skeleton_id in lookup — should still match.
+    hit = mem.lookup(BASE, "i", 0, prev_skeleton_id="unknown_predecessor")
+    assert hit is not None
+
+
+# ---------------------------------------------------------------------------
+# Cross-goal navigation sharing (Change 4)
+# ---------------------------------------------------------------------------
+
+def test_navigation_scope_entries_are_shared_across_goals(mem):
+    """Trusted navigation entries should be reusable by different goals."""
+    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
+    after = s(X.detail_screen())
+
+    # Record a navigation entry under intent "goal_A"
+    entry = mem.record(
+        screen=BASE, intent_id="goal_A", visit=0,
+        action=act(action="tap", target=Target(index=el.index)),
+        element=el, postcondition=Postcondition(kind="screen_changed"),
+        after=after, run_id="r1")
+
+    # Promote to trusted so cross-goal sharing kicks in.
+    entry.stats.n_success = 10
+    entry.stats.consecutive_failures = 0
+    entry.state = "trusted"
+    mem.db.execute(
+        "UPDATE entry SET state='trusted', n_success=10, scope='navigation' WHERE id=?",
+        (entry.id,))
+    mem.db.commit()
+
+    # Lookup under a different intent should find the navigation entry.
+    hit = mem.lookup(BASE, "goal_B", 0)
+    assert hit is not None
+    assert hit.id == entry.id
+
+
+# ---------------------------------------------------------------------------
+# Negative cache: dead ends (Change 7)
+# ---------------------------------------------------------------------------
+
+def test_dead_end_is_recorded_and_bans_action(mem):
+    """A dead-end action signature should be banned in future lookups."""
+    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
+    action = act(action="tap", target=Target(index=el.index))
+    after = s(X.detail_screen())
+
+    learn(mem, BASE, action, el, after)
+
+    # Record the action as a dead end.
+    mem.record_dead_end(BASE, "i", action.signature(), "didn't work")
+
+    # Now lookup should skip this action.
+    hit = mem.lookup(BASE, "i", 0)
+    assert hit is None  # banned by dead-end
+
+
+def test_dead_end_expires(mem):
+    """Dead-end entries should expire after their TTL."""
+    import time as _time
+
+    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
+    action = act(action="tap", target=Target(index=el.index))
+    after = s(X.detail_screen())
+
+    learn(mem, BASE, action, el, after)
+    mem.record_dead_end(BASE, "i", action.signature(), "test")
+
+    # Artificially expire the dead end.
+    mem.db.execute("UPDATE dead_end SET expires_at = 0")
+    mem.db.commit()
+
+    # Now lookup should find the entry again.
+    hit = mem.lookup(BASE, "i", 0)
+    assert hit is not None
+
+
+# ---------------------------------------------------------------------------
+# Adaptive SimHash threshold (Change 3)
+# ---------------------------------------------------------------------------
+
+def test_probation_entries_use_tighter_simhash_threshold(mem):
+    """Probation entries should use t_strict, not t_sim."""
+    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
+    after = s(X.detail_screen())
+
+    entry = learn(mem, BASE, act(action="tap", target=Target(index=el.index)),
+                  el, after)
+    assert entry.state == "probation"
+
+    # Create a screen with a SimHash distance of 4 (within t_sim=6 but above t_strict=3).
+    drifted = s(X.settings_screen())
+    drifted.simhash = BASE.simhash ^ 0b11110000  # 4 bits different
+
+    hit = mem.lookup(drifted, "i", 0)
+    # Should miss because probation entries use t_strict=3.
+    assert hit is None
+
+
+# ---------------------------------------------------------------------------
+# Enhanced GC (Change 8)
+# ---------------------------------------------------------------------------
+
+def test_gc_removes_retired_entries(mem):
+    """gc() should remove entries in 'retired' state."""
+    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
+    entry = learn(mem, BASE, act(action="tap", target=Target(index=el.index)),
+                  el, s(X.detail_screen()))
+    mem.db.execute("UPDATE entry SET state='retired' WHERE id=?", (entry.id,))
+    mem.db.commit()
+
+    n = mem.gc()
+    assert n >= 1
+    assert mem.get(entry.id) is None
+
+
+def test_gc_cleans_expired_dead_ends(mem):
+    """gc() should remove expired dead-end entries."""
+    mem.record_dead_end(BASE, "i", "tap/#1", "test")
+    mem.db.execute("UPDATE dead_end SET expires_at = 0")
+    mem.db.commit()
+
+    n = mem.gc()
+    assert n >= 1
+
+
+# ---------------------------------------------------------------------------
+# Intent key with verb polarity
+# ---------------------------------------------------------------------------
+
+def test_intent_key_opposite_goals_differ():
+    """Turning on vs turning off should produce different cache keys."""
+    assert intent_key("Turn on Wi-Fi") != intent_key("Turn off Wi-Fi")
+    assert intent_key("enable dark mode") != intent_key("disable dark mode")
+
+
+def test_intent_key_same_goal_rewording_matches():
+    """Trivial rewording should still produce the same intent key."""
+    assert intent_key("Turn on Wi-Fi") == intent_key("turn on   wi-fi")
+    assert intent_key("open Settings") == intent_key("open   settings")

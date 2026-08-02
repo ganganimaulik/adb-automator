@@ -164,6 +164,31 @@ def mask_goal(raw: str) -> str:
     return s
 
 
+def normalize_verb_polarity(goal: str) -> str:
+    """Extract and normalize the primary verb polarity from a goal string.
+
+    Returns only the polarity prefix (e.g. ``[+]``, ``[-]``) so that opposite
+    actions hash differently, or an empty string when no polarity is detected.
+    """
+    if not goal:
+        return ""
+
+    rules = [
+        (r"\b(turn on|enable|activate|switch on|set)\b", "[+]"),
+        (r"\b(turn off|disable|deactivate|switch off|unset)\b", "[-]"),
+        (r"\b(open|go to|navigate to|launch|start)\b", "[open]"),
+        (r"\b(close|exit|leave|quit)\b", "[close]"),
+        (r"\b(increase|raise|higher|up)\b", "[+adj]"),
+        (r"\b(decrease|lower|reduce|down)\b", "[-adj]"),
+    ]
+
+    for pattern, prefix in rules:
+        if re.search(pattern, goal, re.IGNORECASE):
+            return prefix
+
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
