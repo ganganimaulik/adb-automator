@@ -156,6 +156,7 @@ _ENV_MAP = {
     "ADBAGENT_PROVIDER": "llm.provider",
     "ADBAGENT_BASE_URL": "llm.base_url",
     "ADBAGENT_RPM": "llm.rpm",
+    "ADBAGENT_MAX_TOKENS": "llm.max_tokens",
     "ADBAGENT_DB": "memory.db",
     "ADBAGENT_BUDGET_USD": "safety.budget_usd",
     "ADBAGENT_MAX_STEPS": "run.max_steps",

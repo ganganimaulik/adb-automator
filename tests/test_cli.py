@@ -174,3 +174,13 @@ def test_model_image_cli_and_env_precedence(monkeypatch, tmp_path):
 
     cfg = build_config(parse(["run", "g", "--model-image", "vision-from-cli"]))
     assert cfg.llm.model_image == "vision-from-cli"
+
+
+def test_max_tokens_cli_and_env_precedence(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ADBAGENT_MAX_TOKENS", "2500")
+    assert build_config(parse(["run", "g"])).llm.max_tokens == 2500
+
+    cfg = build_config(parse(["run", "g", "--max-tokens", "4000"]))
+    assert cfg.llm.max_tokens == 4000
+
