@@ -36,7 +36,7 @@ from pydantic import BaseModel, ConfigDict
 from . import trust
 from .actions import AgentAction, Postcondition
 from .config import Config
-from .fingerprint import class_eq, hamming, mask_text, rid_norm
+from .fingerprint import class_eq, hamming, mask_goal, mask_text, rid_norm
 from .screen import Element, Screen
 
 log = logging.getLogger("adbagent.memory")
@@ -412,7 +412,7 @@ class CachedStep:
 def intent_key(goal: str) -> str:
     """Normalised goal, so trivial rewording still hits the cache."""
     import hashlib
-    normalised = " ".join(mask_text(goal).split())
+    normalised = " ".join(mask_goal(goal).split())
     return hashlib.blake2b(normalised.encode("utf-8"), digest_size=8).hexdigest()
 
 
