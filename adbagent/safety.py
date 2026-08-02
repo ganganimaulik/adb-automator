@@ -150,6 +150,8 @@ REPEAT_HINT_AT = 3
 FORCE_BACK_AT = 5
 WINDOW = 8
 
+_SCROLL_OPPOSITES = {"up": "down", "down": "up", "left": "right", "right": "left"}
+
 
 @dataclass
 class LoopDetector:
@@ -189,6 +191,79 @@ class LoopDetector:
                 if tail[:period] == tail[period:]:
                     return True
         return False
+
+    def _consecutive_scroll_dirs(self) -> List[str]:
+        """Trailing run of scroll directions from the history buffer."""
+        dirs: List[str] = []
+        for _, sig in reversed(self.history):
+            parts = sig.split("/")
+            if parts[0] != "scroll":
+                break
+            dirs.append(parts[-1])  # direction is always the last segment
+        dirs.reverse()
+        return dirs
+
+    def scroll_oscillating(self) -> bool:
+        """Alternating opposite scrolls, e.g. down/up/down/up.
+
+        Regular ``oscillating()`` compares screen ``exact_id`` sequences, but
+        scrolling changes visible content (and therefore ``exact_id``) on every
+        step, so it never triggers.  This method looks at the trailing run of
+        scroll action signatures instead.
+        """
+        dirs = self._consecutive_scroll_dirs()
+        if len(dirs) < 4:
+            return False
+        tail = dirs[-4:]
+        return all(
+            tail[i] == _SCROLL_OPPOSITES.get(tail[i - 1], "")
+            for i in range(1, len(tail))
+        )
+
+    def scroll_context(self) -> Optional[str]:
+        """Rich situational context about scrolling patterns for the LLM.
+
+        Returns ``None`` when there is nothing noteworthy.  Otherwise returns
+        a multi-sentence description that tells the model *exactly* what it
+        has been doing so it can course-correct on its own.
+        """
+        dirs = self._consecutive_scroll_dirs()
+        if len(dirs) < 3:
+            return None
+
+        n = len(dirs)
+        counts: Dict[str, int] = {}
+        for d in dirs:
+            counts[d] = counts.get(d, 0) + 1
+        breakdown = ", ".join(f"{c}x {d}" for d, c in counts.items())
+
+        parts: List[str] = [
+            f"You have scrolled {n} times consecutively ({breakdown}).",
+        ]
+
+        if self.scroll_oscillating():
+            # Show the actual recent pattern so the LLM can see it plainly.
+            recent = " → ".join(dirs[-6:])
+            parts.append(
+                f"Your recent scroll pattern is: {recent}. "
+                f"You are alternating between opposite directions, which "
+                f"means you are re-reading content you already saw."
+            )
+            parts.append(
+                "You must stop scrolling now. Either you have already seen "
+                "all the content and should report 'done' with a summary of "
+                "what you found, or the information is not here and you "
+                "should try a different approach (e.g. search, go back) or "
+                "report 'fail'."
+            )
+        elif n >= 5:
+            parts.append(
+                "You have been scrolling for a while. Consider whether you "
+                "have already seen the content you need, or whether a "
+                "different approach (search, filter, etc.) would be faster."
+            )
+
+        return " ".join(parts)
 
     def ban(self, skeleton_id: str, signature: str) -> None:
         log.info("banning %s on this screen for the rest of the run", signature)

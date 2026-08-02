@@ -79,6 +79,7 @@ class RunState:
     loops: LoopDetector = field(default_factory=LoopDetector)
     want_screenshot: bool = False
     last_failure: str = ""
+    scroll_warnings: int = 0
     audits: int = 0
     audits_agreed: int = 0
     started_at: float = field(default_factory=time.monotonic)
@@ -284,6 +285,18 @@ class Agent:
                 continue
 
             hint = state.loops.hint(screen.exact_id)
+
+            # Scroll awareness: give the LLM full context about its
+            # scrolling pattern so it can course-correct on its own.
+            scroll_ctx = state.loops.scroll_context()
+            if scroll_ctx:
+                hint = scroll_ctx
+                # Also ban cached scroll replays so only the LLM decides.
+                if state.loops.scroll_oscillating():
+                    for _, sig in state.loops.history:
+                        if sig.startswith("scroll/"):
+                            state.loops.ban(screen.skeleton_id, sig)
+
             if state.loops.should_force_back(screen.exact_id) or state.loops.oscillating():
                 log.warning("step %d: stuck in a loop; going back", state.step)
                 rec.event("loop_break", exact_id=screen.exact_id)
@@ -317,6 +330,27 @@ class Agent:
                 state.llm_calls += 1
                 state.want_screenshot = action.confidence == "low"
                 source = "llm"
+
+            # Last-resort guard: if the LLM was given full scroll context
+            # multiple times and still insists on scrolling, reject it.
+            if action.action == "scroll" and state.loops.scroll_oscillating():
+                state.scroll_warnings += 1
+                if state.scroll_warnings >= 3:
+                    log.warning("step %d: rejecting scroll after %d warnings",
+                                state.step, state.scroll_warnings)
+                    rec.event("scroll_rejected", step=state.step,
+                              action=action.describe())
+                    state.last_failure = (
+                        "scrolling was blocked because you have been "
+                        "alternating up and down despite being told to stop. "
+                        "Do something else or report done/fail.")
+                    state.consecutive_failures += 1
+                    state.history.append(
+                        f"{state.step}. {action.describe()} -> rejected "
+                        f"(scroll oscillation, warning #{state.scroll_warnings})")
+                    del state.history[:-12]
+                    self._maybe_give_up(state)
+                    continue
 
             rec.event("decide", step=state.step, source=source,
                       skeleton=screen.skeleton_id, action=action.model_dump(),
