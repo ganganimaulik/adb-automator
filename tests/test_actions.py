@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from adbagent.actions import (AgentAction, Postcondition, Target, check_postcondition,
+                              describe_target, format_history_entry,
                               resolve_target, synthesise_postcondition, verify)
 from adbagent.fingerprint import attach
 from adbagent.screen import parse
@@ -229,6 +230,26 @@ def test_describe_untruncated_text():
     long_msg = "Bumble matches checked: 5 matches visible — K, Z, A, D, and R (all Date matches), with recent conversation previews shown on the Chats screen."
     action = act(action="done", text=long_msg)
     assert action.describe() == f"done {long_msg}"
+
+
+def test_describe_target_with_element():
+    el = BASE.elements[0]
+    target = Target(index=el.index)
+    desc = describe_target(target, el)
+    assert f"#{el.index}" in desc
+    assert el.kind() in desc
+    assert el.best_text in desc
+
+
+def test_format_history_entry_rich_context():
+    el = BASE.elements[0]
+    action = act(action="tap", target=Target(index=el.index), observation="settings home")
+    entry = format_history_entry(1, action, screen=BASE, element=el, grade="success")
+    assert "1." in entry
+    assert "tap #1" in entry
+    assert f"in {BASE.package}" in entry
+    assert "(Obs: settings home)" in entry
+    assert "-> success" in entry
 
 
 # ---------------------------------------------------------------------------

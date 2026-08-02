@@ -163,6 +163,11 @@ class LoopDetector:
     #: consecutive-scroll counter.
     scroll_dir_log: List[str] = field(default_factory=list)
     total_scroll_count: int = 0
+    #: Consecutive forced-back presses without an intervening real action.
+    #: When this reaches the cap the agent stops pressing back and lets the
+    #: LLM try a different approach.
+    consecutive_backs: int = 0
+    _BACK_LOOP_CAP: int = field(default=2, repr=False)
 
     def record(self, exact_id: str, signature: str) -> None:
         self.history.append((exact_id, signature))
@@ -183,15 +188,36 @@ class LoopDetector:
         # Don't count repeated scrolls on the same screen as a navigation
         # loop.  Scroll stalls mean end-of-list, not that the agent is stuck
         # bouncing between screens.
+        # Also exclude "forced-back" signatures: those are our own
+        # interventions, not real agent actions.  Counting them created a
+        # positive-feedback loop where each forced back made the next one
+        # trigger sooner.
         non_scroll = sum(
             1 for eid, sig in self.history
-            if eid == exact_id and not sig.startswith("scroll/")
+            if eid == exact_id
+            and not sig.startswith("scroll/")
+            and sig != "forced-back"
         )
         return non_scroll >= FORCE_BACK_AT
 
+    def in_back_loop(self) -> bool:
+        """True when pressing back is itself the problem.
+
+        After ``_BACK_LOOP_CAP`` consecutive forced-backs, the caller
+        should stop pressing back and let the LLM try something else.
+        """
+        return self.consecutive_backs >= self._BACK_LOOP_CAP
+
     def oscillating(self) -> bool:
-        """A repeating 2- or 3-step cycle, e.g. open -> back -> open -> back."""
-        ids = [h for h, _ in self.history]
+        """A repeating 2- or 3-step cycle, e.g. open -> back -> open -> back.
+
+        Ignores patterns that consist entirely of forced-back entries,
+        because those are a symptom of *this* guard firing repeatedly,
+        not of the agent misbehaving.
+        """
+        # Filter out forced-back entries to check for real oscillation.
+        real = [(h, s) for h, s in self.history if s != "forced-back"]
+        ids = [h for h, _ in real]
         for period in (2, 3):
             if len(ids) >= period * 2:
                 tail = ids[-period * 2:]

@@ -178,10 +178,10 @@ class AgentAction(BaseModel):
                 parts.append(str(extra))
         return "/".join(parts)
 
-    def describe(self) -> str:
+    def describe(self, element: Optional[Element] = None) -> str:
         bits = [self.action]
         if self.target is not None:
-            bits.append(self.target.describe())
+            bits.append(describe_target(self.target, element))
         if self.action == "input_text" and self.text is not None:
             bits.append(f"{self.text!r}")
         elif self.action in ("open_app", "done", "fail", "ask_user") and self.text:
@@ -190,7 +190,63 @@ class AgentAction(BaseModel):
             bits.append(self.key)
         if self.direction:
             bits.append(self.direction)
+            if self.scroll_amount != 1.0:
+                bits.append(f"amount={self.scroll_amount}")
         return " ".join(bits)
+
+
+def describe_target(target: Target, element: Optional[Element] = None) -> str:
+    base = target.describe()
+    if element is not None:
+        details = [element.kind()]
+        if element.best_text:
+            text_str = " ".join(element.best_text.split())
+            if len(text_str) > 30:
+                text_str = text_str[:27] + "..."
+            details.append(f'"{text_str}"')
+        if element.resource_id:
+            details.append(f"id={element.resource_id}")
+        if element.checkable:
+            details.append(f"checked={'true' if element.checked else 'false'}")
+        if element.selected:
+            details.append("selected")
+        return f"{base} [{' '.join(details)}]"
+    return base
+
+
+def format_history_entry(step: int, action: AgentAction,
+                         screen: Optional[Screen] = None,
+                         element: Optional[Element] = None,
+                         grade: Optional[str] = None,
+                         reason: str = "",
+                         prefix: str = "") -> str:
+    """Format an action history entry with rich target, screen, observation, and outcome context."""
+    if element is None and screen is not None and action.target is not None:
+        element = resolve_target(action.target, screen)
+
+    parts = [f"{step}."]
+    if prefix:
+        parts.append(prefix)
+
+    parts.append(action.describe(element=element))
+
+    pkg = screen.package if screen and screen.package else ""
+    if pkg:
+        parts.append(f"in {pkg}")
+
+    obs = (action.observation or "").strip()
+    if obs:
+        obs_clean = " ".join(obs.split())
+        if len(obs_clean) > 60:
+            obs_clean = obs_clean[:57] + "..."
+        parts.append(f"(Obs: {obs_clean})")
+
+    if grade:
+        parts.append(f"-> {grade}")
+        if reason:
+            parts.append(f"({reason})")
+
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
