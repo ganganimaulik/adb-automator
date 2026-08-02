@@ -244,3 +244,46 @@ def webview_screen() -> str:
         N("android.webkit.WebView", (0, 80, W, H), rid="web_content",
           package="com.android.chrome"),
     ]))
+
+
+# ---------------------------------------------------------------------------
+# Horizontal scroll screen: a carousel of cards inside an HorizontalScrollView
+# ---------------------------------------------------------------------------
+
+CARD_W = 320
+CARD_GAP = 24
+CAROUSEL_TOP = 500
+CAROUSEL_H = 400
+
+
+def horizontal_card(i: int, label: str, scroll: int = 0) -> N:
+    left = CARD_GAP + i * (CARD_W + CARD_GAP) - scroll
+    return N("android.widget.FrameLayout", (left, CAROUSEL_TOP + 20,
+             left + CARD_W, CAROUSEL_TOP + CAROUSEL_H - 20),
+             rid="card_item", clickable=True, focusable=True, children=[
+                 N("android.widget.TextView",
+                   (left + 20, CAROUSEL_TOP + 40, left + CARD_W - 20,
+                    CAROUSEL_TOP + 120),
+                   text=label, rid="card_title"),
+             ])
+
+
+def horizontal_scroll_screen(cards: int = 5, scroll: int = 0,
+                              labels: Optional[List[str]] = None,
+                              clock: str = "9:41") -> str:
+    """A screen with a horizontal carousel of cards."""
+    names = labels or [f"Card {i + 1}" for i in range(cards)]
+    kids = [horizontal_card(i, names[i % len(names)], scroll=scroll)
+            for i in range(cards)]
+    # Filter out cards that scrolled entirely off the left edge.
+    kids = [k for k in kids if k.bounds[2] > 0]
+    carousel = N("android.widget.HorizontalScrollView",
+                 (0, CAROUSEL_TOP, W, CAROUSEL_TOP + CAROUSEL_H),
+                 rid="carousel", scrollable=True, children=kids)
+
+    return dump(N("android.widget.FrameLayout", (0, 0, W, H), rid="content",
+                  children=[
+                      status_bar(clock),
+                      toolbar("Gallery"),
+                      carousel,
+                  ]))

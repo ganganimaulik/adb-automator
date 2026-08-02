@@ -230,3 +230,82 @@ def test_describe_untruncated_text():
     action = act(action="done", text=long_msg)
     assert action.describe() == f"done {long_msg}"
 
+
+# ---------------------------------------------------------------------------
+# Multi-signal end-of-scroll detection
+# ---------------------------------------------------------------------------
+
+def test_scroll_no_change_with_identical_exact_id():
+    """Signal 1: byte-identical hierarchy means nothing moved."""
+    action = act(action="scroll", direction="down")
+    outcome = verify(action, BASE, BASE)
+    assert outcome.grade == "no_change"
+
+
+def test_scroll_no_change_near_identical_screen():
+    """Signal 2: same skeleton + simhash close + scroller content unchanged.
+
+    A toggle flip changes exact_id (checked state is in exact_id) but not
+    skeleton or simhash.  With the same scroller content, this should still
+    be detected as a scroll no-op.
+    """
+    before = s(X.settings_screen(checked_row=-1))
+    after = s(X.settings_screen(checked_row=0))
+    # Verify the exact_ids are different (the checked state changed).
+    assert before.exact_id != after.exact_id
+    # But the skeleton is the same and simhash is close.
+    assert before.skeleton_id == after.skeleton_id
+    action = act(action="scroll", direction="down")
+    outcome = verify(action, before, after)
+    assert outcome.grade == "no_change"
+
+
+def test_scroll_no_change_via_text_overlap():
+    """Signal 3: ≥90% of scroller child texts are identical.
+
+    A different tab is selected (changes exact_id and may move simhash a few
+    bits), but the list content is the same.
+    """
+    labels = ["Wi-Fi", "Bluetooth", "Mobile data", "Airplane mode",
+              "Hotspot", "VPN", "DNS"]
+    before = s(X.settings_screen(labels=labels, selected_tab="network"))
+    after = s(X.settings_screen(labels=labels, selected_tab="devices"))
+    # The selected tab differs → exact_id differs.
+    assert before.exact_id != after.exact_id
+    action = act(action="scroll", direction="down")
+    outcome = verify(action, before, after)
+    assert outcome.grade == "no_change"
+
+
+def test_genuine_scroll_is_detected_as_change():
+    """When the screen genuinely changed, the scroll is NOT graded no_change.
+
+    Uses a structurally different screen as the 'after' to simulate content
+    that actually scrolled into view and changed the hierarchy.
+    """
+    before = s(X.settings_screen())
+    after = s(X.detail_screen())
+    action = act(action="scroll", direction="down")
+    outcome = verify(action, before, after)
+    # The screen genuinely changed — it should NOT be no_change.
+    assert outcome.grade != "no_change"
+
+
+# ---------------------------------------------------------------------------
+# Horizontal scroll rendering
+# ---------------------------------------------------------------------------
+
+def test_horizontal_scroller_shows_scrollable_h_flag():
+    from adbagent.screen import render_element
+    screen = s(X.horizontal_scroll_screen())
+    scroller = next(e for e in screen.elements if e.scrollable)
+    rendered = render_element(scroller)
+    assert "scrollable-h" in rendered
+
+
+def test_vertical_scroller_shows_scrollable_flag():
+    from adbagent.screen import render_element
+    scroller = next(e for e in BASE.elements if e.scrollable)
+    rendered = render_element(scroller)
+    assert "scrollable" in rendered
+    assert "scrollable-h" not in rendered

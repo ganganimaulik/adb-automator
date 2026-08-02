@@ -34,6 +34,11 @@ _TRUE = {"true", "True", "1"}
 # Classes we treat as text entry. There is no "editable" attribute in the dump.
 _EDIT_SUFFIXES = ("EditText", "AutoCompleteTextView", "SearchView", "TextInputEditText")
 
+# Known horizontal scroller class suffixes.
+_HORIZONTAL_SCROLLER_SUFFIXES = (
+    "HorizontalScrollView", "ViewPager2", "ViewPager",
+)
+
 # The IME renders as its own window root inside the same <hierarchy>. Its
 # presence must not change a screen's identity, so it is dropped during parse.
 IME_PACKAGE_HINTS = ("inputmethod", "latin", "keyboard", "swiftkey", "gboard")
@@ -125,6 +130,18 @@ class Element:
     def center(self) -> Tuple[int, int]:
         l, t, r, b = self.bounds
         return ((l + r) // 2, (t + b) // 2)
+
+    @property
+    def is_horizontal(self) -> bool:
+        """True when this scrollable container scrolls horizontally."""
+        if not self.scrollable:
+            return False
+        if self.cls.endswith(_HORIZONTAL_SCROLLER_SUFFIXES):
+            return True
+        # Heuristic: a scroller much wider than tall is probably horizontal.
+        if self.width > 0 and self.height > 0 and self.width > self.height * 1.5:
+            return True
+        return False
 
     @property
     def editable(self) -> bool:
@@ -447,7 +464,7 @@ def render_element(el: Element) -> str:
     if el.password:
         flags.append("password")
     if el.scrollable:
-        flags.append("scrollable")
+        flags.append("scrollable-h" if el.is_horizontal else "scrollable")
     if el.long_clickable and not el.clickable:
         flags.append("long-press-only")
     if el.repeat > 1:
