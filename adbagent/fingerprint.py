@@ -148,6 +148,22 @@ def mask_text(raw: str) -> str:
     return s[:TEXT_LIMIT]
 
 
+def mask_goal(raw: str) -> str:
+    """Like mask_text but without the 32-char truncation.
+
+    Designed for normalising goal strings, which are full sentences and
+    must not be truncated -- otherwise two goals that differ only in an
+    entity name at position > 32 will collide.
+    """
+    if not raw:
+        return ""
+    s = unicodedata.normalize("NFKC", raw).strip()
+    for pattern, token in _MASKS:
+        s = pattern.sub(token, s)
+    s = " ".join(s.split()).lower()
+    return s
+
+
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
