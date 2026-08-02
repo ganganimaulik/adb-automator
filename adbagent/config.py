@@ -82,18 +82,7 @@ class DeviceConfig:
 @dataclass
 class MemoryConfig:
     db: str = "memory.db"
-    enabled: bool = True
-    #: SimHash Hamming distance ceiling within a skeleton bucket (out of 64).
-    t_sim: int = 6
-    #: Stricter ceiling for the cross-bucket fallback tier.
-    t_strict: int = 3
-    anchor_strict: float = 0.55
-    anchor_relaxed: float = 0.35
-    #: Refuse to replay when the top two anchor candidates are this close.
-    ambiguity_gap: float = 0.08
-    shadow_audit_probation: float = 0.20
-    shadow_audit_active: float = 0.20
-    shadow_audit_trusted: float = 0.05
+
 
 
 @dataclass

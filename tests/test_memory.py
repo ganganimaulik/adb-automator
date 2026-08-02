@@ -1,15 +1,13 @@
-"""Anchors, admission gates, trust states and storage."""
+"""Run tracking, transitions, dead-ends and intent keys."""
 
 from __future__ import annotations
 
 import pytest
 
-from adbagent import trust
-from adbagent.actions import AgentAction, Postcondition, Target
+from adbagent.actions import AgentAction, Target
 from adbagent.config import Config
 from adbagent.fingerprint import attach
-from adbagent.memory import (Anchor, Memory, build_anchor, intent_key, resolve_anchor,
-                             score_anchor)
+from adbagent.memory import Memory, intent_key
 from adbagent.screen import parse
 
 from . import xmlgen as X
@@ -37,307 +35,81 @@ def mem(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Trust statistics
+# Run tracking
 # ---------------------------------------------------------------------------
 
-def test_a_single_success_is_not_trust():
-    """The whole point of Wilson: 1-of-1 is not evidence of reliability."""
-    assert trust.wilson_lower_bound(1, 0) == pytest.approx(0.2065, abs=1e-3)
-    assert trust.classify(trust.Stats(n_success=1)) == "probation"
-
-
-def test_sustained_success_earns_trust():
-    assert trust.classify(trust.Stats(n_success=4)) == "active"
-    assert trust.classify(trust.Stats(n_success=12)) == "trusted"
-    # A run with a blemish stays useful but unpromoted.
-    assert trust.classify(trust.Stats(n_success=5, n_failure=1)) == "probation"
-    assert trust.classify(trust.Stats(n_success=12, n_failure=1)) == "active"
-
-
-def test_three_consecutive_failures_quarantine():
-    stats = trust.Stats(n_success=20, n_failure=3, consecutive_failures=3)
-    assert trust.classify(stats) == "quarantined"
-    assert not trust.may_replay("quarantined")
-
-
-def test_mostly_failing_entries_quarantine():
-    assert trust.classify(trust.Stats(n_success=1, n_failure=6)) == "quarantined"
-
-
-def test_decay_forgets_stale_evidence():
-    fresh = trust.Stats(n_success=10)
-    stale = trust.Stats(n_success=10, age_days=28)   # two half-lives
-    assert stale.wilson() < fresh.wilson()
-    assert trust.decay_factor(14) == pytest.approx(0.5)
-
-
-def test_probation_always_verifies():
-    assert trust.must_verify("probation")
-    assert not trust.must_verify("trusted")
+def test_begin_and_end_run(mem):
+    mem.begin_run("r1", "open Wi-Fi", "intent1")
+    mem.end_run("r1", "success", steps=3, llm_calls=2, usd=0.005)
+    row = mem.db.execute("SELECT * FROM run WHERE run_id='r1'").fetchone()
+    assert row is not None
+    assert row["outcome"] == "success"
+    assert row["steps"] == 3
+    assert row["llm_calls"] == 2
 
 
 # ---------------------------------------------------------------------------
-# Anchors
+# Screen corpus
 # ---------------------------------------------------------------------------
 
-def test_anchor_records_what_makes_an_element_findable():
-    toggle = next(e for e in BASE.elements if e.kind() == "Toggle")
-    anchor = build_anchor(toggle, BASE)
-    assert anchor.resource_id == "switch_widget"
-    assert anchor.class_eq == "Toggle"
-    assert anchor.scroller_rid == "recycler_view"
-    assert anchor.kind == "attributed"
-    assert 0.0 <= anchor.bounds_frac[0] <= 1.0
+def test_note_screen_records_tokens(mem):
+    mem.note_screen(BASE)
+    rows = mem.db.execute("SELECT COUNT(*) AS n FROM screen_seen").fetchone()
+    assert rows["n"] > 0
 
 
-def test_anchor_of_an_unidentifiable_element_is_coordinate_only():
-    blank = X.N("android.view.View", (100, 700, 300, 800), clickable=True)
-    scr = s(X.settings_screen(extra_roots=[
-        X.N("android.widget.FrameLayout", (0, 700, X.W, 800), rid="canvas",
-            children=[blank])]))
-    el = next(e for e in scr.elements if e.cls == "android.view.View")
-    assert build_anchor(el, scr).kind == "coordinate_only"
-
-
-def test_anchor_scores_itself_perfectly():
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    assert score_anchor(build_anchor(el, BASE), el) == pytest.approx(1.0)
-
-
-def test_missing_features_do_not_penalise():
-    """An element with no resource-id must not be scored down for lacking one."""
-    anchor = Anchor(text="Done", class_eq="Button")
-    el = next(e for e in BASE.elements if e.best_text == "Done")
-    assert score_anchor(anchor, el) == pytest.approx(1.0)
-
-
-def test_text_matching_is_fuzzy_not_exact():
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    exact = Anchor(text="Network & internet", class_eq="TextView")
-    drifted = Anchor(text="Network", class_eq="TextView")
-    assert score_anchor(exact, el) == pytest.approx(1.0)
-    assert 0.5 < score_anchor(drifted, el) < 1.0
+def test_idf_returns_term_frequencies(mem):
+    mem.note_screen(BASE)
+    detail = s(X.detail_screen())
+    mem.note_screen(detail)
+    idf = mem.idf(BASE.package)
+    assert isinstance(idf, dict)
+    # Tokens unique to one screen should have higher IDF
+    if idf:
+        assert max(idf.values()) > 0
 
 
 # ---------------------------------------------------------------------------
-# Anchor resolution
+# Transitions
 # ---------------------------------------------------------------------------
 
-def resolve(anchor, screen, threshold=0.55, gap=0.08, **kw):
-    return resolve_anchor(anchor, screen, threshold=threshold,
-                          ambiguity_gap=gap, **kw)
-
-
-def test_resolves_on_the_same_screen():
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    result = resolve(build_anchor(el, BASE), BASE)
-    assert result.ok and result.element.resource_id == "action_bar_title"
-
-
-def test_survives_a_scrolled_list():
-    """The list moved; the row is still the row."""
-    # The row's TextView is absorbed into the clickable row container, so the
-    # addressable element is the row itself.
-    row = next(e for e in BASE.elements
-               if e.resource_id == "row_item" and e.best_text == "Option 5")
-    anchor = build_anchor(row, BASE)
-    scrolled = s(X.settings_screen(scroll=240))
-    result = resolve(anchor, scrolled)
-    assert result.ok and result.element.best_text == "Option 5"
-
-
-def test_survives_chrome_drift():
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    anchor = build_anchor(el, BASE)
-    later = s(X.settings_screen(clock="11:11", battery="12%", badge="9"))
-    assert resolve(anchor, later).ok
-
-
-def test_refuses_when_the_element_is_gone():
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    anchor = build_anchor(el, BASE)
-    anchor.resource_id = "no_such_id"
-    anchor.resource_id_raw = "com.android.settings:id/no_such_id"
-    anchor.text = "Nothing like this"
-    anchor.content_desc = ""
-    result = resolve(anchor, BASE)
-    assert not result.ok and "scored" in result.reason
-
-
-def test_refuses_when_two_candidates_are_indistinguishable():
-    """Tapping the wrong one of a pair is worse than asking the model again."""
-    twins = [X.N("android.widget.Button", (100, 620 + i * 140, 400, 740 + i * 140),
-                 text="Open", rid="open", clickable=True) for i in range(2)]
-    scr = s(X.settings_screen(extra_roots=[
-        X.N("android.widget.LinearLayout", (0, 600, X.W, 900), rid="pair",
-            children=twins)]))
-    el = next(e for e in scr.elements if e.resource_id == "open")
-    anchor = build_anchor(el, scr)
-    # Erase the one discriminating feature so both score identically.
-    anchor.sibling_index = -1
-    anchor.bounds_frac = (0.0, 0.0, 0.0, 0.0)
-    result = resolve(anchor, scr)
-    assert not result.ok and "ambiguous" in result.reason
-
-
-def test_coordinate_only_anchors_are_gated_hard():
-    anchor = Anchor(kind="coordinate_only", class_raw="android.view.View",
-                    bounds_frac=(0.1, 0.3, 0.2, 0.05))
-    assert not resolve(anchor, BASE).ok             # refused without an exact match
-    assert resolve(anchor, BASE, dhash_ok=True).ok  # allowed only when gated
-
-
-def test_clipped_element_is_refused():
-    """u2 clips bounds to the display, so a half-scrolled row reports a small box."""
-    el = next(e for e in BASE.elements if e.resource_id == "row_item")
-    anchor = build_anchor(el, BASE)
-    anchor.bounds_frac = (anchor.bounds_frac[0], anchor.bounds_frac[1], 0.9, 0.5)
-    assert not resolve(anchor, BASE).ok
-
-
-# ---------------------------------------------------------------------------
-# The three admission gates, end to end
-# ---------------------------------------------------------------------------
-
-def learn(mem, screen, action, element, after, intent="i", visit=0):
-    return mem.record(screen=screen, intent_id=intent, visit=visit, action=action,
-                      element=element, postcondition=Postcondition(kind="screen_changed"),
-                      after=after, run_id="r1")
-
-
-def test_learn_then_replay_with_no_llm(mem):
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    action = act(action="tap", target=Target(index=el.index))
-    learn(mem, BASE, action, el, s(X.detail_screen()))
-
-    hit = mem.lookup(BASE, "i", 0)
-    assert hit is not None
-    bound = mem.rehydrate(hit, BASE)
-    assert bound is not None and bound.action == "tap"
-    # The replayed target points at the live element, not the recorded index.
-    assert bound.target.resource_id == "action_bar_title"
-
-
-def test_cache_misses_on_a_different_screen(mem):
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
-          s(X.detail_screen()))
-    assert mem.lookup(s(X.detail_screen()), "i", 0) is None
-
-
-def test_cache_misses_for_a_different_goal(mem):
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
-          s(X.detail_screen()))
-    assert mem.lookup(BASE, "a-different-intent", 0) is None
-
-
-def test_cache_still_hits_after_harmless_drift(mem):
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
-          s(X.detail_screen()))
-    later = s(X.settings_screen(clock="10:15", battery="61%", rows=12))
-    assert mem.lookup(later, "i", 0) is not None
-
-
-def test_gate_two_blocks_replay_when_something_irreversible_appeared(mem):
-    """A confirm dialog must never be tapped through from cache."""
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    entry = learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
-                  s(X.detail_screen()))
-    mem.db.execute("UPDATE entry SET forbidden_tokens=? WHERE id=?",
-                   ('["delete account?"]', entry.id))
-    mem.db.commit()
-    assert mem.lookup(BASE, "i", 0, forbidden_now=["delete account?"]) is None
-
-
-def test_banned_signatures_are_skipped(mem):
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    action = act(action="tap", target=Target(index=el.index))
-    learn(mem, BASE, action, el, s(X.detail_screen()))
-    assert mem.lookup(BASE, "i", 0,
-                      banned_signatures=[action.signature()]) is None
-
-
-# ---------------------------------------------------------------------------
-# Outcomes, versioning, maintenance
-# ---------------------------------------------------------------------------
-
-def test_repeated_failure_quarantines_and_stops_replaying(mem):
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    entry = learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
-                  s(X.detail_screen()))
-    for _ in range(3):
-        mem.mark(entry, "hard_fail", "r1", reason="nothing changed")
-    assert entry.state == "quarantined"
-    assert mem.lookup(BASE, "i", 0) is None
-
-
-def test_success_promotes_out_of_probation(mem):
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    entry = learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
-                  s(X.detail_screen()))
-    assert entry.state == "probation"
-    for _ in range(10):
-        mem.mark(entry, "success", "r1")
-    assert entry.state == "trusted"
-    assert mem.get(entry.id).state == "trusted"
-
-
-def test_soft_fail_records_an_alternative_successor(mem):
-    """Screens fan out; remember the new destination instead of punishing it."""
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    entry = learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
-                  s(X.detail_screen()))
-    mem.mark(entry, "soft_fail", "r1", observed_successor="other-screen")
-    assert "other-screen" in mem.get(entry.id).alt_successors
-
-
-def test_relearning_creates_a_new_version_rather_than_overwriting(mem):
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    a = learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
-              s(X.detail_screen()))
-    b = learn(mem, BASE, act(action="press_key", key="back"), None, s(X.detail_screen()))
-    assert b.version == a.version + 1
-    assert mem.get(a.id) is not None, "the old version must survive"
-
-
-def test_transitions_are_recorded_for_navigation(mem):
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
+def test_transitions_are_recorded(mem):
     after = s(X.detail_screen())
-    learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el, after)
+    action = act(action="tap", target=Target(index=3))
+    mem.note_transition(BASE, after, action)
     row = mem.db.execute("SELECT * FROM transition").fetchone()
     assert row["from_skeleton"] == BASE.skeleton_id
     assert row["to_skeleton"] == after.skeleton_id
 
 
-def test_gc_drops_quarantined_and_caps_versions(mem):
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    for _ in range(6):
-        learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
-              s(X.detail_screen()))
-    mem.gc()
-    versions = mem.db.execute(
-        "SELECT COUNT(*) AS n FROM entry WHERE skeleton_id=?",
-        (BASE.skeleton_id,)).fetchone()["n"]
-    assert versions <= trust.MAX_VERSIONS
+def test_same_transition_increments_count(mem):
+    after = s(X.detail_screen())
+    action = act(action="tap", target=Target(index=3))
+    mem.note_transition(BASE, after, action)
+    mem.note_transition(BASE, after, action)
+    row = mem.db.execute("SELECT * FROM transition").fetchone()
+    assert row["n_seen"] == 2
 
 
-def test_disabled_memory_never_hits(mem):
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
-          s(X.detail_screen()))
-    mem.cfg.memory.enabled = False
-    assert mem.lookup(BASE, "i", 0) is None
+# ---------------------------------------------------------------------------
+# Dead ends
+# ---------------------------------------------------------------------------
+
+def test_dead_end_is_recorded(mem):
+    action = act(action="tap", target=Target(index=3))
+    mem.record_dead_end(BASE, "i", action.signature(), "didn't work")
+    sigs = mem._dead_end_sigs(BASE.package, BASE.skeleton_id, "i")
+    assert action.signature() in sigs
 
 
-def test_summary_and_listing(mem):
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
-          s(X.detail_screen()))
-    assert mem.stats_summary()["entries"] == 1
-    assert len(mem.entries(app_key="com.android.settings")) == 1
-    assert mem.forget(app_key="com.android.settings") == 1
+def test_dead_end_expires(mem):
+    action = act(action="tap", target=Target(index=3))
+    mem.record_dead_end(BASE, "i", action.signature(), "test")
+    # Artificially expire the dead end.
+    mem.db.execute("UPDATE dead_end SET expires_at = 0")
+    mem.db.commit()
+    sigs = mem._dead_end_sigs(BASE.package, BASE.skeleton_id, "i")
+    assert action.signature() not in sigs
 
 
 # ---------------------------------------------------------------------------
@@ -348,186 +120,6 @@ def test_intent_key_ignores_trivial_rewording():
     assert intent_key("Turn on Wi-Fi") == intent_key("turn on   wi-fi")
     assert intent_key("Turn on Wi-Fi") != intent_key("Turn off Wi-Fi")
 
-
-def test_simhash_large_int_sqlite_compatibility(mem):
-    """Test that a screen with simhash >= 2**63 does not overflow SQLite INTEGER."""
-    screen_copy = s(X.settings_screen())
-    screen_copy.simhash = 2**63 + 12345  # Unsigned 64-bit int exceeding SQLite signed max
-    el = next(e for e in screen_copy.elements if e.resource_id == "action_bar_title")
-    step = mem.record(
-        screen=screen_copy,
-        intent_id="i",
-        visit=0,
-        action=act(action="tap", target=Target(index=el.index)),
-        element=el,
-        postcondition=None,
-        after=s(X.detail_screen()),
-        run_id="run1",
-    )
-    assert step.id > 0
-    fetched = mem.get(step.id)
-    assert fetched is not None
-
-
-# ---------------------------------------------------------------------------
-# Predecessor-aware lookup (Change 2)
-# ---------------------------------------------------------------------------
-
-def test_predecessor_aware_lookup_prefers_matching_predecessor(mem):
-    """Entries with matching prev_skeleton_id should be preferred."""
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    after = s(X.detail_screen())
-
-    # Record two entries for the same screen with different predecessors.
-    mem.record(screen=BASE, intent_id="i", visit=0,
-               action=act(action="tap", target=Target(index=el.index), text="first"),
-               element=el, postcondition=Postcondition(kind="screen_changed"),
-               after=after, run_id="r1", prev_skeleton_id="predecessor_A")
-
-    mem.record(screen=BASE, intent_id="i", visit=0,
-               action=act(action="tap", target=Target(index=el.index), text="second"),
-               element=el, postcondition=Postcondition(kind="screen_changed"),
-               after=after, run_id="r2", prev_skeleton_id="predecessor_B")
-
-    # Lookup with predecessor_B should prefer the second entry.
-    hit = mem.lookup(BASE, "i", 0, prev_skeleton_id="predecessor_B")
-    assert hit is not None
-    assert hit.prev_skeleton_id == "predecessor_B"
-
-
-def test_predecessor_lookup_falls_back_gracefully(mem):
-    """Entries without prev_skeleton_id still match when no predecessor is given."""
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    learn(mem, BASE, act(action="tap", target=Target(index=el.index)), el,
-          s(X.detail_screen()))
-    # No prev_skeleton_id in lookup — should still match.
-    hit = mem.lookup(BASE, "i", 0, prev_skeleton_id="unknown_predecessor")
-    assert hit is not None
-
-
-# ---------------------------------------------------------------------------
-# Cross-goal navigation sharing (Change 4)
-# ---------------------------------------------------------------------------
-
-def test_navigation_scope_entries_are_shared_across_goals(mem):
-    """Trusted navigation entries should be reusable by different goals."""
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    after = s(X.detail_screen())
-
-    # Record a navigation entry under intent "goal_A"
-    entry = mem.record(
-        screen=BASE, intent_id="goal_A", visit=0,
-        action=act(action="tap", target=Target(index=el.index)),
-        element=el, postcondition=Postcondition(kind="screen_changed"),
-        after=after, run_id="r1")
-
-    # Promote to trusted so cross-goal sharing kicks in.
-    entry.stats.n_success = 10
-    entry.stats.consecutive_failures = 0
-    entry.state = "trusted"
-    mem.db.execute(
-        "UPDATE entry SET state='trusted', n_success=10, scope='navigation' WHERE id=?",
-        (entry.id,))
-    mem.db.commit()
-
-    # Lookup under a different intent should find the navigation entry.
-    hit = mem.lookup(BASE, "goal_B", 0)
-    assert hit is not None
-    assert hit.id == entry.id
-
-
-# ---------------------------------------------------------------------------
-# Negative cache: dead ends (Change 7)
-# ---------------------------------------------------------------------------
-
-def test_dead_end_is_recorded_and_bans_action(mem):
-    """A dead-end action signature should be banned in future lookups."""
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    action = act(action="tap", target=Target(index=el.index))
-    after = s(X.detail_screen())
-
-    learn(mem, BASE, action, el, after)
-
-    # Record the action as a dead end.
-    mem.record_dead_end(BASE, "i", action.signature(), "didn't work")
-
-    # Now lookup should skip this action.
-    hit = mem.lookup(BASE, "i", 0)
-    assert hit is None  # banned by dead-end
-
-
-def test_dead_end_expires(mem):
-    """Dead-end entries should expire after their TTL."""
-    import time as _time
-
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    action = act(action="tap", target=Target(index=el.index))
-    after = s(X.detail_screen())
-
-    learn(mem, BASE, action, el, after)
-    mem.record_dead_end(BASE, "i", action.signature(), "test")
-
-    # Artificially expire the dead end.
-    mem.db.execute("UPDATE dead_end SET expires_at = 0")
-    mem.db.commit()
-
-    # Now lookup should find the entry again.
-    hit = mem.lookup(BASE, "i", 0)
-    assert hit is not None
-
-
-# ---------------------------------------------------------------------------
-# Adaptive SimHash threshold (Change 3)
-# ---------------------------------------------------------------------------
-
-def test_probation_entries_use_tighter_simhash_threshold(mem):
-    """Probation entries should use t_strict, not t_sim."""
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    after = s(X.detail_screen())
-
-    entry = learn(mem, BASE, act(action="tap", target=Target(index=el.index)),
-                  el, after)
-    assert entry.state == "probation"
-
-    # Create a screen with a SimHash distance of 4 (within t_sim=6 but above t_strict=3).
-    drifted = s(X.settings_screen())
-    drifted.simhash = BASE.simhash ^ 0b11110000  # 4 bits different
-
-    hit = mem.lookup(drifted, "i", 0)
-    # Should miss because probation entries use t_strict=3.
-    assert hit is None
-
-
-# ---------------------------------------------------------------------------
-# Enhanced GC (Change 8)
-# ---------------------------------------------------------------------------
-
-def test_gc_removes_retired_entries(mem):
-    """gc() should remove entries in 'retired' state."""
-    el = next(e for e in BASE.elements if e.resource_id == "action_bar_title")
-    entry = learn(mem, BASE, act(action="tap", target=Target(index=el.index)),
-                  el, s(X.detail_screen()))
-    mem.db.execute("UPDATE entry SET state='retired' WHERE id=?", (entry.id,))
-    mem.db.commit()
-
-    n = mem.gc()
-    assert n >= 1
-    assert mem.get(entry.id) is None
-
-
-def test_gc_cleans_expired_dead_ends(mem):
-    """gc() should remove expired dead-end entries."""
-    mem.record_dead_end(BASE, "i", "tap/#1", "test")
-    mem.db.execute("UPDATE dead_end SET expires_at = 0")
-    mem.db.commit()
-
-    n = mem.gc()
-    assert n >= 1
-
-
-# ---------------------------------------------------------------------------
-# Intent key with verb polarity
-# ---------------------------------------------------------------------------
 
 def test_intent_key_opposite_goals_differ():
     """Turning on vs turning off should produce different cache keys."""

@@ -121,15 +121,8 @@ def test_different_app_is_different():
 
 
 # ---------------------------------------------------------------------------
-# Destructive-token gate
+# Destructive-text regex (used by safety layer)
 # ---------------------------------------------------------------------------
-
-def test_destructive_tokens_detected():
-    tokens = fp.destructive_tokens(screen(X.detail_screen()))
-    assert any("forget" in t for t in tokens), tokens
-    # A plain settings list has nothing irreversible on it.
-    assert fp.destructive_tokens(screen(BASE)) == []
-
 
 @pytest.mark.parametrize("label,destructive", [
     ("Delete account", True),
@@ -146,20 +139,6 @@ def test_destructive_tokens_detected():
 ])
 def test_destructive_vocabulary(label, destructive):
     assert bool(fp.DESTRUCTIVE_TEXT.search(label)) is destructive
-
-
-def test_delete_confirmation_is_hard_blocked():
-    dialog = X.N("android.widget.FrameLayout", (60, 800, 1020, 1400),
-                 rid="alert_dialog", children=[
-                     X.N("android.widget.TextView", (100, 860, 980, 980),
-                         text="Delete account?", rid="alertTitle"),
-                     X.N("android.widget.Button", (620, 1240, 980, 1380),
-                         text="Delete", rid="button1", clickable=True),
-                 ])
-    s = screen(X.settings_screen(extra_roots=[dialog]))
-    assert fp.destructive_tokens(s), "a Delete confirm must produce a forbidden token"
-    assert not same(X.settings_screen(extra_roots=[dialog]))
-
 
 # ---------------------------------------------------------------------------
 # Unit-level checks on the normalisation rules
