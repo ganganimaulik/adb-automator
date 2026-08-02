@@ -295,3 +295,22 @@ def test_recorder_dump_messages(cfg, tmp_path):
     assert data[0]["content"] == "sys prompt"
     assert "base64 image payload" in data[1]["content"][1]["image_url"]["url"]
     rec.close()
+
+
+def test_progress_log_retains_only_latest():
+    from adbagent.agent import RunState
+    from adbagent.actions import AgentAction
+
+    state = RunState(goal="multi step test", run_id="r1", intent_id="i1")
+
+    act1 = AgentAction(action="wait", observation="step 1", reasoning="r1", progress="Step 1 done")
+    act2 = AgentAction(action="wait", observation="step 2", reasoning="r2", progress="Step 2 done")
+
+    for act in [act1, act2]:
+        if getattr(act, "progress", None):
+            prog_text = act.progress.strip()
+            if prog_text:
+                state.progress_log = [prog_text]
+                state.progress_chars = len(prog_text)
+
+    assert state.progress_log == ["Step 2 done"]

@@ -530,16 +530,18 @@ class LLMClient:
             content.append(image_part(screenshot))
             log.info("submitting screenshot (%d bytes) to LLM", len(screenshot))
 
+        state_text = prompts.state_block(scratchpad, progress)
         messages = [
             {"role": "system",
              "content": prompts.system_prompt(harden_schema(AgentAction))},
             {"role": "user",
              "content": prompts.device_profile(width, height, package)},
             {"role": "user", "content": prompts.goal_block(goal)},
-            {"role": "user", "content": prompts.history_block(history, scratchpad,
-                                                              progress)},
-            {"role": "user", "content": content},
+            {"role": "user", "content": prompts.history_only_block(history)},
         ]
+        if state_text:
+            messages.append({"role": "user", "content": state_text})
+        messages.append({"role": "user", "content": content})
         if recorder is not None:
             recorder.dump_messages(step, messages, purpose=purpose)
         target = self.model_image if screenshot else self.model

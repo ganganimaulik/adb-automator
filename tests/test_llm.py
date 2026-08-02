@@ -218,3 +218,40 @@ def test_judge_uses_config_max_tokens(monkeypatch):
     assert verdict.satisfied is True
     assert recorded_max_tokens == [3200]
 
+
+def test_decide_messages_cache_friendly_structure(monkeypatch):
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = Config()
+    client = LLMClient(cfg)
+
+    from adbagent.actions import Target
+    captured_messages = []
+    def mock_structured(messages, model_cls, model, purpose):
+        captured_messages.append(messages)
+        return AgentAction(observation="on home", reasoning="tap home", action="tap", target=Target(index=1))
+
+    monkeypatch.setattr(client, "structured", mock_structured)
+
+    client.decide(
+        goal="test goal",
+        width=720, height=1600, package="com.example",
+        history=["1. tap #1"],
+        rendered="screen 1",
+        scratchpad="collected notes",
+        progress="step 1 done"
+    )
+
+    msgs = captured_messages[0]
+    # Expect 6 messages: system, device, goal, pure history, state (scratchpad+progress), content
+    assert len(msgs) == 6
+    assert msgs[0]["role"] == "system"
+    assert "Device: 720x1600 px" in msgs[1]["content"]
+    assert msgs[2]["content"] == "GOAL: test goal"
+    assert msgs[3]["content"] == "HISTORY (oldest first):\n1. tap #1"
+    assert "YOUR SCRATCHPAD" in msgs[4]["content"]
+    assert "YOUR PROGRESS" in msgs[4]["content"]
+    assert "CURRENT SCREEN:\nscreen 1" in msgs[5]["content"][0]["text"]
+
