@@ -36,12 +36,13 @@ from pydantic import BaseModel, ConfigDict
 from . import trust
 from .actions import AgentAction, Postcondition
 from .config import Config
-from .fingerprint import class_eq, hamming, mask_goal, mask_text, rid_norm
+from .fingerprint import (class_eq, hamming, mask_goal, mask_text,
+                          normalize_verb_polarity, rid_norm)
 from .screen import Element, Screen
 
 log = logging.getLogger("adbagent.memory")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -71,6 +72,7 @@ CREATE TABLE IF NOT EXISTS entry (
 
     next_skeleton_id  TEXT,
     alt_successors    TEXT NOT NULL DEFAULT '[]',
+    prev_skeleton_id  TEXT,
 
     state             TEXT NOT NULL DEFAULT 'probation',
     version           INTEGER NOT NULL DEFAULT 1,
@@ -132,7 +134,35 @@ CREATE TABLE IF NOT EXISTS run (
     started_at  REAL NOT NULL,
     ended_at    REAL
 );
+
+CREATE TABLE IF NOT EXISTS dead_end (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_key     TEXT NOT NULL,
+    skeleton_id TEXT NOT NULL,
+    intent_id   TEXT NOT NULL,
+    action_sig  TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    expires_at  REAL NOT NULL,
+    UNIQUE(app_key, skeleton_id, intent_id, action_sig)
+);
+
+CREATE INDEX IF NOT EXISTS dead_end_lookup
+    ON dead_end(app_key, skeleton_id, intent_id);
+
+CREATE TABLE IF NOT EXISTS app_tuning (
+    app_key     TEXT PRIMARY KEY,
+    t_sim_adj   INTEGER NOT NULL DEFAULT 0,
+    anchor_adj  REAL NOT NULL DEFAULT 0.0,
+    updated_at  REAL NOT NULL
+);
 """
+
+# -- Schema migration from v1 to v2 -----------------------------------------
+
+_MIGRATE_V1_TO_V2 = [
+    "ALTER TABLE entry ADD COLUMN prev_skeleton_id TEXT",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +443,7 @@ class CachedStep:
     forbidden_tokens: List[str]
     next_skeleton_id: str
     alt_successors: List[str]
+    prev_skeleton_id: str
     state: str
     version: int
     stats: trust.Stats
@@ -426,10 +457,16 @@ class CachedStep:
 
 
 def intent_key(goal: str) -> str:
-    """Normalised goal, so trivial rewording still hits the cache."""
+    """Normalised goal, so trivial rewording still hits the cache.
+
+    Incorporates verb polarity so that opposite-intent goals (e.g. "turn on
+    WiFi" vs "turn off WiFi") produce different keys.
+    """
     import hashlib
+    polarity = normalize_verb_polarity(goal)
     normalised = " ".join(mask_goal(goal).split())
-    return hashlib.blake2b(normalised.encode("utf-8"), digest_size=8).hexdigest()
+    combined = f"{polarity}\x1f{normalised}" if polarity else normalised
+    return hashlib.blake2b(combined.encode("utf-8"), digest_size=8).hexdigest()
 
 
 def _to_sqlite_int(val: int) -> int:
@@ -437,6 +474,9 @@ def _to_sqlite_int(val: int) -> int:
     if val >= (1 << 63):
         return val - (1 << 64)
     return val
+
+
+_AUTO_GC_INTERVAL_S = 86400  # 24 hours
 
 
 class Memory:
@@ -448,11 +488,37 @@ class Memory:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(self.path))
         self.db.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        """Create tables, migrate from older schema versions, and auto-GC."""
         self.db.executescript(DDL)
+
+        # -- Detect existing schema version and migrate --------------------
+        row = self.db.execute(
+            "SELECT v FROM meta WHERE k='schema_version'").fetchone()
+        old_version = int(row["v"]) if row else 0
+
+        if old_version < 2:
+            for stmt in _MIGRATE_V1_TO_V2:
+                try:
+                    self.db.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # column/table already exists
+
         self.db.execute(
             "INSERT INTO meta(k, v) VALUES('schema_version', ?) "
             "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(SCHEMA_VERSION),))
         self.db.commit()
+
+        # -- Auto-GC if more than 24 hours since last run ------------------
+        last_gc_row = self.db.execute(
+            "SELECT v FROM meta WHERE k='last_gc_at'").fetchone()
+        last_gc = float(last_gc_row["v"]) if last_gc_row else 0.0
+        if time.time() - last_gc > _AUTO_GC_INTERVAL_S:
+            n = self.gc()
+            if n:
+                log.info("auto-gc: removed %d stale entries", n)
 
     def close(self) -> None:
         self.db.commit()
@@ -495,15 +561,32 @@ class Memory:
 
     def lookup(self, screen: Screen, intent_id: str, visit: int,
                *, forbidden_now: Sequence[str] = (),
-               banned_signatures: Sequence[str] = ()) -> Optional[CachedStep]:
+               banned_signatures: Sequence[str] = (),
+               prev_skeleton_id: str = "") -> Optional[CachedStep]:
         """Find a replayable step for this screen, or None to fall back to the LLM.
 
         Gate 1 is the fingerprint, gate 2 the discriminative tokens. Gate 3
         (anchor resolvability) is applied by the caller via `rehydrate`, because
         it may want to scroll and retry first.
+
+        Enhancements over v1:
+        - Prefers entries whose ``prev_skeleton_id`` matches the actual
+          predecessor screen, making the cache path-aware.
+        - Uses tighter SimHash thresholds for probation entries.
+        - Falls back to ``navigation``-scoped trusted entries from any goal
+          when no intent-specific match is found.
+        - Automatically bans action signatures from the ``dead_end`` table.
         """
         if not self.cfg.memory.enabled:
             return None
+
+        # Merge in dead-end bans for this screen.
+        all_bans = set(banned_signatures) | self._dead_end_sigs(
+            screen.package, screen.skeleton_id, intent_id)
+
+        # Per-app threshold adjustments from adaptive tuning.
+        tuning = self._app_tuning(screen.package)
+        t_sim_base = self.cfg.memory.t_sim + tuning.get("t_sim_adj", 0)
 
         rows = self.db.execute(
             "SELECT * FROM entry WHERE app_key=? AND skeleton_id=? AND intent_id=? "
@@ -519,20 +602,34 @@ class Memory:
             rows = [r for r in rows
                     if hamming(r["simhash"], screen.simhash) <= self.cfg.memory.t_strict]
 
+        # Fallback tier 2: cross-goal navigation entries (trusted only).
+        if not rows:
+            rows = self.db.execute(
+                "SELECT * FROM entry WHERE app_key=? AND skeleton_id=? "
+                "AND scope='navigation' AND state='trusted' "
+                "ORDER BY version DESC",
+                (screen.package, screen.skeleton_id)).fetchall()
+
         present = set(screen.tokens)
         forbidden_live = set(forbidden_now)
         candidates: List[CachedStep] = []
 
         for row in rows:
             distance = hamming(row["simhash"], screen.simhash)
-            if distance > self.cfg.memory.t_sim:
-                continue
             entry = self._row_to_step(row)
             entry.match_distance = distance
 
+            # Adaptive SimHash threshold: probation entries must match tighter.
+            if entry.state == "probation":
+                threshold = min(t_sim_base, self.cfg.memory.t_strict)
+            else:
+                threshold = t_sim_base
+            if distance > threshold:
+                continue
+
             if not trust.may_replay(entry.state):
                 continue
-            if entry.action.signature() in banned_signatures:
+            if entry.action.signature() in all_bans:
                 continue
             # Gate 2a: everything that made this screen distinctive must still
             # be here. This is what stops an entry firing on a look-alike.
@@ -548,7 +645,17 @@ class Memory:
 
         if not candidates:
             return None
-        candidates.sort(key=lambda e: (-e.stats.wilson(), e.match_distance))
+
+        # Prefer entries whose predecessor matches the actual previous screen.
+        # This makes the cache path-aware without breaking entries that lack
+        # predecessor information (pre-v2 entries have prev_skeleton_id="").
+        def _sort_key(e: CachedStep):
+            predecessor_match = 0
+            if prev_skeleton_id and e.prev_skeleton_id:
+                predecessor_match = -1 if e.prev_skeleton_id == prev_skeleton_id else 1
+            return (predecessor_match, -e.stats.wilson(), e.match_distance)
+
+        candidates.sort(key=_sort_key)
         return candidates[0]
 
     def rehydrate(self, entry: CachedStep, screen: Screen,
@@ -596,8 +703,9 @@ class Memory:
     def record(self, *, screen: Screen, intent_id: str, visit: int,
                action: AgentAction, element: Optional[Element],
                postcondition: Optional[Postcondition], after: Screen,
-               run_id: str) -> CachedStep:
+               run_id: str, prev_skeleton_id: str = "") -> CachedStep:
         """Learn a step that the LLM chose and that verified successfully."""
+        from .actions import is_navigation_action
         from .fingerprint import destructive_tokens, required_tokens
 
         anchor = build_anchor(element, screen) if element is not None else None
@@ -605,19 +713,25 @@ class Memory:
         required = required_tokens(screen.tokens, idf)
         forbidden = destructive_tokens(after)
 
+        # Classify scope: 'navigation' for pure navigational steps so they can
+        # be shared across goals once they earn 'trusted' status.
+        scope = "navigation" if is_navigation_action(action, element) else "step"
+
         now = time.time()
         cursor = self.db.execute(
             "INSERT INTO entry(app_key, skeleton_id, simhash, intent_id, "
             " visit_ordinal, scope, anchor_json, action_json, postcondition_json,"
             " required_tokens, forbidden_tokens, next_skeleton_id, alt_successors,"
-            " state, version, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,'step',?,?,?,?,?,?,'[]','probation',?,?,?)",
-            (screen.package, screen.skeleton_id, _to_sqlite_int(screen.simhash), intent_id, visit,
+            " prev_skeleton_id, state, version, created_at, updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'[]',?,'probation',?,?,?)",
+            (screen.package, screen.skeleton_id, _to_sqlite_int(screen.simhash),
+             intent_id, visit, scope,
              anchor.model_dump_json() if anchor else None,
              action.model_dump_json(),
              postcondition.model_dump_json() if postcondition else None,
              json.dumps(required), json.dumps(forbidden),
              after.skeleton_id,
+             prev_skeleton_id or None,
              self._next_version(screen, intent_id, visit), now, now))
         self.db.commit()
 
@@ -739,11 +853,23 @@ class Memory:
         return n
 
     def gc(self, max_age_days: float = 90.0) -> int:
-        """Retire entries that are stale or have proven themselves wrong."""
-        cutoff = time.time() - max_age_days * 86400
-        n = self.db.execute(
+        """Retire entries that are stale or have proven themselves wrong.
+
+        Enhanced in v2: also removes retired entries, shortens quarantine
+        retention to 7 days, cleans up old outcomes and expired dead ends,
+        and records the last-GC timestamp for auto-GC scheduling.
+        """
+        now = time.time()
+        cutoff = now - max_age_days * 86400
+        n = 0
+        # Quarantined entries: 7-day retention (was 30).
+        n += self.db.execute(
             "DELETE FROM entry WHERE state='quarantined' AND updated_at < ?",
-            (time.time() - 30 * 86400,)).rowcount
+            (now - 7 * 86400,)).rowcount
+        # Retired entries: clean up immediately.
+        n += self.db.execute(
+            "DELETE FROM entry WHERE state='retired'").rowcount
+        # Low-evidence entries past the age cutoff.
         n += self.db.execute(
             "DELETE FROM entry WHERE COALESCE(last_used_at, created_at) < ? "
             "AND n_success < 2", (cutoff,)).rowcount
@@ -755,6 +881,18 @@ class Memory:
             "      PARTITION BY app_key, skeleton_id, intent_id, visit_ordinal "
             "      ORDER BY version DESC) AS rn FROM entry"
             "  ) WHERE rn > ?)", (trust.MAX_VERSIONS,)).rowcount
+        # Outcome history older than 90 days.
+        n += self.db.execute(
+            "DELETE FROM entry_outcome WHERE at < ?",
+            (now - 90 * 86400,)).rowcount
+        # Expired dead ends.
+        n += self.db.execute(
+            "DELETE FROM dead_end WHERE expires_at < ?", (now,)).rowcount
+        self.db.commit()
+        # Record last-GC timestamp for auto-GC scheduling.
+        self.db.execute(
+            "INSERT INTO meta(k, v) VALUES('last_gc_at', ?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(now),))
         self.db.commit()
         return n
 
@@ -788,6 +926,7 @@ class Memory:
             forbidden_tokens=json.loads(row["forbidden_tokens"]),
             next_skeleton_id=row["next_skeleton_id"] or "",
             alt_successors=json.loads(row["alt_successors"]),
+            prev_skeleton_id=row["prev_skeleton_id"] or "",
             state=row["state"],
             version=row["version"],
             stats=trust.Stats(
@@ -797,3 +936,84 @@ class Memory:
                 age_days=age_days,
             ),
         )
+
+    # -- dead ends ---------------------------------------------------------
+
+    _DEAD_END_TTL_S = 86400  # 24 hours
+
+    def record_dead_end(self, screen: Screen, intent_id: str,
+                        action_sig: str, reason: str) -> None:
+        """Remember that an action on this screen is a dead end.
+
+        Future lookups will automatically ban this action signature for 24 hours.
+        """
+        now = time.time()
+        self.db.execute(
+            "INSERT INTO dead_end(app_key, skeleton_id, intent_id, action_sig, "
+            " reason, created_at, expires_at) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(app_key, skeleton_id, intent_id, action_sig) "
+            "DO UPDATE SET reason=excluded.reason, created_at=excluded.created_at, "
+            " expires_at=excluded.expires_at",
+            (screen.package, screen.skeleton_id, intent_id, action_sig,
+             reason, now, now + self._DEAD_END_TTL_S))
+        self.db.commit()
+
+    def _dead_end_sigs(self, app_key: str, skeleton_id: str,
+                       intent_id: str) -> set:
+        """Active dead-end action signatures for a screen."""
+        now = time.time()
+        rows = self.db.execute(
+            "SELECT action_sig FROM dead_end WHERE app_key=? AND skeleton_id=? "
+            "AND intent_id=? AND expires_at > ?",
+            (app_key, skeleton_id, intent_id, now)).fetchall()
+        return {r["action_sig"] for r in rows}
+
+    # -- per-app adaptive tuning -------------------------------------------
+
+    def _app_tuning(self, app_key: str) -> Dict[str, Any]:
+        """Read per-app threshold adjustments (from adaptive trust)."""
+        row = self.db.execute(
+            "SELECT * FROM app_tuning WHERE app_key=?", (app_key,)).fetchone()
+        if row is None:
+            return {}
+        return {"t_sim_adj": row["t_sim_adj"], "anchor_adj": row["anchor_adj"]}
+
+    def update_app_tuning(self, app_key: str) -> None:
+        """Recompute per-app tuning from recent shadow audit data.
+
+        If agreement rate drops below 70%, tighten thresholds. If above 90%,
+        loosen slightly. This turns shadow audit data into real behaviour changes.
+        """
+        rows = self.db.execute(
+            "SELECT eo.grade FROM entry_outcome eo "
+            "JOIN entry e ON eo.entry_id = e.id "
+            "WHERE e.app_key=? AND eo.at > ? "
+            "ORDER BY eo.at DESC LIMIT 50",
+            (app_key, time.time() - 7 * 86400)).fetchall()
+        if len(rows) < 10:
+            return  # not enough data
+
+        successes = sum(1 for r in rows if r["grade"] in ("success", "soft_fail"))
+        agreement = successes / len(rows)
+
+        if agreement < 0.70:
+            adj_sim, adj_anchor = -2, 0.10
+        elif agreement > 0.90:
+            adj_sim, adj_anchor = 1, -0.05
+        else:
+            adj_sim, adj_anchor = 0, 0.0
+
+        # Clamp adjustments to prevent extreme drift.
+        adj_sim = max(-3, min(2, adj_sim))
+        adj_anchor = max(-0.10, min(0.15, adj_anchor))
+
+        now = time.time()
+        self.db.execute(
+            "INSERT INTO app_tuning(app_key, t_sim_adj, anchor_adj, updated_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(app_key) DO UPDATE SET "
+            "t_sim_adj=excluded.t_sim_adj, anchor_adj=excluded.anchor_adj, "
+            "updated_at=excluded.updated_at",
+            (app_key, adj_sim, adj_anchor, now))
+        self.db.commit()
+        log.info("app tuning for %s: t_sim_adj=%d, anchor_adj=%.2f (agreement=%.0f%%)",
+                 app_key, adj_sim, adj_anchor, agreement * 100)

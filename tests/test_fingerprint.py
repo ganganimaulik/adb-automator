@@ -248,3 +248,38 @@ def test_horizontal_scroll_matches_identity():
     a = screen(X.horizontal_scroll_screen(scroll=0))
     b = screen(X.horizontal_scroll_screen(scroll=200))
     assert fp.hamming(a.simhash, b.simhash) <= T_SIM
+
+
+# ---------------------------------------------------------------------------
+# Verb polarity normalization
+# ---------------------------------------------------------------------------
+
+def test_verb_polarity_opposite_goals_produce_different_prefixes():
+    """'turn on WiFi' and 'turn off WiFi' must hash differently."""
+    assert fp.normalize_verb_polarity("turn on WiFi") == "[+]"
+    assert fp.normalize_verb_polarity("turn off WiFi") == "[-]"
+    assert fp.normalize_verb_polarity("enable dark mode") == "[+]"
+    assert fp.normalize_verb_polarity("disable dark mode") == "[-]"
+
+
+def test_verb_polarity_navigation_verbs():
+    assert fp.normalize_verb_polarity("open Settings") == "[open]"
+    assert fp.normalize_verb_polarity("go to display settings") == "[open]"
+    assert fp.normalize_verb_polarity("close the app") == "[close]"
+    assert fp.normalize_verb_polarity("exit the app") == "[close]"
+
+
+def test_verb_polarity_adjustment_verbs():
+    assert fp.normalize_verb_polarity("increase brightness") == "[+adj]"
+    assert fp.normalize_verb_polarity("decrease volume") == "[-adj]"
+
+
+def test_verb_polarity_case_insensitive():
+    assert fp.normalize_verb_polarity("TURN ON airplane mode") == "[+]"
+    assert fp.normalize_verb_polarity("Turn Off WiFi") == "[-]"
+
+
+def test_verb_polarity_no_match_returns_empty():
+    assert fp.normalize_verb_polarity("check the weather") == ""
+    assert fp.normalize_verb_polarity("") == ""
+    assert fp.normalize_verb_polarity("find my phone") == ""
