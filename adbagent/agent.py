@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import safety, trust
-from .actions import (ActionError, AgentAction, execute,
+from .actions import (ActionError, AgentAction, execute, format_history_entry,
                       synthesise_postcondition, verify)
 from .config import Config
 from .device import Device, DeviceTimeout, DeviceLost
@@ -436,8 +436,12 @@ class Agent:
                         "else, or report done/fail.")
                     state.consecutive_failures += 1
                     state.history.append(
-                        f"{state.step}. {action.describe()} -> rejected "
-                        f"(scroll reversal, warning #{state.scroll_warnings})")
+                        format_history_entry(
+                            state.step, action, screen=screen,
+                            grade="rejected",
+                            reason=f"scroll reversal, warning #{state.scroll_warnings}"
+                        )
+                    )
                     del state.history[:-12]
                     self._maybe_give_up(state)
                     continue
@@ -480,7 +484,10 @@ class Agent:
                 if not safety.confirm(
                         f"Step {state.step}: the agent wants to press {label!r} "
                         f"in {screen.package}. This cannot be undone.", cfg):
-                    state.history.append(f"{state.step}. refused to press {label!r}")
+                    state.history.append(
+                        f"{state.step}. refused to press {label!r}"
+                        + (f" in {screen.package}" if screen.package else "")
+                    )
                     state.last_failure = (f"pressing {label!r} was refused; find "
                                           f"another way or stop")
                     rec.event("refused", label=label)
@@ -494,7 +501,9 @@ class Agent:
 
             if cfg.run.dry_run:
                 log.info("dry run: would %s", action.describe())
-                state.history.append(f"{state.step}. (dry run) {action.describe()}")
+                state.history.append(
+                    format_history_entry(state.step, action, screen=screen, prefix="(dry run)")
+                )
                 continue
 
             # ---- 6. act -------------------------------------------------
@@ -506,6 +515,13 @@ class Agent:
                 state.consecutive_failures += 1
                 if entry is not None:
                     self.mem.mark(entry, "hard_fail", state.run_id, str(exc))
+                state.history.append(
+                    format_history_entry(
+                        state.step, action, screen=screen,
+                        grade="failed", reason=str(exc)
+                    )
+                )
+                del state.history[:-12]
                 self._maybe_give_up(state)
                 continue
             except (DeviceTimeout, DeviceLost) as exc:
@@ -572,8 +588,11 @@ class Agent:
 
             state.loops.record(screen.exact_id, action.signature())
             state.history.append(
-                f"{state.step}. {action.describe()} -> {outcome.grade}"
-                + (f" ({outcome.reason})" if outcome.reason else ""))
+                format_history_entry(
+                    state.step, action, screen=screen, element=element,
+                    grade=outcome.grade, reason=outcome.reason
+                )
+            )
             del state.history[:-12]  # keep the prompt bounded
 
             state.prev_skeleton_id = screen.skeleton_id
@@ -787,23 +806,37 @@ def explore(dev: Device, mem: Memory, llm: LLMClient, cfg: Config,
                 if not safety.confirm(message, cfg):
                     blocked.append(f"{action.describe()}: {why}")
                     state.history.append(
-                        f"{state.step}. skipped {action.describe()} -- not read-only. "
-                        f"Go back and try a different part of the app.")
+                        format_history_entry(
+                            state.step, action, screen=screen,
+                            prefix="skipped -- not read-only."
+                        ) + " Go back and try a different part of the app."
+                    )
                     del state.history[:-12]
                     dev.press("back")
                     continue
 
             try:
-                execute(dev, action, screen)
+                element = execute(dev, action, screen)
             except (ActionError, ValueError) as exc:
-                state.history.append(f"{state.step}. {action.describe()} failed: {exc}")
+                state.history.append(
+                    format_history_entry(
+                        state.step, action, screen=screen,
+                        grade="failed", reason=str(exc)
+                    )
+                )
+                del state.history[:-12]
                 continue
 
             after = dev.observe(settle=True)
             mem.note_transition(screen, after, action)
             state.loops.record(screen.exact_id, action.signature())
-            state.history.append(f"{state.step}. {action.describe()} -> "
-                                 f"{'new screen' if after.skeleton_id not in seen else 'seen before'}")
+            screen_status = "new screen" if after.skeleton_id not in seen else "seen before"
+            state.history.append(
+                format_history_entry(
+                    state.step, action, screen=screen, element=element,
+                    grade=screen_status
+                )
+            )
             del state.history[:-12]
     finally:
         rec.close()
