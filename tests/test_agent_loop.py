@@ -1,7 +1,7 @@
 """The whole loop, end to end, against a scripted phone.
 
-The headline test is `test_second_run_makes_no_llm_calls`. Everything the
-project claims comes down to that number being zero.
+The agent always uses the LLM for decisions. These tests verify the core loop:
+perceive → ask the LLM → guard → act → verify → learn → repeat.
 """
 
 from __future__ import annotations
@@ -44,79 +44,16 @@ def run(dev, mem, cfg, policy, **kw):
 
 
 # ---------------------------------------------------------------------------
-# The headline claim
+# Basic operation
 # ---------------------------------------------------------------------------
 
-def test_first_run_uses_the_llm_and_succeeds(cfg, mem):
+def test_run_uses_the_llm_and_succeeds(cfg, mem):
     dev = fake.FakeDevice(cfg)
     outcome, state, llm = run(dev, mem, cfg,
                               fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     assert outcome == "success"
     assert dev.state == "wifi"
     assert llm.calls >= 2          # at least one decide plus the completion judge
-    assert state.cache_hits == 0
-
-
-def test_second_run_makes_no_llm_calls(cfg, mem):
-    """Learn once, then replay for free. This is the entire point of the project."""
-    first = fake.FakeDevice(cfg)
-    _, state1, llm1 = run(first, mem, cfg, fake.reach_state(first, "wifi", ["Wi-Fi"]), sampler=lambda: 1.0)
-    assert state1.finished == "success"
-    decides1 = llm1.calls - llm1.judges
-    assert decides1 >= 1
-
-    # A fresh phone in the same starting state, same goal, same memory.
-    second = fake.FakeDevice(cfg)
-    llm2 = fake.FakeLLM(second, fake.reach_state(second, "wifi", ["Wi-Fi"]))
-    # An assertion supplied by the user removes the only remaining LLM call --
-    # the completion judge -- so the whole run is free.
-    oracle = Oracle(text="Forget network")
-    outcome, state2 = Agent(second, mem, llm2, cfg, oracle=oracle, sampler=lambda: 1.0).run(GOAL)
-
-    assert outcome == "success"
-    assert second.state == "wifi"
-    assert llm2.calls == 0, "the second run must not consult the model at all"
-    assert state2.cache_hits >= 1
-
-
-def test_replay_survives_cosmetic_drift(cfg, mem):
-    """A different clock and a longer list must not cost an LLM call."""
-    first = fake.FakeDevice(cfg)
-    run(first, mem, cfg, fake.reach_state(first, "wifi", ["Wi-Fi"]), sampler=lambda: 1.0)
-
-    drifted = fake.FakeDevice(cfg)
-    drifted.app["home"].xml = X.settings_screen(
-        rows=11, clock="11:47", battery="23%", badge="9",
-        labels=["Wi-Fi", "Bluetooth", "Mobile network", "Hotspot", "Data usage",
-                "Airplane mode", "VPN", "Private DNS", "NFC", "Cast", "Tethering"])
-    # `home` is generated dynamically, so point the generator at the drifted XML.
-    drifted._xml = lambda: drifted.app[drifted.state].xml  # type: ignore[assignment]
-
-    llm = fake.FakeLLM(drifted, fake.reach_state(drifted, "wifi", ["Wi-Fi"]))
-    outcome, state = Agent(drifted, mem, llm, cfg,
-                           oracle=Oracle(text="Forget network"), sampler=lambda: 1.0).run(GOAL)
-    assert outcome == "success"
-    assert state.cache_hits >= 1
-    assert llm.calls == 0
-
-
-def test_cache_falls_back_to_the_llm_when_the_app_changes(cfg, mem):
-    """Break the learned screen; the agent must notice and re-plan."""
-    first = fake.FakeDevice(cfg)
-    run(first, mem, cfg, fake.reach_state(first, "wifi", ["Wi-Fi"]))
-
-    changed = fake.FakeDevice(cfg)
-    # The row is renamed -- the anchor's text no longer matches.
-    changed.app["home"] = fake.FakeScreen(
-        xml=X.settings_screen(rows=4, title="Connections",
-                              labels=["Wireless", "Bluetooth", "Hotspot", "VPN"]),
-        taps={"Wireless": "wifi"})
-    changed._xml = lambda: changed.app[changed.state].xml  # type: ignore[assignment]
-
-    llm = fake.FakeLLM(changed, fake.reach_state(changed, "wifi", ["Wireless"]))
-    outcome, state = Agent(changed, mem, llm, cfg).run(GOAL)
-    assert outcome == "success"
-    assert llm.calls >= 1, "a changed app must bring the model back"
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +146,6 @@ def test_credential_screen_hands_over_and_learns_nothing(cfg, mem):
     outcome, state = Agent(dev, mem, llm, cfg).run("log in")
     assert outcome == "needs_user"
     assert llm.calls == 0, "the model must never even see a credential screen"
-    assert mem.stats_summary()["entries"] == 0
 
 
 def test_irreversible_action_is_refused_when_unattended(cfg, mem):
@@ -323,7 +259,7 @@ def test_never_screenshot_wins(cfg):
     cfg.run.never_screenshot = True
     screen = attach(parse(X.webview_screen(), width=X.W, height=X.H))
     want, _ = needs_screenshot(RunState(goal="g", run_id="r", intent_id="i"),
-                              screen, cfg)
+                               screen, cfg)
     assert not want
 
 
@@ -340,62 +276,6 @@ def test_run_writes_artifacts(cfg, mem, tmp_path):
     lines = [l for l in events.read_text().splitlines() if l.strip()]
     kinds = {__import__("json").loads(l)["kind"] for l in lines}
     assert {"run_start", "decide", "verify", "run_end"} <= kinds
-
-
-# ---------------------------------------------------------------------------
-# Shadow audit -- measuring whether the cache is actually right
-# ---------------------------------------------------------------------------
-
-def test_shadow_audit_records_agreement(cfg, mem):
-    """Sampled cache hits ask the model too, and record whether it agreed."""
-    first = fake.FakeDevice(cfg)
-    run(first, mem, cfg, fake.reach_state(first, "wifi", ["Wi-Fi"]))
-
-    second = fake.FakeDevice(cfg)
-    llm = fake.FakeLLM(second, fake.reach_state(second, "wifi", ["Wi-Fi"]))
-    _, state = Agent(second, mem, llm, cfg, oracle=Oracle(text="Forget network"),
-                     sampler=lambda: 0.0).run(GOAL)   # always audit
-    assert state.audits >= 1
-    assert state.audit_agreement() == 1.0
-    assert llm.calls == state.audits, "audits are the only calls a cached run makes"
-
-
-def test_shadow_audit_notices_disagreement(cfg, mem):
-    first = fake.FakeDevice(cfg)
-    run(first, mem, cfg, fake.reach_state(first, "wifi", ["Wi-Fi"]))
-
-    second = fake.FakeDevice(cfg)
-
-    def contrarian(screen, llm):
-        el = next(e for e in screen.elements if e.best_text == "Bluetooth")
-        return AgentAction(observation="o", reasoning="r", action="tap",
-                           target={"index": el.index})
-
-    llm = fake.FakeLLM(second, contrarian)
-    _, state = Agent(second, mem, llm, cfg, oracle=Oracle(text="Forget network"),
-                     sampler=lambda: 0.0).run(GOAL)
-    assert state.audits >= 1
-    assert state.audit_agreement() == 0.0
-    # Disagreement demotes the stale cache entry and executes the model's proposed action.
-    assert second.state == "bluetooth"
-    cached_entries = mem.entries()
-    assert len(cached_entries) >= 1
-    audited_entry = cached_entries[0]
-    outcomes = [r[0] for r in mem.db.execute(
-        "SELECT grade FROM entry_outcome WHERE entry_id=?", (audited_entry.id,)).fetchall()]
-    assert "soft_fail" in outcomes
-
-
-def test_shadow_audit_is_off_when_not_sampled(cfg, mem):
-    first = fake.FakeDevice(cfg)
-    run(first, mem, cfg, fake.reach_state(first, "wifi", ["Wi-Fi"]))
-
-    second = fake.FakeDevice(cfg)
-    llm = fake.FakeLLM(second, fake.reach_state(second, "wifi", ["Wi-Fi"]))
-    _, state = Agent(second, mem, llm, cfg, oracle=Oracle(text="Forget network"),
-                     sampler=lambda: 1.0).run(GOAL)   # never audit
-    assert state.audits == 0
-    assert llm.calls == 0
 
 
 def test_recorder_dump_messages(cfg, tmp_path):

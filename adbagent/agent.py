@@ -2,8 +2,7 @@
 
 Read this file to understand the whole system. The shape is:
 
-    perceive -> fingerprint -> cache lookup -> (replay | ask the LLM)
-             -> guard -> act -> verify -> learn -> repeat
+    perceive -> ask the LLM -> guard -> act -> verify -> learn -> repeat
 
 The LLM appears in exactly two places, both marked `### LLM ###`. Everything
 else -- recognising the screen, resolving an anchor, dismissing a nag, deciding
@@ -16,20 +15,19 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import safety, trust
+from . import safety
 from .actions import (ActionError, AgentAction, execute, format_history_entry,
                       synthesise_postcondition, verify)
 from .config import Config
 from .device import Device, DeviceTimeout, DeviceLost
 from .llm import BudgetExceeded, LLMClient, LLMError
-from .memory import CachedStep, Memory, intent_key
+from .memory import Memory, intent_key
 from .safety import Aborted, LoopDetector
 from .screen import Screen, render
 
@@ -72,7 +70,6 @@ class RunState:
     intent_id: str
     step: int = 0
     llm_calls: int = 0
-    cache_hits: int = 0
     consecutive_failures: int = 0
     history: List[str] = field(default_factory=list)
     visits: Dict[str, int] = field(default_factory=dict)
@@ -80,8 +77,6 @@ class RunState:
     want_screenshot: bool = False
     last_failure: str = ""
     scroll_warnings: int = 0
-    audits: int = 0
-    audits_agreed: int = 0
     started_at: float = field(default_factory=time.monotonic)
     finished: Optional[Outcome] = None
     #: Running scratchpad for data-collection goals.  The LLM writes into the
@@ -89,8 +84,6 @@ class RunState:
     #: so it knows what it has already captured.
     scratchpad: List[str] = field(default_factory=list)
     scratchpad_chars: int = 0
-    prev_skeleton_id: str = ""
-    nav_stack: List[str] = field(default_factory=list)
     #: Progress tracker for multi-step goals.  The LLM writes into the
     #: ``progress`` field; we keep the last few entries and feed them back.
     progress_log: List[str] = field(default_factory=list)
@@ -99,13 +92,6 @@ class RunState:
     @property
     def elapsed(self) -> float:
         return time.monotonic() - self.started_at
-
-    def cache_rate(self) -> float:
-        return self.cache_hits / self.step if self.step else 0.0
-
-    def audit_agreement(self) -> Optional[float]:
-        """Measured cache precision, or None when nothing was audited."""
-        return self.audits_agreed / self.audits if self.audits else None
 
 
 class Recorder:
@@ -186,56 +172,13 @@ def needs_screenshot(state: RunState, screen: Screen, cfg: Config) -> Tuple[bool
 class Agent:
     def __init__(self, dev: Device, mem: Memory, llm: Optional[LLMClient],
                  cfg: Config, *, oracle: Optional[Oracle] = None,
-                 on_event=None, sampler=None):
+                 on_event=None):
         self.dev = dev
         self.mem = mem
         self.llm = llm
         self.cfg = cfg
         self.oracle = oracle or Oracle()
         self.on_event = on_event or (lambda *a, **k: None)
-        #: Injectable so tests can force or suppress shadow audits.
-        self.sampler = sampler or random.random
-
-    def _shadow_audit(self, state: RunState, screen: Screen,
-                      entry: CachedStep, cached: AgentAction,
-                      rec: Recorder) -> Tuple[bool, Optional[AgentAction]]:
-        """Occasionally ask the model anyway, and record whether it agreed.
-
-        If the model disagrees with the cache, the cached entry is demoted (marked
-        as a soft failure) and the model's proposed action is returned to override
-        the stale cache entry.
-        """
-        if self.llm is None:
-            return True, None
-        rate = trust.shadow_audit_rate(
-            entry.state, self.cfg.memory.shadow_audit_probation,
-            self.cfg.memory.shadow_audit_active,
-            self.cfg.memory.shadow_audit_trusted)
-        if rate <= 0 or self.sampler() >= rate:
-            return True, None
-        try:
-            proposed = self.llm.decide(                        ### LLM (audit only)
-                goal=state.goal, rendered=render(screen), history=state.history,
-                width=screen.width, height=screen.height, package=screen.package,
-                step=state.step, recorder=rec, purpose="shadow_audit")
-        except (LLMError, BudgetExceeded) as exc:
-            log.debug("shadow audit skipped: %s", exc)
-            return True, None
-        state.llm_calls += 1
-        agreed = proposed.signature() == cached.signature()
-        state.audits += 1
-        if agreed:
-            state.audits_agreed += 1
-        else:
-            log.warning("shadow audit DISAGREES on %s: cache says %s, model says %s",
-                        entry.describe(), cached.describe(), proposed.describe())
-            self.mem.mark(entry, "soft_fail", state.run_id, "shadow audit disagreement")
-        rec.event("shadow_audit", entry_id=entry.id, agreed=agreed,
-                  cached=cached.describe(), proposed=proposed.describe(),
-                  overridden=not agreed)
-        if agreed:
-            return True, None
-        return False, proposed
 
     # -- public ------------------------------------------------------------
 
@@ -265,17 +208,9 @@ class Agent:
         finally:
             outcome = state.finished or "failed"
             usd = self.llm.ledger.total_usd if self.llm else 0.0
-            self.mem.end_run(run_id, outcome, state.step, state.llm_calls,
-                             state.cache_hits, usd)
-            try:
-                screen_pkg = getattr(self, '_last_package', '')
-                if screen_pkg:
-                    self.mem.update_app_tuning(screen_pkg)
-            except Exception:  # noqa: BLE001
-                pass
+            self.mem.end_run(run_id, outcome, state.step, state.llm_calls, usd)
             recorder.event("run_end", outcome=outcome, steps=state.step,
-                           llm_calls=state.llm_calls, cache_hits=state.cache_hits,
-                           audits=state.audits, audit_agreement=state.audit_agreement(),
+                           llm_calls=state.llm_calls,
                            usd=round(usd, 6))
             recorder.close()
 
@@ -336,7 +271,6 @@ class Agent:
             scroll_ctx = state.loops.scroll_context()
             if scroll_ctx:
                 hint = scroll_ctx
-                # Also ban cached scroll replays so only the LLM decides.
                 if (state.loops.scroll_oscillating()
                         or state.loops.direction_reversals() >= 5):
                     for _, sig in state.loops.history:
@@ -358,8 +292,6 @@ class Agent:
                              "done/fail.")
                     hint = f"{hint} {extra}" if hint else extra
                     state.loops.consecutive_backs = 0
-                    # Ban the back action on this screen so the cache does not
-                    # replay it either.
                     state.loops.ban(screen.skeleton_id, "forced-back")
                 else:
                     log.warning("step %d: stuck in a loop; going back",
@@ -370,55 +302,26 @@ class Agent:
                     state.loops.consecutive_backs += 1
                     continue
 
-            # ---- 3. cache lookup (no LLM) -------------------------------
-            # Check if we're revisiting via back navigation
-            if (state.nav_stack and screen.skeleton_id in state.nav_stack
-                    and screen.skeleton_id != state.nav_stack[-1]):
-                # Back-navigation landed on a previously visited screen.
-                # Pop the stack and rewind the visit counter so the cache
-                # uses the original visit ordinal.
-                idx = len(state.nav_stack) - 1 - state.nav_stack[::-1].index(screen.skeleton_id)
-                state.nav_stack = state.nav_stack[:idx + 1]
-                v = state.visits.get(screen.skeleton_id, 1)
-                if v > 0:
-                    state.visits[screen.skeleton_id] = v - 1
-
+            # ---- 3. visit tracking --------------------------------------
             visit = state.visits.get(screen.skeleton_id, 0)
             state.visits[screen.skeleton_id] = visit + 1
 
-            # Update navigation stack
-            if not state.nav_stack or state.nav_stack[-1] != screen.skeleton_id:
-                state.nav_stack.append(screen.skeleton_id)
-
-            prev_skeleton = state.prev_skeleton_id
-            entry, action, source = self._from_cache(state, screen, prev_skeleton)
-            if entry is not None and action is not None:
-                agreed, proposed = self._shadow_audit(state, screen, entry, action, rec)
-                if not agreed and proposed is not None:
-                    action = proposed
-                    source = "llm"
-
-            # ---- 4. ask the model, but only if we must ------------------
+            # ---- 4. ask the model ---------------------------------------
             screenshot: Optional[bytes] = None
-            if action is None:
-                if self.llm is None:
-                    log.error("cache miss and no LLM configured")
-                    state.finished = "failed"
-                    return
-                want, note = needs_screenshot(state, screen, cfg)
-                if want:
-                    screenshot = self.dev.screenshot()
-                notes = " ".join(filter(None, (note, hint, state.last_failure)))
-                action = self.llm.decide(                      ### LLM ###
-                    goal=state.goal, rendered=render(screen), history=state.history,
-                    width=screen.width, height=screen.height, package=screen.package,
-                    screenshot=screenshot, note=notes,
-                    scratchpad="\n".join(state.scratchpad),
-                    progress="\n".join(state.progress_log),
-                    step=state.step, recorder=rec)
-                state.llm_calls += 1
-                state.want_screenshot = action.confidence == "low"
-                source = "llm"
+            want, note = needs_screenshot(state, screen, cfg)
+            if want:
+                screenshot = self.dev.screenshot()
+            notes = " ".join(filter(None, (note, hint, state.last_failure)))
+            action = self.llm.decide(                      ### LLM ###
+                goal=state.goal, rendered=render(screen), history=state.history,
+                width=screen.width, height=screen.height, package=screen.package,
+                screenshot=screenshot, note=notes,
+                scratchpad="\n".join(state.scratchpad),
+                progress="\n".join(state.progress_log),
+                step=state.step, recorder=rec)
+            state.llm_calls += 1
+            state.want_screenshot = action.confidence == "low"
+            source = "llm"
 
             # Track scroll direction globally (survives interleaved taps).
             if action.action == "scroll" and action.direction:
@@ -494,7 +397,7 @@ class Agent:
 
             rec.event("decide", step=state.step, source=source,
                       skeleton=screen.skeleton_id, action=action.model_dump(),
-                      entry_id=getattr(entry, "id", None), screenshot=bool(screenshot))
+                      screenshot=bool(screenshot))
             self.on_event("step", state=state, screen=screen, action=action,
                           source=source, screenshot=bool(screenshot))
 
@@ -533,8 +436,6 @@ class Agent:
                 log.warning("step %d: %s", state.step, exc)
                 state.last_failure = str(exc)
                 state.consecutive_failures += 1
-                if entry is not None:
-                    self.mem.mark(entry, "hard_fail", state.run_id, str(exc))
                 state.history.append(
                     format_history_entry(
                         state.step, action, screen=screen,
@@ -558,39 +459,20 @@ class Agent:
                     state.finished = "aborted"
                     return
                 continue
-            post = (entry.postcondition if entry is not None
-                    else synthesise_postcondition(action, element))
-            expected = entry.next_skeleton_id if entry is not None else ""
-            if entry is not None and after.skeleton_id in entry.alt_successors:
-                expected = after.skeleton_id
-            outcome = verify(action, screen, after, post, expected or None)
+            post = synthesise_postcondition(action, element)
+            expected = ""
+            outcome = verify(action, screen, after, post, None)
 
             rec.event("verify", step=state.step, grade=outcome.grade,
                       reason=outcome.reason, after=after.skeleton_id)
 
             # ---- 8. learn (no LLM) --------------------------------------
-            if entry is not None:
-                self.mem.mark(entry, outcome.grade, state.run_id, outcome.reason,
-                              observed_successor=after.skeleton_id)
-                if not outcome.ok:
-                    # Rewind so the next pass looks the entry up again, misses
-                    # (it has just been demoted), and hands over to the model.
-                    state.visits[screen.skeleton_id] = visit
-                    state.last_failure = (f"the remembered action "
-                                          f"{action.describe()} failed: {outcome.reason}")
-                    state.consecutive_failures += 1
-            elif outcome.ok:
-                self.mem.record(screen=screen, intent_id=state.intent_id, visit=visit,
-                                action=action, element=element, postcondition=post,
-                                after=after, run_id=state.run_id,
-                                prev_skeleton_id=prev_skeleton)
-            else:
+            if not outcome.ok:
                 state.consecutive_failures += 1
                 state.last_failure = f"{action.describe()} failed: {outcome.reason}"
                 state.want_screenshot = True
-                if source == "llm":
-                    self.mem.record_dead_end(screen, state.intent_id,
-                                             action.signature(), outcome.reason)
+                self.mem.record_dead_end(screen, state.intent_id,
+                                         action.signature(), outcome.reason)
 
             if outcome.ok:
                 state.consecutive_failures = 0
@@ -616,84 +498,7 @@ class Agent:
             )
             del state.history[:-12]  # keep the prompt bounded
 
-            state.prev_skeleton_id = screen.skeleton_id
             self._maybe_give_up(state)
-
-    # -- cache -------------------------------------------------------------
-
-    def _from_cache(self, state: RunState, screen: Screen, prev_skeleton_id: str = ""
-                    ) -> Tuple[Optional[CachedStep], Optional[AgentAction], str]:
-        from .fingerprint import destructive_tokens
-
-        entry = self.mem.lookup(
-            screen, state.intent_id, state.visits[screen.skeleton_id] - 1,
-            prev_skeleton_id=prev_skeleton_id,
-            forbidden_now=destructive_tokens(screen),
-            banned_signatures=list(state.loops.bans_for(screen.skeleton_id)))
-        if entry is None:
-            return None, None, "llm"
-
-        action = self.mem.rehydrate(entry, screen)
-        if action is None and entry.anchor is not None and entry.anchor.scroller_rid:
-            action = self._scroll_to_find(entry, screen)
-        if action is None:
-            self.mem.mark(entry, "hard_fail", state.run_id, "anchor did not bind")
-            return None, None, "llm"
-
-        state.cache_hits += 1
-        log.info("step %d: cache hit %s", state.step, entry.describe())
-        return entry, action, "cache"
-
-    def _scroll_to_find(self, entry: CachedStep, screen: Screen
-                        ) -> Optional[AgentAction]:
-        """The element is in a list that has moved. Look for it before giving up."""
-        # Determine scroll direction from the scroller's orientation.
-        direction = "down"
-        if entry.anchor is not None and entry.anchor.scroller_rid:
-            from .fingerprint import rid_norm
-            for el in screen.elements:
-                if (el.scrollable
-                        and rid_norm(el.resource_id) == entry.anchor.scroller_rid
-                        and el.is_horizontal):
-                    direction = "right"
-                    break
-        opposite = "up" if direction == "down" else "left"
-
-        def search_dir(d: str, current_screen: Screen) -> Tuple[Optional[AgentAction], int]:
-            previous = current_screen.exact_id
-            for attempt in range(4):
-                self.dev.scroll(d)
-                current = self.dev.observe(settle=True)
-                if current.exact_id == previous:
-                    return None, attempt + 1
-                previous = current.exact_id
-                if current.skeleton_id != entry.skeleton_id:
-                    return None, attempt + 1
-                act = self.mem.rehydrate(entry, current, minor_deviation=True)
-                if act is not None:
-                    return act, attempt + 1
-            return None, 4
-
-        # 1. Try primary direction
-        action, scrolls = search_dir(direction, screen)
-        if action is not None:
-            log.info("found it after %d scroll(s)", scrolls)
-            return action
-
-        # 2. Scroll back to original position
-        for _ in range(scrolls):
-            self.dev.scroll(opposite)
-        
-        if scrolls > 0:
-            screen = self.dev.observe(settle=True)
-
-        # 3. Try opposite direction
-        action, opp_scrolls = search_dir(opposite, screen)
-        if action is not None:
-            log.info("found it after %d scroll(s) in opposite direction", opp_scrolls)
-            return action
-
-        return None
 
     # -- terminal actions --------------------------------------------------
 
@@ -759,110 +564,3 @@ class Agent:
             log.error("giving up after %d consecutive failures",
                       state.consecutive_failures)
             state.finished = "failed"
-
-
-# ---------------------------------------------------------------------------
-# Explore mode
-# ---------------------------------------------------------------------------
-
-EXPLORE_GOAL = (
-    "Explore this app to learn how it is laid out. Visit as many DIFFERENT "
-    "screens as you can. Open a section, look at it, then press back and open "
-    "the next one. Do not change any setting, do not type anything, and do not "
-    "press any button that sends, buys, deletes or posts. When you have seen "
-    "everything reachable, reply done."
-)
-
-
-def explore(dev: Device, mem: Memory, llm: LLMClient, cfg: Config,
-            package: str = "", max_screens: int = 40) -> Dict[str, Any]:
-    """Wander an app to warm the cache, refusing anything that changes state.
-
-    Read-only by construction: every action the model proposes is classified,
-    and anything that could mutate is either skipped or -- when it is the only
-    way forward -- put to the user.
-    """
-    seen: set = set()
-    state = RunState(goal=EXPLORE_GOAL, run_id=uuid.uuid4().hex[:12],
-                     intent_id=intent_key("explore:" + (package or "any")))
-    mem.begin_run(state.run_id, EXPLORE_GOAL, state.intent_id)
-
-    if package:
-        dev.open_app(package)
-        time.sleep(1.0)
-
-    rec = Recorder(cfg, state.run_id)
-    try:
-        blocked: List[str] = []
-        while len(seen) < max_screens and state.step < cfg.run.max_steps:
-            state.step += 1
-            screen = dev.observe()
-            mem.note_screen(screen)
-            seen.add(screen.skeleton_id)
-
-            if safety.sensitive_screen(screen) is not None:
-                log.info("skipping a credential screen")
-                dev.press("back")
-                continue
-            if package and screen.package and screen.package != package:
-                dev.press("back")
-                continue
-
-            want, note = needs_screenshot(state, screen, cfg)
-            action = llm.decide(
-                goal=EXPLORE_GOAL, rendered=render(screen), history=state.history,
-                width=screen.width, height=screen.height, package=screen.package,
-                screenshot=dev.screenshot() if want else None,
-                note=" ".join(filter(None, (note, state.loops.hint(screen.exact_id)))),
-                step=state.step, recorder=rec, purpose="explore")
-            state.llm_calls += 1
-
-            if action.action in ("done", "fail"):
-                break
-
-            ok, why = safety.is_read_only(action, screen)
-            if not ok:
-                message = (f"Explore wants to {action.describe()} in {screen.package}, "
-                           f"which is not read-only ({why}).")
-                if not safety.confirm(message, cfg):
-                    blocked.append(f"{action.describe()}: {why}")
-                    state.history.append(
-                        format_history_entry(
-                            state.step, action, screen=screen,
-                            prefix="skipped -- not read-only."
-                        ) + " Go back and try a different part of the app."
-                    )
-                    del state.history[:-12]
-                    dev.press("back")
-                    continue
-
-            try:
-                element = execute(dev, action, screen)
-            except (ActionError, ValueError) as exc:
-                state.history.append(
-                    format_history_entry(
-                        state.step, action, screen=screen,
-                        grade="failed", reason=str(exc)
-                    )
-                )
-                del state.history[:-12]
-                continue
-
-            after = dev.observe(settle=True)
-            mem.note_transition(screen, after, action)
-            state.loops.record(screen.exact_id, action.signature())
-            screen_status = "new screen" if after.skeleton_id not in seen else "seen before"
-            state.history.append(
-                format_history_entry(
-                    state.step, action, screen=screen, element=element,
-                    grade=screen_status
-                )
-            )
-            del state.history[:-12]
-    finally:
-        rec.close()
-
-    mem.end_run(state.run_id, "success", state.step, state.llm_calls, 0,
-                llm.ledger.total_usd)
-    return {"screens": len(seen), "steps": state.step, "llm_calls": state.llm_calls,
-            "blocked": blocked, "usd": llm.ledger.total_usd}

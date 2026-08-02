@@ -444,34 +444,6 @@ DESTRUCTIVE_TEXT = re.compile(
 )
 
 
-def destructive_tokens(screen: Screen) -> List[str]:
-    """Masked labels on the screen that name an irreversible action."""
-    found: List[str] = []
-    for el in screen.elements:
-        label = el.best_text
-        if label and DESTRUCTIVE_TEXT.search(label):
-            token = mask_text(label)
-            if token and token not in found:
-                found.append(token)
-    return found
-
-
-def required_tokens(tokens: Sequence[str], idf: Dict[str, float],
-                    top_n: int = 5) -> List[str]:
-    """The highest-IDF skeleton tokens: what makes *this* screen not *that* one.
-
-    ``idf`` is built from the app's own corpus of seen screens. With no corpus
-    yet, every token has equal weight and we fall back to the rarest tokens on
-    the screen itself.
-    """
-    unique = list(dict.fromkeys(tokens))
-    if not unique:
-        return []
-    default = max(idf.values()) if idf else 1.0
-    ranked = sorted(unique, key=lambda t: (-idf.get(t, default), t))
-    return ranked[:top_n]
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

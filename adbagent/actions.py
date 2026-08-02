@@ -1,9 +1,8 @@
 """The action space, its execution, and the verification DSL.
 
-This module is the contract in three directions at once: it is the JSON schema
-the model must answer with, the thing the device layer executes, and the record
-the cache stores and replays. Keeping all three in one place is what stops them
-drifting apart.
+This module is the contract in two directions at once: it is the JSON schema
+the model must answer with and the thing the device layer executes. Keeping
+both in one place is what stops them drifting apart.
 
 Two deliberate schema choices:
 

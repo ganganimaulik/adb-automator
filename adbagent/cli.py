@@ -93,7 +93,6 @@ OVERRIDES = {
     "never_screenshot": "run.never_screenshot",
     "allow_destructive": "safety.allow_destructive",
     "unattended": "safety.unattended",
-    "no_cache": "memory.enabled",
 }
 
 
@@ -105,19 +104,11 @@ def build_config(args: argparse.Namespace):
         value = getattr(args, flag, None)
         if value is None:
             continue
-        if flag == "no_cache":
-            overrides[dotted] = not value
-        else:
-            overrides[dotted] = value
+        overrides[dotted] = value
 
     loaded = load_config(getattr(args, "config", None), overrides)
     for warning in loaded.warnings:
         print(f"  config: {warning}", file=sys.stderr)
-
-    # Only the explore command uses --app to pin to a single package.
-    app = getattr(args, "app", None)
-    if app:
-        loaded.config.safety.package_allowlist = [app]
 
     return loaded.config
 
@@ -201,12 +192,7 @@ def cmd_doctor(args) -> int:
     out.say(out.bold("Memory"))
     out.ok(f"database {cfg.db_path}")
     if cfg.db_path.exists():
-        from .memory import Memory
-        with Memory(cfg) as mem:
-            summary = mem.stats_summary()
-        out.ok(f"{summary['entries']} learned steps across {summary['apps']} app(s)")
-        if summary["by_state"]:
-            out.say(f"        {summary['by_state']}")
+        out.ok("database exists")
     else:
         out.say(out.dim("        (not created yet -- it appears on the first run)"))
 
@@ -447,16 +433,13 @@ def _live_reporter(out: Out):
             return
         state = kw["state"]
         action = kw["action"]
-        source = kw["source"]
         screenshot = kw.get("screenshot", False)
-        tag = out.green("CACHE") if source == "cache" else out.cyan(" LLM ")
         shot = " +img" if screenshot else ""
-        out.say(f"  {state.step:>3} [{tag}]{shot} {action.describe()}")
-        if source == "llm":
-            if getattr(action, "observation", None):
-                out.say(out.dim(f"        Obs:       {action.observation}"))
-            if getattr(action, "reasoning", None):
-                out.say(out.dim(f"        Reasoning: {action.reasoning}"))
+        out.say(f"  {state.step:>3}{shot} {action.describe()}")
+        if getattr(action, "observation", None):
+            out.say(out.dim(f"        Obs:       {action.observation}"))
+        if getattr(action, "reasoning", None):
+            out.say(out.dim(f"        Reasoning: {action.reasoning}"))
     return report
 
 
@@ -513,13 +496,8 @@ def cmd_run(args) -> int:
                     out.say(f"  {chunk}")
                 out.say()
             out.say(f"  {colour(outcome.upper())}  "
-                    f"{state.step} steps, {state.llm_calls} LLM calls "
-                    f"({state.cache_rate():.0%} from cache), "
+                    f"{state.step} steps, {state.llm_calls} LLM calls, "
                     f"{tilde}${spent:.4f}, {elapsed:.1f}s")
-            agreement = state.audit_agreement()
-            if agreement is not None:
-                note = f"  cache audited {state.audits}x, model agreed {agreement:.0%}"
-                out.say(out.dim(note) if agreement == 1.0 else out.yellow(note))
             if outcome != "success":
                 exit_code = 1
             if outcome in ("aborted", "needs_user"):
@@ -530,111 +508,10 @@ def cmd_run(args) -> int:
     return exit_code
 
 
-# ---------------------------------------------------------------------------
-# explore
-# ---------------------------------------------------------------------------
-
-def cmd_explore(args) -> int:
-    from .agent import explore
-    from .device import Device
-    from .llm import LLMClient
-    from .memory import Memory
-
-    out = Out()
-    cfg = build_config(args)
-    if not cfg.llm.model:
-        out.bad("no model chosen. Run `adbagent models` and pass --model.")
-        return 1
-
-    out.say(out.dim("  Explore is read-only: it navigates and scrolls, but never "
-                    "types and never presses anything that changes state."))
-    _ensure_device(args, cfg, out)
-    with Device(cfg, args.device or "") as dev, Memory(cfg) as mem:
-        llm = LLMClient(cfg, run_id=f"explore-{int(time.time())}")
-        result = explore(dev, mem, llm, cfg, package=args.app or "",
-                         max_screens=args.max_screens)
-    out.say()
-    out.say(f"  Visited {result['screens']} screen(s) in {result['steps']} steps, "
-            f"{result['llm_calls']} LLM calls, ${result['usd']:.4f}")
-    if result["blocked"]:
-        out.say(out.yellow(f"  Skipped {len(result['blocked'])} action(s) that "
-                           f"would have changed something:"))
-        for item in result["blocked"][:10]:
-            out.say(f"    - {item}")
-    return 0
 
 
-# ---------------------------------------------------------------------------
-# memory
-# ---------------------------------------------------------------------------
 
-def cmd_memory(args) -> int:
-    from .memory import Memory
 
-    out = Out()
-    cfg = build_config(args)
-    with Memory(cfg) as mem:
-        if args.memory_command == "ls":
-            entries = mem.entries(app_key=args.app or "", state=args.state or "")
-            if not entries:
-                out.say("  (nothing learned yet)")
-                return 0
-            out.say(f"  {'ID':>5}  {'STATE':<12} {'V':>2} {'OK':>4} {'BAD':>4}  "
-                    f"{'APP':<32} ACTION")
-            for e in entries:
-                out.say(f"  {e.id:>5}  {e.state:<12} {e.version:>2} "
-                        f"{e.stats.n_success:>4.0f} {e.stats.n_failure:>4.0f}  "
-                        f"{e.app_key[:32]:<32} {e.action.describe()}")
-            out.say()
-            out.say(f"  {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}")
-            return 0
-
-        if args.memory_command == "show":
-            entry = mem.get(args.id)
-            if entry is None:
-                out.bad(f"no entry {args.id}")
-                return 1
-            out.say(json.dumps({
-                "id": entry.id, "app": entry.app_key, "state": entry.state,
-                "version": entry.version, "skeleton": entry.skeleton_id,
-                "intent": entry.intent_id, "visit": entry.visit_ordinal,
-                "action": entry.action.model_dump(),
-                "anchor": entry.anchor.model_dump() if entry.anchor else None,
-                "postcondition": (entry.postcondition.model_dump()
-                                  if entry.postcondition else None),
-                "required_tokens": entry.required_tokens,
-                "forbidden_tokens": entry.forbidden_tokens,
-                "next_screen": entry.next_skeleton_id,
-                "alt_successors": entry.alt_successors,
-                "successes": entry.stats.n_success,
-                "failures": entry.stats.n_failure,
-                "wilson": round(entry.stats.wilson(), 3),
-            }, indent=2, default=str))
-            out.say()
-            out.say("  recent outcomes:")
-            for row in mem.db.execute(
-                    "SELECT grade, reason, match_distance, anchor_score, at "
-                    "FROM entry_outcome WHERE entry_id=? ORDER BY at DESC LIMIT 10",
-                    (entry.id,)):
-                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(row["at"]))
-                out.say(f"    {when}  {row['grade']:<10} d={row['match_distance']} "
-                        f"score={row['anchor_score']:.2f}  {row['reason'] or ''}")
-            return 0
-
-        if args.memory_command == "forget":
-            n = mem.forget(entry_id=args.id or 0, app_key=args.app or "",
-                           state=args.state or "")
-            out.say(f"  forgot {n} entr{'y' if n == 1 else 'ies'}")
-            return 0
-
-        if args.memory_command == "gc":
-            n = mem.gc()
-            out.say(f"  retired {n} entr{'y' if n == 1 else 'ies'}")
-            return 0
-
-        summary = mem.stats_summary()
-        out.say(json.dumps(summary, indent=2))
-        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -660,15 +537,13 @@ def cmd_report(args) -> int:
     for event in events:
         if event["kind"] == "decide":
             action = event.get("action", {})
-            tag = "CACHE" if event.get("source") == "cache" else " LLM "
             shot = " +img" if event.get("screenshot") else ""
-            out.say(f"  {event.get('step', 0):>3} [{tag}]{shot} "
+            out.say(f"  {event.get('step', 0):>3}{shot} "
                     f"{action.get('action')} {action.get('target') or ''}")
-            if event.get("source") == "llm":
-                if action.get("observation"):
-                    out.say(out.dim(f"        Obs:       {action.get('observation')}"))
-                if action.get("reasoning"):
-                    out.say(out.dim(f"        Reasoning: {action.get('reasoning')}"))
+            if action.get("observation"):
+                out.say(out.dim(f"        Obs:       {action.get('observation')}"))
+            if action.get("reasoning"):
+                out.say(out.dim(f"        Reasoning: {action.get('reasoning')}"))
         elif event["kind"] == "verify":
             out.say(f"      -> {event.get('grade')} {event.get('reason') or ''}")
         elif event["kind"] in ("dismiss", "refused", "loop_break", "sensitive",
@@ -679,8 +554,7 @@ def cmd_report(args) -> int:
     out.say()
     if end:
         out.say(f"  {end.get('outcome', '?').upper()}: {end.get('steps')} steps, "
-                f"{end.get('llm_calls')} LLM calls, "
-                f"{end.get('cache_hits')} cache hits, ${end.get('usd', 0):.4f}")
+                f"{end.get('llm_calls')} LLM calls, ${end.get('usd', 0):.4f}")
     return 0
 
 
@@ -764,8 +638,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="text that must be on screen for success")
     p.add_argument("--dry-run", dest="dry_run", action="store_true",
                    help="decide every step but execute nothing")
-    p.add_argument("--no-cache", dest="no_cache", action="store_true",
-                   help="ignore learned steps (the slow, expensive baseline)")
+
     p.add_argument("--always-screenshot", dest="always_screenshot",
                    action="store_true")
     p.add_argument("--never-screenshot", dest="never_screenshot",
@@ -780,38 +653,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_device(p)
     p.set_defaults(func=cmd_run)
 
-    p = sub.add_parser("explore", help="learn an app's layout, read-only")
-    p.add_argument("--app", help="package to explore")
-    p.add_argument("--max-screens", dest="max_screens", type=int, default=40)
-    p.add_argument("--max-steps", dest="max_steps", type=int)
-    p.add_argument("--budget-usd", dest="budget_usd", type=float)
-    p.add_argument("--unattended", action="store_true")
-    p.add_argument("--allow-destructive", dest="allow_destructive",
-                   action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--artifacts-dir", dest="artifacts_dir")
-    _add_common(p)
-    _add_device(p)
-    p.set_defaults(func=cmd_explore)
 
-    p = sub.add_parser("memory", help="inspect and curate what has been learned")
-    msub = p.add_subparsers(dest="memory_command")
-    for name, help_text in (("ls", "list learned steps"),
-                            ("show", "everything about one entry"),
-                            ("forget", "delete entries"),
-                            ("gc", "retire stale and quarantined entries"),
-                            ("stats", "summary")):
-        sp = msub.add_parser(name, help=help_text)
-        if name in ("show", "forget"):
-            sp.add_argument("id", nargs="?", type=int)
-        if name in ("ls", "forget"):
-            sp.add_argument("--app")
-            sp.add_argument("--state",
-                            choices=["probation", "active", "trusted",
-                                     "quarantined", "retired"])
-        _add_common(sp)
-        sp.set_defaults(func=cmd_memory, memory_command=name)
-    _add_common(p)
-    p.set_defaults(func=cmd_memory, memory_command="stats")
 
     p = sub.add_parser("report", help="summarise a recorded run")
     p.add_argument("run", help="path to runs/<id> or its events.jsonl")
