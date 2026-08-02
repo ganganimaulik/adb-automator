@@ -16,6 +16,8 @@ dependencies = [
     "pillow>=10.0",
     "lxml>=5.0",
     "retry2>=0.9.5",
+    "qrcode>=7.0",
+    "zeroconf>=0.130.0",
 ]
 
 [project.optional-dependencies]
