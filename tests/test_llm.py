@@ -196,3 +196,25 @@ def test_llm_config_model_fallbacks():
     cfg_custom = LLMConfig(model="main-model", model_small="small-model", model_image="vision-model")
     assert cfg_custom.small() == "small-model"
     assert cfg_custom.image() == "vision-model"
+
+
+def test_judge_uses_config_max_tokens(monkeypatch):
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = Config()
+    cfg.llm.max_tokens = 3200
+    client = LLMClient(cfg)
+
+    recorded_max_tokens = []
+    def mock_post(messages, *, model, schema, max_tokens, purpose):
+        recorded_max_tokens.append(max_tokens)
+        return '{"satisfied": true, "evidence": "all good"}', None
+
+    monkeypatch.setattr(client, "_post", mock_post)
+
+    verdict = client.judge(goal="test", rendered="xml", history=[])
+    assert verdict.satisfied is True
+    assert recorded_max_tokens == [3200]
+

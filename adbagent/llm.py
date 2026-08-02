@@ -491,9 +491,10 @@ class LLMClient:
             except TruncatedResponse as exc:
                 # Asking again with the same ceiling would truncate again. Give
                 # the model more room instead, once.
-                if budget >= 6000:
+                max_budget = max(self.cfg.llm.max_tokens * 2, 6000)
+                if budget >= max_budget:
                     raise
-                budget = min(6000, budget * 2)
+                budget = min(max_budget, budget * 2)
                 log.warning("%s; retrying with max_tokens=%d", exc, budget)
                 last_error = str(exc)
                 continue
@@ -538,7 +539,8 @@ class LLMClient:
         return self.structured(messages, AgentAction, model=target, purpose="decide")
 
     def judge(self, *, goal: str, rendered: str, history: Sequence[str],
-              screenshot: Optional[bytes] = None) -> "Verdict":
+              screenshot: Optional[bytes] = None,
+              max_tokens: int = 0) -> "Verdict":
         from . import prompts
 
         content: List[Dict[str, Any]] = [
@@ -551,7 +553,7 @@ class LLMClient:
         ]
         target = self.model_image if screenshot else self.model_small
         return self.structured(messages, Verdict, model=target,
-                               max_tokens=400, purpose="judge")
+                               max_tokens=max_tokens, purpose="judge")
 
 
 class Verdict(BaseModel):
