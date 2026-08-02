@@ -433,7 +433,8 @@ class LLMClient:
             kwargs["extra_body"] = extra
 
         last: Optional[Exception] = None
-        for attempt in range(5):
+        retries = self.cfg.llm.max_retries
+        for attempt in range(retries):
             self.limiter.wait()
             started = time.monotonic()
             try:
@@ -467,7 +468,7 @@ class LLMClient:
             log.warning("LLM call failed (%s); retrying in %.1fs", last, delay)
             time.sleep(delay)
 
-        raise LLMError(f"giving up after 5 attempts: {last}")
+        raise LLMError(f"giving up after {retries} attempts: {last}")
 
     # -- structured calls --------------------------------------------------
 

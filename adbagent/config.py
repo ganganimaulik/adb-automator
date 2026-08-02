@@ -48,6 +48,8 @@ class LLMConfig:
     api_key_env: str = "FIREWORKS_API_KEY"
     #: Seconds. Agentic workloads are long; Fireworks recommends 5-30 min.
     read_timeout: float = 300.0
+    #: How many times to retry a failed LLM call before giving up.
+    max_retries: int = 5
 
     def small(self) -> str:
         return self.model_small or self.model
