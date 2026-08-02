@@ -648,15 +648,24 @@ class Device:
                                         duration=duration), "swipe")
 
     def scroll(self, direction: str, scale: float = 0.6,
-               box: Optional[Sequence[int]] = None) -> None:
-        """Scroll the screen or a box. `direction` is the content's travel."""
-        # swipe_ext takes the *gesture* direction, which is the opposite of the
-        # direction the content moves: to scroll down, you swipe up.
-        gesture = {"down": "up", "up": "down", "left": "right", "right": "left"}
+               box: Optional[Sequence[int]] = None,
+               duration: Optional[float] = None) -> None:
+        """Scroll or swipe the screen or a box.
+
+        For vertical scrolling ("down"/"up"), "down" moves content down (swipes finger up)
+        and "up" moves content up (swipes finger down).
+        For horizontal swiping ("left"/"right"), "left" swipes finger left (showing next item/photo)
+        and "right" swipes finger right (showing previous item/photo).
+        """
+        gesture = {"down": "up", "up": "down", "left": "left", "right": "right"}
         gesture_dir = gesture.get(direction, direction)
+        kwargs: dict = {"scale": scale}
+        if box:
+            kwargs["box"] = tuple(box)
+        if duration is not None:
+            kwargs["duration"] = duration
         self._act(
-            lambda: self.u2.swipe_ext(gesture_dir, scale=scale,
-                                      box=tuple(box) if box else None),
+            lambda: self.u2.swipe_ext(gesture_dir, **kwargs),
             "scroll")
 
     def press(self, key: str) -> None:

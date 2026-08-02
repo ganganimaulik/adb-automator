@@ -37,10 +37,10 @@ THE ACTIONS
 - long_press      press and hold.
 - input_text      type into a field. Give the target and the text.
 - press_key       back, home, enter, recent, delete, search, menu.
-- scroll          move the content. "down" reveals what is below; "right" reveals \
-what is to the right. Use left/right for horizontal scrollers (carousels, tabs). \
-Set scroll_amount to control distance: 0.5 for half-page, 1 for one page (default), \
-up to 5 for fast navigation through long content like chat history.
+- scroll          move the content in lists or feeds. "down" reveals what is below; "up" reveals what is above. \
+Set scroll_amount to control distance: 0.5 for half-page, 1 for one page (default), up to 5 for fast navigation.
+- swipe           fast flick gesture to switch photos, cards, tabs, or full-page views. Use direction "left" for next photo/item \
+and "right" for previous photo/item. Supports `target` (element box), `scroll_amount` (scale), and `duration` (speed, default 0.15s).
 - open_app        launch a package by name, e.g. com.android.settings.
 - wait            let a slow screen finish loading.
 - ask_user        stop and ask the person for something only they can supply.

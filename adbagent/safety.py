@@ -235,7 +235,7 @@ class LoopDetector:
         dirs: List[str] = []
         for _, sig in reversed(self.history):
             parts = sig.split("/")
-            if parts[0] != "scroll":
+            if parts[0] not in ("scroll", "swipe"):
                 break
             dirs.append(parts[-1])  # direction is always the last segment
         dirs.reverse()
@@ -413,7 +413,7 @@ def is_read_only(action: AgentAction, screen: Screen) -> Tuple[bool, str]:
     spending money by accident, so the default here is to refuse anything that
     is not plainly navigational.
     """
-    if action.action in ("scroll", "wait", "done", "fail", "ask_user"):
+    if action.action in ("scroll", "swipe", "wait", "done", "fail", "ask_user"):
         return True, ""
     if action.action == "press_key":
         if action.key in ("back", "home", "recent"):
