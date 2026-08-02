@@ -101,12 +101,12 @@ class SafetyConfig:
     #: Empty means "any package". A run with --app pins this to that package.
     package_allowlist: List[str] = field(default_factory=list)
     budget_usd: float = 2.0
-    max_actions_per_minute: int = 60
     #: Skip the interactive confirmation on irreversible actions.
     allow_destructive: bool = False
     #: Never prompt; abort instead of asking. For unattended runs.
     unattended: bool = False
     allow_shell: bool = False
+
 
 
 @dataclass
@@ -207,10 +207,16 @@ def _apply_mapping(cfg: Config, data: Dict[str, Any], origin: str) -> List[str]:
             continue
         for key, value in values.items():
             try:
+                section = getattr(cfg, section_name, None)
+                if section and hasattr(section, key):
+                    current_val = getattr(section, key)
+                    if value == "" and current_val != "":
+                        continue
                 _set_path(cfg, f"{section_name}.{key}", value)
             except (KeyError, ValueError, TypeError) as exc:
                 warnings.append(f"{origin}: {exc}")
     return warnings
+
 
 
 def find_config_file(explicit: Optional[str] = None,
