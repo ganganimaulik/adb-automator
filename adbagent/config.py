@@ -18,13 +18,17 @@ from typing import Any, Dict, List, Optional
 DEFAULT_CONFIG_NAMES = ("config.json", "adbagent.json")
 
 # Packages the agent may always touch, whatever the target app is: the system UI
-# (status bar, ANR dialogs), the permission controller, and the package installer.
+# (status bar, ANR dialogs), the permission controller, the package installer,
+# and cross-app utilities like share sheets and file pickers.
 SYSTEM_PACKAGES = [
     "com.android.systemui",
     "com.google.android.permissioncontroller",
     "com.android.permissioncontroller",
     "com.android.packageinstaller",
     "com.google.android.packageinstaller",
+    "com.android.intentresolver",
+    "com.android.documentsui",
+    "com.google.android.markup",
     "android",
 ]
 

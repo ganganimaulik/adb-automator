@@ -287,12 +287,6 @@ class Agent:
                 self.dev.tap(*interstitial.center)
                 continue
 
-            if not safety.in_scope(screen, cfg):
-                if not self._recover_scope(state, screen):
-                    state.finished = "aborted"
-                    return
-                continue
-
             hint = state.loops.hint(screen.exact_id)
 
             # Scroll awareness: give the LLM full context about its
@@ -573,22 +567,6 @@ class Agent:
               f"  Do it on the device yourself, then re-run the goal.\n")
         state.finished = "needs_user"
 
-    # -- recovery ----------------------------------------------------------
-
-    def _recover_scope(self, state: RunState, screen: Screen) -> bool:
-        allowed = self.cfg.allowed_packages()
-        target = allowed[0] if allowed else ""
-        log.warning("left the target app (now in %s); going back",
-                    screen.package or "?")
-        state.consecutive_failures += 1
-        if state.consecutive_failures > 3 and target:
-            self.dev.open_app(target)
-            state.consecutive_failures = 0
-            return True
-        if state.consecutive_failures > 6:
-            return False
-        self.dev.press("back")
-        return True
 
     def _recover_device(self, state: RunState, exc: Exception) -> bool:
         log.warning("device trouble (%s); recovering", exc)

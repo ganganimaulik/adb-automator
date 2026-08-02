@@ -82,7 +82,7 @@ def test_config_file_wins_over_environment(monkeypatch, tmp_path):
 
 
 def test_app_flag_pins_the_package_allowlist():
-    cfg = build_config(parse(["run", "g", "--app", "com.android.settings"]))
+    cfg = build_config(parse(["explore", "--app", "com.android.settings"]))
     allowed = cfg.allowed_packages()
     assert "com.android.settings" in allowed
     # System chrome is always tolerated, or every permission dialog is an escape.

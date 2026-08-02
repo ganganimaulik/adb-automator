@@ -114,9 +114,11 @@ def build_config(args: argparse.Namespace):
     for warning in loaded.warnings:
         print(f"  config: {warning}", file=sys.stderr)
 
+    # Only the explore command uses --app to pin to a single package.
     app = getattr(args, "app", None)
     if app:
         loaded.config.safety.package_allowlist = [app]
+
     return loaded.config
 
 
@@ -634,7 +636,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run", help="pursue a goal on the device")
     p.add_argument("goal", help="what to accomplish, in plain language")
-    p.add_argument("--app", help="pin the run to one package")
     p.add_argument("--repeat", default="1",
                    help="how many times to repeat the goal ('inf' for forever)")
     p.add_argument("--max-steps", dest="max_steps", type=int)
