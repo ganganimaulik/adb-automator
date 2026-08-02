@@ -394,7 +394,7 @@ class Agent:
                       skeleton=screen.skeleton_id, action=action.model_dump(),
                       entry_id=getattr(entry, "id", None), screenshot=bool(screenshot))
             self.on_event("step", state=state, screen=screen, action=action,
-                          source=source)
+                          source=source, screenshot=bool(screenshot))
 
             # ---- 5. guard the chosen action -----------------------------
             label = safety.irreversible(action, screen)

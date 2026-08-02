@@ -526,6 +526,7 @@ class LLMClient:
             # Text before image: it measurably improves grounding, and the image
             # is the most volatile block so it must come last for cache reuse.
             content.append(image_part(screenshot))
+            log.info("submitting screenshot (%d bytes) to LLM", len(screenshot))
 
         messages = [
             {"role": "system",
@@ -551,6 +552,7 @@ class LLMClient:
                                         progress))]
         if screenshot:
             content.append(image_part(screenshot))
+            log.info("submitting screenshot (%d bytes) to LLM", len(screenshot))
         messages = [
             {"role": "system", "content": prompts.JUDGE_SYSTEM},
             {"role": "user", "content": content},
