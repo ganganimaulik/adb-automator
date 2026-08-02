@@ -636,16 +636,21 @@ class Device:
     def tap(self, x: int, y: int) -> None:
         # Any coordinate below 1 is interpreted by u2 as a *fraction* of the
         # screen, so a legitimate pixel 0 must be nudged to 1.
-        self._act(lambda: self.u2.click(max(1, int(x)), max(1, int(y))), "tap")
+        px, py = max(1, int(x)), max(1, int(y))
+        print(f"Tap at ({px}, {py})")
+        self._act(lambda: self.u2.click(px, py), "tap")
 
     def long_press(self, x: int, y: int, duration: float = 0.6) -> None:
-        self._act(lambda: self.u2.long_click(max(1, int(x)), max(1, int(y)), duration),
+        px, py = max(1, int(x)), max(1, int(y))
+        print(f"Long press at ({px}, {py}) (duration={duration:.2f}s)")
+        self._act(lambda: self.u2.long_click(px, py, duration),
                   "long_press")
 
     def swipe(self, fx: int, fy: int, tx: int, ty: int, duration: float = 0.25) -> None:
-        self._act(lambda: self.u2.swipe(max(1, int(fx)), max(1, int(fy)),
-                                        max(1, int(tx)), max(1, int(ty)),
-                                        duration=duration), "swipe")
+        pfx, pfy = max(1, int(fx)), max(1, int(fy))
+        ptx, pty = max(1, int(tx)), max(1, int(ty))
+        print(f"Swipe ({pfx}, {pfy}) -> ({ptx}, {pty}) (duration={duration:.2f}s)")
+        self._act(lambda: self.u2.swipe(pfx, pfy, ptx, pty, duration=duration), "swipe")
 
     def scroll(self, direction: str, scale: float = 0.6,
                box: Optional[Sequence[int]] = None,
@@ -657,6 +662,13 @@ class Device:
         For horizontal swiping ("left"/"right"), "left" swipes finger left (showing next item/photo)
         and "right" swipes finger right (showing previous item/photo).
         """
+        extra = []
+        if box:
+            extra.append(f"box={tuple(box)}")
+        if duration is not None:
+            extra.append(f"duration={duration:.2f}s")
+        extra_str = f", {', '.join(extra)}" if extra else ""
+        print(f"Scrolling {direction} (scale={scale}{extra_str})")
         gesture = {"down": "up", "up": "down", "left": "left", "right": "right"}
         gesture_dir = gesture.get(direction, direction)
         kwargs: dict = {"scale": scale}
@@ -672,9 +684,11 @@ class Device:
         key = key.lower()
         if key not in PRESS_KEYS:
             raise ValueError(f"unsupported key {key!r}; server accepts {sorted(PRESS_KEYS)}")
+        print(f"Press key {key!r}")
         self._act(lambda: self.u2.press(key), "press")
 
     def input_text(self, text: str, clear: bool = True) -> None:
+        print(f"Input text {text!r} (clear={clear})")
         self._act(lambda: self.u2.send_keys(text, clear=clear), "input_text")
 
     def clear_text(self) -> None:

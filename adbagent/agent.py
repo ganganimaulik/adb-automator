@@ -296,6 +296,7 @@ class Agent:
                 else:
                     log.warning("step %d: stuck in a loop; going back",
                                 state.step)
+                    self.on_event("loop_warning", message=f"step {state.step}: stuck in a loop; going back")
                     rec.event("loop_break", exact_id=screen.exact_id)
                     self.dev.press("back")
                     state.loops.record(screen.exact_id, "forced-back")
@@ -355,6 +356,7 @@ class Agent:
                 if state.scroll_warnings >= 3:
                     log.warning("step %d: rejecting scroll after %d warnings",
                                 state.step, state.scroll_warnings)
+                    self.on_event("loop_warning", message=f"step {state.step}: scroller stuck; rejecting scroll action")
                     rec.event("scroll_rejected", step=state.step,
                               action=action.describe())
                     state.last_failure = (
@@ -405,6 +407,7 @@ class Agent:
             # ---- 5. guard the chosen action -----------------------------
             label = safety.irreversible(action, screen)
             if label is not None:
+                self.on_event("safety_warning", message=f"step {state.step}: irreversible action {label!r} in {screen.package}")
                 if not safety.confirm(
                         f"Step {state.step}: the agent wants to press {label!r} "
                         f"in {screen.package}. This cannot be undone.", cfg):

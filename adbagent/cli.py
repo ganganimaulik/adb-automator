@@ -427,19 +427,31 @@ def cmd_dump(args) -> int:
 # run
 # ---------------------------------------------------------------------------
 
-def _live_reporter(out: Out):
+def _live_reporter(out: Out, max_steps: Optional[int] = None):
     def report(kind: str, **kw) -> None:
+        if kind == "loop_warning":
+            msg = kw.get("message", "")
+            out.say(out.yellow(f"        [Loop Warning] {msg}"))
+            return
+        if kind == "safety_warning":
+            msg = kw.get("message", "")
+            out.say(out.yellow(f"        [Safety Warning] {msg}"))
+            return
         if kind != "step":
             return
         state = kw["state"]
         action = kw["action"]
         screenshot = kw.get("screenshot", False)
         shot = " +img" if screenshot else ""
-        out.say(f"  {state.step:>3}{shot} {action.describe()}")
+        step_hdr = f"  [{state.step:>2}/{max_steps}]" if max_steps else f"  {state.step:>3}"
+        conf = " (confidence: low)" if getattr(action, "confidence", None) == "low" else ""
+        out.say(f"{step_hdr}{shot} {action.describe()}{conf}")
         if getattr(action, "observation", None):
             out.say(out.dim(f"        Obs:       {action.observation}"))
         if getattr(action, "reasoning", None):
             out.say(out.dim(f"        Reasoning: {action.reasoning}"))
+        if getattr(action, "progress", None):
+            out.say(out.dim(f"        Progress:  {action.progress}"))
     return report
 
 
@@ -476,7 +488,7 @@ def cmd_run(args) -> int:
             llm.run_id = f"run-{int(time.time())}-{iteration}"
             spent_before = llm.ledger.total_usd
             agent = Agent(dev, mem, llm, cfg, oracle=oracle,
-                          on_event=_live_reporter(out))
+                          on_event=_live_reporter(out, max_steps=cfg.run.max_steps))
             if infinite or total > 1:
                 out.say(out.bold(f"\n  iteration {iteration}"))
             started = time.monotonic()

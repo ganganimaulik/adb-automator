@@ -392,3 +392,42 @@ def test_textless_photo_screen_scroll_changed():
     outcome = verify(action, before, after)
     assert outcome.grade != "no_change"
 
+
+def test_scroll_base_scale_validation():
+    a = act(action="scroll", direction="down", base_scale=0.8)
+    assert a.base_scale == 0.8
+
+    with pytest.raises(ValidationError):
+        act(action="scroll", direction="down", base_scale=0.05)  # < 0.1
+
+    with pytest.raises(ValidationError):
+        act(action="scroll", direction="down", base_scale=1.2)   # > 1.0
+
+
+def test_scroll_execution_with_custom_base_scale():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    screen = s(X.settings_screen())
+
+    # Default base_scale (0.6)
+    action_default = act(action="scroll", direction="down")
+    execute(dev, action_default, screen)
+    dev.scroll.assert_called_with("down", scale=0.6, box=None, duration=0.3)
+
+    dev.scroll.reset_mock()
+
+    # Custom base_scale (0.8)
+    action_custom = act(action="scroll", direction="down", base_scale=0.8)
+    execute(dev, action_custom, screen)
+    dev.scroll.assert_called_with("down", scale=0.8, box=None, duration=0.3)
+
+
+def test_scroll_describe_with_base_scale():
+    a = act(action="scroll", direction="down", base_scale=0.8)
+    desc = a.describe()
+    assert "scroll down" in desc
+    assert "base_scale=0.8" in desc
+
+

@@ -135,8 +135,11 @@ class AgentAction(BaseModel):
     scroll_amount: float = Field(
         1, description="For scroll/swipe: distance or scale multiplier (0.25 for quarter page/small swipe, 1 for full page/swipe, up to 5).",
         ge=0.25, le=5)
+    base_scale: Optional[float] = Field(
+        None, description="For scroll: base drag scale per step (default 0.6, range 0.1 to 1.0).",
+        ge=0.1, le=1.0)
     duration: Optional[float] = Field(
-        None, description="For swipe/scroll: gesture duration in seconds (e.g. 0.15 for fast flick, 0.5 for scroll).",
+        None, description="For swipe/scroll: gesture duration in seconds (e.g. 0.15 for fast flick, 0.3 for scroll).",
         ge=0.05, le=3.0)
     confidence: Literal["high", "low"] = Field(
         "high", description="Use 'low' when unsure; you will be shown a screenshot.")
@@ -190,8 +193,9 @@ class AgentAction(BaseModel):
             bits.append(self.key)
         if self.direction:
             bits.append(self.direction)
-            if self.scroll_amount != 1.0:
-                bits.append(f"amount={self.scroll_amount}")
+            bits.append(f"amount={self.scroll_amount}")
+            if self.base_scale is not None:
+                bits.append(f"base_scale={self.base_scale}")
         return " ".join(bits)
 
 
@@ -206,6 +210,8 @@ def describe_target(target: Target, element: Optional[Element] = None) -> str:
             details.append(f'"{text_str}"')
         if element.resource_id:
             details.append(f"id={element.resource_id}")
+        if element.center:
+            details.append(f"at ({element.center[0]},{element.center[1]})")
         if element.checkable:
             details.append(f"checked={'true' if element.checked else 'false'}")
         if element.selected:
@@ -326,9 +332,9 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
             scale = min(0.95, max(0.2, 0.8 * amount))
             dev.scroll(action.direction or "left", scale=scale, box=box, duration=duration)
         else:
-            # Scroll action: default duration 0.5s for steady list scrolling
-            duration = action.duration if action.duration is not None else 0.5
-            base_scale = 0.6
+            # Scroll action: default duration 0.3s for steady list scrolling
+            duration = action.duration if action.duration is not None else 0.3
+            base_scale = action.base_scale if action.base_scale is not None else 0.6
             full_scrolls = int(amount)
             remainder = amount - full_scrolls
             import time
