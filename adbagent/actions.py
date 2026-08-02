@@ -237,8 +237,6 @@ def format_history_entry(step: int, action: AgentAction,
     obs = (action.observation or "").strip()
     if obs:
         obs_clean = " ".join(obs.split())
-        if len(obs_clean) > 60:
-            obs_clean = obs_clean[:57] + "..."
         parts.append(f"(Obs: {obs_clean})")
 
     if grade:
@@ -323,8 +321,8 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
                 action = action.model_copy(update={"direction": remapped})
         amount = max(0.25, min(action.scroll_amount, 5.0))
         if action.action == "swipe":
-            # Fast flick swipe: default duration 0.15s, single gesture with wider default scale 0.8
-            duration = action.duration if action.duration is not None else 0.15
+            # Swipe gesture: default duration 0.3s for reliable ViewPager/gallery transitions, single gesture with scale 0.8
+            duration = action.duration if action.duration is not None else 0.3
             scale = min(0.95, max(0.2, 0.8 * amount))
             dev.scroll(action.direction or "left", scale=scale, box=box, duration=duration)
         else:

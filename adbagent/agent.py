@@ -311,7 +311,12 @@ class Agent:
             want, note = needs_screenshot(state, screen, cfg)
             if want:
                 screenshot = self.dev.screenshot()
-            notes = " ".join(filter(None, (note, hint, state.last_failure)))
+            banned_actions = state.loops.bans_for(screen.skeleton_id)
+            ban_note = ""
+            if banned_actions:
+                ban_note = (f"BANNED ACTIONS on this screen (these produced NO change - DO NOT REPEAT): "
+                            f"{', '.join(sorted(banned_actions))}.")
+            notes = " ".join(filter(None, (note, hint, ban_note, state.last_failure)))
             action = self.llm.decide(                      ### LLM ###
                 goal=state.goal, rendered=render(screen), history=state.history,
                 width=screen.width, height=screen.height, package=screen.package,
@@ -388,12 +393,8 @@ class Agent:
             if getattr(action, "progress", None):
                 prog_text = action.progress.strip()
                 if prog_text:
-                    state.progress_log.append(prog_text)
-                    state.progress_chars += len(prog_text)
-                    # Keep only the most recent entries to stay bounded.
-                    while len(state.progress_log) > 5:
-                        removed = state.progress_log.pop(0)
-                        state.progress_chars -= len(removed)
+                    state.progress_log = [prog_text]
+                    state.progress_chars = len(prog_text)
 
             rec.event("decide", step=state.step, source=source,
                       skeleton=screen.skeleton_id, action=action.model_dump(),
@@ -484,11 +485,14 @@ class Agent:
                     h_dir = action.direction in ("left", "right")
                     axis = "horizontal" if h_dir else "vertical"
                     act_name = "Swiping" if action.action == "swipe" else "Scrolling"
+                    extra_tip = ""
+                    if h_dir and ("MediaView" in screen.activity or "gallery" in screen.activity.lower()):
+                        extra_tip = " Press back (#1) to return to the thumbnail grid or chat list and select photos directly."
                     state.last_failure = (
                         f"{act_name} {action.direction} did not reveal new "
                         f"content \u2014 you have reached the end of the "
                         f"{axis} scrollable area. Do not {action.action} "
-                        f"{action.direction} again here.")
+                        f"{action.direction} again here.{extra_tip}")
 
             state.loops.record(screen.exact_id, action.signature())
             state.history.append(

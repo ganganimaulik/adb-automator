@@ -139,19 +139,29 @@ def goal_block(goal: str) -> str:
     return f"GOAL: {goal}"
 
 
-def history_block(history: Sequence[str], scratchpad: str = "",
-                  progress: str = "") -> str:
-    parts = []
+def history_only_block(history: Sequence[str]) -> str:
     if not history:
-        parts.append("HISTORY: (nothing yet -- this is the first step)")
-    else:
-        parts.append("HISTORY (oldest first):\n" + "\n".join(history))
+        return "HISTORY: (nothing yet -- this is the first step)"
+    return "HISTORY (oldest first):\n" + "\n".join(history)
+
+
+def state_block(scratchpad: str = "", progress: str = "") -> str:
+    parts = []
     if scratchpad:
         parts.append("YOUR SCRATCHPAD (your latest collected data -- update this "
                      "with the complete list including any new items):\n" + scratchpad)
     if progress:
         parts.append("YOUR PROGRESS (your working memory of completed and "
                      "remaining sub-steps):\n" + progress)
+    return "\n\n".join(parts)
+
+
+def history_block(history: Sequence[str], scratchpad: str = "",
+                  progress: str = "") -> str:
+    parts = [history_only_block(history)]
+    st = state_block(scratchpad, progress)
+    if st:
+        parts.append(st)
     return "\n\n".join(parts)
 
 

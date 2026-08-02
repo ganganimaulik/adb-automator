@@ -252,6 +252,15 @@ def test_format_history_entry_rich_context():
     assert "-> success" in entry
 
 
+def test_format_history_entry_untruncated_observation():
+    el = BASE.elements[0]
+    long_obs = ("WhatsApp media viewer showing Krishna's 9:25 am photo: mixed nuts "
+                "(almonds, cashews, walnuts) on scale reading 6g.")
+    action = act(action="tap", target=Target(index=el.index), observation=long_obs)
+    entry = format_history_entry(37, action, screen=BASE, element=el)
+    assert f"(Obs: {long_obs})" in entry
+
+
 # ---------------------------------------------------------------------------
 # Multi-signal end-of-scroll detection
 # ---------------------------------------------------------------------------
