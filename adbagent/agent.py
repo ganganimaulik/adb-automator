@@ -164,6 +164,31 @@ class Recorder:
 # Screenshot policy
 # ---------------------------------------------------------------------------
 
+def step_metrics(calls: List[Any], detail: bool = True) -> Dict[str, Any]:
+    """Roll up the LLM calls one step made, for `events.jsonl`.
+
+    A step is not one call: a screenshot turn is an image analysis *and* a
+    decision, and a repaired reply is two decisions. Recording the total next to
+    the per-call breakdown is what makes "where did the 26 seconds go" a query
+    rather than an argument.
+
+    `detail=False` drops the per-call list, for the run-level rollup where every
+    call already has its own event.
+    """
+    per_call = [c.metrics() for c in calls]
+    return {
+        **({"calls": per_call} if detail else {}),
+        "n_calls": len(per_call),
+        "prompt_tokens": sum(c["prompt_tokens"] for c in per_call),
+        "cached_tokens": sum(c["cached_tokens"] for c in per_call),
+        "completion_tokens": sum(c["completion_tokens"] for c in per_call),
+        "reasoning_tokens": sum(c["reasoning_tokens"] for c in per_call),
+        "reasoning_chars": sum(c["reasoning_chars"] for c in per_call),
+        "latency_s": round(sum(c["latency_s"] for c in per_call), 3),
+        "usd": round(sum(c["usd"] for c in per_call), 6),
+    }
+
+
 def needs_screenshot(state: RunState, screen: Screen, cfg: Config) -> Tuple[bool, str]:
     """XML-first: pay for vision only when the tree cannot answer the question."""
     if cfg.run.never_screenshot:
@@ -208,6 +233,29 @@ class Agent:
         self.on_event = on_event or (lambda *a, **k: None)
         self.skills = SkillRegistry(cfg.skills.skills_dir)
 
+    # -- perception helpers ------------------------------------------------
+
+    def _ensure_screenshot(self, screen: Screen) -> bytes:
+        """The screenshot for `screen`, captured at most once.
+
+        Verification already grabs a screenshot of the screen it lands on, and
+        that screen becomes the next turn's `screen`. Capturing again here would
+        pay a second device round trip for a frame nothing has touched since --
+        and would leave the pager's `dhash` computed from different pixels than
+        the ones the model is shown, which is the signal that decides whether a
+        swipe advanced the item.
+
+        Every path that acts on the device between the two points -- dismissing
+        an interstitial, breaking a loop with `back` -- clears `screen` to None
+        and re-observes, so a screen carrying a screenshot is always current.
+        """
+        if screen.screenshot is None:
+            screen.screenshot = self.dev.screenshot()
+        if screen.dhash is None:
+            from .fingerprint import compute_dhash
+            screen.dhash = compute_dhash(screen.screenshot)
+        return screen.screenshot
+
     # -- public ------------------------------------------------------------
 
     def run(self, goal: str, run_id: str = "") -> Tuple[Outcome, RunState]:
@@ -239,7 +287,9 @@ class Agent:
             self.mem.end_run(run_id, outcome, state.step, state.llm_calls, usd)
             recorder.event("run_end", outcome=outcome, steps=state.step,
                            llm_calls=state.llm_calls,
-                           usd=round(usd, 6))
+                           usd=round(usd, 6),
+                           llm=step_metrics(self.llm.ledger.calls if self.llm else [],
+                                            detail=False))
             recorder.close()
 
         return state.finished or "failed", state
@@ -370,10 +420,7 @@ class Agent:
             screenshot: Optional[bytes] = None
             want, note = needs_screenshot(state, screen, cfg)
             if want:
-                screenshot = self.dev.screenshot()
-                screen.screenshot = screenshot
-                from .fingerprint import compute_dhash
-                screen.dhash = compute_dhash(screenshot)
+                screenshot = self._ensure_screenshot(screen)
                 if screen.is_pager and not state.item_key:
                     # The caption was hidden, so the item had no key until now;
                     # the screenshot gives it a pixel-derived one.
@@ -428,6 +475,7 @@ class Agent:
             model_name = self.llm.model if self.llm else ""
             self.on_event("llm_start", step=state.step, purpose="decide", model=model_name, screenshot=bool(screenshot))
             t0_llm = time.monotonic()
+            ledger_mark = self.llm.ledger.mark() if self.llm else 0
             action = self.llm.decide(                      ### LLM ###
                 goal=state.goal, rendered=render(screen), history=state.history,
                 width=screen.width, height=screen.height, package=screen.package,
@@ -437,7 +485,8 @@ class Agent:
                 step=state.step, recorder=rec,
                 on_event=self.on_event)
             t_llm = time.monotonic() - t0_llm
-            last_call = self.llm.ledger.calls[-1] if (self.llm and self.llm.ledger.calls) else None
+            step_calls = self.llm.ledger.since(ledger_mark) if self.llm else []
+            last_call = step_calls[-1] if step_calls else None
             self.on_event("llm_end", step=state.step, purpose="decide", elapsed=t_llm, call=last_call)
             state.llm_calls += 1
             state.want_screenshot = action.confidence == "low"
@@ -545,7 +594,8 @@ class Agent:
 
             rec.event("decide", step=state.step, source=source,
                       skeleton=screen.skeleton_id, action=action.model_dump(),
-                      screenshot=bool(screenshot))
+                      screenshot=bool(screenshot),
+                      wall_s=round(t_llm, 3), llm=step_metrics(step_calls))
             self.on_event("step", state=state, screen=screen, action=action,
                           source=source, screenshot=bool(screenshot))
 
@@ -609,10 +659,9 @@ class Agent:
             try:
                 after = self.dev.observe(settle=True)
                 if want or action.action in ("scroll", "swipe") or state.want_screenshot:
-                    shot_after = self.dev.screenshot()
-                    after.screenshot = shot_after
-                    from .fingerprint import compute_dhash
-                    after.dhash = compute_dhash(shot_after)
+                    # Also the screenshot the *next* turn will show the model, if
+                    # it wants one -- `_ensure_screenshot` will not re-take it.
+                    self._ensure_screenshot(after)
             except (DeviceTimeout, DeviceLost) as exc:
                 if not self._recover_device(state, exc):
                     state.finished = "aborted"
@@ -620,7 +669,6 @@ class Agent:
                 continue
             t_settle = time.monotonic() - t0_verify
             post = synthesise_postcondition(action, element)
-            expected = ""
             outcome = verify(action, screen, after, post, None)
 
             # A ViewPager quietly drops a fling it judges too slow or too short,
@@ -640,10 +688,7 @@ class Agent:
                 try:
                     execute(self.dev, retry, screen)
                     after = self.dev.observe(settle=True)
-                    shot_after = self.dev.screenshot()
-                    after.screenshot = shot_after
-                    from .fingerprint import compute_dhash
-                    after.dhash = compute_dhash(shot_after)
+                    self._ensure_screenshot(after)
                     outcome = verify(retry, screen, after, post, None)
                 except (ActionError, ValueError) as exc:
                     log.warning("step %d: pager retry failed: %s", state.step, exc)
@@ -764,10 +809,11 @@ class Agent:
         if self.llm is None:
             return "success"
 
-        shot = self.dev.screenshot()
+        shot = self._ensure_screenshot(screen)
         model_name = (self.llm.model_image if shot else self.llm.model_small) if self.llm else ""
         self.on_event("llm_start", step=state.step, purpose="judge", model=model_name, screenshot=bool(shot))
         t0_judge = time.monotonic()
+        ledger_mark = self.llm.ledger.mark()
         # The judge is shown everything the run collected, including records a
         # later rewrite of the notes dropped. Without that it grades the goal on
         # whatever survived the model's last edit -- which is how a run that had
@@ -781,10 +827,13 @@ class Agent:
                                  step=state.step, recorder=rec,
                                  on_event=self.on_event)
         t_judge = time.monotonic() - t0_judge
-        last_call = self.llm.ledger.calls[-1] if (self.llm and self.llm.ledger.calls) else None
+        judge_calls = self.llm.ledger.since(ledger_mark)
+        last_call = judge_calls[-1] if judge_calls else None
         self.on_event("llm_end", step=state.step, purpose="judge", elapsed=t_judge, call=last_call, verdict=verdict)
         state.llm_calls += 1
-        rec.event("judge", satisfied=verdict.satisfied, evidence=verdict.evidence)
+        rec.event("judge", step=state.step, satisfied=verdict.satisfied,
+                  evidence=verdict.evidence, wall_s=round(t_judge, 3),
+                  llm=step_metrics(judge_calls))
         if verdict.satisfied:
             log.info("verified: %s", verdict.evidence)
             return "success"

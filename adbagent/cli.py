@@ -712,9 +712,93 @@ def cmd_run(args) -> int:
 # report
 # ---------------------------------------------------------------------------
 
+def resolve_run(run_arg: Optional[str], artifacts_dir: str = "runs") -> Optional[Path]:
+    """A run directory from a path, or the most recent one for "latest"/omitted."""
+    if run_arg and run_arg != "latest":
+        return Path(run_arg).expanduser()
+    runs_dir = Path(artifacts_dir).expanduser()
+    if not runs_dir.is_dir():
+        return None
+    candidates = sorted((d for d in runs_dir.iterdir() if d.is_dir()),
+                        key=lambda d: d.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
+def _median(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    values = sorted(values)
+    mid = len(values) // 2
+    if len(values) % 2:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2
+
+
+def _percentile(values: List[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    values = sorted(values)
+    return values[min(len(values) - 1, int(len(values) * pct))]
+
+
+def _cost_summary(out: Out, events: List[Dict[str, Any]]) -> None:
+    """Where the wall clock and the tokens went.
+
+    Recorded per step by `agent.step_metrics`; runs from before that landed have
+    no `llm` block and simply print nothing.
+    """
+    steps = [e for e in events if e.get("kind") in ("decide", "judge") and e.get("llm")]
+    if not steps:
+        return
+
+    def col(key: str) -> List[float]:
+        return [float(e["llm"].get(key) or 0) for e in steps]
+
+    latency = [float(e.get("wall_s") or e["llm"].get("latency_s") or 0) for e in steps]
+    prompt, cached = col("prompt_tokens"), col("cached_tokens")
+    completion, reasoning = col("completion_tokens"), col("reasoning_tokens")
+    reasoning_chars = col("reasoning_chars")
+    # Providers do not all report `reasoning_tokens`; the characters we saw
+    # streamed are measured either way, so fall back to those at 4 chars/token.
+    if not any(reasoning) and any(reasoning_chars):
+        reasoning = [c / 4 for c in reasoning_chars]
+        estimated = " (est. from streamed text)"
+    else:
+        estimated = ""
+
+    total_prompt, total_cached = sum(prompt), sum(cached)
+    total_completion, total_reasoning = sum(completion), sum(reasoning)
+    hit_rate = (total_cached / total_prompt * 100) if total_prompt else 0.0
+    think_share = (total_reasoning / total_completion * 100) if total_completion else 0.0
+
+    out.say()
+    out.say(out.bold("  ── Cost of thinking ──"))
+    out.say(f"  latency/step   {_median(latency):6.1f}s median   "
+            f"{_percentile(latency, 0.9):6.1f}s p90   "
+            f"{sum(latency):8.0f}s total")
+    out.say(f"  prompt tokens  {_median(prompt):6.0f} median   "
+            f"{total_prompt:8.0f} total   "
+            f"{hit_rate:4.0f}% served from cache")
+    out.say(f"  output tokens  {_median(completion):6.0f} median   "
+            f"{total_completion:8.0f} total")
+    out.say(f"  of which think {_median(reasoning):6.0f} median   "
+            f"{total_reasoning:8.0f} total   "
+            f"{think_share:4.0f}% of output{estimated}")
+    if think_share >= 50:
+        out.say(out.dim("  Reasoning tokens dominate output, so they dominate "
+                        "latency: try a lower reasoning effort."))
+    if total_prompt and hit_rate < 40:
+        out.say(out.dim("  Low prompt-cache hit rate: something near the top of "
+                        "the prompt is changing every turn."))
+
+
 def cmd_report(args) -> int:
     out = Out()
-    path = Path(args.run).expanduser()
+    path = resolve_run(getattr(args, "run", None),
+                       getattr(args, "artifacts_dir", None) or "runs")
+    if path is None:
+        out.bad("no runs found")
+        return 1
     events_file = path / "events.jsonl" if path.is_dir() else path
     if not events_file.exists():
         out.bad(f"no events at {events_file}")
@@ -754,14 +838,17 @@ def cmd_report(args) -> int:
             out.say(f"      -> {event.get('grade')} {event.get('reason') or ''}")
         elif event["kind"] in ("dismiss", "refused", "loop_break", "sensitive",
                                "judge", "error", "gave_up"):
+            # `llm` and `wall_s` are per-call metrics; they are summarised in the
+            # cost block below rather than dumped inline as a dict.
             out.say(f"      [{event['kind']}] "
                     + " ".join(f"{k}={v}" for k, v in event.items()
-                               if k not in ("t", "kind")))
+                               if k not in ("t", "kind", "llm", "wall_s")))
     if last_notes:
         out.say()
         out.say(out.bold("  ── Collected Data ──"))
         out.say()
         out.say(f"  {last_notes}")
+    _cost_summary(out, events)
     out.say()
     if end:
         out.say(f"  {end.get('outcome', '?').upper()}: {end.get('steps')} steps, "
@@ -770,25 +857,118 @@ def cmd_report(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# replay
+# ---------------------------------------------------------------------------
+
+def cmd_replay(args) -> int:
+    """Re-issue a recorded run's decisions and diff them against what it did."""
+    from .actions import AgentAction
+    from .llm import LLMClient
+    from . import replay as rp
+
+    # `--json` puts a document on stdout, so the narration has to go quiet --
+    # otherwise the header lines land in whatever is parsing it. Failures still
+    # print, because a bare exit code is not a diagnosis.
+    out = Out()
+    say = Out(quiet=bool(args.json))
+
+    cfg = build_config(args)
+    if not cfg.llm.model:
+        out.bad("no model chosen. Run `adbagent models` and pass --model.")
+        return 1
+
+    path = resolve_run(getattr(args, "run", None), cfg.run.artifacts_dir)
+    if path is None:
+        out.bad("no runs found")
+        return 1
+
+    steps = getattr(args, "steps", None)
+    try:
+        cases = rp.load_cases(path, purpose=args.purpose, steps=steps,
+                              limit=args.limit or 0)
+    except rp.ReplayError as exc:
+        out.bad(str(exc))
+        return 1
+    if not cases:
+        out.bad(f"no replayable {args.purpose} cases in {path}")
+        return 1
+
+    llm = LLMClient(cfg, run_id=f"replay-{path.name}")
+    schema_cls = AgentAction if args.purpose == "decide" else None
+    if schema_cls is None:
+        out.bad(f"replaying {args.purpose!r} is not supported yet "
+                f"(only 'decide' has a schema to diff)")
+        return 1
+
+    def decide(messages: List[Dict[str, Any]]):
+        mark = llm.ledger.mark()
+        action = llm.structured(messages, AgentAction, model=cfg.llm.model,
+                               purpose="replay")
+        calls = llm.ledger.since(mark)
+        from .agent import step_metrics
+        return action, step_metrics(calls, detail=False)
+
+    mode = "rebuilt system prompt" if args.rebuild_system else "verbatim"
+    say.say(say.bold(f"  replaying {len(cases)} {args.purpose} case(s) from "
+                     f"{path.name}"))
+    say.say(say.dim(f"  mode: {mode}   model: {cfg.llm.model}"))
+    say.say()
+
+    colour = {"match": say.green, "same_action": say.yellow,
+              "differs": say.red, "error": say.red}
+
+    def show(result: rp.Result) -> None:
+        tag = colour[result.verdict](f"{result.verdict:<11}")
+        line = (f"  {result.step:>4}  {tag} {result.recorded:<28} "
+                f"{result.replayed or result.error:<28}")
+        if result.verdict != "match" and result.grade:
+            line += say.dim(f" (recorded: {result.grade})")
+        say.say(line)
+
+    report = rp.replay(cases, decide,
+                       rebuild_system_prompt=args.rebuild_system,
+                       on_result=None if args.json else show)
+    risky = report.regressions
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+        return 1 if risky else 0
+
+    say.say()
+    say.say(say.bold(f"  {report.count('match')}/{report.n} identical "
+                     f"({report.agreement * 100:.0f}%)"))
+    for verdict in ("same_action", "differs", "error"):
+        n = report.count(verdict)
+        if n:
+            say.say(f"  {n} {verdict.replace('_', ' ')}")
+    if report.skipped:
+        say.say(say.dim(f"  {len(report.skipped)} skipped (dumped images are "
+                        f"placeholders, not replayable)"))
+    if risky:
+        say.warn(f"{len(risky)} diverged from a step that had worked: "
+                 + ", ".join(str(r.step) for r in risky[:12]))
+    else:
+        say.ok("no divergence from a step that had worked")
+    thinking = report.median("reasoning_tokens") or report.median("reasoning_chars") / 4
+    tilde = "~" if llm.ledger.estimated else ""
+    say.say(say.dim(
+        f"  median {report.median('latency_s'):.1f}s/case, "
+        f"{report.median('completion_tokens'):.0f} output tokens "
+        f"({thinking:.0f} thinking), "
+        f"{tilde}${llm.ledger.total_usd:.4f} spent"))
+    return 1 if risky else 0
+
+
+# ---------------------------------------------------------------------------
 # scratchpad
 # ---------------------------------------------------------------------------
 
 def cmd_scratchpad(args) -> int:
     out = Out()
-    run_arg = getattr(args, "run", None)
-    if run_arg and run_arg != "latest":
-        path = Path(run_arg).expanduser()
-    else:
-        runs_dir = Path("runs")
-        if not runs_dir.exists():
-            out.bad("no runs directory found")
-            return 1
-        run_dirs = sorted([d for d in runs_dir.iterdir() if d.is_dir()],
-                          key=lambda d: d.stat().st_mtime, reverse=True)
-        if not run_dirs:
-            out.bad("no runs found in runs/")
-            return 1
-        path = run_dirs[0]
+    path = resolve_run(getattr(args, "run", None))
+    if path is None:
+        out.bad("no runs found")
+        return 1
 
     events_file = path / "events.jsonl" if path.is_dir() else path
     if not events_file.exists():
@@ -1093,9 +1273,31 @@ def build_parser() -> argparse.ArgumentParser:
 
 
     p = sub.add_parser("report", help="summarise a recorded run")
-    p.add_argument("run", help="path to runs/<id> or its events.jsonl")
+    p.add_argument("run", nargs="?", default="latest",
+                   help="path to runs/<id> or its events.jsonl "
+                        "(default: the most recent run)")
     _add_common(p)
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("replay",
+                       help="re-run a recorded run's decisions and diff them")
+    p.add_argument("run", nargs="?", default="latest",
+                   help="path to runs/<id> (default: the most recent run)")
+    p.add_argument("--rebuild-system", dest="rebuild_system",
+                   action="store_true",
+                   help="swap in the system prompt prompts.py builds today, "
+                        "to test a prompt edit (default: send the recording "
+                        "verbatim, to test a model or decoder change)")
+    p.add_argument("--limit", type=int, default=0,
+                   help="replay at most N cases, sampled evenly across the run")
+    p.add_argument("--steps", type=int, nargs="+",
+                   help="replay only these step numbers")
+    p.add_argument("--purpose", default="decide",
+                   help="which recorded calls to replay (default: decide)")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable report on stdout")
+    _add_common(p)
+    p.set_defaults(func=cmd_replay)
 
     p = sub.add_parser("scratchpad", help="show latest or specified run scratchpad / collected data")
     p.add_argument("run", nargs="?", default="latest", help="path to run directory or 'latest' (default)")
