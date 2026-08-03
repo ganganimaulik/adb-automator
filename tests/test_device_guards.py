@@ -53,6 +53,8 @@ def test_dangerous_commands_are_refused(command):
     "settings get global window_animation_scale",
     "settings put global window_animation_scale 0",
     "settings put system screen_off_timeout 1800000",
+    "settings put system accelerometer_rotation 0",
+    "settings put system user_rotation 0",
     "input tap 100 200",
     "am start -a android.intent.action.VIEW -d https://example.com",
     "pm list packages",

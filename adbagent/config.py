@@ -85,6 +85,8 @@ class DeviceConfig:
     watchdog_s: float = 60.0
     #: Zero the animator scales for the duration of the run (restored on exit).
     disable_animations: bool = True
+    #: Disable auto-rotate and force portrait mode for the duration of the run (restored on exit).
+    disable_auto_rotate: bool = True
 
 
 @dataclass
@@ -172,6 +174,7 @@ _ENV_MAP = {
     "ADBAGENT_BUDGET_USD": "safety.budget_usd",
     "ADBAGENT_MAX_STEPS": "run.max_steps",
     "ADBAGENT_SKILLS_DIR": "skills.skills_dir",
+    "ADBAGENT_DISABLE_AUTO_ROTATE": "device.disable_auto_rotate",
     "ANDROID_SERIAL": "device.serial",
 }
 
