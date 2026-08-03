@@ -17,22 +17,6 @@ from typing import Any, Dict, List, Optional
 
 DEFAULT_CONFIG_NAMES = ("config.json", "adbagent.json")
 
-# Packages the agent may always touch, whatever the target app is: the system UI
-# (status bar, ANR dialogs), the permission controller, the package installer,
-# and cross-app utilities like share sheets and file pickers.
-SYSTEM_PACKAGES = [
-    "com.android.systemui",
-    "com.google.android.permissioncontroller",
-    "com.android.permissioncontroller",
-    "com.android.packageinstaller",
-    "com.google.android.packageinstaller",
-    "com.android.intentresolver",
-    "com.android.documentsui",
-    "com.google.android.markup",
-    "android",
-]
-
-
 @dataclass
 class LLMConfig:
     provider: str = "fireworks"
@@ -103,14 +87,17 @@ class MemoryConfig:
 
 @dataclass
 class SafetyConfig:
-    #: Empty means "any package". A run with --app pins this to that package.
-    package_allowlist: List[str] = field(default_factory=list)
+    # A `package_allowlist` used to live here, along with an `allowed_packages()`
+    # that composed it with a list of system packages. Nothing ever consulted
+    # either, so setting it bought exactly nothing while reading like a sandbox.
+    # An inert safety control is worse than an absent one, so it is gone rather
+    # than documented. The guards that do work are in `safety.py`, and they key
+    # off what is on screen rather than off which package drew it.
     budget_usd: float = 2.0
     #: Skip the interactive confirmation on irreversible actions.
     allow_destructive: bool = False
     #: Never prompt; abort instead of asking. For unattended runs.
     unattended: bool = False
-    allow_shell: bool = False
 
 
 @dataclass
@@ -162,12 +149,6 @@ class Config:
 
     def api_key(self) -> str:
         return os.environ.get(self.llm.api_key_env, "")
-
-    def allowed_packages(self) -> List[str]:
-        """Target packages plus the system packages we always tolerate."""
-        if not self.safety.package_allowlist:
-            return []  # unrestricted
-        return list(dict.fromkeys(self.safety.package_allowlist + SYSTEM_PACKAGES))
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

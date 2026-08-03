@@ -523,3 +523,67 @@ def test_a_screenshot_turn_is_timed_for_both_of_its_calls(cfg, mem, tmp_path):
     decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
     assert decides[0]["llm"]["n_calls"] == 2
     assert decides[0]["wall_s"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Dead ends survive the run that found them
+# ---------------------------------------------------------------------------
+
+def test_a_dud_control_found_in_one_run_is_not_retried_in_the_next(cfg, mem):
+    """The only knowledge in this system that outlives the process.
+
+    Failures were being written to SQLite on every step and read back by nothing,
+    so every run rediscovered the same dud control on the same screen.
+    """
+    from adbagent.memory import intent_key
+
+    dev = fake.FakeDevice(cfg)
+    screen = dev.observe()
+    dud = AgentAction(observation="settings", reasoning="try it",
+                      action="tap", target={"index": 4})
+    mem.record_dead_end(screen, intent_key(GOAL), dud.signature(),
+                        "nothing changed")
+
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    note = "\n".join(llm.notes)
+    assert "KNOWN DEAD ENDS here from earlier runs" in note
+    assert dud.signature() in note
+    assert "nothing changed" in note
+
+
+def test_a_dead_end_from_a_different_goal_is_not_mentioned(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    screen = dev.observe()
+    dud = AgentAction(observation="settings", reasoning="try it",
+                      action="tap", target={"index": 4})
+    mem.record_dead_end(screen, "some-other-intent", dud.signature(), "no change")
+
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    Agent(dev, mem, llm, cfg).run(GOAL)
+    assert "KNOWN DEAD ENDS" not in "\n".join(llm.notes)
+
+
+def test_this_runs_bans_are_not_repeated_as_remembered_ones(cfg, mem):
+    """Both lists come from the same failure once it has been recorded, and
+    saying it twice in one prompt reads as two separate findings."""
+    dev = fake.FakeDevice(cfg)
+    calls = {"n": 0}
+
+    def policy(screen, llm):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            # #7 is "VPN", a row the fake never navigates from: no change.
+            return AgentAction(observation="settings", reasoning="try VPN",
+                               action="tap", target={"index": 7})
+        return AgentAction(observation="settings", reasoning="done",
+                           action="done", text="finished")
+
+    llm = fake.FakeLLM(dev, policy)
+    Agent(dev, mem, llm, cfg).run(GOAL)
+    for note in llm.notes:
+        signature = "tap/#7"
+        if "BANNED ACTIONS" in note and signature in note:
+            after = note.split("BANNED ACTIONS", 1)[1]
+            assert after.count(signature) == 1, note

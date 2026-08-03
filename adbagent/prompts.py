@@ -217,15 +217,6 @@ def state_block(scratchpad: str = "", progress: str = "") -> str:
     return "\n\n".join(parts)
 
 
-def history_block(history: Sequence[str], scratchpad: str = "",
-                  progress: str = "") -> str:
-    parts = [history_only_block(history)]
-    st = state_block(scratchpad, progress)
-    if st:
-        parts.append(st)
-    return "\n\n".join(parts)
-
-
 # ---------------------------------------------------------------------------
 # Situational advice
 # ---------------------------------------------------------------------------
@@ -321,12 +312,6 @@ def situational_notes(*, goal: str = "", is_pager: bool = False,
     if packages_seen > 1 or _mentions(goal, _SWITCH_WORDS):
         parts.append(MULTI_APP_ADVICE)
     return "\n\n".join(parts)
-
-
-def skill_block(skill_text: str) -> str:
-    if not skill_text:
-        return ""
-    return f"APP SKILL & GUIDANCE:\n{skill_text}"
 
 
 def screen_block(rendered: str, note: str = "", image_analysis: str = "") -> str:

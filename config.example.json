@@ -29,7 +29,6 @@
   },
 
   "safety": {
-    "package_allowlist": [],
     "budget_usd": 2.0,
     "allow_destructive": false,
     "unattended": false

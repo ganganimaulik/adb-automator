@@ -9,9 +9,9 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 log = logging.getLogger("adbagent.skills")
 
@@ -116,7 +116,7 @@ class Skill:
             f"**Packages**: {', '.join(self.packages) if self.packages else 'None'}",
             f"**Aliases**: {', '.join(self.aliases) if self.aliases else 'None'}",
             "",
-            f"## Description",
+            "## Description",
             self.description or "No description provided.",
             "",
         ]
@@ -385,8 +385,8 @@ class SkillGenerator:
         if existing_skill:
             prompt_parts.append(f"EXISTING SKILL DEFINITION:\n{json.dumps(existing_skill.to_dict(), indent=2)}")
         prompt_parts.append(f"USER TASKS PERFORMED: {tasks}")
-        prompt_parts.append(f"SCREEN STATES OBSERVED:\n" + "\n".join(screen_summaries or ["(none)"]))
-        prompt_parts.append(f"ACTIONS TAKEN DURING EXPLORATION:\n" + "\n".join(actions_taken or ["(none)"]))
+        prompt_parts.append("SCREEN STATES OBSERVED:\n" + "\n".join(screen_summaries or ["(none)"]))
+        prompt_parts.append("ACTIONS TAKEN DURING EXPLORATION:\n" + "\n".join(actions_taken or ["(none)"]))
         prompt_parts.append(f"Generate an updated, complete App Skill JSON object for {app_name_or_pkg} combining existing skill information and new exploration findings.")
 
         prompt = "\n\n".join(prompt_parts)

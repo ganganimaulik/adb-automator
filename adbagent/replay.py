@@ -55,6 +55,17 @@ class ReplayError(RuntimeError):
     pass
 
 
+def worked(grade: str) -> bool:
+    """Whether a recorded step's verification counted as a success.
+
+    An empty grade is a terminal action -- a `done` that stood, or a `fail` -- and
+    counts as having worked, because the run ended on it deliberately. Stated once
+    here because both the case and its result ask the same question, and two
+    copies of this tuple would drift.
+    """
+    return grade in ("", "success", "soft_fail")
+
+
 # ---------------------------------------------------------------------------
 # Loading a run
 # ---------------------------------------------------------------------------
@@ -78,12 +89,8 @@ class Case:
 
     @property
     def recorded_was_good(self) -> bool:
-        """Whether the baseline is worth agreeing with.
-
-        A step with no grade is a terminal action -- `done` that stood, or `fail`
-        -- and counts as good, since the run ended on it deliberately.
-        """
-        return self.grade in ("", "success", "soft_fail")
+        """Whether the baseline is worth agreeing with."""
+        return worked(self.grade)
 
 
 def has_stub_image(messages: Sequence[Dict[str, Any]]) -> bool:
@@ -259,8 +266,7 @@ class Result:
     @property
     def regression_risk(self) -> bool:
         """Diverged from a step that had worked."""
-        return self.verdict in ("differs", "error") and self.grade in (
-            "", "success", "soft_fail")
+        return self.verdict in ("differs", "error") and worked(self.grade)
 
 
 def compare(recorded: Dict[str, Any], replayed: Any) -> str:

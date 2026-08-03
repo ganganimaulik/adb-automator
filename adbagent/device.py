@@ -427,6 +427,12 @@ class Device:
             self._set_animations("0")
         if self.cfg.device.disable_auto_rotate:
             self._disable_auto_rotate()
+        # Before keeping the screen on, turn it on. `wake` existed and nothing
+        # called it, so a phone that had dimmed off since the last run started the
+        # next one against a black screen: an empty dump, a `degenerate` verdict,
+        # and a screenshot of nothing for the model to puzzle over. `stayon` only
+        # holds a screen that is already awake.
+        self.wake()
         self._keep_screen_awake()
         return self
 
@@ -718,12 +724,6 @@ class Device:
         if press_enter:
             self.press("enter")
 
-    def clear_text(self) -> None:
-        self._act(lambda: self.u2.clear_text(), "clear_text")
-
-    def hide_keyboard(self) -> None:
-        self._safe(lambda: self.u2.hide_keyboard())
-
     def get_clipboard(self) -> str:
         try:
             res = _guard(lambda: self.u2.clipboard, self.cfg.device.watchdog_s, "get_clipboard")
@@ -763,7 +763,6 @@ class Device:
             packages = [p for p in packages if q in p.lower()]
         return sorted(packages)
 
-    list_packages = list_apps
 
     def _act(self, fn: Callable[[], T], what: str) -> T:
         return _guard(fn, self.cfg.device.watchdog_s, what)

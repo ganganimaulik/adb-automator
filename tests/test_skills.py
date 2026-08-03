@@ -1,8 +1,4 @@
 import json
-from pathlib import Path
-import pytest
-
-from adbagent.config import Config
 from adbagent.skills import Skill, Workflow, SkillRegistry, SkillGenerator
 from adbagent.cli import main
 
@@ -131,20 +127,71 @@ class MockLLM:
         }
 
 
-def test_skill_generator(tmp_path):
+GENERATED = {
+    "name": "GeneratedApp",
+    "packages": ["com.generated.app"],
+    "aliases": ["genapp"],
+    "description": "Auto generated skill description",
+    "workflows": [{"name": "task1", "steps": "Step 1 details"}],
+    "nuances": ["Nuance 1"],
+    "recommendations": ["Recommendation 1"],
+}
+
+
+def test_skill_generator_saves_what_the_model_returned(tmp_path):
+    registry = SkillRegistry(tmp_path / "skills")
+    skill = SkillGenerator(registry).generate_from_exploration(
+        "com.generated.app", tasks="open the app and look around",
+        screen_summaries=["home screen"], actions_taken=["tap #1"],
+        llm_client=MockLLM(json.dumps(GENERATED)))
+
+    assert skill.name == "GeneratedApp"
+    assert skill.packages == ["com.generated.app"]
+    assert [w.name for w in skill.workflows] == ["task1"]
+    # Saved to disk and available to the next run, which is the point of the
+    # command -- an in-memory skill helps nobody.
+    assert (tmp_path / "skills" / "generatedapp.json").is_file()
+    assert SkillRegistry(tmp_path / "skills").find_by_package(
+        "com.generated.app") is not None
+
+
+def test_a_fenced_reply_is_still_parsed(tmp_path):
+    """Models wrap JSON in ```json fences whatever the prompt says."""
+    registry = SkillRegistry(tmp_path / "skills")
+    skill = SkillGenerator(registry).generate_from_exploration(
+        "com.generated.app", tasks="t", screen_summaries=[], actions_taken=[],
+        llm_client=MockLLM("```json\n" + json.dumps(GENERATED) + "\n```"))
+    assert skill.name == "GeneratedApp"
+
+
+def test_an_unparseable_reply_falls_back_instead_of_raising(tmp_path):
+    """An exploration run that ends in a bad reply should still leave a skill
+    holding the tasks it was given, not lose the whole session."""
+    registry = SkillRegistry(tmp_path / "skills")
+    skill = SkillGenerator(registry).generate_from_exploration(
+        "com.generated.app", tasks="open the app",
+        screen_summaries=[], actions_taken=[],
+        llm_client=MockLLM("I'm afraid I can't do that"))
+    assert skill.packages == ["com.generated.app"]
+    assert "open the app" in skill.workflows[0].steps
+
+
+def test_generating_again_merges_into_the_existing_skill(tmp_path):
     registry = SkillRegistry(tmp_path / "skills")
     generator = SkillGenerator(registry)
+    generator.generate_from_exploration(
+        "com.generated.app", tasks="t", screen_summaries=[], actions_taken=[],
+        llm_client=MockLLM(json.dumps(GENERATED)))
 
-    llm_resp = json.dumps({
-        "name": "GeneratedApp",
-        "packages": ["com.generated.app"],
-        "aliases": ["genapp"],
-        "description": "Auto generated skill description",
-        "workflows": [{"name": "task1", "steps": "Step 1 details"}],
-        "nuances": ["Nuance 1"],
-        "recommendations": ["Recommendation 1"]
-    })
-    mock_llm = MockLLM(llm_resp)
+    second = dict(GENERATED, nuances=["Nuance 2"],
+                  workflows=[{"name": "task2", "steps": "Step 2"}])
+    merged = generator.generate_from_exploration(
+        "com.generated.app", tasks="t", screen_summaries=[], actions_taken=[],
+        llm_client=MockLLM(json.dumps(second)))
+
+    assert set(merged.nuances) == {"Nuance 1", "Nuance 2"}
+    assert {w.name for w in merged.workflows} == {"task1", "task2"}
+
 
 def test_skill_merge():
     sk1 = Skill(

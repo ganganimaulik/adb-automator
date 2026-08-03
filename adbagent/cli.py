@@ -712,7 +712,6 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             out.say(out.dim(f"        Vision{m_str}: {result}"))
 
         elif kind == "step":
-            state = kw["state"]
             action = kw["action"]
             screenshot = kw.get("screenshot", False)
             shot = " +img" if screenshot else ""
