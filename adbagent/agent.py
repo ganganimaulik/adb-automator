@@ -332,8 +332,6 @@ class Agent:
                         return
                     continue
                 self.on_event("perceive", step=state.step, elapsed=time.monotonic() - t0_perceive)
-            self.mem.note_screen(screen)
-            self._last_package = screen.package
             if screen.package:
                 state.packages.add(screen.package)
 
@@ -485,11 +483,32 @@ class Agent:
                           read_count=state.items.read_count,
                           total=state.items.total)
 
-            banned_actions = state.loops.bans_for(screen.skeleton_id)
+            # Two sources, one note. `loops` remembers what failed in this run;
+            # `mem.dead_ends` remembers what failed in *earlier* runs on this
+            # screen for this goal, which is the only knowledge here that outlives
+            # the process. Recording those and never reading them back meant
+            # rediscovering the same dud control on every run.
+            banned_actions = set(state.loops.bans_for(screen.skeleton_id))
+            remembered = self.mem.dead_ends(screen, state.intent_id)
             ban_note = ""
-            if banned_actions:
-                ban_note = (f"BANNED ACTIONS on this screen (these produced NO change - DO NOT REPEAT): "
-                            f"{', '.join(sorted(banned_actions))}.")
+            if banned_actions or remembered:
+                lines = []
+                if banned_actions:
+                    lines.append(
+                        "BANNED ACTIONS on this screen (these produced NO change "
+                        f"- DO NOT REPEAT): {', '.join(sorted(banned_actions))}.")
+                fresh = {sig: why for sig, why in remembered.items()
+                         if sig not in banned_actions}
+                if fresh:
+                    lines.append(
+                        "KNOWN DEAD ENDS here from earlier runs (do not repeat "
+                        "them): " + "; ".join(
+                            f"{sig} ({why})" for sig, why in sorted(fresh.items()))
+                        + ".")
+                ban_note = "\n".join(lines)
+                rec.event("dead_ends", step=state.step,
+                          this_run=sorted(banned_actions),
+                          remembered=sorted(remembered))
             # Check for active app skill guidance
             skill_note = ""
             if cfg.skills.enabled:

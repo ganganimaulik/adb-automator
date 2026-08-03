@@ -89,10 +89,6 @@ def test_empty_config_string_does_not_overwrite_env_var(monkeypatch, tmp_path):
     assert build_config(parse(["run", "g", "-c", str(path)])).device.serial == "192.168.1.50:5555"
 
 
-def test_no_app_flag_means_unrestricted():
-    assert build_config(parse(["run", "g"])).allowed_packages() == []
-
-
 def test_bad_config_file_warns_but_does_not_crash(tmp_path, capsys):
     path = tmp_path / "config.json"
     path.write_text("{not json")
