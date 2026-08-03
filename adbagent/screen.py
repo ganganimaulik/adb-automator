@@ -213,6 +213,8 @@ class Screen:
     simhash: int = 0
     exact_id: str = ""
     tokens: Tuple[str, ...] = ()
+    screenshot: Optional[bytes] = None
+    dhash: Optional[int] = None
 
     def by_index(self, i: int) -> Optional[Element]:
         for el in self.elements:

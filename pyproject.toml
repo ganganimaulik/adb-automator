@@ -18,6 +18,7 @@ dependencies = [
     "retry2>=0.9.5",
     "qrcode>=7.0",
     "zeroconf>=0.130.0",
+    "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
