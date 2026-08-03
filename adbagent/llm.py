@@ -393,19 +393,22 @@ class LLMClient:
     # -- transport ---------------------------------------------------------
 
     def _extra_body(self) -> Dict[str, Any]:
-        if self.provider.name != "fireworks":
-            return {}
-        return {
-            # Pin the run to one replica so the static prefix keeps hitting the
-            # prompt cache, which is where most of the input discount comes from.
-            "prompt_cache_key": self.run_id or "adbagent",
-            # Fireworks silently truncates an over-long prompt by default. For an
-            # agent that would mean acting on a screen it only half saw.
-            "context_length_exceeded_behavior": "error",
-            # UI dumps are attacker-controllable text and can contain chat
-            # template markers.
-            "safe_tokenization": False,
-        }
+        extra: Dict[str, Any] = {}
+        if self.provider.name == "fireworks":
+            extra.update({
+                # Pin the run to one replica so the static prefix keeps hitting the
+                # prompt cache, which is where most of the input discount comes from.
+                "prompt_cache_key": self.run_id or "adbagent",
+                # Fireworks silently truncates an over-long prompt by default. For an
+                # agent that would mean acting on a screen it only half saw.
+                "context_length_exceeded_behavior": "error",
+                # UI dumps are attacker-controllable text and can contain chat
+                # template markers.
+                "safe_tokenization": False,
+            })
+        if self.cfg.llm.service_tier:
+            extra["service_tier"] = self.cfg.llm.service_tier
+        return extra
 
     def _post(self, messages: List[Dict[str, Any]], *, model: str,
               schema: Optional[Dict[str, Any]], max_tokens: int,

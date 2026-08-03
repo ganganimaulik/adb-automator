@@ -54,6 +54,8 @@ class LLMConfig:
     read_timeout: float = 300.0
     #: How many times to retry a failed LLM call before giving up.
     max_retries: int = 5
+    #: Service tier for request (e.g. "priority").
+    service_tier: str = ""
 
     def small(self) -> str:
         return self.model_small or self.model
@@ -150,6 +152,7 @@ _ENV_MAP = {
     "ADBAGENT_MODEL_SMALL": "llm.model_small",
     "ADBAGENT_MODEL_IMAGE": "llm.model_image",
     "ADBAGENT_PROVIDER": "llm.provider",
+    "ADBAGENT_SERVICE_TIER": "llm.service_tier",
     "ADBAGENT_BASE_URL": "llm.base_url",
     "ADBAGENT_RPM": "llm.rpm",
     "ADBAGENT_MAX_TOKENS": "llm.max_tokens",

@@ -241,3 +241,13 @@ def test_live_reporter_terminal_output(capsys):
     assert "Progress:  Step 2 of 5 done" in captured.out
     assert "[Loop Warning] step 3: stuck in a loop; going back" in captured.out
     assert "[Safety Warning] step 3: irreversible action 'delete' in com.example" in captured.out
+
+
+def test_service_tier_cli_and_env_precedence(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ADBAGENT_SERVICE_TIER", "priority")
+    assert build_config(parse(["run", "g"])).llm.service_tier == "priority"
+
+    cfg = build_config(parse(["run", "g", "--service-tier", "default"]))
+    assert cfg.llm.service_tier == "default"
+
