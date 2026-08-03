@@ -204,11 +204,26 @@ class FakeLLM:
         self.ledger = Ledger()
         self.seen_screenshots = 0
         self.notes: List[str] = []
+        #: Item labels the sweep asked to have read, in order.
+        self.reads_requested: List[str] = []
 
     def analyze_image(self, screenshot: bytes, *, goal: str = "", rendered: str = "", **kwargs) -> str:
         self.ledger.record(Call(model=self.model_image, prompt_tokens=500,
                                 completion_tokens=100, purpose="analyze_image"))
         return "fake visual analysis"
+
+    def read_item(self, screenshot: bytes, *, goal: str = "", label: str = "",
+                  **kwargs) -> str:
+        """One compact reading of one gallery item, as the sweep asks for.
+
+        Counted separately from `calls`: the point of sweeping is that these
+        replace *decide* calls, so a test that asserts the saving needs the two
+        numbers apart.
+        """
+        self.reads_requested.append(label)
+        self.ledger.record(Call(model=self.model_image, prompt_tokens=400,
+                                completion_tokens=30, purpose="read_item"))
+        return f"reading of {label or 'an unlabelled item'}"
 
     def decide(self, *, goal: str, rendered: str, history, width: int, height: int,
                package: str = "", screenshot: Optional[bytes] = None,

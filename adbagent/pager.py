@@ -515,6 +515,93 @@ class ItemLedger:
 
 
 # ---------------------------------------------------------------------------
+# Sweeping
+# ---------------------------------------------------------------------------
+#
+# Walking a set is the one thing an agent does that is genuinely mechanical.
+# Every turn of it asks the same question -- is there another item, and what does
+# it say -- and answers it with the same gesture. In the run this module was
+# written for, 71 of 127 steps were the single action `swipe #4 left`, each one
+# paid for with a full reasoning turn at 26s median and 96s at the ninetieth
+# percentile.
+#
+# So once the model has chosen to page forward and the item verifiably moved, the
+# loop keeps paging in code: swipe, read the item, ledger it, repeat. The model is
+# not being second-guessed -- its decision is being *repeated* for as long as the
+# situation stays the one it decided about. The moment anything is not mechanical
+# any more, control goes back.
+#
+# The gesture the sweep issues is the narrowest one available: a horizontal fling
+# on the pager element, in the direction the model asked for. It never taps, types,
+# navigates or presses a key, so there is no action it can take that the model did
+# not already authorise.
+
+#: Directions that page between items rather than scrolling within one.
+PAGING_DIRECTIONS = frozenset({"left", "right"})
+
+
+def can_sweep(screen: Screen, ledger: ItemLedger, *, action: str,
+              direction: str, moved: bool) -> bool:
+    """Whether a model-issued gesture authorises continuing mechanically.
+
+    Requires all of: the gesture was a horizontal page, on a screen that is a
+    pager with a flingable element, and it demonstrably moved the item. That last
+    condition is what makes this safe on an unfamiliar app -- a screen where the
+    swipe does nothing, or where "left" means something other than "next", never
+    gets a second automatic gesture.
+    """
+    if action not in ("swipe", "scroll") or direction not in PAGING_DIRECTIONS:
+        return False
+    if not moved:
+        return False
+    if not getattr(screen, "is_pager", False):
+        return False
+    if pager_element(screen) is None:
+        return False
+    return not stop_sweeping(screen, ledger, direction=direction)
+
+
+def stop_sweeping(screen: Screen, ledger: ItemLedger, *, direction: str,
+                  package: str = "") -> str:
+    """Why the sweep should hand back, or ``""`` to keep going.
+
+    Ordered by how far the situation has departed from "paging through a set":
+    left the set entirely, set finished, or merely lost the caption -- the last of
+    which is a pause rather than an ending, since the model's own instructions
+    tell it to tap the item to bring the title bar back.
+    """
+    if package and screen.package and screen.package != package:
+        return f"the foreground app changed to {screen.package}"
+    if not getattr(screen, "is_pager", False):
+        return "this is no longer a carousel"
+    if pager_element(screen) is None:
+        return "the pager element is no longer on screen"
+    if ledger.complete:
+        return "every item in the set has been read"
+    if direction in ledger.edges:
+        return f"the {direction} end of the set has been reached"
+    if not screen.item_label:
+        # A pixel-derived key is not ledgerable -- the crop moves with the
+        # chrome, so the same photo hashes differently once the toolbar goes.
+        # Sweeping on would advance through items the ledger cannot name.
+        return "the item caption is hidden, so items cannot be told apart"
+    return ""
+
+
+def sweep_summary(first_step: int, last_step: int, direction: str,
+                  swept: int, read: int, reason: str) -> str:
+    """One history line for a whole sweep.
+
+    A line per gesture would be twelve near-identical entries pushing the rest of
+    the history out of the prompt, to say something the ledger block already says
+    per item and in more detail.
+    """
+    span = f"{first_step}" if first_step == last_step else f"{first_step}-{last_step}"
+    return (f"{span}. swept {swept} item(s) {direction} through the carousel, "
+            f"read {read} — stopped because {reason}")
+
+
+# ---------------------------------------------------------------------------
 # Guidance
 # ---------------------------------------------------------------------------
 

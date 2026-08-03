@@ -59,6 +59,13 @@ class LLMConfig:
     max_retries: int = 5
     #: Service tier for request (e.g. "priority").
     service_tier: str = ""
+    #: True when `model` itself accepts images. The screenshot then goes straight
+    #: to the deciding call and the separate `model_image` description is skipped
+    #: -- one round trip per screenshot turn instead of two. Left off by default
+    #: because a text-only model given an image part fails the whole call, and
+    #: the catalogue flag that would settle it (`adbagent models --vision`) is not
+    #: consulted at run time.
+    vision_in_decider: bool = False
 
     def small(self) -> str:
         return self.model_small or self.model
@@ -119,6 +126,15 @@ class RunConfig:
     #: Maximum characters retained in the agent scratchpad. The scratchpad lets
     #: the agent accumulate data (messages, search results, etc.) across turns.
     scratchpad_max_chars: int = 50_000
+    #: After the model swipes through a carousel and the item verifiably moves,
+    #: keep swiping and reading in code rather than paying a full reasoning turn
+    #: to be told "swipe left" again. 71 of 127 steps in the run that motivated
+    #: this were exactly that one gesture.
+    pager_sweep: bool = True
+    #: Items per sweep before control returns to the model. The sweep stops on
+    #: its own at an edge, a hidden caption or a full ledger; this is the cap for
+    #: when none of those arrive, so an endless feed cannot run away with the run.
+    pager_sweep_max: int = 12
 
 
 @dataclass
@@ -173,6 +189,8 @@ _ENV_MAP = {
     "ADBAGENT_DB": "memory.db",
     "ADBAGENT_BUDGET_USD": "safety.budget_usd",
     "ADBAGENT_MAX_STEPS": "run.max_steps",
+    "ADBAGENT_PAGER_SWEEP": "run.pager_sweep",
+    "ADBAGENT_VISION_IN_DECIDER": "llm.vision_in_decider",
     "ADBAGENT_SKILLS_DIR": "skills.skills_dir",
     "ADBAGENT_DISABLE_AUTO_ROTATE": "device.disable_auto_rotate",
     "ANDROID_SERIAL": "device.serial",
