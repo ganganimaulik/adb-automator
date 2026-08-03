@@ -6,6 +6,8 @@ perceive → ask the LLM → guard → act → verify → learn → repeat.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from adbagent.actions import AgentAction
@@ -358,3 +360,116 @@ def test_scroll_swipe_no_change_does_not_ban_action(cfg, mem):
     assert "scroll/down" not in state.loops.bans_for(dev.observe().skeleton_id)
 
 
+
+
+# ---------------------------------------------------------------------------
+# Screenshots are captured once per screen
+# ---------------------------------------------------------------------------
+
+def test_a_screen_is_photographed_once_however_many_times_it_is_needed(cfg, mem):
+    """Verification's screenshot IS the next turn's screenshot.
+
+    `observe(settle=True)` has already waited for the tree to stop moving, and
+    every path that touches the device between verifying one step and deciding
+    the next (dismissing an interstitial, breaking a loop with `back`) drops the
+    screen and re-observes. So a second capture buys nothing and costs a device
+    round trip -- and leaves the pager comparing a `dhash` taken from different
+    pixels than the ones the model was shown.
+    """
+    cfg.run.always_screenshot = True
+    dev = fake.FakeDevice(cfg)
+    step_count = {"n": 0}
+
+    def policy(screen, llm):
+        step_count["n"] += 1
+        if step_count["n"] == 1:
+            return AgentAction(observation="feed", reasoning="scroll",
+                               action="scroll", direction="down")
+        return AgentAction(observation="feed", reasoning="finished",
+                           action="done", text="done")
+
+    llm = fake.FakeLLM(dev, policy)
+    outcome, state = Agent(dev, mem, llm, cfg).run("scroll the feed")
+    assert outcome == "success"
+    # Step 1 decides (1) and verifies (2). Step 2 reuses the verify screenshot,
+    # and so does the completion judge. Four captures would mean the fix regressed.
+    assert dev.screenshots == 2
+
+
+def test_the_screenshot_the_model_saw_is_the_one_the_dhash_came_from(cfg, mem):
+    from adbagent.agent import Agent as _Agent
+
+    dev = fake.FakeDevice(cfg)
+    agent = _Agent(dev, mem, None, cfg)
+    screen = dev.observe()
+    first = agent._ensure_screenshot(screen)
+    assert dev.screenshots == 1
+    assert agent._ensure_screenshot(screen) is first
+    assert dev.screenshots == 1
+
+
+# ---------------------------------------------------------------------------
+# Token instrumentation
+# ---------------------------------------------------------------------------
+
+def _events(tmp_path, run_id):
+    path = tmp_path / "runs" / run_id / "events.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()
+            if line.strip()]
+
+
+def test_every_decision_records_what_it_cost(cfg, mem, tmp_path):
+    """Latency work needs per-step tokens in the artifact, not just a total."""
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
+    assert decides
+    for event in decides:
+        metrics = event["llm"]
+        assert metrics["n_calls"] >= 1
+        assert metrics["prompt_tokens"] == 1000     # from FakeLLM's ledger
+        assert metrics["completion_tokens"] == 50
+        assert "wall_s" in event
+
+
+def test_a_vision_turn_is_attributed_both_of_its_calls(cfg, mem, tmp_path):
+    """A screenshot turn is an image analysis *then* a decision. Charging the
+    step for only the last one is how a 2-call turn reads as a 1-call turn."""
+    cfg.run.always_screenshot = True
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
+    assert decides[0]["llm"]["n_calls"] == 2
+    purposes = [c["purpose"] for c in decides[0]["llm"]["calls"]]
+    assert purposes == ["analyze_image", "decide"]
+    # 500 + 1000 prompt, 100 + 50 completion.
+    assert decides[0]["llm"]["prompt_tokens"] == 1500
+    assert decides[0]["llm"]["completion_tokens"] == 150
+
+
+def test_the_judge_is_costed_separately_from_the_step_that_proposed_done(cfg, mem, tmp_path):
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    judges = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "judge"]
+    assert len(judges) == 1
+    assert judges[0]["step"] == state.step
+    assert "llm" in judges[0] and "wall_s" in judges[0]
+
+
+def test_the_run_total_omits_the_per_call_breakdown(cfg, mem, tmp_path):
+    """Each call already has its own event; repeating them all in `run_end`
+    would double the size of the artifact for nothing."""
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    end = next(e for e in _events(tmp_path, state.run_id) if e["kind"] == "run_end")
+    assert "calls" not in end["llm"]
+    assert end["llm"]["n_calls"] >= 2
+    assert end["llm"]["prompt_tokens"] > 0

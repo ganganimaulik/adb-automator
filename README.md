@@ -258,6 +258,79 @@ line and the absorbed keys stop being keys while remaining perfectly present. An
 a shortened record only counts as a loss when a *figure* went missing or when most
 of the record did, so rewording "mixed nuts ~5g" to "nuts 5g" passes in silence.
 
+## Measuring a change
+
+Almost all of a run's wall clock is the model thinking. On a 136-step album walk:
+26s median per step against 3.4s to act, settle and verify — so every device-side
+optimisation is competing over 7% of the time. `adbagent report` says where the
+rest went:
+
+```
+  ── Cost of thinking ──
+  latency/step     26.2s median     96.3s p90       5186s total
+  prompt tokens     5500 median   698500 total       56% served from cache
+  output tokens     4400 median   558800 total
+  of which think    4200 median   533400 total       95% of output
+```
+
+Reasoning tokens are the interesting line. A model spending 4,200 of them to
+decide "swipe left again" is not being 95% smarter, it is being 20× slower, and
+until this block existed the number was invisible: `Call` carried
+`cached_tokens` and nothing populated it, and `completion_tokens` went to the
+terminal and nowhere else. Every call is now written into `events.jsonl` against
+the step that made it — including the second call a screenshot turn makes, which
+"the last call" silently dropped. Not all providers report `reasoning_tokens`;
+the thinking still arrives as `reasoning_content` deltas or inside `<think>`
+tags, so the characters are counted either way and the report says when it is
+falling back to them.
+
+Changing any of this means changing what the model does, which is why the runs
+are also a regression set. Each one already stores both halves of every
+decision: the exact messages sent (`step_NNN_decide_messages.json`) and the
+action that came back (`events.jsonl`). `adbagent replay` re-issues the messages
+and diffs the answers.
+
+```bash
+adbagent replay                          # the most recent run, verbatim
+adbagent replay runs/<id> --rebuild-system
+adbagent replay runs/<id> --limit 20 --json
+```
+
+Two modes, because they answer different questions. **Verbatim** holds the prompt
+fixed and varies the model, the temperature, the reasoning effort — this is the
+mode for "does thinking-off change any decision". **`--rebuild-system`** swaps
+message[0] for whatever `prompts.py` produces today and leaves the run's own
+observations alone — this is the mode for "did my prompt edit change any
+decision". The instructions all live in the system message; everything after it
+is observation. What is deliberately not offered is re-rendering the screen from
+the recording: the dumps keep the rendered text and not the XML, so a rebuilt
+screen block would be a re-quote rather than a re-render, and it would quietly
+stop testing `screen.py` the moment that module changed.
+
+Divergence is not failure, and treating it as failure is how a harness like this
+becomes noise you learn to ignore. Roughly one step in twenty of a real run was
+graded `no_change` or worse, and diverging from one of *those* is the outcome you
+were hoping for. So each case carries the grade its recorded action earned, and
+the two are reported apart:
+
+```
+  1/1 identical (100%)
+    14  differs     swipe #4 left   scroll #4 down   (recorded: no_change)
+  OK    no divergence from a step that had worked
+```
+
+The exit code is 1 only when a step that *had* worked came back different, so CI
+can gate on it. Prose is ignored when comparing — `observation`, `reasoning` and
+`notes` will never match verbatim and grading them would drown the signal. What
+counts is whether the phone would have been driven the same way. Two targets that
+name the same element differently (a recorded `#3` against a fresh
+`text="Wi-Fi"`) are reported as a divergence rather than guessed at: there is no
+live screen to resolve either against.
+
+Replaying costs real tokens against the real API. `--limit` samples evenly across
+the run rather than truncating, because the interesting steps of a long run are
+at the end and the first twenty are all opening navigation.
+
 ## Development
 
 ```bash

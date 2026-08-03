@@ -29,6 +29,10 @@ def test_every_subcommand_parses():
         ["dump", "--detail", "4"],
         ["run", "turn on wifi"],
         ["report", "runs/abc"],
+        ["report"],
+        ["replay"],
+        ["replay", "runs/abc", "--rebuild-system", "--limit", "10"],
+        ["replay", "runs/abc", "--steps", "4", "7", "--json"],
         ["apps", "--search", "whatsapp", "-3"],
     ):
         assert parse(argv).func is not None
@@ -139,6 +143,223 @@ def test_report_reads_a_run(tmp_path, capsys):
     assert "SUCCESS" in out and "0.0031" in out
     assert "Obs:       Settings list screen" in out
     assert "Reasoning: Tapping Wi-Fi settings element" in out
+    # A run recorded before per-call metrics existed has nothing to summarise.
+    assert "Cost of thinking" not in out
+
+
+def _metric_run(tmp_path, **over):
+    """A run directory whose decide events carry per-call metrics."""
+    metrics = {"n_calls": 1, "prompt_tokens": 5500, "cached_tokens": 3100,
+               "completion_tokens": 4400, "reasoning_tokens": 4200,
+               "reasoning_chars": 16800, "latency_s": 26.0, "usd": 0.002}
+    metrics.update(over)
+    run_dir = tmp_path / "runs" / "metrics"
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text("\n".join(json.dumps(e) for e in [
+        {"t": 1, "kind": "run_start", "goal": "browse the album", "model": "m"},
+        {"t": 2, "kind": "decide", "step": 1, "wall_s": 26.0, "llm": metrics,
+         "action": {"action": "swipe", "direction": "left"}},
+        {"t": 3, "kind": "verify", "step": 1, "grade": "success", "reason": ""},
+        {"t": 4, "kind": "decide", "step": 2, "wall_s": 96.0, "llm": metrics,
+         "action": {"action": "done"}},
+        {"t": 5, "kind": "run_end", "outcome": "success", "steps": 2,
+         "llm_calls": 2, "usd": 0.004},
+    ]))
+    return run_dir
+
+
+def test_report_summarises_where_the_time_went(tmp_path, capsys):
+    run_dir = _metric_run(tmp_path)
+    assert cmd_report(parse(["report", str(run_dir)])) == 0
+    out = capsys.readouterr().out
+    assert "Cost of thinking" in out
+    assert "56% served from cache" in out       # 6200 of 11000
+    assert "95% of output" in out               # 8400 of 8800
+    assert "lower reasoning effort" in out      # the conclusion, spelled out
+    # The metrics block is summarised, never dumped as a dict.
+    assert "'reasoning_chars'" not in out
+
+
+def test_report_flags_a_cold_prompt_cache(tmp_path, capsys):
+    run_dir = _metric_run(tmp_path, cached_tokens=0)
+    cmd_report(parse(["report", str(run_dir)]))
+    out = capsys.readouterr().out
+    assert "0% served from cache" in out
+    assert "changing every turn" in out
+
+
+def test_report_estimates_thinking_when_the_provider_will_not_say(tmp_path, capsys):
+    """Not every provider reports `reasoning_tokens`, but the thinking still
+    arrives on the wire, so the characters we counted stand in for it."""
+    run_dir = _metric_run(tmp_path, reasoning_tokens=0, reasoning_chars=16800)
+    cmd_report(parse(["report", str(run_dir)]))
+    out = capsys.readouterr().out
+    assert "est. from streamed text" in out
+    assert "4200 median" in out                 # 16800 chars / 4
+
+
+def test_report_defaults_to_the_most_recent_run(tmp_path, capsys, monkeypatch):
+    import os
+    monkeypatch.chdir(tmp_path)
+    older = tmp_path / "runs" / "older"
+    older.mkdir(parents=True)
+    (older / "events.jsonl").write_text(json.dumps(
+        {"t": 1, "kind": "run_start", "goal": "the older run", "model": "m"}))
+    newer = tmp_path / "runs" / "newer"
+    newer.mkdir(parents=True)
+    (newer / "events.jsonl").write_text(json.dumps(
+        {"t": 1, "kind": "run_start", "goal": "the newer run", "model": "m"}))
+    os.utime(older, (1, 1))
+
+    assert cmd_report(parse(["report"])) == 0
+    assert "the newer run" in capsys.readouterr().out
+
+
+def test_report_says_so_when_there_are_no_runs(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert cmd_report(parse(["report"])) == 1
+    assert "no runs found" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# replay
+# ---------------------------------------------------------------------------
+
+def _replay_run(tmp_path):
+    from adbagent.actions import AgentAction
+
+    run_dir = tmp_path / "runs" / "rep"
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text("\n".join(json.dumps(e) for e in [
+        {"t": 1, "kind": "run_start", "goal": "open wifi", "model": "m"},
+        {"t": 2, "kind": "decide", "step": 1,
+         "action": AgentAction(observation="o", reasoning="r", action="tap",
+                               target={"index": 3}).model_dump()},
+        {"t": 3, "kind": "verify", "step": 1, "grade": "success", "reason": ""},
+    ]))
+    (run_dir / "step_001_decide_messages.json").write_text(json.dumps([
+        {"role": "system", "content": "OLD SYSTEM PROMPT"},
+        {"role": "user", "content": "GOAL: open wifi"},
+    ]))
+    return run_dir
+
+
+def _fake_client(monkeypatch, answer):
+    """Stand in for LLMClient so no network or API key is needed."""
+    from adbagent.llm import Call, Ledger
+
+    class FakeClient:
+        seen = []
+
+        def __init__(self, cfg, run_id=""):
+            self.cfg = cfg
+            self.model = cfg.llm.model
+            self.ledger = Ledger()
+
+        def structured(self, messages, model_cls, **kw):
+            FakeClient.seen.append(messages)
+            self.ledger.record(Call(model=self.model, prompt_tokens=100,
+                                    completion_tokens=200, reasoning_tokens=150,
+                                    latency_s=1.5, purpose="replay"))
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+    FakeClient.seen = []
+    monkeypatch.setattr("adbagent.llm.LLMClient", FakeClient)
+    return FakeClient
+
+
+def test_replay_reports_agreement_and_exits_clean(tmp_path, capsys, monkeypatch):
+    from adbagent.actions import AgentAction
+    from adbagent.cli import cmd_replay
+
+    run_dir = _replay_run(tmp_path)
+    _fake_client(monkeypatch, AgentAction(observation="different words",
+                                          reasoning="also different",
+                                          action="tap", target={"index": 3}))
+    code = cmd_replay(parse(["replay", str(run_dir), "--model", "m"]))
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "1/1 identical" in out
+    assert "no divergence from a step that had worked" in out
+
+
+def test_replay_exits_nonzero_when_a_working_step_changed(tmp_path, capsys, monkeypatch):
+    from adbagent.actions import AgentAction
+    from adbagent.cli import cmd_replay
+
+    run_dir = _replay_run(tmp_path)
+    _fake_client(monkeypatch, AgentAction(observation="o", reasoning="r",
+                                          action="press_key", key="back"))
+    code = cmd_replay(parse(["replay", str(run_dir), "--model", "m"]))
+    out = capsys.readouterr().out
+    assert code == 1                       # so CI can gate on it
+    assert "diverged from a step that had worked: 1" in out
+    assert "tap #3" in out and "press_key back" in out
+
+
+def test_replay_sends_the_recording_verbatim_by_default(tmp_path, capsys, monkeypatch):
+    from adbagent.actions import AgentAction
+    from adbagent.cli import cmd_replay
+
+    run_dir = _replay_run(tmp_path)
+    client = _fake_client(monkeypatch, AgentAction(
+        observation="o", reasoning="r", action="tap", target={"index": 3}))
+
+    cmd_replay(parse(["replay", str(run_dir), "--model", "m"]))
+    assert client.seen[0][0]["content"] == "OLD SYSTEM PROMPT"
+
+    client.seen.clear()
+    cmd_replay(parse(["replay", str(run_dir), "--model", "m", "--rebuild-system"]))
+    assert "driving a real Android phone" in client.seen[0][0]["content"]
+
+
+def test_replay_json_is_machine_readable(tmp_path, capsys, monkeypatch):
+    from adbagent.actions import AgentAction
+    from adbagent.cli import cmd_replay
+
+    run_dir = _replay_run(tmp_path)
+    _fake_client(monkeypatch, AgentAction(observation="o", reasoning="r",
+                                          action="tap", target={"index": 3}))
+    cmd_replay(parse(["replay", str(run_dir), "--model", "m", "--json"]))
+    data = json.loads(capsys.readouterr().out)
+    assert data["cases"] == 1
+    assert data["agreement"] == 1.0
+    assert data["median"]["reasoning_tokens"] == 150
+
+
+def test_replay_survives_a_model_that_will_not_answer(tmp_path, capsys, monkeypatch):
+    from adbagent.cli import cmd_replay
+    from adbagent.llm import LLMError
+
+    run_dir = _replay_run(tmp_path)
+    _fake_client(monkeypatch, LLMError("never produced a valid AgentAction"))
+    code = cmd_replay(parse(["replay", str(run_dir), "--model", "m"]))
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "error" in out
+
+
+def test_replay_needs_a_model(tmp_path, capsys, monkeypatch):
+    from adbagent.cli import cmd_replay
+
+    monkeypatch.chdir(tmp_path)          # no config.json to supply one
+    run_dir = _replay_run(tmp_path)
+    assert cmd_replay(parse(["replay", str(run_dir)])) == 1
+    assert "no model chosen" in capsys.readouterr().out
+
+
+def test_replay_says_so_when_a_run_has_no_cases(tmp_path, capsys, monkeypatch):
+    from adbagent.cli import cmd_replay
+
+    _fake_client(monkeypatch, None)
+    run_dir = tmp_path / "runs" / "bare"
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text(json.dumps(
+        {"t": 1, "kind": "run_start", "goal": "g", "model": "m"}))
+    assert cmd_replay(parse(["replay", str(run_dir), "--model", "m"])) == 1
+    assert "no replayable decide cases" in capsys.readouterr().out
 
 
 def test_live_reporter_displays_llm_reasoning(capsys):
