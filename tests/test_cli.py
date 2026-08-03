@@ -508,27 +508,37 @@ def test_live_reporter_displays_notes(capsys):
         reasoning="Reading item",
         action="tap",
         target=Target(index=1),
-        notes="Item price is $15",
+        notes=[{"key": "Item B", "value": "$15"}],
     )
     reporter("step", state=state, action=action)
     captured = capsys.readouterr()
-    assert "Notes:     Item price is $15" in captured.out
+    # Records, not the pydantic repr of the list holding them.
+    assert "Notes:     Item B: $15" in captured.out
 
 
-def test_cmd_scratchpad(tmp_path, monkeypatch, capsys):
+def test_cmd_scratchpad_accumulates_the_deltas(tmp_path, monkeypatch, capsys):
+    """`notes` in an event is only that turn's delta, so the whole ledger has to
+    be rebuilt from every event rather than read off the last one."""
     from adbagent.cli import cmd_scratchpad
 
     runs_dir = tmp_path / "runs" / "run1"
     runs_dir.mkdir(parents=True)
     events = runs_dir / "events.jsonl"
-    events.write_text(json.dumps({"kind": "decide", "action": {"notes": "Collected data XYZ"}}) + "\n" +
-                      json.dumps({"kind": "image_analysis", "model": "vision-1", "result": "Digital scale showing 275g water"}) + "\n")
+    events.write_text("\n".join(json.dumps(e) for e in (
+        {"kind": "decide", "step": 1,
+         "action": {"notes": [{"key": "9:30", "value": "water 275g"}]}},
+        {"kind": "decide", "step": 2,
+         "action": {"notes": [{"key": "9:31", "value": "banana 120g"}]}},
+        {"kind": "image_analysis", "model": "vision-1",
+         "result": "Digital scale showing 275g water"},
+    )) + "\n")
 
     monkeypatch.chdir(tmp_path)
     args = parse(["scratchpad", "latest"])
     assert cmd_scratchpad(args) == 0
     captured = capsys.readouterr()
-    assert "Notes: Collected data XYZ" in captured.out
+    assert "9:30: water 275g" in captured.out
+    assert "9:31: banana 120g" in captured.out       # not just the last turn's
     assert "Latest Vision Analysis: Digital scale showing 275g water" in captured.out
 
 

@@ -16,6 +16,7 @@ $ adbagent run "turn on airplane mode" --app com.android.settings
 - **App Exploration:** Explores app UI layouts safely without modifying state.
 - **Run Reports:** Generate readable execution traces and reports for completed runs.
 - **Carousel Sweeps:** Pages through galleries in code once the model has chosen to, replacing a reasoning turn per photo with a one-line vision read.
+- **Data Collection That Cannot Drop:** The model sends each fact once as a `{key, value}` record and the harness keeps the union, so a reading it stops repeating is still on the record at the end.
 - **Replayable Runs:** Re-issues a recorded run's decisions against a changed prompt or model and diffs the results.
 
 ## Install
@@ -124,6 +125,23 @@ Speed knobs, in `config.json`:
 | `run.pager_sweep` | `true` | After the model pages through a carousel and the item verifiably moves, keep paging in code — a vision read per item instead of a reasoning turn. Stops at either end of the set, on a hidden caption, on a dialog, or on an app switch. |
 | `run.pager_sweep_max` | `12` | Items per sweep before control returns to the model. |
 | `llm.vision_in_decider` | `false` | Set when `llm.model` itself accepts images: the screenshot then goes straight to the deciding call instead of being described first by `llm.model_image`, which is one round trip per screenshot turn instead of two. Leave off for a text-only model — it would fail the whole call. |
+| `run.scratchpad_max_chars` | `50000` | Ceiling on the collected-data block in the prompt. Records are kept by the harness, so this only bounds how many are rendered back; the oldest go first and the block says how many it left out. |
+
+### Collected data
+
+A goal that spans screenfuls — a chat history, an album, a long list — needs the
+model to accumulate readings across turns. It used to do that by rewriting its
+complete ledger into one free-text field every turn, which put the whole run's
+findings behind an instruction it had to obey perfectly every time. In
+`runs/af76720d05c4` it did not: four measured weights became `[pending]` in a
+single rewrite, were never restated across the remaining 59 turns, and the run
+reported a photo as unreadable whose reading it had already taken.
+
+So the model now sends only what is new or corrected, as `{key, value}` records,
+and `scratchpad.py` maintains the union. A record it stops mentioning cannot go
+missing, because nothing replaces it. Reusing a key corrects that record and the
+value it replaced is kept alongside, so a re-read that disagrees with the first
+reading shows up as a disagreement rather than a silent overwrite.
 
 ## Development
 

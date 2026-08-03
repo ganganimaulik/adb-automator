@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from adbagent.actions import AgentAction
 from adbagent.config import Config
 from adbagent.fingerprint import attach
-from adbagent.llm import Call, Ledger, Verdict
+from adbagent.llm import Call, Ledger, ScreenAnalysis, Verdict
 from adbagent.screen import Screen, parse
 
 from . import xmlgen as X
@@ -204,13 +204,27 @@ class FakeLLM:
         self.ledger = Ledger()
         self.seen_screenshots = 0
         self.notes: List[str] = []
+        #: The rendered collected-data ledger as each turn saw it.
+        self.scratchpads: List[str] = []
         #: Item labels the sweep asked to have read, in order.
         self.reads_requested: List[str] = []
+        #: How many separate vision passes were made, and what they return.
+        self.analyses = 0
+        self.vision_reading = ""
+        self.vision_label = ""
 
-    def analyze_image(self, screenshot: bytes, *, goal: str = "", rendered: str = "", **kwargs) -> str:
+    @property
+    def needs_vision_pass(self) -> bool:
+        return True
+
+    def analyze_image(self, screenshot: bytes, *, goal: str = "", rendered: str = "",
+                      **kwargs) -> ScreenAnalysis:
         self.ledger.record(Call(model=self.model_image, prompt_tokens=500,
                                 completion_tokens=100, purpose="analyze_image"))
-        return "fake visual analysis"
+        self.analyses += 1
+        return ScreenAnalysis(reading=self.vision_reading,
+                              item_label=self.vision_label,
+                              notable="fake visual analysis")
 
     def read_item(self, screenshot: bytes, *, goal: str = "", label: str = "",
                   **kwargs) -> str:
@@ -235,6 +249,7 @@ class FakeLLM:
             if not image_analysis:
                 image_analysis = self.analyze_image(screenshot, goal=goal, rendered=rendered)
         self.notes.append(note)
+        self.scratchpads.append(scratchpad)
         self.ledger.record(Call(model=self.model, prompt_tokens=1000,
                                 completion_tokens=50, purpose="decide"))
         return self.policy(self.dev.observe(), self)

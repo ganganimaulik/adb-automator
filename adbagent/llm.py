@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, TypeVar
 
 import httpx
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import Config
 
@@ -422,6 +422,38 @@ def text_part(text: str) -> Dict[str, Any]:
     return {"type": "text", "text": text}
 
 
+class ScreenAnalysis(BaseModel):
+    """What the vision model is allowed to say about a screenshot.
+
+    Every field is optional in practice -- an empty string means "does not
+    apply" -- so the model is never pushed into inventing a dialog or a reading
+    to fill a slot. See :data:`prompts.IMAGE_ANALYSIS_SYSTEM` for why this
+    replaced free prose.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reading: str = Field("", description="The fact the goal asks for, read off "
+                                        "the image. Empty if not applicable.")
+    item_label: str = Field("", description="The app's own caption for the item "
+                                            "shown, if visible.")
+    blocking_dialog: str = Field("", description="Dialog or prompt covering the "
+                                                 "screen, with its buttons.")
+    notable: str = Field("", description="Anything else visually important that "
+                                         "the accessibility tree omits.")
+
+    def render(self) -> str:
+        """The lines worth putting in a prompt -- named, and only if filled."""
+        labels = (("reading", "Reading"), ("item_label", "Item label"),
+                  ("blocking_dialog", "BLOCKING"), ("notable", "Also visible"))
+        lines = []
+        for field_name, label in labels:
+            value = " ".join(str(getattr(self, field_name) or "").split())
+            if value:
+                lines.append(f"{label}: {value}")
+        return "\n".join(lines)
+
+
 class Prefetch:
     """A call started now and collected later, so it overlaps device work.
 
@@ -537,7 +569,8 @@ class LLMClient:
         if schema is not None:
             kwargs["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {"name": "AgentAction", "schema": schema},
+                "json_schema": {"name": schema.get("title") or "AgentAction",
+                                "schema": schema},
             }
         extra = self._extra_body()
         if extra:
@@ -773,9 +806,18 @@ class LLMClient:
 
     # -- the two things the agent loop actually calls -----------------------
 
+    @property
+    def needs_vision_pass(self) -> bool:
+        """True when a screenshot has to be described before the decider sees it.
+
+        False means the decider is looking at the image itself, and a separate
+        description would be a second round trip spent on prose it does not need.
+        """
+        return not self.cfg.llm.vision_in_decider
+
     def analyze_image(self, screenshot: bytes, *, goal: str = "", rendered: str = "",
                       step: int = 0, recorder: Optional[Any] = None,
-                      on_event: Optional[Callable[..., None]] = None) -> str:
+                      on_event: Optional[Callable[..., None]] = None) -> ScreenAnalysis:
         """Use the vision model (self.model_image) ONLY to analyze the image content."""
         from . import prompts
 
@@ -798,18 +840,26 @@ class LLMClient:
         kw = {}
         if on_event is not None:
             kw["on_event"] = on_event
-        raw, _ = self._post(messages, model=self.model_image, schema=None,
-                             max_tokens=self.cfg.llm.max_tokens, purpose="analyze_image",
-                             **kw)
+        try:
+            analysis = self.structured(messages, ScreenAnalysis,
+                                       model=self.model_image,
+                                       max_tokens=min(600, self.cfg.llm.max_tokens),
+                                       purpose="analyze_image", **kw)
+        except LLMError as exc:
+            # A vision model that cannot hold the schema is not worth failing the
+            # step over: the description is an aid, and the element list the
+            # decider actually acts on is unaffected.
+            log.warning("image analysis produced no usable answer: %s", exc)
+            analysis = ScreenAnalysis()
         elapsed = time.monotonic() - t0
-        result = raw.strip()
+        result = analysis.render()
         last_call = self.ledger.calls[-1] if self.ledger.calls else None
         if on_event:
             on_event("llm_end", step=step, purpose="analyze_image", elapsed=elapsed, call=last_call)
             on_event("image_analysis", step=step, model=self.model_image, elapsed=elapsed, result=result)
         if recorder is not None and hasattr(recorder, "event"):
             recorder.event("image_analysis", step=step, model=self.model_image, result=result)
-        return result
+        return analysis
 
     def read_item(self, screenshot: bytes, *, goal: str = "", label: str = "",
                   step: int = 0, recorder: Optional[Any] = None,
@@ -859,9 +909,12 @@ class LLMClient:
         # only worth a whole extra call when the decider is blind.
         inline_image = bool(screenshot) and self.cfg.llm.vision_in_decider
         if screenshot and not image_analysis and not inline_image:
+            # The agent normally runs this pass itself, because it wants the
+            # structured fields for its own ledgers; this covers the callers that
+            # do not -- the judge, replay, a bare `decide`.
             image_analysis = self.analyze_image(
-                screenshot, goal=goal, rendered=rendered, step=step, recorder=recorder, on_event=on_event
-            )
+                screenshot, goal=goal, rendered=rendered, step=step,
+                recorder=recorder, on_event=on_event).render()
 
         content: List[Dict[str, Any]] = [
             text_part(prompts.screen_block(rendered, note, image_analysis=image_analysis or ""))]

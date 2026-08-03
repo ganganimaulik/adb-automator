@@ -473,3 +473,53 @@ def test_the_run_total_omits_the_per_call_breakdown(cfg, mem, tmp_path):
     assert "calls" not in end["llm"]
     assert end["llm"]["n_calls"] >= 2
     assert end["llm"]["prompt_tokens"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Repeated history, folded in the loop
+# ---------------------------------------------------------------------------
+
+def test_a_repeated_action_folds_in_the_history_the_loop_keeps(cfg, mem):
+    """`prompts.history_only_block` renders whatever the loop appended, so the
+    fold has to happen on the way in -- see `actions.append_history`."""
+    cfg.run.max_steps = 8
+
+    def policy(screen, llm):
+        if llm.calls > 5:
+            return AgentAction(observation="enough", reasoning="stop",
+                               action="done", text="done waiting")
+        return AgentAction(observation=f"waiting, turn {llm.calls}",
+                           reasoning="let the screen settle",
+                           action="wait", duration=0.05)
+
+    _, state, _ = run(fake.FakeDevice(cfg), mem, cfg, policy)
+
+    waits = [line for line in state.history if "wait" in line]
+    assert len(waits) == 1, f"identical waits were not folded: {waits}"
+    assert "[x5]" in waits[0]
+    # The readings are what a fold must never discard.
+    assert "waiting, turn 1" in waits[0] and "waiting, turn 5" in waits[0]
+
+
+def test_the_situational_advice_only_shows_up_when_it_applies(cfg, mem):
+    """The gallery, scrolling and app-switching blocks are 36% of what the system
+    prompt used to be, and irrelevant on a turn like this one."""
+    dev = fake.FakeDevice(cfg)
+    _, _, llm = run(dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+
+    assert llm.notes, "no NOTE block was built at all"
+    assert not any("BROWSING A GALLERY" in note for note in llm.notes)
+    assert not any("SWITCHING APPS" in note for note in llm.notes)
+
+
+def test_a_screenshot_turn_is_timed_for_both_of_its_calls(cfg, mem, tmp_path):
+    """`report`'s latency/step reads `wall_s`, so a step whose cost covers two
+    calls must have a clock that covers them too."""
+    cfg.run.always_screenshot = True
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
+    assert decides[0]["llm"]["n_calls"] == 2
+    assert decides[0]["wall_s"] > 0

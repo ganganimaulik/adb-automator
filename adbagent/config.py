@@ -123,8 +123,10 @@ class RunConfig:
     always_screenshot: bool = False
     never_screenshot: bool = False
     dry_run: bool = False
-    #: Maximum characters retained in the agent scratchpad. The scratchpad lets
-    #: the agent accumulate data (messages, search results, etc.) across turns.
+    #: Ceiling on the collected-data block in the prompt. The model sends one
+    #: record at a time and the harness keeps the union, so this bounds how much
+    #: of that union is rendered back -- the oldest records go first, and the
+    #: block says how many it left out.
     scratchpad_max_chars: int = 50_000
     #: After the model swipes through a carousel and the item verifiably moves,
     #: keep swiping and reading in code rather than paying a full reasoning turn
