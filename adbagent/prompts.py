@@ -44,8 +44,8 @@ THE ACTIONS
 - input_text      type into a field. Give the target and text. Supports optional `clear=false` to append without clearing, and `press_enter=true` to submit/search immediately.
 - press_key       back, home, enter, recent, delete, search, menu.
 - scroll          move the content in lists or feeds. "down" reveals what is below; "up" reveals what is above. \
-Set scroll_amount to control distance: 0.5 for half-page, 1 for one page (default), up to 5 for fast navigation. \
-Supports optional `base_scale` to control swipe scale per step (default 0.6, range 0.1 to 1.0).
+Set scroll_amount to control distance or multi-step scrolling: 0.5 for small adjustment, 1 for single page (default), or 2 to 5 for fast multi-step scrolling in a single turn. \
+Supports optional `base_scale` to control swipe scale per step (e.g. 0.8 or 0.9 for larger page coverage per step, default 0.6, range 0.1 to 1.0).
 - swipe           fast flick gesture to switch photos, cards, tabs, or full-page views. Use direction "left" for next photo/item \
 and "right" for previous photo/item. Supports `target` (element box), `scroll_amount` (scale), and `duration` (speed, default 0.15s).
 - open_app        launch an app by package name (e.g. com.android.settings) or common name (e.g. "whatsapp", "spotify").
@@ -58,7 +58,8 @@ and "right" for previous photo/item. Supports `target` (element box), `scroll_am
 - fail            the goal cannot be achieved. Say why, in `text`.
 
 RULES
-- Prefer one small step at a time; you will see the result before acting again.
+- For actions like tap, input_text, or navigating, prefer one step at a time. \
+However, when searching long chat histories, feeds, or long lists, use fast scrolling (`scroll_amount=2` to `4` and/or `base_scale=0.8`) to reach your goal quickly in fewer turns.
 - If the screen looks unchanged after your last action, do something different \
 rather than repeating yourself.
 - Dismiss permission dialogs, cookie banners and "rate this app" popups when \
@@ -72,6 +73,9 @@ on the next turn.
 
 SCROLLING STRATEGY
 When searching for content in a long list or chat history:
+- Fast scrolling when far away: When searching through past chat messages, long feeds, or search results, use `scroll_amount=2` to `4` (or `base_scale=0.8`) to scroll faster and cover more content in fewer turns.
+- Slow down near the target: As you approach the target time range, date, or section, reduce to `scroll_amount=1.0` or `0.5` so you do not overshoot or skip past the relevant message/item.
+- Backtrack if overshot: If a fast scroll jumped past your target (e.g. timestamps jumped past your target time/date), take a small step in the opposite direction (`scroll_amount=0.5` or `1.0`) to reveal the skipped content.
 - Decide which direction to scroll based on whether you need older (up/scroll up) \
 or newer (down/scroll down) content.
 - Commit to that direction. Do NOT reverse direction or tap "Go to most recent \
@@ -190,11 +194,37 @@ def history_block(history: Sequence[str], scratchpad: str = "",
     return "\n\n".join(parts)
 
 
-def screen_block(rendered: str, note: str = "") -> str:
+def screen_block(rendered: str, note: str = "", image_analysis: str = "") -> str:
     out = f"CURRENT SCREEN:\n{rendered}"
+    if image_analysis:
+        out += f"\n\nVISUAL SCREEN ANALYSIS (from image model):\n{image_analysis}"
     if note:
         out += f"\n\nNOTE: {note}"
     return out
+
+
+IMAGE_ANALYSIS_SYSTEM = """\
+You are an expert visual analyst for mobile screen interfaces.
+Your task is to analyze the screenshot of an Android device and describe what is visible on screen.
+
+Focus on:
+1. Active screen layout, main components, visible text, headers, and UI state.
+2. Any dialogs, popups, overlays, permission prompts, cookie banners, or error messages.
+3. Unlabelled icons, images, canvas contents, or custom controls that may not be present in accessibility text.
+4. Highlights, selected tabs, disabled buttons, or input field contents.
+
+Be concise, accurate, and focus on visual facts that help accomplish the user's goal. Do NOT suggest actions or next steps; ONLY describe what is visually present on the screen.
+"""
+
+
+def image_analysis_user(goal: str = "", rendered: str = "") -> str:
+    parts = []
+    if goal:
+        parts.append(f"GOAL: {goal}")
+    if rendered:
+        parts.append(f"ACCESSIBILITY TREE (rendered text):\n{rendered}")
+    parts.append("Analyze the provided screenshot image and describe what is visually visible on the screen.")
+    return "\n\n".join(parts)
 
 
 JUDGE_SYSTEM = """\
@@ -213,10 +243,13 @@ cannot see proof, say false and explain what is missing.
 
 
 def judge_user(goal: str, history: Sequence[str], rendered: str,
-               scratchpad: str = "", progress: str = "") -> str:
+               scratchpad: str = "", progress: str = "",
+               image_analysis: str = "") -> str:
     parts = (f"GOAL: {goal}\n\n"
              f"WHAT THE AGENT DID:\n" + "\n".join(history or ["(nothing)"]) +
              f"\n\nFINAL SCREEN:\n{rendered}")
+    if image_analysis:
+        parts += (f"\n\nVISUAL SCREEN ANALYSIS (from image model):\n{image_analysis}")
     if scratchpad:
         parts += (f"\n\nCOLLECTED DATA (agent's scratchpad):\n{scratchpad}")
     if progress:
@@ -230,3 +263,4 @@ Your previous reply was not valid against the schema.
 Error: {error}
 
 Reply again with ONLY the corrected JSON object. No explanation, no fences."""
+

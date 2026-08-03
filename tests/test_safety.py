@@ -196,6 +196,18 @@ def test_history_window_is_bounded():
     assert len(loops.history) <= safety.WINDOW
 
 
+def test_element_history_tracking_and_hints():
+    loops = safety.LoopDetector()
+    assert loops.element_history_hint("album_screen") is None
+
+    loops.record_element_action("album_screen", 29, "tap/#6", "tap #6 [View photo 1 of 10]")
+    hint = loops.element_history_hint("album_screen")
+    assert hint is not None
+    assert "PREVIOUS ACTIONS ON THIS SCREEN: step 29: tap #6 [View photo 1 of 10]" in hint
+    assert "do NOT repeat an element index (#N)" in hint
+    assert loops.element_history_hint("other_screen") is None
+
+
 # ---------------------------------------------------------------------------
 # Explore mode: read-only classification
 # ---------------------------------------------------------------------------
