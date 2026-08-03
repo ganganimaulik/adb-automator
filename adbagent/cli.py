@@ -460,26 +460,7 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
     }
 
     def _tail_text(text: str, max_visual_lines: int, width: int) -> str:
-        lines = text.splitlines()
-        if not lines:
-            return text
-        w = max(20, width)
-        used = 0
-        start_idx = len(lines)
-        for i in range(len(lines) - 1, -1, -1):
-            line_len = len(lines[i])
-            vis = max(1, (line_len + w - 1) // w)
-            if used + vis > max_visual_lines and start_idx < len(lines):
-                break
-            used += vis
-            start_idx = i
-
-        if start_idx == 0:
-            return text
-
-        omitted = start_idx
-        truncated_lines = lines[start_idx:]
-        return f"... ({omitted} earlier lines truncated)\n" + "\n".join(truncated_lines)
+        return text
 
     def _render_live_panel() -> Any:
         if not _HAS_RICH:
@@ -487,32 +468,13 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
         thinking = stream_state["thinking_text"].strip()
         content = stream_state["content_text"].strip()
 
-        console = stream_state.get("console")
-        term_height = console.height if (console and getattr(console, "height", None)) else 24
-        term_width = console.width if (console and getattr(console, "width", None)) else 80
-
-        max_body_lines = max(6, term_height - 5)
-        text_width = max(20, term_width - 6)
-
         parts = []
-        if thinking and content:
-            avail_text = max(4, max_body_lines - 4)
-            thinking_max = max(3, avail_text // 3)
-            content_max = avail_text - thinking_max
-            t_tail = _tail_text(thinking, thinking_max, text_width)
-            c_tail = _tail_text(content, content_max, text_width)
-            parts.append(f"[dim italic][Thinking]\n{t_tail}[/dim italic]")
-            parts.append(f"[cyan bold][Response][/cyan bold]\n[dim]{c_tail}[/dim]")
-        elif thinking:
-            avail_text = max(3, max_body_lines - 1)
-            t_tail = _tail_text(thinking, avail_text, text_width)
-            parts.append(f"[dim italic][Thinking]\n{t_tail}[/dim italic]")
-        elif content:
-            avail_text = max(3, max_body_lines - 1)
-            c_tail = _tail_text(content, avail_text, text_width)
-            parts.append(f"[cyan bold][Response][/cyan bold]\n[dim]{c_tail}[/dim]")
+        if thinking:
+            parts.append(f"[dim italic][Thinking]\n{thinking}[/dim italic]")
+        if content:
+            parts.append(f"[cyan bold][Response][/cyan bold]\n[dim]{content}[/dim]")
 
-        body = "\n\n".join(parts) if parts else "[dim]...thinking...[/dim]"
+        body = "\n\n".join(parts) if parts else "[dim]thinking...[/dim]"
         return Panel(body, title="[cyan]LLM Stream[/cyan]", border_style="dim", expand=False)
 
     def report(kind: str, **kw) -> None:

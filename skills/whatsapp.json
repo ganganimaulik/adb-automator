@@ -25,11 +25,11 @@
     },
     {
       "name": "browse_chat_media_grid",
-      "steps": "1. Open target chat or group and make sure all photos are downloaded first. 2. Tap the group/chat title at the top bar to open Chat/Group Info. 3. Tap 'Media, links, and docs'. 4. In the 'Media' tab, view all photos in a clean grid grouped by date. 5. Tap any photo to inspect details, then swipe left/right to browse photos sequentially."
+      "steps": "1. Open target chat or group. 2. Check thumbnails for undownloaded images (showing download arrow/icon or file size overlay) and tap them to trigger download first. 3. Tap the group/chat title at the top bar to open Chat/Group Info. 4. Tap 'Media, links, and docs'. 5. In the 'Media' tab, tap any undownloaded thumbnails to download, then tap a photo to view and swipe left/right to browse sequentially."
     },
     {
       "name": "view_multiple_images_in_chat",
-      "steps": "1. Open target chat or group and make sure all photos are downloaded first. 2. Tap image thumbnail directly (avoid tapping sender profile picture or sender name on message bubbles). 3. In full-screen media viewer, swipe left (action='swipe', direction='left') to move to next photo or swipe right for previous photo. 4. If swiping fails to change images, press back button to return to chat or use 'Media, links, and docs' from Chat Info."
+      "steps": "1. Open target chat or group. 2. Scan chat history for undownloaded images (marked with a download arrow icon) and tap each download icon to download images first. 3. Tap an image thumbnail directly to open full-screen media viewer (avoid tapping sender avatar or name). 4. In full-screen viewer, swipe left (action='swipe', direction='left') for next photo or right for previous photo. If an image displays a central download button, tap it to load the photo before swiping further. 5. If swiping fails, press back and use 'Media, links, and docs' from Chat Info."
     }
   ],
   "nuances": [
@@ -38,12 +38,14 @@
     "CRITICAL: Do NOT tap sender profile avatars or sender names on the left side of message bubbles in group chats. Tapping them opens the Contact Info sheet instead of message content.",
     "CONTACT SHEET LOOP PITFALL: If a Contact Info bottom sheet or Profile Photo Viewer opens accidentally, use system back key ('press_key action=\"back\"') to dismiss it. Tapping the center of the sheet or avatar toggles between full-screen profile photo viewer and contact card in an endless loop.",
     "Tapping an image thumbnail opens full-screen media viewer. Swiping left/right in media viewer navigates through images.",
+    "Undownloaded images show a download arrow icon / file size overlay on blurred thumbnails. Tapping the download button explicitly downloads the image.",
     "Tapping Group/Chat Header -> 'Media, links, and docs' opens grid view of all shared photos, avoiding chat history scrolling delays.",
     "Do NOT tap 'Jump to latest message' or 'Scroll to bottom' floating arrow while searching past messages as it resets your search position.",
     "Sending a message requires explicit tap on the green Send button after typing in input field.",
     "WhatsApp Web / Linked Device notifications may appear as popups; press back or tap outside to dismiss."
   ],
   "recommendations": [
+    "Always tap download arrow icons on undownloaded media thumbnails in chat history or in 'Media, links, and docs' before attempting sequential full-screen viewing or swiping.",
     "To view all photos or shared media efficiently without missing items or getting stuck in message bubbles, navigate to Chat Header -> 'Media, links, and docs'.",
     "Avoid tapping sender avatars/names in group chats; tap image thumbnails in the center of message bubbles.",
     "If trapped in Contact Info sheet or profile photo viewer overlay, immediately run 'press_key action=\"back\"' to exit the loop.",
