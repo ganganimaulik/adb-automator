@@ -29,6 +29,7 @@ def test_every_subcommand_parses():
         ["dump", "--detail", "4"],
         ["run", "turn on wifi"],
         ["report", "runs/abc"],
+        ["apps", "--search", "whatsapp", "-3"],
     ):
         assert parse(argv).func is not None
 
@@ -250,4 +251,26 @@ def test_service_tier_cli_and_env_precedence(monkeypatch, tmp_path):
 
     cfg = build_config(parse(["run", "g", "--service-tier", "default"]))
     assert cfg.llm.service_tier == "default"
+
+
+def test_cmd_apps(monkeypatch, capsys):
+    from unittest.mock import MagicMock
+    from adbagent.cli import cmd_apps
+
+    mock_dev = MagicMock()
+    mock_dev.list_apps.return_value = ["com.whatsapp", "com.whatsapp.w4b"]
+    mock_dev.__enter__.return_value = mock_dev
+
+    monkeypatch.setattr("adbagent.cli._ensure_device", lambda args, cfg, out: None)
+    monkeypatch.setattr("adbagent.device.Device", lambda cfg, serial: mock_dev)
+
+    args = parse(["apps", "--search", "whatsapp", "-3"])
+    code = cmd_apps(args)
+    assert code == 0
+
+    mock_dev.list_apps.assert_called_once_with(query="whatsapp", third_party_only=True)
+    captured = capsys.readouterr()
+    assert "Installed 3rd-Party Apps matching 'whatsapp' (2)" in captured.out
+    assert "- com.whatsapp" in captured.out
+
 

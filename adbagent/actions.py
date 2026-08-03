@@ -32,7 +32,7 @@ log = logging.getLogger("adbagent.actions")
 
 ActionName = Literal[
     "tap", "long_press", "input_text", "press_key", "scroll", "swipe",
-    "open_app", "wait", "ask_user", "done", "fail",
+    "open_app", "list_apps", "get_clipboard", "set_clipboard", "wait", "ask_user", "done", "fail",
 ]
 
 #: Only names the on-device server actually accepts.
@@ -127,8 +127,14 @@ class AgentAction(BaseModel):
         None, description="For tap, long_press, input_text and element scrolls.")
     text: Optional[str] = Field(
         None,
-        description="input_text: what to type. open_app: the package name. "
+        description="input_text: what to type. open_app: package name or app search query. "
+                    "list_apps: optional package name or keyword filter. "
+                    "set_clipboard: text to put in clipboard. "
                     "ask_user: the question. done/fail: a one-line summary.")
+    clear: Optional[bool] = Field(
+        None, description="For input_text: clear field before typing (default True). Set False to append.")
+    press_enter: Optional[bool] = Field(
+        None, description="For input_text: press enter/search key after typing (default False).")
     key: Optional[KeyName] = Field(None, description="For press_key.")
     direction: Optional[ScrollDir] = Field(
         None, description="For scroll and swipe: which direction to move content or gesture ('down', 'up', 'left', 'right').")
@@ -139,8 +145,12 @@ class AgentAction(BaseModel):
         None, description="For scroll: base drag scale per step (default 0.6, range 0.1 to 1.0).",
         ge=0.1, le=1.0)
     duration: Optional[float] = Field(
-        None, description="For swipe/scroll: gesture duration in seconds (e.g. 0.15 for fast flick, 0.3 for scroll).",
-        ge=0.05, le=3.0)
+        None, description="For swipe/scroll/wait: duration in seconds (e.g. 0.15 for fast flick, 0.3 for scroll, 1.0 for wait).",
+        ge=0.05, le=30.0)
+    wait_for_text: Optional[str] = Field(
+        None, description="For wait: text to wait for on screen before returning.")
+    timeout: Optional[float] = Field(
+        None, description="For wait: max seconds to wait (0.5 to 30.0).", ge=0.5, le=30.0)
     confidence: Literal["high", "low"] = Field(
         "high", description="Use 'low' when unsure; you will be shown a screenshot.")
     notes: Optional[str] = Field(
@@ -187,7 +197,7 @@ class AgentAction(BaseModel):
             bits.append(describe_target(self.target, element))
         if self.action == "input_text" and self.text is not None:
             bits.append(f"{self.text!r}")
-        elif self.action in ("open_app", "done", "fail", "ask_user") and self.text:
+        elif self.action in ("open_app", "list_apps", "done", "fail", "ask_user") and self.text:
             bits.append(self.text)
         if self.key:
             bits.append(self.key)
@@ -257,12 +267,31 @@ def format_history_entry(step: int, action: AgentAction,
 # Target resolution
 # ---------------------------------------------------------------------------
 
+def _best_app_match(pkgs: List[str], query: str) -> str:
+    q = query.lower()
+    def score(p: str) -> Tuple[int, int, int, str]:
+        pl = p.lower()
+        sub_variant = 1 if any(v in pl for v in (".lite", ".w4b", ".work", ".beta", ".debug")) else 0
+        exact_seg = 0 if q in pl.split(".") else 1
+        return (sub_variant, exact_seg, len(p), p)
+    return min(pkgs, key=score)
+
+
 def resolve_target(target: Target, screen: Screen) -> Optional[Element]:
-    """Find the element a target refers to on this screen."""
+    """Find the element a target refers to on this screen, with fallback verification."""
     if target.index is not None:
         el = screen.by_index(target.index)
         if el is not None:
-            return el
+            match = True
+            if target.resource_id and el.resource_id != target.resource_id:
+                match = False
+            if target.text and target.text.strip().lower() not in el.best_text.strip().lower():
+                match = False
+            if match:
+                return el
+            log.warning("target index #%d mismatched (text=%r, id=%r); attempting fallback search",
+                        target.index, el.best_text, el.resource_id)
+
     if target.resource_id:
         matches = [e for e in screen.elements if e.resource_id == target.resource_id]
         if len(matches) == 1:
@@ -273,15 +302,16 @@ def resolve_target(target: Target, screen: Screen) -> Optional[Element]:
                     return e
         if matches:
             return matches[0]
+
     if target.text:
         wanted = target.text.strip().lower()
         exact = [e for e in screen.elements if e.best_text.strip().lower() == wanted]
         if exact:
             return exact[0]
-        # Fuzzy, never `==`: label text drifts between app versions and locales.
         loose = [e for e in screen.elements if wanted in e.best_text.strip().lower()]
         if loose:
             return min(loose, key=lambda e: len(e.best_text))
+
     return None
 
 
@@ -312,7 +342,9 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
         # Focus the field first; the IME broadcast path types into whatever has
         # focus, not into a selector.
         dev.tap(*element.center)
-        dev.input_text(action.text or "", clear=True)
+        should_clear = action.clear if action.clear is not None else True
+        should_enter = bool(action.press_enter)
+        dev.input_text(action.text or "", clear=should_clear, press_enter=should_enter)
     elif action.action == "press_key":
         dev.press(action.key or "back")
     elif action.action in ("scroll", "swipe"):
@@ -346,10 +378,60 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
                 dev.scroll(action.direction or "down",
                            scale=round(base_scale * remainder, 2), box=box, duration=duration)
     elif action.action == "open_app":
-        dev.open_app((action.text or "").strip())
+        raw_pkg = (action.text or "").strip()
+        target_pkg = raw_pkg
+        if "." not in raw_pkg:
+            pkgs = dev.list_apps(query=raw_pkg)
+            if pkgs:
+                target_pkg = _best_app_match(pkgs, raw_pkg)
+                log.info("resolved app %r -> %r", raw_pkg, target_pkg)
+        setattr(action, "_resolved_package", target_pkg)
+        dev.open_app(target_pkg)
+        summary = f"opened {target_pkg}" + (f" (resolved from {raw_pkg!r})" if target_pkg != raw_pkg else "")
+        setattr(action, "_result_summary", summary)
+    elif action.action == "list_apps":
+        query = (action.text or "").strip()
+        pkgs = dev.list_apps(query=query)
+        if not pkgs:
+            action_summary = f"no apps found matching {query!r}" if query else "no apps found"
+        else:
+            limit = 20
+            shown = pkgs[:limit]
+            overflow = len(pkgs) - limit
+            action_summary = f"found {len(pkgs)} app(s): {', '.join(shown)}"
+            if overflow > 0:
+                action_summary += f" ... (+{overflow} more)"
+        log.info("list_apps query=%r -> %s", query, action_summary)
+        setattr(action, "_result_summary", action_summary)
+    elif action.action == "get_clipboard":
+        clip = dev.get_clipboard()
+        summary = f"clipboard content: {clip!r}"
+        log.info("get_clipboard -> %s", summary)
+        setattr(action, "_result_summary", summary)
+    elif action.action == "set_clipboard":
+        val = action.text or ""
+        dev.set_clipboard(val)
+        summary = f"set clipboard to {val!r}"
+        log.info("set_clipboard -> %s", summary)
+        setattr(action, "_result_summary", summary)
     elif action.action == "wait":
         import time
-        time.sleep(1.0)
+        timeout = action.timeout if action.timeout is not None else (action.duration or (5.0 if action.wait_for_text else 1.0))
+        if action.wait_for_text:
+            wanted = action.wait_for_text.strip().lower()
+            deadline = time.monotonic() + timeout
+            found = False
+            while time.monotonic() <= deadline + 0.05:
+                curr = dev.observe()
+                els = getattr(curr, "all_elements", None) or getattr(curr, "elements", [])
+                if any(wanted in el.best_text.strip().lower() for el in els if hasattr(el, "best_text") and el.best_text):
+                    found = True
+                    break
+                time.sleep(0.1)
+            summary = f"waited for {action.wait_for_text!r} -> {'found' if found else 'timed out'}"
+            setattr(action, "_result_summary", summary)
+        else:
+            time.sleep(min(timeout, 5.0))
     else:
         raise ActionError(f"{action.action} is terminal and is not executed here")
     return element
@@ -391,8 +473,9 @@ def synthesise_postcondition(action: AgentAction,
                              field="checked",
                              value="false" if element.checked else "true")
     if action.action == "open_app":
-        return Postcondition(kind="app_is", package=(action.text or "").strip())
-    if action.action == "wait":
+        pkg = getattr(action, "_resolved_package", (action.text or "").strip())
+        return Postcondition(kind="app_is", package=pkg)
+    if action.action in ("wait", "list_apps", "get_clipboard", "set_clipboard"):
         return Postcondition(kind="noop_ok")
     return Postcondition(kind="screen_changed")
 
@@ -517,7 +600,15 @@ def verify(action: AgentAction, before: Screen, after: Screen,
            expected_skeleton: Optional[str] = None) -> VerifyOutcome:
     """Grade what actually happened."""
     if action.action == "wait":
-        return VerifyOutcome(grade="success")
+        result_text = getattr(action, "_result_summary", "")
+        return VerifyOutcome(grade="success", reason=result_text or "waited")
+    if action.action in ("get_clipboard", "set_clipboard"):
+        result_text = getattr(action, "_result_summary", "")
+        return VerifyOutcome(grade="success", reason=result_text)
+    if action.action == "list_apps":
+        result_text = getattr(action, "_result_summary", "")
+        reason = f"listed apps ({result_text})" if result_text else "listed apps"
+        return VerifyOutcome(grade="success", reason=reason)
 
     condition = post or synthesise_postcondition(action, None)
 
