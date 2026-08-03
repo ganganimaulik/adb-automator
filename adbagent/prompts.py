@@ -194,6 +194,12 @@ def history_block(history: Sequence[str], scratchpad: str = "",
     return "\n\n".join(parts)
 
 
+def skill_block(skill_text: str) -> str:
+    if not skill_text:
+        return ""
+    return f"APP SKILL & GUIDANCE:\n{skill_text}"
+
+
 def screen_block(rendered: str, note: str = "", image_analysis: str = "") -> str:
     out = f"CURRENT SCREEN:\n{rendered}"
     if image_analysis:

@@ -4,6 +4,7 @@
     "model": "accounts/fireworks/models/kimi-k2p6",
     "model_small": "accounts/fireworks/models/deepseek-v4-flash",
     "model_image": "",
+    "model_skill": "",
     "temperature": 0.0,
     "max_tokens": 128000,
     "rpm": 120,
@@ -32,7 +33,6 @@
     "unattended": false
   },
 
-
   "run": {
     "max_steps": 250,
     "max_consecutive_failures": 4,
@@ -40,5 +40,10 @@
     "artifacts_dir": "runs",
     "always_screenshot": false,
     "never_screenshot": false
+  },
+
+  "skills": {
+    "enabled": true,
+    "skills_dir": "skills"
   }
 }

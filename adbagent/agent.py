@@ -30,6 +30,7 @@ from .llm import BudgetExceeded, LLMClient, LLMError
 from .memory import Memory, intent_key
 from .safety import Aborted, LoopDetector
 from .screen import Screen, render
+from .skills import SkillRegistry
 
 log = logging.getLogger("adbagent.agent")
 
@@ -179,6 +180,7 @@ class Agent:
         self.cfg = cfg
         self.oracle = oracle or Oracle()
         self.on_event = on_event or (lambda *a, **k: None)
+        self.skills = SkillRegistry(cfg.skills.skills_dir)
 
     # -- public ------------------------------------------------------------
 
@@ -323,8 +325,19 @@ class Agent:
             if banned_actions:
                 ban_note = (f"BANNED ACTIONS on this screen (these produced NO change - DO NOT REPEAT): "
                             f"{', '.join(sorted(banned_actions))}.")
+            # Check for active app skill guidance
+            skill_note = ""
+            if cfg.skills.enabled:
+                active_skill = self.skills.find_for_run(screen.package, state.goal)
+                if active_skill:
+                    skill_note = active_skill.to_prompt_text()
+                    rec.event("active_skill", name=active_skill.name, package=screen.package)
+                    if getattr(self, "_active_skill_name", None) != active_skill.name:
+                        self._active_skill_name = active_skill.name
+                        self.on_event("skill_loaded", name=active_skill.name, package=screen.package)
+
             elem_hint = state.loops.element_history_hint(screen.skeleton_id)
-            notes = " ".join(filter(None, (note, hint, elem_hint, ban_note, state.last_failure)))
+            notes = "\n\n".join(filter(None, (note, hint, elem_hint, ban_note, state.last_failure, skill_note)))
             model_name = self.llm.model if self.llm else ""
             self.on_event("llm_start", step=state.step, purpose="decide", model=model_name, screenshot=bool(screenshot))
             t0_llm = time.monotonic()
@@ -569,7 +582,8 @@ class Agent:
                                  history=state.history, screenshot=shot,
                                  scratchpad="\n".join(state.scratchpad),
                                  progress="\n".join(state.progress_log),
-                                 step=state.step, recorder=rec)
+                                 step=state.step, recorder=rec,
+                                 on_event=self.on_event)
         t_judge = time.monotonic() - t0_judge
         last_call = self.llm.ledger.calls[-1] if (self.llm and self.llm.ledger.calls) else None
         self.on_event("llm_end", step=state.step, purpose="judge", elapsed=t_judge, call=last_call, verdict=verdict)
