@@ -274,3 +274,54 @@ def test_cmd_apps(monkeypatch, capsys):
     assert "- com.whatsapp" in captured.out
 
 
+def test_live_reporter_displays_notes(capsys):
+    from adbagent.cli import Out, _live_reporter
+    from adbagent.actions import AgentAction, Target
+    from types import SimpleNamespace
+
+    out = Out()
+    reporter = _live_reporter(out)
+    state = SimpleNamespace(step=1)
+    action = AgentAction(
+        observation="Screen",
+        reasoning="Reading item",
+        action="tap",
+        target=Target(index=1),
+        notes="Item price is $15",
+    )
+    reporter("step", state=state, action=action)
+    captured = capsys.readouterr()
+    assert "Notes:     Item price is $15" in captured.out
+
+
+def test_cmd_scratchpad(tmp_path, monkeypatch, capsys):
+    from adbagent.cli import cmd_scratchpad
+
+    runs_dir = tmp_path / "runs" / "run1"
+    runs_dir.mkdir(parents=True)
+    events = runs_dir / "events.jsonl"
+    events.write_text(json.dumps({"kind": "decide", "action": {"notes": "Collected data XYZ"}}) + "\n" +
+                      json.dumps({"kind": "image_analysis", "model": "vision-1", "result": "Digital scale showing 275g water"}) + "\n")
+
+    monkeypatch.chdir(tmp_path)
+    args = parse(["scratchpad", "latest"])
+    assert cmd_scratchpad(args) == 0
+    captured = capsys.readouterr()
+    assert "Notes: Collected data XYZ" in captured.out
+    assert "Latest Vision Analysis: Digital scale showing 275g water" in captured.out
+
+
+def test_live_reporter_displays_image_analysis(capsys):
+    from adbagent.cli import Out, _live_reporter
+
+    out = Out()
+    reporter = _live_reporter(out)
+    reporter("llm_start", purpose="analyze_image", model="vision-v1", screenshot=True)
+    reporter("image_analysis", model="vision-v1", result="Photo shows 100g oats on scale")
+    captured = capsys.readouterr()
+    assert "calling LLM image analyzer (vision-v1 +img)..." in captured.out
+    assert "Vision (vision-v1): Photo shows 100g oats on scale" in captured.out
+
+
+
+

@@ -445,7 +445,12 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             purpose = kw.get("purpose", "decide")
             model = kw.get("model", "")
             shot = " +img" if kw.get("screenshot") else ""
-            label = "LLM judge" if purpose == "judge" else "LLM"
+            if purpose == "judge":
+                label = "LLM judge"
+            elif purpose == "analyze_image":
+                label = "LLM image analyzer"
+            else:
+                label = "LLM"
             out.say(out.cyan(f"        calling {label} ({model}{shot})..."))
 
         elif kind == "llm_end":
@@ -455,8 +460,19 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             tokens_info = ""
             if call and getattr(call, "prompt_tokens", 0):
                 tokens_info = f" ({call.prompt_tokens} prompt tokens, {call.completion_tokens} completion tokens)"
-            tag = "LLM judge responded" if purpose == "judge" else "LLM responded"
+            if purpose == "judge":
+                tag = "LLM judge responded"
+            elif purpose == "analyze_image":
+                tag = "LLM image analyzer responded"
+            else:
+                tag = "LLM responded"
             out.say(out.dim(f"        {tag} in {elapsed:.2f}s{tokens_info}"))
+
+        elif kind == "image_analysis":
+            result = kw.get("result", "")
+            model = kw.get("model", "")
+            m_str = f" ({model})" if model else ""
+            out.say(out.dim(f"        Vision{m_str}: {result}"))
 
         elif kind == "step":
             state = kw["state"]
@@ -471,6 +487,8 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
                 out.say(out.dim(f"        Reasoning: {action.reasoning}"))
             if getattr(action, "progress", None):
                 out.say(out.dim(f"        Progress:  {action.progress}"))
+            if getattr(action, "notes", None):
+                out.say(out.dim(f"        Notes:     {action.notes}"))
 
         elif kind == "act_end":
             elapsed = kw.get("elapsed", 0.0)
@@ -589,6 +607,7 @@ def cmd_report(args) -> int:
     out.say(out.bold(f"  goal: {start.get('goal', '?')}"))
     out.say(f"  model: {start.get('model', '?')}")
     out.say()
+    last_notes = None
     for event in events:
         if event["kind"] == "decide":
             action = event.get("action", {})
@@ -599,6 +618,17 @@ def cmd_report(args) -> int:
                 out.say(out.dim(f"        Obs:       {action.get('observation')}"))
             if action.get("reasoning"):
                 out.say(out.dim(f"        Reasoning: {action.get('reasoning')}"))
+            if action.get("progress"):
+                out.say(out.dim(f"        Progress:  {action.get('progress')}"))
+            if action.get("notes"):
+                notes_text = action.get("notes")
+                last_notes = notes_text
+                out.say(out.dim(f"        Notes:     {notes_text}"))
+        elif event["kind"] == "image_analysis":
+            result = event.get("result", "")
+            model = event.get("model", "")
+            m_str = f" ({model})" if model else ""
+            out.say(out.dim(f"        Vision{m_str}: {result}"))
         elif event["kind"] == "verify":
             out.say(f"      -> {event.get('grade')} {event.get('reason') or ''}")
         elif event["kind"] in ("dismiss", "refused", "loop_break", "sensitive",
@@ -606,10 +636,71 @@ def cmd_report(args) -> int:
             out.say(f"      [{event['kind']}] "
                     + " ".join(f"{k}={v}" for k, v in event.items()
                                if k not in ("t", "kind")))
+    if last_notes:
+        out.say()
+        out.say(out.bold("  ── Collected Data ──"))
+        out.say()
+        out.say(f"  {last_notes}")
     out.say()
     if end:
         out.say(f"  {end.get('outcome', '?').upper()}: {end.get('steps')} steps, "
                 f"{end.get('llm_calls')} LLM calls, ${end.get('usd', 0):.4f}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# scratchpad
+# ---------------------------------------------------------------------------
+
+def cmd_scratchpad(args) -> int:
+    out = Out()
+    run_arg = getattr(args, "run", None)
+    if run_arg and run_arg != "latest":
+        path = Path(run_arg).expanduser()
+    else:
+        runs_dir = Path("runs")
+        if not runs_dir.exists():
+            out.bad("no runs directory found")
+            return 1
+        run_dirs = sorted([d for d in runs_dir.iterdir() if d.is_dir()],
+                          key=lambda d: d.stat().st_mtime, reverse=True)
+        if not run_dirs:
+            out.bad("no runs found in runs/")
+            return 1
+        path = run_dirs[0]
+
+    events_file = path / "events.jsonl" if path.is_dir() else path
+    if not events_file.exists():
+        out.bad(f"no events at {events_file}")
+        return 1
+
+    last_notes = None
+    last_vision = None
+    for line in events_file.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+            action = event.get("action", {})
+            if isinstance(action, dict) and action.get("notes"):
+                last_notes = action["notes"]
+            if event.get("kind") == "image_analysis" and event.get("result"):
+                last_vision = event.get("result")
+        except Exception:
+            pass
+
+    if last_notes or last_vision:
+        out.say(out.bold(f"  ── Scratchpad ({path.name}) ──"))
+        if last_notes:
+            out.say()
+            out.say(f"  Notes: {last_notes}")
+        if last_vision:
+            out.say()
+            out.say(f"  Latest Vision Analysis: {last_vision}")
+        out.say()
+    else:
+        out.say(out.dim(f"  No scratchpad data collected in {path.name}"))
+
     return 0
 
 
@@ -743,6 +834,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("run", help="path to runs/<id> or its events.jsonl")
     _add_common(p)
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("scratchpad", help="show latest or specified run scratchpad / collected data")
+    p.add_argument("run", nargs="?", default="latest", help="path to run directory or 'latest' (default)")
+    _add_common(p)
+    p.set_defaults(func=cmd_scratchpad)
 
     p = sub.add_parser("apps", help="list or search installed app packages on device")
     p.add_argument("-s", "--search", help="filter packages by substring")
