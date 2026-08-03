@@ -224,10 +224,15 @@ def test_the_agent_is_told_where_it_is_and_what_it_has_read(cfg, mem):
     assert "you are here" in notes
 
     # The last turn's block is the durable memory the model no longer has to
-    # keep by hand: every photo, with what was read off it.
+    # keep by hand: every photo, marked read, with what was read off it. A photo
+    # the sweep passed carries the vision model's reading rather than the
+    # decider's own description of the screen it was on.
     final = llm.notes[-1]
     for stamp in ("9:30 am", "9:45 am", "10:03 am"):
-        assert f"photo Today, {stamp} shows a scale" in final, stamp
+        line = next((l for l in final.splitlines() if f"Today, {stamp}" in l), "")
+        assert line, f"{stamp} is missing from the ledger block"
+        assert "[read]" in line, line
+        assert " -- " in line, f"{stamp} has no reading attached: {line}"
     assert "Every item in this set has been read" in final
 
 
@@ -247,3 +252,130 @@ def test_hidden_chrome_does_not_lose_the_agents_place(cfg, mem):
     dev, _, outcome, state = walk(cfg, mem, chrome_fades_after=1)
     assert outcome == "success"
     assert state.items.read_count == len(STAMPS)
+
+
+# ---------------------------------------------------------------------------
+# Sweeping the album in code
+# ---------------------------------------------------------------------------
+#
+# Walking a set is the one genuinely mechanical thing the agent does: the same
+# question, answered by the same gesture, once per item. In the run this file is
+# named after, 71 of 127 steps were the single action `swipe #4 left`, each one
+# paid for with a reasoning turn at 26s median. These tests are about that bill.
+
+def decides(llm) -> int:
+    """Reasoning turns, excluding the completion judge."""
+    return llm.calls - llm.judges
+
+
+def test_sweeping_replaces_reasoning_turns_with_vision_reads(cfg, mem):
+    cfg.device.serial = ""
+    dev, llm, outcome, state = walk(cfg, mem, chrome_fades_after=999)
+    assert outcome == "success"
+    assert state.items.read_count == len(STAMPS)
+    # Fifteen photos on three decisions: open the walk, and confirm it finished.
+    assert decides(llm) <= 4, f"{decides(llm)} decide calls"
+    assert len(llm.reads_requested) >= len(STAMPS) - 3
+
+
+def test_the_saving_is_real_and_not_an_accounting_trick(cfg, mem):
+    """Same album, same policy, sweep off then on."""
+    cfg.run.pager_sweep = False
+    _, without, _, state_without = walk(cfg, mem, chrome_fades_after=999)
+    cfg.run.pager_sweep = True
+    _, with_sweep, _, state_with = walk(cfg, mem, chrome_fades_after=999)
+
+    assert state_without.items.read_count == len(STAMPS)
+    assert state_with.items.read_count == len(STAMPS)
+    assert decides(with_sweep) < decides(without) / 3, (
+        f"{decides(without)} -> {decides(with_sweep)}")
+
+
+def test_sweeping_off_restores_a_turn_per_photo(cfg, mem):
+    cfg.run.pager_sweep = False
+    _, llm, outcome, state = walk(cfg, mem, chrome_fades_after=999)
+    assert outcome == "success"
+    assert llm.reads_requested == []
+    assert decides(llm) >= len(STAMPS)
+
+
+def test_a_sweep_only_ever_swipes(cfg, mem):
+    """The safety case. The sweep repeats one gesture; it never taps, types,
+    presses a key or navigates, so it can take no action the model did not
+    already authorise on this screen."""
+    dev, _, _, _ = walk(cfg, mem, chrome_fades_after=999)
+    swipes = [a for a in dev.actions if a.startswith("scroll(")]
+    assert swipes, "the album was never paged"
+    assert all(a in ("scroll(left)", "scroll(right)") or a.startswith("tap(")
+               for a in dev.actions), dev.actions
+    assert "press(back)" not in dev.actions
+    assert not any(a.startswith("input_text") for a in dev.actions)
+
+
+def test_a_dropped_fling_mid_sweep_is_retried_not_mistaken_for_the_end(cfg, mem):
+    """A ViewPager drops flings it judges too slow. Believing the first one would
+    hand back four photos early and report the album as finished."""
+    dev, _, outcome, state = walk(cfg, mem, chrome_fades_after=999,
+                                  drop_swipes=frozenset({4, 9}))
+    assert dev.dropped == [4, 9]
+    assert outcome == "success"
+    assert state.items.read_count == len(STAMPS)
+
+
+def test_the_sweep_hands_back_when_the_caption_disappears(cfg, mem):
+    """With chrome fading every two gestures the sweep can only ever cover a
+    couple of photos before items stop being distinguishable -- so it stops, the
+    model taps to bring the caption back, and the album still gets fully read."""
+    dev, llm, outcome, state = walk(cfg, mem, chrome_fades_after=2)
+    assert outcome == "success"
+    assert state.items.read_count == len(STAMPS)
+    assert decides(llm) > 4          # it really did keep asking the model
+    assert "tap(" in " ".join(dev.actions)
+
+
+def test_a_sweep_is_capped_so_an_endless_feed_cannot_run_away(cfg, mem):
+    cfg.run.pager_sweep_max = 3
+    _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
+    events = _events(cfg, state.run_id)
+    sweeps = [e for e in events if e["kind"] == "sweep"]
+    assert sweeps
+    assert all(e["swept"] <= 3 for e in sweeps), sweeps
+    assert any("limit was reached" in e["reason"] for e in sweeps)
+
+
+def test_a_sweep_costs_one_history_entry_not_one_per_photo(cfg, mem):
+    """Twelve near-identical lines would push everything else out of the prompt
+    to say what the ledger block already says per item, in more detail."""
+    _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
+    swept_lines = [h for h in state.history if "swept" in h]
+    assert swept_lines
+    assert len(swept_lines) <= 3
+    assert "item(s) left through the carousel" in swept_lines[0]
+    # And the per-gesture entries are genuinely absent.
+    assert sum(1 for h in state.history if "swipe" in h) < len(STAMPS)
+
+
+def test_the_sweep_records_every_item_it_read(cfg, mem):
+    _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
+    events = _events(cfg, state.run_id)
+    readings = [e for e in events if e["kind"] == "item_reading"]
+    assert len(readings) >= len(STAMPS) - 3
+    assert all(e["reading"] for e in readings)
+    # Each reading is filed against the item it was taken of, not the one the
+    # swipe landed on.
+    labels = {e["item"] for e in readings}
+    assert len(labels) == len(readings)
+
+
+def test_the_sweep_marks_the_end_of_the_album(cfg, mem):
+    _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
+    assert "left" in state.items.edges
+    assert state.items.complete
+
+
+def _events(cfg, run_id):
+    import json
+    from pathlib import Path
+    path = Path(cfg.run.artifacts_dir) / run_id / "events.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()
+            if line.strip()]

@@ -11,8 +11,19 @@ Message layout, most stable first:
     [1] system   role, rules, action schema            never changes
     [2] user     device profile                        constant per run
     [3] user     the goal                              constant per run
-    [4] user     step history                          append-only
-    [5] user     current screen (+ image last)         changes every step
+    [4] user     step history                          append-only for N turns
+    [5] user     scratchpad and progress               changes every step
+    [6] user     current screen (+ image last)         changes every step
+
+"Most stable first" is the whole design, and two things used to break it. The
+device profile carried the foreground package, which changes the moment the goal
+crosses into another app -- taking the goal and the entire history out of the
+cache with it, for a fact the screen block already states in its own header. And
+the history was a sliding window: dropping the oldest entry while appending a new
+one rewrites the block every single turn, so nothing after the goal ever survived
+into the next call. `history_only_block` now advances its window in fixed jumps,
+which makes the block append-only between jumps -- and an append-only block is
+exactly what a prefix cache can reuse.
 """
 
 from __future__ import annotations
@@ -184,13 +195,18 @@ def system_prompt(schema: dict) -> str:
     return SYSTEM + json.dumps(schema, indent=None, sort_keys=True)
 
 
-def device_profile(width: int, height: int, package: str = "",
-                   android: str = "", **_kw) -> str:
+def device_profile(width: int, height: int, android: str = "", **_kw) -> str:
+    """Facts about the phone that hold for the whole run.
+
+    Deliberately *not* the foreground package: it changes whenever the goal
+    crosses into another app, and because this message sits above the goal and
+    the history, one app switch used to evict both from the prompt cache. The
+    screen block names the current app in its own header, where it belongs --
+    next to the elements it describes.
+    """
     bits = [f"Device: {width}x{height} px"]
     if android:
         bits.append(f"Android {android}")
-    if package:
-        bits.append(f"Current app: {package}")
     return " | ".join(bits)
 
 
@@ -198,10 +214,43 @@ def goal_block(goal: str) -> str:
     return f"GOAL: {goal}"
 
 
-def history_only_block(history: Sequence[str]) -> str:
+#: How many of the most recent steps the model always sees.
+HISTORY_KEEP = 10
+#: How far the window jumps when it moves. Between jumps the rendered block only
+#: grows at the end, so the prompt prefix through the history is byte-identical
+#: from one turn to the next and the provider can serve it from cache. A sliding
+#: window rewrites the block every turn and caches nothing; the cost of the jump
+#: is that the block holds up to KEEP + CHUNK - 1 entries just before it moves.
+HISTORY_CHUNK = 6
+
+
+def history_window(n: int, keep: int = HISTORY_KEEP,
+                   chunk: int = HISTORY_CHUNK) -> int:
+    """Index of the first history entry to render, quantised to `chunk`.
+
+    `chunk=0` disables quantisation and gives a plain "last `keep`" window, which
+    is what a one-off call like the completion judge wants -- there is nothing
+    after it to keep a cache warm for.
+    """
+    if keep <= 0 or n <= keep:
+        return 0
+    if chunk <= 1:
+        return n - keep
+    return max(0, ((n - keep) // chunk) * chunk)
+
+
+def history_only_block(history: Sequence[str], keep: int = HISTORY_KEEP,
+                       chunk: int = HISTORY_CHUNK) -> str:
     if not history:
         return "HISTORY: (nothing yet -- this is the first step)"
-    return "HISTORY (oldest first):\n" + "\n".join(history)
+    start = history_window(len(history), keep, chunk)
+    lines = ["HISTORY (oldest first):"]
+    if start:
+        # Part of the stable prefix, so it states a count rather than "since
+        # step N" -- the latter would be one more thing changing every turn.
+        lines.append(f"({start} earlier step(s) omitted)")
+    lines.extend(history[start:])
+    return "\n".join(lines)
 
 
 def state_block(scratchpad: str = "", progress: str = "") -> str:
@@ -253,6 +302,35 @@ Be concise, accurate, and focus on visual facts that help accomplish the user's 
 """
 
 
+ITEM_READING_SYSTEM = """\
+You are reading ONE item of a gallery -- a photo, a card, a slide -- to answer a \
+specific question about it.
+
+Reply with a single short line: the fact the goal asks for, as read off the \
+image. A number, a name, a price, a weight, a date. Nothing else.
+
+- If the item does not contain what the goal asks for, say what it does show, in \
+one clause.
+- If the value is present but unreadable -- glare, blur, a covered display -- say \
+"unreadable" and why, in a few words.
+- Never guess a number you cannot actually see, and never describe the app's \
+own buttons or navigation.
+
+Good: "chicken breast on scale, 428 g"
+Good: "scale display covered by plastic film, unreadable"
+Bad:  "The screen shows a photo opened in the media viewer. At the top left \
+there is a Back arrow..."
+"""
+
+
+def item_reading_user(goal: str = "", label: str = "") -> str:
+    parts = [f"GOAL: {goal}" if goal else "GOAL: describe this item"]
+    if label:
+        parts.append(f'The app labels this item "{label}".')
+    parts.append("Read this item and reply with the one line described above.")
+    return "\n\n".join(parts)
+
+
 def image_analysis_user(goal: str = "", rendered: str = "") -> str:
     parts = []
     if goal:
@@ -280,11 +358,24 @@ Evaluation guidelines:
 """
 
 
+#: The judge runs once, at the end, and there is nothing after it whose cache a
+#: stable window would protect -- so it gets a far longer view than a decide turn.
+#: A verdict on "did this run collect what was asked for" reached from the last
+#: ten steps is a verdict reached from the wrong evidence.
+JUDGE_HISTORY_KEEP = 80
+
+
 def judge_user(goal: str, history: Sequence[str], rendered: str,
                scratchpad: str = "", progress: str = "",
                image_analysis: str = "", done_text: str = "") -> str:
+    if history:
+        start = history_window(len(history), JUDGE_HISTORY_KEEP, chunk=0)
+        shown = ([f"({start} earlier step(s) omitted)"] if start else []) \
+            + list(history[start:])
+    else:
+        shown = ["(nothing)"]
     parts = (f"GOAL: {goal}\n\n"
-             f"WHAT THE AGENT DID:\n" + "\n".join(history or ["(nothing)"]) +
+             f"WHAT THE AGENT DID:\n" + "\n".join(shown) +
              f"\n\nFINAL SCREEN:\n{rendered}")
     if done_text:
         parts += (f"\n\nAGENT DONE SUMMARY / OUTPUT:\n{done_text}")

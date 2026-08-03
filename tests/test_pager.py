@@ -293,3 +293,114 @@ def test_browsing_note_offers_a_way_out_when_the_caption_is_hidden():
 def test_browsing_note_reports_a_dropped_swipe():
     note = pager.browsing_note(viewer(), pager.ItemLedger(), swipe_failed=True)
     assert "did NOT change" in note
+
+
+# ---------------------------------------------------------------------------
+# Sweep policy
+# ---------------------------------------------------------------------------
+#
+# Whether to keep paging in code is decided by pure functions so it can be
+# argued about without a phone attached. The whole safety case rests on these:
+# the sweep only ever repeats a gesture the model just chose, on a screen where
+# that gesture was just shown to work.
+
+def fresh(**kw) -> pager.ItemLedger:
+    ledger = pager.ItemLedger(set_id="album", **kw)
+    return ledger
+
+
+def test_a_verified_page_forward_authorises_carrying_on():
+    assert pager.can_sweep(viewer(), fresh(), action="swipe",
+                           direction="left", moved=True)
+    assert pager.can_sweep(viewer(), fresh(), action="scroll",
+                           direction="right", moved=True)
+
+
+def test_a_gesture_that_did_not_move_never_authorises_a_second_one():
+    """The load-bearing condition. On an app where "left" does not mean "next",
+    or where the fling is dropped, the first gesture is the only automatic one."""
+    assert not pager.can_sweep(viewer(), fresh(), action="swipe",
+                               direction="left", moved=False)
+
+
+def test_only_horizontal_paging_authorises_a_sweep():
+    for action, direction in (("swipe", "down"), ("scroll", "up"),
+                              ("tap", "left"), ("press_key", "left"),
+                              ("swipe", "")):
+        assert not pager.can_sweep(viewer(), fresh(), action=action,
+                                   direction=direction, moved=True), action
+
+
+def test_a_screen_that_is_not_a_carousel_is_never_swept():
+    grid = album()          # an album *grid* is not a pager
+    assert not pager.can_sweep(grid, fresh(), action="swipe",
+                               direction="left", moved=True)
+
+
+def test_a_finished_set_is_not_swept_again():
+    ledger = fresh()
+    ledger.total = 1
+    ledger.note("label:a", viewer(), 1, read=True)
+    assert ledger.complete
+    assert not pager.can_sweep(viewer(), ledger, action="swipe",
+                               direction="left", moved=True)
+
+
+def test_the_far_end_of_a_set_is_not_swept_into():
+    ledger = fresh()
+    ledger.edges.add("left")
+    assert not pager.can_sweep(viewer(), ledger, action="swipe",
+                               direction="left", moved=True)
+    # The other direction is still open: the agent may not have covered it.
+    assert pager.can_sweep(viewer(), ledger, action="swipe",
+                           direction="right", moved=True)
+
+
+def test_a_hidden_caption_pauses_the_sweep():
+    """Not an ending -- a pause. A pixel key moves with the chrome, so items
+    could no longer be told apart, and the model's own instructions tell it to
+    tap the item to bring the title bar back."""
+    reason = pager.stop_sweeping(viewer(chrome=False), fresh(), direction="left")
+    assert "caption is hidden" in reason
+    assert not pager.can_sweep(viewer(chrome=False), fresh(), action="swipe",
+                               direction="left", moved=True)
+
+
+def test_leaving_the_app_stops_the_sweep():
+    reason = pager.stop_sweeping(viewer(), fresh(), direction="left",
+                                 package="com.other.app")
+    assert "foreground app changed" in reason
+
+
+def test_the_same_app_does_not_stop_the_sweep():
+    screen = viewer()
+    assert pager.stop_sweeping(screen, fresh(), direction="left",
+                               package=screen.package) == ""
+
+
+def test_leaving_the_carousel_stops_the_sweep():
+    assert "no longer a carousel" in pager.stop_sweeping(
+        album(), fresh(), direction="left")
+
+
+def test_a_full_set_is_reported_before_a_hidden_caption():
+    """Order matters: "everything is read" is a reason to stop for good, while a
+    hidden caption is a reason to hand back. Reporting the weaker one first would
+    have the model tap to reveal a caption it no longer needs."""
+    ledger = fresh()
+    ledger.total = 1
+    ledger.note("label:a", viewer(), 1, read=True)
+    reason = pager.stop_sweeping(viewer(chrome=False), ledger, direction="left")
+    assert "every item in the set has been read" in reason
+
+
+def test_a_sweep_is_summarised_as_one_history_line():
+    line = pager.sweep_summary(12, 24, "left", 13, 13, "it reached the end")
+    assert line.startswith("12-24.")
+    assert "swept 13 item(s) left" in line
+    assert "read 13" in line
+    assert "it reached the end" in line
+
+
+def test_a_one_step_sweep_does_not_render_a_range():
+    assert pager.sweep_summary(9, 9, "right", 1, 1, "x").startswith("9. ")

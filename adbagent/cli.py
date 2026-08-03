@@ -719,6 +719,23 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             elapsed = kw.get("elapsed", 0.0)
             out.say(out.dim(f"        executed action in {elapsed:.2f}s"))
 
+        elif kind == "sweep_step":
+            label = kw.get("label") or "(caption hidden)"
+            total = kw.get("total") or 0
+            of = f"/{total}" if total else ""
+            moved = "" if kw.get("moved") else "  (did not move)"
+            out.say(f"{step_hdr} {out.cyan('sweep')} {kw.get('direction', '')} "
+                    f"-> {label}  [read {kw.get('read_count', 0)}{of}]{moved}")
+
+        elif kind == "item_reading":
+            out.say(out.dim(f"        Read:      {kw.get('reading', '')}"))
+
+        elif kind == "sweep_end":
+            out.say(out.dim(
+                f"        swept {kw.get('swept', 0)} item(s) "
+                f"{kw.get('direction', '')}, read {kw.get('read', 0)} "
+                f"— stopped because {kw.get('reason', 'it stopped')}"))
+
         elif kind == "settle_start":
             budget = kw.get("budget", 2.0)
             out.say(out.dim(f"        waiting for settle (budget max {budget:.1f}s)..."))
@@ -857,49 +874,74 @@ def _cost_summary(out: Out, events: List[Dict[str, Any]]) -> None:
     Recorded per step by `agent.step_metrics`; runs from before that landed have
     no `llm` block and simply print nothing.
     """
-    steps = [e for e in events if e.get("kind") in ("decide", "judge") and e.get("llm")]
-    if not steps:
+    # Reported per kind of call, not pooled. A swept item is a real vision call
+    # and belongs in the totals, but it is ~25 output tokens against a reasoning
+    # turn's ~4,400 -- pool the two and the median step becomes a vision read,
+    # which is the opposite of what this block exists to show.
+    groups = (("decisions", ("decide", "judge")),
+              ("sweep reads", ("sweep_step",)))
+    buckets = [(label, [e for e in events
+                        if e.get("kind") in kinds and e.get("llm")])
+               for label, kinds in groups]
+    buckets = [(label, rows) for label, rows in buckets if rows]
+    if not buckets:
         return
-
-    def col(key: str) -> List[float]:
-        return [float(e["llm"].get(key) or 0) for e in steps]
-
-    latency = [float(e.get("wall_s") or e["llm"].get("latency_s") or 0) for e in steps]
-    prompt, cached = col("prompt_tokens"), col("cached_tokens")
-    completion, reasoning = col("completion_tokens"), col("reasoning_tokens")
-    reasoning_chars = col("reasoning_chars")
-    # Providers do not all report `reasoning_tokens`; the characters we saw
-    # streamed are measured either way, so fall back to those at 4 chars/token.
-    if not any(reasoning) and any(reasoning_chars):
-        reasoning = [c / 4 for c in reasoning_chars]
-        estimated = " (est. from streamed text)"
-    else:
-        estimated = ""
-
-    total_prompt, total_cached = sum(prompt), sum(cached)
-    total_completion, total_reasoning = sum(completion), sum(reasoning)
-    hit_rate = (total_cached / total_prompt * 100) if total_prompt else 0.0
-    think_share = (total_reasoning / total_completion * 100) if total_completion else 0.0
 
     out.say()
     out.say(out.bold("  ── Cost of thinking ──"))
-    out.say(f"  latency/step   {_median(latency):6.1f}s median   "
-            f"{_percentile(latency, 0.9):6.1f}s p90   "
-            f"{sum(latency):8.0f}s total")
-    out.say(f"  prompt tokens  {_median(prompt):6.0f} median   "
-            f"{total_prompt:8.0f} total   "
-            f"{hit_rate:4.0f}% served from cache")
-    out.say(f"  output tokens  {_median(completion):6.0f} median   "
-            f"{total_completion:8.0f} total")
-    out.say(f"  of which think {_median(reasoning):6.0f} median   "
-            f"{total_reasoning:8.0f} total   "
-            f"{think_share:4.0f}% of output{estimated}")
-    if think_share >= 50:
-        out.say(out.dim("  Reasoning tokens dominate output, so they dominate "
-                        "latency: try a lower reasoning effort."))
-    if total_prompt and hit_rate < 40:
-        out.say(out.dim("  Low prompt-cache hit rate: something near the top of "
-                        "the prompt is changing every turn."))
+    advice: List[str] = []
+
+    for label, rows in buckets:
+        def col(key: str) -> List[float]:
+            return [float(e["llm"].get(key) or 0) for e in rows]
+
+        latency = [float(e.get("wall_s") or e["llm"].get("latency_s") or 0)
+                   for e in rows]
+        prompt, cached = col("prompt_tokens"), col("cached_tokens")
+        completion, reasoning = col("completion_tokens"), col("reasoning_tokens")
+        reasoning_chars = col("reasoning_chars")
+        # Providers do not all report `reasoning_tokens`; the characters we saw
+        # streamed are measured either way, so fall back to those at 4 chars/token.
+        if not any(reasoning) and any(reasoning_chars):
+            reasoning = [c / 4 for c in reasoning_chars]
+            estimated = " (est. from streamed text)"
+        else:
+            estimated = ""
+
+        total_prompt, total_cached = sum(prompt), sum(cached)
+        total_completion, total_reasoning = sum(completion), sum(reasoning)
+        hit_rate = (total_cached / total_prompt * 100) if total_prompt else 0.0
+        think_share = ((total_reasoning / total_completion * 100)
+                       if total_completion else 0.0)
+
+        if len(buckets) > 1:
+            out.say(f"  {label} ({len(rows)})")
+        out.say(f"  latency/step   {_median(latency):6.1f}s median   "
+                f"{_percentile(latency, 0.9):6.1f}s p90   "
+                f"{sum(latency):8.0f}s total")
+        out.say(f"  prompt tokens  {_median(prompt):6.0f} median   "
+                f"{total_prompt:8.0f} total   "
+                f"{hit_rate:4.0f}% served from cache")
+        out.say(f"  output tokens  {_median(completion):6.0f} median   "
+                f"{total_completion:8.0f} total")
+        if total_reasoning:
+            out.say(f"  of which think {_median(reasoning):6.0f} median   "
+                    f"{total_reasoning:8.0f} total   "
+                    f"{think_share:4.0f}% of output{estimated}")
+
+        # Advice is keyed to the reasoning turns only. A one-shot vision read has
+        # no prefix worth caching, so scolding it for a cold cache is noise.
+        if label != "decisions":
+            continue
+        if think_share >= 50:
+            advice.append("Reasoning tokens dominate output, so they dominate "
+                          "latency: try a lower reasoning effort.")
+        if total_prompt and hit_rate < 40:
+            advice.append("Low prompt-cache hit rate: something near the top of "
+                          "the prompt is changing every turn.")
+
+    for line in advice:
+        out.say(out.dim(f"  {line}"))
 
 
 def cmd_report(args) -> int:
