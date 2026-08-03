@@ -26,10 +26,11 @@ from .actions import (ActionError, AgentAction, execute, format_history_entry,
                       synthesise_postcondition, verify)
 from .config import Config
 from .device import Device, DeviceTimeout, DeviceLost
-from .llm import BudgetExceeded, LLMClient, LLMError
+from .llm import BudgetExceeded, LLMClient, LLMError, Prefetch
 from .memory import Memory, intent_key
-from .pager import (ItemLedger, attach_item, browsing_note, loop_id,
-                    pager_element, set_id as pager_set_id)
+from .pager import (ItemLedger, attach_item, browsing_note, can_sweep, loop_id,
+                    pager_element, set_id as pager_set_id, stop_sweeping,
+                    sweep_summary)
 from .safety import Aborted, LoopDetector
 from .scratchpad import ScratchpadGuard
 from .screen import Screen, render
@@ -75,6 +76,11 @@ class RunState:
     step: int = 0
     llm_calls: int = 0
     consecutive_failures: int = 0
+    #: Every step, oldest first. Kept in full rather than truncated: the prompt
+    #: is bounded by how much of this `history_only_block` *renders*, and the one
+    #: call that wants the long view -- the completion judge -- used to be handed
+    #: whatever the last 12 steps happened to be, which is how a run that spent
+    #: 130 steps collecting data got graded on the tail of it.
     history: List[str] = field(default_factory=list)
     visits: Dict[str, int] = field(default_factory=dict)
     loops: LoopDetector = field(default_factory=LoopDetector)
@@ -542,7 +548,6 @@ class Agent:
                             reason=f"scroll reversal, warning #{state.scroll_warnings}"
                         )
                     )
-                    del state.history[:-12]
                     self._maybe_give_up(state)
                     continue
 
@@ -643,7 +648,6 @@ class Agent:
                         grade="failed", reason=str(exc)
                     )
                 )
-                del state.history[:-12]
                 self._maybe_give_up(state)
                 continue
             except (DeviceTimeout, DeviceLost) as exc:
@@ -776,10 +780,205 @@ class Agent:
                     grade=outcome.grade, reason=outcome.reason
                 )
             )
-            del state.history[:-12]  # keep the prompt bounded
 
             self._maybe_give_up(state)
             screen = after
+
+            # ---- 9. keep going, if the rest is mechanical ----------------
+            # The model has just chosen to page through a set and the item moved.
+            # Repeating that decision in code costs a vision read per item
+            # instead of a reasoning turn per item.
+            if (cfg.run.pager_sweep and state.finished is None
+                    and not cfg.run.never_screenshot  # nothing to read with
+                    and can_sweep(screen, state.items, action=action.action,
+                                  direction=action.direction or "",
+                                  moved=state.item_moved is True)):
+                swept = self._sweep_pager(state, rec, screen,
+                                          action.direction or "left")
+                if swept is not None:
+                    screen = swept
+
+    # -- sweeping a carousel -----------------------------------------------
+
+    def _sweep_pager(self, state: RunState, rec: Recorder, screen: Screen,
+                     direction: str) -> Optional[Screen]:
+        """Page through the rest of a set without asking the model each time.
+
+        Entered only from `can_sweep`, so the model has already chosen this
+        gesture on this screen and it has already been shown to move the item.
+        Each iteration reads the item it is standing on, flings once in the same
+        direction, and verifies. The read is started *before* the fling and
+        collected after it, so a ~1.5s vision call overlaps the swipe and the
+        settle rather than following them.
+
+        Returns the screen the sweep ended on, or None if it did nothing.
+        """
+        cfg = self.cfg
+        first_step = state.step + 1
+        swept = 0
+        read = 0
+        reason = ""
+        package = screen.package
+
+        while True:
+            reason = stop_sweeping(screen, state.items, direction=direction,
+                                   package=package)
+            if reason:
+                break
+            if swept >= cfg.run.pager_sweep_max:
+                reason = f"the {cfg.run.pager_sweep_max}-item sweep limit was reached"
+                break
+            if state.step + 1 >= cfg.run.max_steps:
+                reason = "the step budget is nearly exhausted"
+                break
+            if state.elapsed > cfg.run.max_wall_clock_s:
+                reason = "the wall-clock budget is exhausted"
+                break
+
+            # A screen the guards have not cleared is not one to keep swiping on.
+            finding = safety.sensitive_screen(screen)
+            if finding is not None:
+                rec.event("sensitive", reason=finding.reason)
+                self._hand_over(state, finding.reason)
+                return screen
+            if safety.find_interstitial(screen, screen.package) is not None:
+                reason = "a dialog appeared that needs handling"
+                break
+
+            state.step += 1
+
+            # -- where are we? ---------------------------------------------
+            # The main loop resolves the item at the *top* of a turn, so on entry
+            # `state.item_key` still names the item we swiped away from. Resolving
+            # here, once per iteration, is what keeps the ledger keyed to the item
+            # actually on screen -- and `item_moved` is the latch that separates
+            # two items sharing a caption.
+            state.items.rebase(pager_set_id(screen))
+            here = state.items.resolve(screen, moved=state.item_moved)
+            state.item_key = here
+            state.items.note(here, screen, state.step, read=False)
+            if screen.item_label:
+                state.item_moved = None
+            label = screen.item_label
+
+            # -- read the item we are on, in the background ----------------
+            reading: Optional[Prefetch] = None
+            ledger_mark = self.llm.ledger.mark() if self.llm else 0
+            if (self.llm is not None and not cfg.run.never_screenshot
+                    and not state.items.was_read(here)):
+                shot = self._ensure_screenshot(screen)
+                reading = Prefetch(lambda s=shot, l=label: self.llm.read_item(
+                    s, goal=state.goal, label=l, step=state.step))
+
+            # -- fling to the next one -------------------------------------
+            gesture = AgentAction(
+                observation=f"sweeping {direction} through the set",
+                reasoning="continuing the paging the model chose",
+                action="swipe", direction=direction, duration=0.15)
+            try:
+                execute(self.dev, gesture, screen)
+                after = self.dev.observe(settle=True)
+                self._ensure_screenshot(after)
+            except (ActionError, ValueError) as exc:
+                reason = f"the swipe could not be carried out ({exc})"
+                if reading is not None and self._file_reading(state, screen, here,
+                                                              reading, rec):
+                    read += 1
+                break
+            except (DeviceTimeout, DeviceLost) as exc:
+                if not self._recover_device(state, exc):
+                    state.finished = "aborted"
+                return screen
+
+            moved = verify(gesture, screen, after,
+                           synthesise_postcondition(gesture, None),
+                           None).grade != "no_change"
+
+            if not moved:
+                # A ViewPager silently drops a fling it judges too short or too
+                # slow. The main loop retries harder before believing it, and a
+                # sweep that skipped that step would read one dropped gesture as
+                # the end of the album and hand back four photos early.
+                harder = gesture.model_copy(update={"scroll_amount": 2.0,
+                                                    "duration": 0.12})
+                rec.event("pager_retry", step=state.step, during="sweep",
+                          action=harder.describe())
+                try:
+                    execute(self.dev, harder, screen)
+                    after = self.dev.observe(settle=True)
+                    self._ensure_screenshot(after)
+                    moved = verify(harder, screen, after,
+                                   synthesise_postcondition(harder, None),
+                                   None).grade != "no_change"
+                except (ActionError, ValueError) as exc:
+                    log.warning("sweep: harder fling failed: %s", exc)
+                except (DeviceTimeout, DeviceLost) as exc:
+                    if not self._recover_device(state, exc):
+                        state.finished = "aborted"
+                    return screen
+
+            # -- collect the reading, against the item it was taken of -----
+            # Filed before `screen` moves on, because `note` reads the label and
+            # the total off the screen the reading was taken of.
+            if reading is not None and self._file_reading(state, screen, here,
+                                                          reading, rec):
+                read += 1
+            swept += 1
+
+            # Costed like any other step: a sweep step is a real LLM call, and a
+            # report that only totalled `decide` events would show the sweep as
+            # free and quietly understate the run.
+            rec.event("sweep_step", step=state.step, direction=direction,
+                      item=here, label=label, moved=moved,
+                      read_count=state.items.read_count,
+                      llm=step_metrics(self.llm.ledger.since(ledger_mark)
+                                       if self.llm else []))
+            self.on_event("sweep_step", step=state.step, direction=direction,
+                          label=label, moved=moved, swept=swept,
+                          read_count=state.items.read_count,
+                          total=state.items.total)
+
+            state.item_moved = moved
+            if not moved:
+                # The same evidence the main loop uses: a gesture that changed
+                # nothing on a pager is the edge of the set.
+                state.items.edges.add(direction)
+                reason = f"the item stopped moving, so this is the {direction} end"
+                screen = after
+                break
+            screen = after
+
+        if not swept:
+            return None
+
+        log.info("sweep: %d item(s) %s, %d read (%s)", swept, direction, read,
+                 reason or "stopped")
+        rec.event("sweep", first_step=first_step, last_step=state.step,
+                  direction=direction, swept=swept, read=read, reason=reason,
+                  read_count=state.items.read_count)
+        self.on_event("sweep_end", first_step=first_step, last_step=state.step,
+                      direction=direction, swept=swept, read=read, reason=reason)
+        state.history.append(sweep_summary(first_step, state.step, direction,
+                                           swept, read, reason or "it stopped"))
+        # The sweep is browsing, not thrashing, so it is deliberately kept out of
+        # the loop detector: twelve flings on one `skeleton_id` is exactly the
+        # shape that makes `should_force_back` press back and eject the agent.
+        state.last_failure = ""
+        state.consecutive_failures = 0
+        self._maybe_give_up(state)
+        return screen
+
+    def _file_reading(self, state: RunState, screen: Screen, key: str,
+                      reading: "Prefetch", rec: Recorder) -> bool:
+        """Attach a prefetched item reading to the item it was taken of."""
+        text = reading.result(default="")
+        if not text:
+            return False
+        state.items.note(key, screen, state.step, detail=text, read=True)
+        rec.event("item_reading", step=state.step, item=key, reading=text)
+        self.on_event("item_reading", step=state.step, label=screen.item_label,
+                      reading=text)
+        return True
 
     # -- terminal actions --------------------------------------------------
 
