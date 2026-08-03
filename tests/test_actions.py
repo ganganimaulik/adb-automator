@@ -5,9 +5,10 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from adbagent.actions import (AgentAction, Postcondition, Target, check_postcondition,
-                              describe_target, format_history_entry,
-                              resolve_target, synthesise_postcondition, verify)
+from adbagent.actions import (AgentAction, Postcondition, Target, append_history,
+                              check_postcondition, describe_target,
+                              format_history_entry, resolve_target,
+                              synthesise_postcondition, verify)
 from adbagent.fingerprint import attach
 from adbagent.screen import parse
 
@@ -619,3 +620,101 @@ def test_target_resolution_fallback():
 
 
 
+# ---------------------------------------------------------------------------
+# Folding repeated history
+# ---------------------------------------------------------------------------
+#
+# Nine consecutive entries in one prompt from `runs/af76720d05c4`, identical but
+# for the step number and the observation.
+
+def swipe_entry(step: int, obs: str, grade: str = "success") -> str:
+    return format_history_entry(
+        step, act(observation=obs, action="swipe", direction="left",
+                  target=Target(index=4)),
+        screen=BASE, grade=grade)
+
+
+def test_a_repeated_action_folds_into_one_line_with_a_count():
+    history: list = []
+    for step in range(30, 39):
+        append_history(history, swipe_entry(step, f"photo {step}"))
+    assert len(history) == 1
+    assert history[0].startswith("30-38.")
+    assert "[x9]" in history[0]
+
+
+def test_folding_keeps_the_readings_because_they_are_the_data():
+    history: list = []
+    append_history(history, swipe_entry(30, "chicken 425g"))
+    append_history(history, swipe_entry(31, "potatoes 403g"))
+    assert "chicken 425g" in history[0]
+    assert "potatoes 403g" in history[0]
+
+
+def test_a_repeated_reading_is_not_repeated_in_the_fold():
+    history: list = []
+    for step in range(30, 35):
+        append_history(history, swipe_entry(step, "the caption is hidden"))
+    assert history[0].count("the caption is hidden") == 1
+
+
+def test_a_different_outcome_is_a_different_line():
+    history: list = []
+    append_history(history, swipe_entry(30, "photo 1", grade="success"))
+    append_history(history, swipe_entry(31, "photo 2", grade="no_change"))
+    assert len(history) == 2
+
+
+def test_a_different_action_is_a_different_line():
+    history: list = []
+    append_history(history, swipe_entry(30, "photo 1"))
+    append_history(history, format_history_entry(
+        31, act(observation="back to the list", action="press_key", key="back"),
+        screen=BASE, grade="success"))
+    assert len(history) == 2
+
+
+def test_only_the_last_line_is_ever_rewritten():
+    """`prompts.history_only_block` needs the block to stay append-only for the
+    prompt prefix to be cacheable, so a fold must never touch an earlier line."""
+    history: list = []
+    append_history(history, format_history_entry(
+        1, act(observation="home", action="tap", target=Target(index=1)),
+        screen=BASE, grade="success"))
+    before = list(history)
+    for step in range(30, 40):
+        append_history(history, swipe_entry(step, f"photo {step}"))
+        assert history[:len(before)] == before
+
+
+def test_the_readings_in_a_fold_are_bounded():
+    history: list = []
+    for step in range(30, 60):
+        append_history(history, swipe_entry(step, f"reading number {step}"))
+    assert "+" in history[0] and "more" in history[0]
+    assert len(history[0]) < 900
+
+
+def test_a_fold_survives_a_round_trip_through_its_own_format():
+    """Folding is re-entrant: the folded line is parsed back out to fold again."""
+    history: list = []
+    append_history(history, swipe_entry(30, "photo A"))
+    append_history(history, swipe_entry(31, "photo B"))
+    append_history(history, swipe_entry(32, "photo C"))
+    assert history[0].startswith("30-32.")
+    assert "[x3]" in history[0]
+    assert all(p in history[0] for p in ("photo A", "photo B", "photo C"))
+
+
+def test_an_observation_containing_brackets_does_not_break_the_fold():
+    history: list = []
+    append_history(history, swipe_entry(30, "photo (blurry) shows 425g"))
+    append_history(history, swipe_entry(31, "photo (clear) shows 426g"))
+    assert len(history) == 1
+    assert "425g" in history[0] and "426g" in history[0]
+
+
+def test_a_line_with_no_step_number_is_never_folded():
+    history = ["some free-form note the loop wrote"]
+    append_history(history, "another free-form note")
+    assert len(history) == 2

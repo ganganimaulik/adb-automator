@@ -10,7 +10,8 @@ import pytest
 
 from adbagent.actions import AgentAction
 from adbagent.llm import (Call, Ledger, LLMError, ModelInfo, PROVIDERS, RateLimiter,
-                          extract_json, harden_schema, image_part, qualify, text_part)
+                          ScreenAnalysis, extract_json, harden_schema, image_part,
+                          qualify, text_part)
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +252,8 @@ def test_decide_messages_cache_friendly_structure(monkeypatch):
     assert "Device: 720x1600 px" in msgs[1]["content"]
     assert msgs[2]["content"] == "GOAL: test goal"
     assert msgs[3]["content"] == "HISTORY (oldest first):\n1. tap #1"
-    assert "YOUR SCRATCHPAD" in msgs[4]["content"]
+    # The ledger renders its own header, so the block carries it through verbatim.
+    assert "collected notes" in msgs[4]["content"]
     assert "YOUR PROGRESS" in msgs[4]["content"]
     assert "CURRENT SCREEN:\nscreen 1" in msgs[5]["content"][0]["text"]
 
@@ -281,21 +283,17 @@ def test_image_model_used_for_image_analysis_and_main_model_decides_action(monke
     cfg.llm.model_image = "vision-analysis-model"
     client = LLMClient(cfg)
 
-    posted_models = []
-    def mock_post(messages, *, model, schema, max_tokens, purpose):
-        posted_models.append((model, purpose))
-        return "Visual analysis: pop up detected showing Allow button", None
-
     structured_models = []
-    def mock_structured(messages, model_cls, model, purpose):
+    def mock_structured(messages, model_cls, model="", purpose="decide", **kw):
         structured_models.append((model, purpose))
+        if model_cls is ScreenAnalysis:
+            return ScreenAnalysis(blocking_dialog="permission popup, Allow button")
         # Ensure visual analysis was passed to main model
         last_msg = messages[-1]["content"][0]["text"]
         assert "VISUAL SCREEN ANALYSIS (from image model)" in last_msg
         assert "Allow button" in last_msg
         return AgentAction(observation="popup", reasoning="tap allow", action="tap", target=Target(index=1))
 
-    monkeypatch.setattr(client, "_post", mock_post)
     monkeypatch.setattr(client, "structured", mock_structured)
 
     action = client.decide(
@@ -306,8 +304,8 @@ def test_image_model_used_for_image_analysis_and_main_model_decides_action(monke
         screenshot=b"fake-image-bytes"
     )
 
-    # _post should be called with vision-analysis-model for purpose analyze_image
-    assert ("accounts/fireworks/models/vision-analysis-model", "analyze_image") in posted_models
+    # the vision pass goes to the image model, under its own purpose
+    assert ("accounts/fireworks/models/vision-analysis-model", "analyze_image") in structured_models
     # structured decision should be called with main-action-model for purpose decide
     assert ("accounts/fireworks/models/main-action-model", "decide") in structured_models
     assert action.action == "tap"
@@ -618,7 +616,8 @@ def _stub_decide(monkeypatch, client):
 
     def analyze_image(screenshot, **kw):
         seen["analyses"] += 1
-        return "a long prose description of the screen"
+        return ScreenAnalysis(reading="428 g on the scale",
+                              notable="a dimmed Save button")
 
     monkeypatch.setattr(client, "structured", structured)
     monkeypatch.setattr(client, "analyze_image", analyze_image)
@@ -765,3 +764,131 @@ def test_the_ledger_survives_two_calls_settling_at_once():
 
     assert ledger.n_calls == 800
     assert ledger.total_usd == pytest.approx(800 * 2 / 1e3)
+
+
+# ---------------------------------------------------------------------------
+# The vision contract
+# ---------------------------------------------------------------------------
+#
+# Free prose ran 1,143 chars median and 2,284 at worst over the runs in `runs/`,
+# half of them spending a sentence on the Android nav bar. Four named fields ask
+# for the same facts without the padding.
+
+def test_the_vision_schema_asks_for_four_named_facts():
+    schema = harden_schema(ScreenAnalysis)
+    assert set(schema["properties"]) == {
+        "reading", "item_label", "blocking_dialog", "notable"}
+    assert schema["additionalProperties"] is False
+
+
+def test_an_empty_field_renders_to_nothing():
+    """Every field is optional in practice, so the model is never pushed into
+    inventing a dialog to fill a slot."""
+    assert ScreenAnalysis().render() == ""
+    assert ScreenAnalysis(reading="428 g").render() == "Reading: 428 g"
+
+
+def test_a_filled_analysis_renders_one_short_labelled_line_each():
+    rendered = ScreenAnalysis(reading="428 g on the scale",
+                              item_label="Today, 9:45 am",
+                              blocking_dialog="Allow location? [Deny] [Allow]",
+                              notable="Save button dimmed").render()
+    assert rendered.splitlines() == [
+        "Reading: 428 g on the scale",
+        "Item label: Today, 9:45 am",
+        "BLOCKING: Allow location? [Deny] [Allow]",
+        "Also visible: Save button dimmed",
+    ]
+    # An order of magnitude under the 1,143-char median it replaces.
+    assert len(rendered) < 150
+
+
+def test_the_vision_prompt_forbids_the_nav_bar_it_kept_describing():
+    from adbagent import prompts
+    assert "navigation bar" in prompts.IMAGE_ANALYSIS_SYSTEM
+    assert "Never describe" in prompts.IMAGE_ANALYSIS_SYSTEM
+
+
+def test_a_vision_model_that_cannot_hold_the_schema_does_not_fail_the_step(monkeypatch):
+    """The description is an aid; the element list the decider acts on is
+    unaffected, so a malformed answer degrades rather than aborts."""
+    client = _client(monkeypatch)
+
+    def explode(*a, **kw):
+        raise LLMError("never produced a valid ScreenAnalysis")
+
+    monkeypatch.setattr(client, "structured", explode)
+    assert client.analyze_image(b"jpeg").render() == ""
+
+
+# ---------------------------------------------------------------------------
+# Situational advice, gated
+# ---------------------------------------------------------------------------
+#
+# These three blocks were 36% of the system prompt and irrelevant on most turns.
+# They live in the NOTE block now, which is rebuilt every turn anyway, so varying
+# them costs no prompt-cache prefix.
+
+def test_the_system_prompt_no_longer_carries_the_situational_blocks():
+    from adbagent import prompts
+    assert "SCROLLING STRATEGY" not in prompts.SYSTEM
+    assert "BROWSING A GALLERY" not in prompts.SYSTEM
+    assert "MULTI-APP NAVIGATION" not in prompts.SYSTEM
+    # It kept the parts that apply on every single turn.
+    assert "THE ACTIONS" in prompts.SYSTEM
+    assert "SECURITY" in prompts.SYSTEM
+    assert len(prompts.SYSTEM) < 7000          # was 9,722
+
+
+def test_an_ordinary_turn_gets_no_situational_advice():
+    from adbagent.prompts import situational_notes
+    assert situational_notes(goal="turn on wifi") == ""
+
+
+def test_a_pager_turn_gets_the_gallery_block_only():
+    from adbagent.prompts import situational_notes
+    note = situational_notes(goal="turn on wifi", is_pager=True)
+    assert "BROWSING A GALLERY" in note
+    assert "SCROLLING STRATEGY" not in note
+
+
+def test_scrolling_advice_arrives_once_scrolling_starts():
+    from adbagent.prompts import situational_notes
+    assert "SCROLLING STRATEGY" not in situational_notes(goal="turn on wifi")
+    assert "SCROLLING STRATEGY" in situational_notes(goal="turn on wifi", scrolls=1)
+
+
+def test_a_search_goal_gets_scrolling_advice_before_the_first_scroll():
+    """Waiting for the first scroll would withhold "start fast, slow down near the
+    target" from the turn that chooses the first scroll's size."""
+    from adbagent.prompts import situational_notes
+    note = situational_notes(goal="find every message about the menu",
+                             has_scroller=True)
+    assert "SCROLLING STRATEGY" in note
+
+
+def test_a_search_goal_on_an_unscrollable_screen_gets_nothing():
+    from adbagent.prompts import situational_notes
+    assert situational_notes(goal="find the wifi setting", has_scroller=False) == ""
+
+
+def test_app_switching_advice_arrives_once_the_run_crosses_apps():
+    from adbagent.prompts import situational_notes
+    assert "SWITCHING APPS" not in situational_notes(goal="read my chats",
+                                                    packages_seen=1)
+    assert "SWITCHING APPS" in situational_notes(goal="read my chats",
+                                                packages_seen=2)
+
+
+def test_a_goal_that_says_it_will_switch_apps_gets_the_advice_up_front():
+    from adbagent.prompts import situational_notes
+    note = situational_notes(goal="copy the address and paste it into maps")
+    assert "SWITCHING APPS" in note
+
+
+def test_the_blocks_stack_when_they_all_apply():
+    from adbagent.prompts import situational_notes
+    note = situational_notes(goal="find and share every photo", is_pager=True,
+                             scrolls=3, packages_seen=2)
+    assert all(block in note for block in
+               ("BROWSING A GALLERY", "SCROLLING STRATEGY", "SWITCHING APPS"))

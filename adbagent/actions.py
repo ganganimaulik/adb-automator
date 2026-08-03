@@ -18,9 +18,12 @@ Two deliberate schema choices:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Literal, Optional, Tuple
+import re
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (BaseModel, ConfigDict, Field, field_validator,
+                      model_validator)
 
 from .screen import Element, Screen
 from .fingerprint import DESTRUCTIVE_TEXT
@@ -114,6 +117,24 @@ class Postcondition(BaseModel):
     package: Optional[str] = None
 
 
+class Note(BaseModel):
+    """One collected fact.
+
+    The model sends only the records that are new or corrected this turn; the
+    harness maintains the union across turns (see :mod:`scratchpad`). Reusing a
+    key corrects that record; a key never sent again keeps its value.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = Field(
+        description="Short stable identifier this fact hangs off: a timestamp, "
+                    "item name or label (e.g. \"9:45\", \"Item B\", \"total\"). "
+                    "Reuse the SAME key to correct a value you already sent.")
+    value: str = Field(
+        description="The fact itself, e.g. \"chicken 425g (+1g vs menu 424g)\".")
+
+
 class AgentAction(BaseModel):
     """One step. The model replies with exactly this object and nothing else."""
 
@@ -153,12 +174,32 @@ class AgentAction(BaseModel):
         None, description="For wait/sleep: max seconds to wait (0.5 to 30.0).", ge=0.5, le=30.0)
     confidence: Literal["high", "low"] = Field(
         "high", description="Use 'low' when unsure; you will be shown a screenshot.")
-    notes: Optional[str] = Field(
+    notes: Optional[List[Note]] = Field(
         None,
-        description="Data collection scratchpad. See DATA COLLECTION above.")
+        description="NEW or CORRECTED data records only, as {key, value}. The "
+                    "harness keeps every record you have ever sent, so never "
+                    "restate ones already listed under COLLECTED DATA. See DATA "
+                    "COLLECTION above.")
     progress: Optional[str] = Field(
         None,
         description="Multi-step progress tracker. See PROGRESS TRACKING above.")
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def _accept_prose_notes(cls, value: object) -> object:
+        """Take a bare string where records were asked for.
+
+        Two callers need this. A model that ignores the record shape and writes
+        ``"9:45 chicken 425g; 9:51 chicken 426g"`` should still have its readings
+        kept rather than rejected into a repair round-trip; and every action in a
+        recording made before the schema changed has ``notes`` as a string, which
+        ``replay`` must still be able to load.
+        """
+        if isinstance(value, (str, dict)):
+            from .scratchpad import as_records
+            return [{"key": key, "value": text}
+                    for key, text in as_records(value)] or None
+        return value
 
     @model_validator(mode="after")
     def _check_arguments(self) -> "AgentAction":
@@ -261,6 +302,140 @@ def format_history_entry(step: int, action: AgentAction,
             parts.append(f"({reason})")
 
     return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Folding repeated history
+# ---------------------------------------------------------------------------
+#
+# Paging an album produces the same line over and over. From
+# `runs/af76720d05c4`, nine consecutive entries in one prompt:
+#
+#     34. swipe #4 [Scroller "Image" at (360,800)] left amount=1.0 in
+#         com.whatsapp (Obs: ...) -> success
+#
+# identical but for the step number and the observation -- and the observation is
+# the only part carrying information, because it holds what the model read off
+# that item. So a run is folded into one line that keeps the count and the
+# readings, which is what `screen._collapse_identical_siblings` already does for
+# repeated elements.
+#
+# Folding happens at append time, and only against the immediately preceding
+# entry, so the rendered block still only ever differs from last turn's at its
+# final line. That is the same append-only property `prompts.history_only_block`
+# needs for the prompt prefix to stay cacheable -- rewriting the tail is free,
+# rewriting the middle is not.
+
+_HIST_STEP = re.compile(r"^(\d+)(?:-(\d+))?\.\s+")
+#: The Obs clause may itself contain brackets, so it ends where the next known
+#: field begins rather than at the first closing paren.
+_HIST_OBS = re.compile(r"\s*\(Obs: (.*?)\)(?=\s*(?:->|\[x\d+\]|$))")
+_HIST_COUNT = re.compile(r"\s*\[x(\d+)\]")
+#: How a fold records readings it had to drop, so re-folding keeps the tally
+#: instead of forgetting it a second time.
+_HIST_DROPPED = re.compile(r"^\.\.\.\s*\+(\d+)\s+more$")
+
+#: How many distinct readings a folded line keeps, and how much room they get.
+#: Enough to see what a sweep collected; not so much that the fold costs more
+#: than the lines it replaced. Both bounds are enforced in one place, and what
+#: they drop is stated rather than quietly disappearing.
+MAX_FOLDED_READINGS = 6
+MAX_FOLDED_READING_CHARS = 400
+
+
+@dataclass
+class _Folded:
+    first: int
+    last: int
+    count: int
+    body: str
+    readings: List[str]
+    dropped: int = 0
+
+
+def _split_history(line: str) -> Optional[_Folded]:
+    """Take a history line back apart, folded or not."""
+    match = _HIST_STEP.match(line)
+    if not match:
+        return None
+    first = int(match.group(1))
+    last = int(match.group(2) or match.group(1))
+    rest = line[match.end():]
+
+    readings: List[str] = []
+    dropped = 0
+    obs = _HIST_OBS.search(rest)
+    if obs:
+        for part in obs.group(1).split(" | "):
+            part = part.strip()
+            if not part:
+                continue
+            already = _HIST_DROPPED.match(part)
+            if already:
+                dropped += int(already.group(1))
+            else:
+                readings.append(part)
+        rest = rest[:obs.start()] + rest[obs.end():]
+
+    count = 1
+    repeat = _HIST_COUNT.search(rest)
+    if repeat:
+        count = int(repeat.group(1))
+        rest = rest[:repeat.start()] + rest[repeat.end():]
+
+    return _Folded(first, last, count, " ".join(rest.split()), readings, dropped)
+
+
+def _join_history(folded: _Folded) -> str:
+    steps = (f"{folded.first}." if folded.first == folded.last
+             else f"{folded.first}-{folded.last}.")
+    out = f"{steps} {folded.body}"
+    if folded.count > 1:
+        out += f" [x{folded.count}]"
+
+    shown, used = [], 0
+    for reading in folded.readings:
+        if (len(shown) >= MAX_FOLDED_READINGS
+                or used + len(reading) > MAX_FOLDED_READING_CHARS):
+            break
+        shown.append(reading)
+        used += len(reading)
+    dropped = folded.dropped + len(folded.readings) - len(shown)
+
+    if shown or dropped:
+        joined = " | ".join(shown)
+        if dropped > 0:
+            joined += f"{' | ' if shown else ''}... +{dropped} more"
+        out += f" (Obs: {joined})"
+    return out
+
+
+def append_history(history: List[str], entry: str) -> List[str]:
+    """Append `entry`, folding it into the previous line if it repeats it.
+
+    Two entries repeat when everything except the step number and the
+    observation matches: the same action on the same screen with the same
+    outcome. Distinct observations are kept, deduplicated and in order, because
+    on a pager they *are* the collected readings.
+    """
+    if not history:
+        history.append(entry)
+        return history
+
+    new = _split_history(entry)
+    prev = _split_history(history[-1])
+    if new is None or prev is None or new.body != prev.body:
+        history.append(entry)
+        return history
+
+    for reading in new.readings:
+        if reading not in prev.readings:
+            prev.readings.append(reading)
+    prev.last = new.last
+    prev.count += new.count
+    prev.dropped += new.dropped
+    history[-1] = _join_history(prev)
+    return history
 
 
 # ---------------------------------------------------------------------------

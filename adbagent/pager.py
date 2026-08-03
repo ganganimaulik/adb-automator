@@ -434,14 +434,19 @@ class ItemLedger:
         return raw
 
     def note(self, key: str, screen: Screen, step: int, *,
-             detail: str = "", read: bool = False) -> bool:
-        """Record a sighting and move the cursor. True when the item is new."""
+             detail: str = "", read: bool = False, label: str = "") -> bool:
+        """Record a sighting and move the cursor. True when the item is new.
+
+        `label` is a fallback for when the app's own caption is not in the tree --
+        the image model can often still see one. It never overrides a caption the
+        app did supply, and it is never used for identity: `key` decides that.
+        """
         if not key:
             return False
         self.cursor = key
         if screen.item_total:
             self.total = max(self.total, screen.item_total)
-        label = screen.item_label or key
+        label = screen.item_label or " ".join(str(label or "").split())[:80] or key
         record = self.items.get(key)
         if record is None:
             occurrence = key.rsplit("#", 1)[-1] if "#" in key else ""

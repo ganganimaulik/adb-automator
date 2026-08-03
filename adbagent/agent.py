@@ -21,18 +21,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import safety
-from .actions import (ActionError, AgentAction, execute, format_history_entry,
-                      synthesise_postcondition, verify)
+from . import prompts, safety
+from .actions import (ActionError, AgentAction, append_history, execute,
+                      format_history_entry, synthesise_postcondition, verify)
 from .config import Config
 from .device import Device, DeviceTimeout, DeviceLost
-from .llm import BudgetExceeded, LLMClient, LLMError, Prefetch
+from .llm import (BudgetExceeded, LLMClient, LLMError, Prefetch, ScreenAnalysis)
 from .memory import Memory, intent_key
 from .pager import (ItemLedger, attach_item, browsing_note, can_sweep, loop_id,
                     pager_element, set_id as pager_set_id, stop_sweeping,
                     sweep_summary)
 from .safety import Aborted, LoopDetector
-from .scratchpad import ScratchpadGuard
+from .scratchpad import NoteLedger
 from .screen import Screen, render
 from .skills import SkillRegistry
 
@@ -89,20 +89,16 @@ class RunState:
     scroll_warnings: int = 0
     started_at: float = field(default_factory=time.monotonic)
     finished: Optional[Outcome] = None
-    #: Running scratchpad for data-collection goals.  The LLM writes the COMPLETE
-    #: collected state into the ``notes`` field of its action every turn and we
-    #: keep only that latest value, because the model re-emits its whole ledger
-    #: each turn and appending would archive a hundred near-identical copies.
-    #: ``guard`` is what makes overwriting safe -- see `scratchpad.py`.
-    scratchpad: List[str] = field(default_factory=list)
+    #: Everything the run has collected. The model sends only what is new or
+    #: corrected each turn (the ``notes`` field) and this keeps the union, so a
+    #: record it stops mentioning cannot go missing -- see `scratchpad.py`.
+    scratchpad: NoteLedger = field(default_factory=NoteLedger)
     #: Progress tracker for multi-step goals.  The LLM writes into the
     #: ``progress`` field; we keep the latest entry and feed it back.
     progress_log: List[str] = field(default_factory=list)
-    #: Append-only archive of every record the model has written, so a rewrite
-    #: that quietly drops a figure is caught and handed back rather than lost.
-    guard: ScratchpadGuard = field(default_factory=ScratchpadGuard)
-    #: Rendered "you dropped these" block, carried to the next turn's prompt.
-    dropped_note: str = ""
+    #: Distinct packages this run has been in. Two or more means it is a
+    #: multi-app run, which is when the app-switching advice earns its tokens.
+    packages: set = field(default_factory=set)
     #: Which items of a gallery / carousel have actually been looked at. Kept by
     #: code rather than by the model, because a ledger the model rewrites by hand
     #: every turn silently loses an entry the moment it forgets to repeat one.
@@ -116,6 +112,15 @@ class RunState:
     @property
     def elapsed(self) -> float:
         return time.monotonic() - self.started_at
+
+    def remember(self, entry: str) -> None:
+        """Add a history line, folding it into the previous one if it repeats it.
+
+        Paging an album produces the same line dozens of times over; see
+        `actions.append_history` for why the fold happens here, at append time,
+        rather than when the block is rendered.
+        """
+        append_history(self.history, entry)
 
 
 class Recorder:
@@ -329,6 +334,8 @@ class Agent:
                 self.on_event("perceive", step=state.step, elapsed=time.monotonic() - t0_perceive)
             self.mem.note_screen(screen)
             self._last_package = screen.package
+            if screen.package:
+                state.packages.add(screen.package)
 
             # A programmatic assertion is the cheapest and most reliable way to
             # know we are done, so it is checked before anything else happens.
@@ -433,6 +440,26 @@ class Agent:
                     state.item_key = state.items.resolve(
                         attach_item(screen), moved=state.item_moved)
 
+            # The vision pass runs here rather than inside `decide` so its
+            # structured fields reach the ledgers below: a `reading` the image
+            # model took off this item is the same fact the pager ledger keeps per
+            # item, and routing it through prose for the decider to re-extract
+            # loses it the moment the decider paraphrases.
+            #
+            # The step's cost mark and clock both start *before* it, because a
+            # screenshot turn is an analysis and then a decision, and charging the
+            # step for only the second one is how a two-call turn reads as a
+            # one-call turn -- and how `report`'s latency/step quietly loses the
+            # vision time on the ~22% of turns that take a screenshot.
+            ledger_mark = self.llm.ledger.mark() if self.llm else 0
+            t0_step_llm = time.monotonic()
+            analysis: Optional[ScreenAnalysis] = None
+            if (screenshot and self.llm is not None
+                    and self.llm.needs_vision_pass):
+                analysis = self.llm.analyze_image(
+                    screenshot, goal=state.goal, rendered=render(screen),
+                    step=state.step, recorder=rec, on_event=self.on_event)
+
             # A pager item is ledgered here, once its identity and whether we
             # have vision on it are both settled. `read` is deliberately keyed to
             # the screenshot and not to the sighting: having seen an item's
@@ -440,7 +467,9 @@ class Agent:
             pager_note = ""
             if screen.is_pager:
                 state.items.note(state.item_key, screen, state.step,
-                                 read=bool(screenshot))
+                                 read=bool(screenshot),
+                                 detail=analysis.reading if analysis else "",
+                                 label=analysis.item_label if analysis else "")
                 if screen.item_label:
                     # `item_moved` is a latch, not a per-turn flag: it has to
                     # survive the turns where the caption is hidden, because the
@@ -475,22 +504,34 @@ class Agent:
             elem_hint = state.loops.element_history_hint(
                 screen.skeleton_id,
                 repeatable=pager_el.index if pager_el is not None else 0)
-            notes = "\n\n".join(filter(None, (note, state.dropped_note, pager_note,
+            # Advice that only applies sometimes lives here rather than in the
+            # system prompt: this block is rebuilt every turn anyway, so varying
+            # it is free, whereas varying the system message evicts the whole
+            # prompt prefix from the provider's cache.
+            situational = prompts.situational_notes(
+                goal=state.goal, is_pager=screen.is_pager,
+                scrolls=state.loops.total_scroll_count,
+                has_scroller=any(el.scrollable and not el.is_horizontal
+                                 for el in screen.elements),
+                packages_seen=len(state.packages))
+            notes = "\n\n".join(filter(None, (note, pager_note,
                                              hint, elem_hint, ban_note,
-                                             state.last_failure, skill_note)))
+                                             state.last_failure, skill_note,
+                                             situational)))
             model_name = self.llm.model if self.llm else ""
             self.on_event("llm_start", step=state.step, purpose="decide", model=model_name, screenshot=bool(screenshot))
             t0_llm = time.monotonic()
-            ledger_mark = self.llm.ledger.mark() if self.llm else 0
             action = self.llm.decide(                      ### LLM ###
                 goal=state.goal, rendered=render(screen), history=state.history,
                 width=screen.width, height=screen.height, package=screen.package,
                 screenshot=screenshot, note=notes,
-                scratchpad="\n".join(state.scratchpad),
+                scratchpad=state.scratchpad.render(cfg.run.scratchpad_max_chars),
                 progress="\n".join(state.progress_log),
+                image_analysis=analysis.render() if analysis else None,
                 step=state.step, recorder=rec,
                 on_event=self.on_event)
-            t_llm = time.monotonic() - t0_llm
+            t_llm = time.monotonic() - t0_llm            # the decision alone
+            t_step_llm = time.monotonic() - t0_step_llm  # + any vision pass
             step_calls = self.llm.ledger.since(ledger_mark) if self.llm else []
             last_call = step_calls[-1] if step_calls else None
             self.on_event("llm_end", step=state.step, purpose="decide", elapsed=t_llm, call=last_call)
@@ -541,7 +582,7 @@ class Agent:
                         "told to stop. Commit to one direction, do something "
                         "else, or report done/fail.")
                     state.consecutive_failures += 1
-                    state.history.append(
+                    state.remember(
                         format_history_entry(
                             state.step, action, screen=screen,
                             grade="rejected",
@@ -552,29 +593,15 @@ class Agent:
                     continue
 
             # -- accumulate scratchpad notes --------------------------------
-            # The latest note replaces the previous one; the guard is what keeps
-            # that from being lossy. It archives every record the model writes and
-            # tells us which ones this rewrite stopped covering, so a dropped
-            # figure comes back in the next prompt instead of vanishing for the
-            # rest of the run.
+            # The model sends only what is new or corrected; the union is kept
+            # here. Nothing it stops mentioning can be lost, because nothing is
+            # being replaced -- which is what the previous contract, where the
+            # model rewrote the whole ledger every turn, could not promise.
             if getattr(action, "notes", None):
-                cap = cfg.run.scratchpad_max_chars
-                note_text = action.notes.strip()[:cap]
-                if note_text:
-                    losses = state.guard.update(note_text, state.step)
-                    state.dropped_note = state.guard.report(losses)
-                    if losses:
-                        rec.event("scratchpad_dropped", step=state.step,
-                                  keys=[loss.key for loss in losses],
-                                  reported=bool(state.dropped_note))
-                    # Append scroll position context so the LLM has spatial
-                    # memory even if it forgets to include it in its notes.
-                    if state.loops.total_scroll_count > 0:
-                        scroll_info = (f"\n[Scroll stats: {state.loops.total_scroll_count} "
-                                       f"scroll(s) so far, {state.loops.direction_reversals()} "
-                                       f"direction reversal(s)]")
-                        note_text = note_text + scroll_info
-                    state.scratchpad = [note_text]
+                written = state.scratchpad.update(action.notes, state.step)
+                if written:
+                    rec.event("scratchpad", step=state.step, keys=written,
+                              total=len(state.scratchpad))
 
             # -- attach what the model read off this item --------------------
             # The observation describes the screen the model was just shown, so
@@ -586,8 +613,14 @@ class Agent:
             # chrome ("the caption is hidden") -- and letting that overwrite the
             # reading taken a turn earlier would throw away the one thing worth
             # keeping.
+            #
+            # A `reading` from the vision pass already went in above and wins: the
+            # decider's observation is its restatement of that same reading, and a
+            # restatement is where a figure gets rounded or paraphrased away. The
+            # observation is what there is when the decider has its own eyes and
+            # there was no separate pass.
             if (screen.is_pager and state.item_key and action.observation
-                    and screenshot):
+                    and screenshot and not (analysis and analysis.reading)):
                 state.items.note(state.item_key, screen, state.step,
                                  detail=action.observation)
 
@@ -600,7 +633,7 @@ class Agent:
             rec.event("decide", step=state.step, source=source,
                       skeleton=screen.skeleton_id, action=action.model_dump(),
                       screenshot=bool(screenshot),
-                      wall_s=round(t_llm, 3), llm=step_metrics(step_calls))
+                      wall_s=round(t_step_llm, 3), llm=step_metrics(step_calls))
             self.on_event("step", state=state, screen=screen, action=action,
                           source=source, screenshot=bool(screenshot))
 
@@ -611,7 +644,7 @@ class Agent:
                 if not safety.confirm(
                         f"Step {state.step}: the agent wants to press {label!r} "
                         f"in {screen.package}. This cannot be undone.", cfg):
-                    state.history.append(
+                    state.remember(
                         f"{state.step}. refused to press {label!r}"
                         + (f" in {screen.package}" if screen.package else "")
                     )
@@ -629,7 +662,7 @@ class Agent:
 
             if cfg.run.dry_run:
                 log.info("dry run: would %s", action.describe())
-                state.history.append(
+                state.remember(
                     format_history_entry(state.step, action, screen=screen, prefix="(dry run)")
                 )
                 continue
@@ -642,7 +675,7 @@ class Agent:
                 log.warning("step %d: %s", state.step, exc)
                 state.last_failure = str(exc)
                 state.consecutive_failures += 1
-                state.history.append(
+                state.remember(
                     format_history_entry(
                         state.step, action, screen=screen,
                         grade="failed", reason=str(exc)
@@ -774,7 +807,7 @@ class Agent:
             state.loops.record_element_action(
                 screen.skeleton_id, state.step, action.signature(), action.describe(element=element)
             )
-            state.history.append(
+            state.remember(
                 format_history_entry(
                     state.step, action, screen=screen, element=element,
                     grade=outcome.grade, reason=outcome.reason
@@ -958,7 +991,7 @@ class Agent:
                   read_count=state.items.read_count)
         self.on_event("sweep_end", first_step=first_step, last_step=state.step,
                       direction=direction, swept=swept, read=read, reason=reason)
-        state.history.append(sweep_summary(first_step, state.step, direction,
+        state.remember(sweep_summary(first_step, state.step, direction,
                                            swept, read, reason or "it stopped"))
         # The sweep is browsing, not thrashing, so it is deliberately kept out of
         # the loop detector: twelve flings on one `skeleton_id` is exactly the
@@ -999,7 +1032,7 @@ class Agent:
             if self.oracle.satisfied(self.dev, screen):
                 return "success"
             log.warning("the agent said done but the assertion disagrees")
-            state.history.append(
+            state.remember(
                 f"{state.step}. claimed done, but the success check failed")
             state.last_failure = ("your 'done' was rejected: the success condition "
                                  "is still not met")
@@ -1013,11 +1046,11 @@ class Agent:
         self.on_event("llm_start", step=state.step, purpose="judge", model=model_name, screenshot=bool(shot))
         t0_judge = time.monotonic()
         ledger_mark = self.llm.ledger.mark()
-        # The judge is shown everything the run collected, including records a
-        # later rewrite of the notes dropped. Without that it grades the goal on
+        # The judge is shown every record the run collected, not the last thing
+        # the model happened to write. Without that it grades the goal on
         # whatever survived the model's last edit -- which is how a run that had
         # read a value ends up reporting it as unavailable.
-        collected = state.guard.preserved("\n".join(state.scratchpad))
+        collected = state.scratchpad.plain(self.cfg.run.scratchpad_max_chars)
         verdict = self.llm.judge(goal=state.goal, rendered=render(screen),  ### LLM ###
                                  history=state.history, screenshot=shot,
                                  scratchpad=collected,
@@ -1037,7 +1070,7 @@ class Agent:
             log.info("verified: %s", verdict.evidence)
             return "success"
         log.warning("premature 'done': %s", verdict.evidence)
-        state.history.append(f"{state.step}. claimed done; rejected: {verdict.evidence}")
+        state.remember(f"{state.step}. claimed done; rejected: {verdict.evidence}")
         state.last_failure = f"your 'done' was rejected: {verdict.evidence}"
         return None
 
