@@ -10,7 +10,8 @@
     "rpm": 120,
     "max_retries": 10,
     "service_tier": "",
-    "api_key_env": "FIREWORKS_API_KEY"
+    "api_key_env": "FIREWORKS_API_KEY",
+    "vision_in_decider": false
   },
 
   "device": {
@@ -40,7 +41,10 @@
     "max_wall_clock_s": 1800,
     "artifacts_dir": "runs",
     "always_screenshot": false,
-    "never_screenshot": false
+    "never_screenshot": false,
+    "scratchpad_max_chars": 50000,
+    "pager_sweep": true,
+    "pager_sweep_max": 12
   },
 
   "skills": {
