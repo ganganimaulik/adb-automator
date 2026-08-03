@@ -138,8 +138,10 @@ class FakeDevice:
         elif key == "home":
             self.state = "launcher"
 
-    def input_text(self, text: str, clear: bool = True) -> None:
-        self.actions.append(f"input_text({text!r})")
+    def input_text(self, text: str, clear: bool = True, press_enter: bool = False) -> None:
+        self.actions.append(f"input_text({text!r},clear={clear},press_enter={press_enter})")
+        if press_enter:
+            self.actions.append("press(enter)")
 
     def clear_text(self) -> None:
         self.actions.append("clear_text")
@@ -147,9 +149,27 @@ class FakeDevice:
     def hide_keyboard(self) -> None:
         pass
 
+    def get_clipboard(self) -> str:
+        self.actions.append("get_clipboard")
+        return getattr(self, "clipboard_text", "sample clipboard text")
+
+    def set_clipboard(self, text: str) -> None:
+        self.actions.append(f"set_clipboard({text!r})")
+        self.clipboard_text = text
+
     def open_app(self, package: str) -> None:
         self.actions.append(f"open_app({package})")
         self.state = "home"
+
+    def list_apps(self, query: str = "", third_party_only: bool = False) -> List[str]:
+        self.actions.append(f"list_apps({query!r})")
+        pkgs = ["com.android.settings", "com.whatsapp", "com.spotify.music"]
+        if query:
+            q = query.lower()
+            pkgs = [p for p in pkgs if q in p.lower()]
+        return sorted(pkgs)
+
+    list_packages = list_apps
 
     # -- misc --------------------------------------------------------------
 

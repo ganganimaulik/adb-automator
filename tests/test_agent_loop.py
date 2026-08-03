@@ -314,3 +314,26 @@ def test_progress_log_retains_only_latest():
                 state.progress_chars = len(prog_text)
 
     assert state.progress_log == ["Step 2 done"]
+
+
+def test_list_apps_in_agent_loop(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    step_count = {"n": 0}
+
+    def policy(screen, llm):
+        step_count["n"] += 1
+        if step_count["n"] == 1:
+            return AgentAction(observation="home screen", reasoning="find whatsapp package",
+                               action="list_apps", text="whatsapp")
+        elif step_count["n"] == 2:
+            return AgentAction(observation="home screen", reasoning="open whatsapp",
+                               action="open_app", text="com.whatsapp")
+        return AgentAction(observation="whatsapp opened", reasoning="done",
+                           action="done", text="opened whatsapp")
+
+    llm = fake.FakeLLM(dev, policy)
+    outcome, state = Agent(dev, mem, llm, cfg).run("open whatsapp")
+    assert outcome == "success"
+    assert "list_apps('whatsapp')" in dev.actions
+    assert "open_app(com.whatsapp)" in dev.actions
+

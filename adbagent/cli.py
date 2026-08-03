@@ -614,6 +614,33 @@ def cmd_report(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# apps
+# ---------------------------------------------------------------------------
+
+def cmd_apps(args) -> int:
+    from .device import Device
+
+    out = Out()
+    cfg = build_config(args)
+    _ensure_device(args, cfg, out)
+
+    with Device(cfg, args.device or "") as dev:
+        query = getattr(args, "search", "") or ""
+        third_party = getattr(args, "third_party", False)
+        pkgs = dev.list_apps(query=query, third_party_only=third_party)
+        title = "Installed Apps" if not third_party else "Installed 3rd-Party Apps"
+        if query:
+            title += f" matching {query!r}"
+        out.say(out.bold(f"  {title} ({len(pkgs)})"))
+        out.say()
+        for pkg in pkgs:
+            out.say(f"  - {pkg}")
+        if not pkgs:
+            out.say("  (no matching apps found)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -716,6 +743,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("run", help="path to runs/<id> or its events.jsonl")
     _add_common(p)
     p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("apps", help="list or search installed app packages on device")
+    p.add_argument("-s", "--search", help="filter packages by substring")
+    p.add_argument("-3", "--third-party", dest="third_party", action="store_true",
+                   help="only show third-party installed apps")
+    _add_common(p)
+    _add_device(p)
+    p.set_defaults(func=cmd_apps)
 
     return parser
 

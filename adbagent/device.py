@@ -687,9 +687,11 @@ class Device:
         print(f"Press key {key!r}")
         self._act(lambda: self.u2.press(key), "press")
 
-    def input_text(self, text: str, clear: bool = True) -> None:
-        print(f"Input text {text!r} (clear={clear})")
+    def input_text(self, text: str, clear: bool = True, press_enter: bool = False) -> None:
+        print(f"Input text {text!r} (clear={clear}, press_enter={press_enter})")
         self._act(lambda: self.u2.send_keys(text, clear=clear), "input_text")
+        if press_enter:
+            self.press("enter")
 
     def clear_text(self) -> None:
         self._act(lambda: self.u2.clear_text(), "clear_text")
@@ -697,8 +699,46 @@ class Device:
     def hide_keyboard(self) -> None:
         self._safe(lambda: self.u2.hide_keyboard())
 
+    def get_clipboard(self) -> str:
+        try:
+            res = _guard(lambda: self.u2.clipboard, self.cfg.device.watchdog_s, "get_clipboard")
+            return res if isinstance(res, str) else str(res or "")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("get_clipboard u2 failed (%s); using shell", exc)
+            out = self._safe(lambda: self.shell("cmd clipboard get", timeout=10)) or ""
+            return out.strip()
+
+    def set_clipboard(self, text: str) -> None:
+        print(f"Set clipboard {text!r}")
+        try:
+            _guard(lambda: self.u2.set_clipboard(text), self.cfg.device.watchdog_s, "set_clipboard")
+        except Exception as exc:  # noqa: BLE001
+            log.debug("set_clipboard u2 failed (%s); using shell", exc)
+            self._safe(lambda: self.shell(f"cmd clipboard set {text!r}", timeout=10))
+
     def open_app(self, package: str) -> None:
         self._act(lambda: self.u2.app_start(package, stop=False), "open_app")
+
+    def list_apps(self, query: str = "", third_party_only: bool = False) -> List[str]:
+        """List installed application packages on the device, optionally filtered by query string."""
+        cmd = "pm list packages"
+        if third_party_only:
+            cmd += " -3"
+        cmd += " -e"
+        out = self.shell(cmd, timeout=15)
+        packages: List[str] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("package:"):
+                pkg = line[8:].strip()
+                if pkg:
+                    packages.append(pkg)
+        if query:
+            q = query.strip().lower()
+            packages = [p for p in packages if q in p.lower()]
+        return sorted(packages)
+
+    list_packages = list_apps
 
     def _act(self, fn: Callable[[], T], what: str) -> T:
         return _guard(fn, self.cfg.device.watchdog_s, what)

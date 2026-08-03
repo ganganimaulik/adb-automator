@@ -431,3 +431,109 @@ def test_scroll_describe_with_base_scale():
     assert "base_scale=0.8" in desc
 
 
+def test_list_apps_action():
+    a = act(action="list_apps", text="whatsapp")
+    assert a.action == "list_apps"
+    assert a.text == "whatsapp"
+    assert a.describe() == "list_apps whatsapp"
+
+    b = act(action="list_apps")
+    assert b.action == "list_apps"
+    assert b.text is None
+    assert b.describe() == "list_apps"
+
+
+def test_list_apps_execution():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    dev.list_apps.return_value = ["com.whatsapp", "com.whatsapp.w4b"]
+    screen = s(X.settings_screen())
+
+    action = act(action="list_apps", text="whatsapp")
+    execute(dev, action, screen)
+
+    dev.list_apps.assert_called_once_with(query="whatsapp")
+    assert getattr(action, "_result_summary") == "found 2 app(s): com.whatsapp, com.whatsapp.w4b"
+
+    outcome = verify(action, screen, screen)
+    assert outcome.grade == "success"
+    assert "com.whatsapp" in outcome.reason
+
+
+def test_clipboard_actions():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    dev.get_clipboard.return_value = "hello clipboard"
+    screen = s(X.settings_screen())
+
+    get_act = act(action="get_clipboard")
+    execute(dev, get_act, screen)
+    dev.get_clipboard.assert_called_once()
+    assert verify(get_act, screen, screen).reason == "clipboard content: 'hello clipboard'"
+
+    set_act = act(action="set_clipboard", text="new text")
+    execute(dev, set_act, screen)
+    dev.set_clipboard.assert_called_once_with("new text")
+    assert verify(set_act, screen, screen).reason == "set clipboard to 'new text'"
+
+
+def test_smart_open_app():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    dev.list_apps.return_value = ["com.spotify.music", "com.spotify.lite"]
+    screen = s(X.settings_screen())
+
+    # Common app name fuzzy resolution
+    action = act(action="open_app", text="spotify")
+    execute(dev, action, screen)
+
+    dev.list_apps.assert_called_once_with(query="spotify")
+    dev.open_app.assert_called_once_with("com.spotify.music")
+    assert getattr(action, "_resolved_package") == "com.spotify.music"
+
+
+def test_smarter_input_text():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    screen = s(X.settings_screen())
+
+    action = act(action="input_text", target=Target(index=1), text="search query", clear=False, press_enter=True)
+    execute(dev, action, screen)
+
+    dev.input_text.assert_called_once_with("search query", clear=False, press_enter=True)
+
+
+def test_condition_based_wait():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    screen = s(X.settings_screen())
+    dev.observe.return_value = screen
+
+    action = act(action="wait", wait_for_text="Option 1", timeout=2.0)
+    execute(dev, action, screen)
+
+    assert "found" in getattr(action, "_result_summary")
+    assert verify(action, screen, screen).grade == "success"
+
+
+def test_target_resolution_fallback():
+    # Index 1 on BASE is status bar "9:41"
+    # If target specifies index=1 but text="Option 4" (mismatch), fallback should search for text "Option 4"
+    target = Target(index=1, text="Option 4", resource_id="btn_option4")
+    el = resolve_target(target, BASE)
+    assert el is not None
+    assert "Option 4" in el.best_text
+
+
+
+
