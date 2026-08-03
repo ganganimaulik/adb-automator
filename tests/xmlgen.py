@@ -287,3 +287,101 @@ def horizontal_scroll_screen(cards: int = 5, scroll: int = 0,
                       toolbar("Gallery"),
                       carousel,
                   ]))
+
+
+# ---------------------------------------------------------------------------
+# A WhatsApp-style media viewer: one photo of an album, full-bleed pager
+#
+# Traced from a real run (runs/af76720d05c4). Two shapes matter, because the
+# app fades its overlay chrome out after a few seconds and the tree collapses:
+# with chrome the photo's timestamp is addressable, without it nothing is.
+# ---------------------------------------------------------------------------
+
+WA = "com.whatsapp"
+MEDIA_ACTIVITY = ".mediaview.MediaViewActivity"
+ALBUM_ACTIVITY = ".conversation.conversationrow.album.MediaAlbumActivity"
+
+
+def nav_bar() -> N:
+    return N("android.widget.FrameLayout", (0, H - 120, W, H),
+             package="com.android.systemui", children=[
+                 N("android.widget.ImageButton", (60, H - 110, 180, H - 10),
+                   desc="Back", rid="back", package="com.android.systemui",
+                   clickable=True),
+                 N("android.widget.ImageButton", (480, H - 110, 600, H - 10),
+                   desc="Home", rid="home", package="com.android.systemui",
+                   clickable=True),
+                 N("android.widget.ImageButton", (900, H - 110, 1020, H - 10),
+                   desc="Overview", rid="recent_apps",
+                   package="com.android.systemui", clickable=True),
+             ])
+
+
+def media_viewer(timestamp: str = "9:33 am", sender: str = "+91 93275 84664",
+                 chrome: bool = True) -> str:
+    """One photo of an album in the full-screen viewer.
+
+    ``chrome=False`` is the state the overlay fades to: the pager is the only
+    thing left, and the photo has no caption anywhere in the tree.
+    """
+    pager = N("androidx.viewpager.widget.ViewPager", (0, 0, W, H - 120),
+              desc="Image", rid="pager", package=WA, scrollable=True)
+    kids = [pager]
+    if chrome:
+        kids += [
+            N("android.widget.LinearLayout", (0, 80, W, 260), rid="action_bar",
+              package=WA, children=[
+                  N("android.widget.ImageButton", (24, 120, 144, 240),
+                    desc="Back", package=WA, clickable=True),
+                  N("android.widget.Button", (170, 110, 700, 250),
+                    text=f"{sender} Today, {timestamp}", rid="title_holder",
+                    package=WA, clickable=True),
+                  N("android.widget.Button", (720, 110, 850, 250), text="Save",
+                    package=WA, clickable=True),
+                  N("android.widget.ImageButton", (900, 110, 1020, 250),
+                    desc="More options", rid="menuitem_overflow", package=WA,
+                    clickable=True),
+              ]),
+            N("android.widget.LinearLayout", (0, H - 400, W, H - 140), package=WA,
+              children=[
+                  N("android.widget.Button", (40, H - 380, 400, H - 260),
+                    text="Reply", rid="quick_reactions_reply_container",
+                    package=WA, clickable=True),
+                  N("android.widget.Button", (440, H - 380, 560, H - 260),
+                    text="❤️", rid="quick_reaction_emoji_1",
+                    package=WA, clickable=True),
+              ]),
+        ]
+    kids.append(nav_bar())
+    return dump(N("android.widget.FrameLayout", (0, 0, W, H), rid="content",
+                  package=WA, children=kids))
+
+
+def media_album(header: str = "9:30 am", total: str = "15 photos",
+                sender: str = "+91 93275 84664") -> str:
+    """The album grid, which publishes only its first two tiles to the tree."""
+    return dump(N("android.widget.FrameLayout", (0, 0, W, H), rid="content",
+                  package=WA, children=[
+                      N("android.widget.LinearLayout", (0, 80, W, 260),
+                        rid="action_bar", package=WA, children=[
+                            N("android.widget.ImageButton", (24, 120, 144, 240),
+                              desc="Back", package=WA, clickable=True),
+                            N("android.widget.TextView", (170, 110, 700, 180),
+                              text=sender, package=WA),
+                            N("android.widget.TextView", (170, 185, 700, 250),
+                              text=total, package=WA),
+                        ]),
+                      N("androidx.recyclerview.widget.RecyclerView",
+                        (0, 260, W, H - 120), rid="list", package=WA,
+                        scrollable=True, children=[
+                            N("android.widget.Button", (40, 280, 300, 340),
+                              text=header, package=WA, clickable=True),
+                            N("android.widget.Button", (0, 360, W, 1200),
+                              desc="Enlarge photo", rid="image", package=WA,
+                              clickable=True),
+                            N("android.widget.Button", (0, 1220, W, 2060),
+                              desc="Enlarge photo", rid="image", package=WA,
+                              clickable=True),
+                        ]),
+                      nav_bar(),
+                  ]))

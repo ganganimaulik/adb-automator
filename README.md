@@ -134,7 +134,8 @@ replays it as a readable trace.
 This is the part that makes or breaks the project. Too strict and it never hits;
 too loose and it taps the wrong thing.
 
-Every screen gets four fingerprints from a single dump:
+Every screen gets four fingerprints from a single dump, plus a fifth for screens
+that page between items:
 
 | level | what it covers | used for |
 |---|---|---|
@@ -142,6 +143,7 @@ Every screen gets four fingerprints from a single dump:
 | `skeleton_id` | structure, positions quantised, list rows capped, no text | bucket key |
 | `simhash64` | structure plus *chrome* text | distance within a bucket |
 | `exact_id` | everything including all text and state | change and loop detection |
+| `item_key` | which item of a set is on screen (see below) | verifying a swipe, gallery ledger |
 
 Three rules do most of the work:
 
@@ -177,6 +179,84 @@ A sampled fraction of cache hits are **shadow-audited**: the agent asks the mode
 anyway, executes the cache's answer regardless, and records whether the two
 agreed. That turns "we think the cache is right" into a number you can read at
 the end of a run. Persistent disagreement means the fingerprint is too loose.
+
+## Galleries, carousels and anything that pages
+
+Screen identity is the wrong unit for a photo viewer, and getting this wrong is
+expensive. Photo 7 and photo 8 of an album are the *same screen*: same structure,
+so the same `skeleton_id` by design, and the same `exact_id` too, because
+`mask_text` rewrites the caption's "Today, 9:33 am" as `<time>`. Three things
+break at once. A swipe cannot be verified, so a fling the ViewPager dropped is
+reported to the model as progress. The loop detector sees one screen visited
+fifteen times and presses back, ejecting the agent from the album. And nothing
+records which photos have been looked at, so the model has to keep that ledger by
+hand in a field it rewrites every turn — where one omission loses an item for
+good.
+
+`pager.py` adds a fifth level of identity, per *item* rather than per screen:
+
+- the caption the app already puts on screen — `"Today, 9:33 am"`, `"3 of 15"` —
+  read unmasked from chrome, never from inside the pager;
+- a perceptual hash of the item's own pixels with the top and bottom bands
+  cropped off, for the seconds after the overlay fades and the tree collapses to
+  a single scroller. The bands matter: a toolbar fading over a photo moves the
+  whole-screen hash further than turning the page does.
+
+A caption proves *difference* but never *sameness* — captions are minute-
+resolution timestamps and two photos sent in the same minute share one — so equal
+captions fall through to the pixels rather than concluding anything.
+
+On top of that identity the loop keeps a **ledger**: every item seen, whether the
+agent actually had vision on it, and what it read off it. The ledger is
+maintained by code and shown to the model each turn, so it cannot be forgotten;
+it guarantees one screenshot per unread item, because a weight on a kitchen scale
+exists only in pixels; and it separates two same-minute photos, using the
+verified fact that the last swipe moved as the evidence that the second sighting
+is a different photo. Reaching an edge is recorded too, since most apps never
+publish how many items a set holds and "swiping forward twice changed nothing" is
+the only end-of-set signal there is.
+
+The guards were taught the axis they are on, as well. Vertical advice ("keep
+scrolling UP for older content") is meaningless on a carousel, a horizontal swipe
+is never banned for vertical thrashing, and repeated paging is browsing rather
+than a navigation loop.
+
+## The scratchpad cannot quietly forget
+
+For collection goals the model keeps its findings in a `notes` field it rewrites
+in full every turn, and only the latest value is kept. Appending instead would be
+worse — the model re-emits its entire ledger each turn, so an append log is a
+hundred near-identical copies of the same list — but overwriting puts the whole
+run's findings behind one instruction the model has to obey perfectly every single
+turn.
+
+It doesn't. From one real run, two consecutive turns:
+
+```
+step 73  ... 9:45 chicken 425g (OK); 9:59 potatoes 403g; 10:03 tomatoes 120g.
+step 74  ... 9:45 [pending];         9:59 [pending];     10:03 [pending].
+```
+
+Four measured readings gone in one rewrite, never restated across the remaining
+59 turns, and the run's closing report listed the 10:03 photo as unreadable — a
+question it had already answered. The scratchpad peaked at 664 characters against
+a 50,000-character cap, so overwriting was not buying anything either.
+
+So `scratchpad.py` keeps an append-only archive of every record the model writes,
+keyed by the identifier each record starts with, and each turn reports the ones
+the new note stopped covering. The latest note stays authoritative and stays the
+only curated view; the archive just refuses to let a figure disappear silently,
+and the completion judge is shown the union so a verdict is reached on everything
+the run collected rather than on whatever survived the last edit.
+
+Most of the work is in *not* crying wolf, since a block the model learns to skip
+is worse than no block. Comparison is per key rather than across the note, because
+a note holding both a menu and a set of measured weights restates the same figures
+twice and a note-wide check would find "120g" still present. A key is looked up
+wherever it ended up, because records merge — three `[pending]` entries become one
+line and the absorbed keys stop being keys while remaining perfectly present. And
+a shortened record only counts as a loss when a *figure* went missing or when most
+of the record did, so rewording "mixed nuts ~5g" to "nuts 5g" passes in silence.
 
 ## Development
 

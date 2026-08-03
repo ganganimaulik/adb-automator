@@ -182,14 +182,28 @@ class LoopDetector:
             actions.append((step, signature, action_desc))
             del actions[:-10]
 
-    def element_history_hint(self, skeleton_id: str) -> Optional[str]:
-        """Contextual hint summarizing previous element actions performed on this screen identity."""
+    def element_history_hint(self, skeleton_id: str,
+                             repeatable: int = 0) -> Optional[str]:
+        """Contextual hint summarizing previous element actions performed on this screen identity.
+
+        ``repeatable`` names an element that is *meant* to be acted on every
+        turn -- the pager of a carousel. Without it this hint tells the agent not
+        to reuse the one element that advances a gallery, which pushes it into
+        flinging arbitrary indices instead.
+        """
         actions = self.element_actions.get(skeleton_id, [])
         if not actions:
             return None
         recent = actions[-5:]
         formatted = [f"step {step}: {desc}" for step, _, desc in recent]
         summary = "; ".join(formatted)
+        if repeatable:
+            return (
+                f"PREVIOUS ACTIONS ON THIS SCREEN: {summary}. "
+                f"#{repeatable} is the pager for this screen: swiping it again "
+                f"is how you reach the next item, so repeating it is correct. "
+                f"Do not substitute a different index for it."
+            )
         return (
             f"PREVIOUS ACTIONS ON THIS SCREEN: {summary}. "
             f"If you are reviewing multiple items or photos in a list or grid, "
@@ -216,10 +230,15 @@ class LoopDetector:
         # interventions, not real agent actions.  Counting them created a
         # positive-feedback loop where each forced back made the next one
         # trigger sooner.
+        # Horizontal swipes are excluded for the same reason: paging a carousel
+        # is browsing, not a navigation loop, and the remedy here -- a back press
+        # -- ejects the agent from the set it was working through.
         non_scroll = sum(
             1 for eid, sig in self.history
             if eid == exact_id
             and not sig.startswith("scroll/")
+            and not (sig.startswith("swipe/")
+                     and sig.rsplit("/", 1)[-1] in ("left", "right"))
             and sig != "forced-back"
         )
         return non_scroll >= FORCE_BACK_AT
@@ -297,36 +316,54 @@ class LoopDetector:
         self.scroll_dir_log.append(direction)
         self.total_scroll_count += 1
 
-    def direction_reversals(self) -> int:
+    def axis_log(self, axis: str = "") -> List[str]:
+        """The scroll log, optionally narrowed to one axis.
+
+        The two axes are different activities -- walking a chat history versus
+        paging a carousel -- and mixing them produces nonsense: eight vertical
+        reversals while browsing a gallery gets reported as "you have reversed
+        direction 8 times" next to a history reading "left → left → left".
+        """
+        if axis == "horizontal":
+            wanted = ("left", "right")
+        elif axis == "vertical":
+            wanted = ("up", "down")
+        else:
+            return list(self.scroll_dir_log)
+        return [d for d in self.scroll_dir_log if d in wanted]
+
+    def direction_reversals(self, axis: str = "") -> int:
         """Count how many times the scroll direction has flipped.
 
         A reversal is any transition from one vertical direction to its
         opposite (up→down or down→up), or horizontal (left→right, right→left).
         Consecutive scrolls in the same direction count as one "run".
+        Pass *axis* to count only reversals on that axis.
         """
-        if len(self.scroll_dir_log) < 2:
+        log_entries = self.axis_log(axis)
+        if len(log_entries) < 2:
             return 0
         reversals = 0
-        prev = self.scroll_dir_log[0]
-        for d in self.scroll_dir_log[1:]:
+        prev = log_entries[0]
+        for d in log_entries[1:]:
             if d != prev and d == _SCROLL_OPPOSITES.get(prev, ""):
                 reversals += 1
             if d != prev:
                 prev = d
         return reversals
 
-    def scroll_direction_hint(self) -> Optional[str]:
+    def scroll_direction_hint(self, axis: str = "") -> Optional[str]:
         """Warning when the agent keeps reversing scroll direction.
 
         Returns ``None`` when there are fewer than 3 reversals.  Otherwise
         returns a strongly-worded hint that tells the model to commit to one
         direction and stop undoing its progress.
         """
-        reversals = self.direction_reversals()
+        reversals = self.direction_reversals(axis)
         if reversals < 3:
             return None
 
-        recent = " → ".join(self.scroll_dir_log[-8:])
+        recent = " → ".join(self.axis_log(axis)[-8:])
         parts = [
             f"WARNING: You have reversed your scroll direction {reversals} "
             f"times during this task. Your scroll history: {recent}.",
@@ -334,7 +371,16 @@ class LoopDetector:
             "a button like 'Go to most recent message'), you UNDO all your "
             "scrolling progress and have to start over.",
         ]
-        if reversals >= 5:
+        if axis == "horizontal":
+            # Naming a vertical remedy on a carousel is worse than saying
+            # nothing: there is no "older content" along this axis.
+            parts.append(
+                "Commit to one direction: keep swiping LEFT to move forward "
+                "through the set until you reach the end, then stop. Do not "
+                "alternate left and right — that re-shows items you have "
+                "already looked at."
+            )
+        elif reversals >= 5:
             parts.append(
                 "You MUST stop reversing now. Commit to one direction: if you "
                 "are looking for OLDER content, keep scrolling UP consistently. "
@@ -352,17 +398,22 @@ class LoopDetector:
             )
         return " ".join(parts)
 
-    def scroll_context(self) -> Optional[str]:
+    def scroll_context(self, axis: str = "") -> Optional[str]:
         """Rich situational context about scrolling patterns for the LLM.
 
         Returns ``None`` when there is nothing noteworthy.  Otherwise returns
         a multi-sentence description that tells the model *exactly* what it
-        has been doing so it can course-correct on its own.
+        has been doing so it can course-correct on its own.  Pass *axis* to
+        narrow the report to the axis actually in play on this screen.
         """
         # Start with direction reversal context (survives interleaved taps).
-        reversal_hint = self.scroll_direction_hint()
+        reversal_hint = self.scroll_direction_hint(axis)
 
         dirs = self._consecutive_scroll_dirs()
+        if axis == "horizontal":
+            dirs = [d for d in dirs if d in ("left", "right")]
+        elif axis == "vertical":
+            dirs = [d for d in dirs if d in ("up", "down")]
         if len(dirs) < 6 and reversal_hint is None:
             return None
 

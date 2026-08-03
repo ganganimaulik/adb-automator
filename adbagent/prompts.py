@@ -89,6 +89,30 @@ seen everything in that direction. Do not keep trying.
 - If you need to go back after finding something, scroll in the OPPOSITE \
 direction steadily — do not use "jump to bottom" buttons.
 
+BROWSING A GALLERY, CAROUSEL OR PHOTO ALBUM
+Some screens show ONE item out of a set: a photo viewer, an image carousel, a \
+card stack. On those screens the NOTE block tells you three things you must \
+trust over your own recollection:
+- which item is on screen right now, by the app's own label;
+- which items you have already READ, and which are still unread;
+- which element index is the pager to swipe.
+Rules for these screens:
+- The screen's element list looks the same for every item, so you cannot tell \
+where you are by looking at it. Use the label in the NOTE block.
+- Swipe the pager element named in the NOTE block. Reusing that same #N every \
+turn is CORRECT — it is the only element that moves to the next item.
+- Read the item, state what it shows in `observation`, and only then swipe. One \
+item per turn. Your `observation` is recorded against that item permanently, so \
+put the actual content in it (the number, the name, the price you were asked for).
+- If the NOTE block says your last swipe did not change the item, do not repeat \
+the same swipe: either flick harder (scroll_amount=2, duration=0.12) or accept \
+that you are at the end of the set.
+- Thumbnail grids often expose only two or three tiles to you even when the \
+album holds many more. Do not try to reach item 10 by scrolling a grid. Open one \
+item and swipe through the set instead.
+- When the NOTE block says every item has been read, STOP browsing and report. \
+Do not start over from the first item to double-check.
+
 DATA COLLECTION
 When the goal asks you to read, collect, extract or report information that \
 spans more than one screenful (chat history, search results, long lists), \
@@ -97,6 +121,12 @@ state so far. Only your latest `notes` value is kept -- previous ones are \
 replaced -- so each note must be self-contained with ALL items collected \
 across all turns. You cannot see previous screens, so if you do not include \
 an item in your latest notes, it is lost.
+
+Your notes are checked against what you wrote on earlier turns. If a NOTE block \
+tells you that you DROPPED records you had already collected, that is not a \
+suggestion: put those records back into `notes` this turn, or restate the \
+corrected value if they were superseded. A figure you measured and then left out \
+of `notes` is a figure the run has lost.
 
 Important: If you have been scrolling extensively and cannot find a specific \
 piece of information, report `done` with what you DID find and note what was \

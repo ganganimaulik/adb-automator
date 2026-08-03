@@ -448,10 +448,20 @@ DESTRUCTIVE_TEXT = re.compile(
 # Perceptual Image Fingerprinting (dHash)
 # ---------------------------------------------------------------------------
 
-def compute_dhash(image_bytes: bytes, hash_size: int = 8) -> Optional[int]:
+def compute_dhash(image_bytes: bytes, hash_size: int = 8,
+                  box: Optional[Sequence[int]] = None,
+                  box_frac: Optional[Sequence[float]] = None) -> Optional[int]:
     """Compute 64-bit difference hash (dHash) for an image.
 
-    Fast perceptual hash for detecting visual screen changes.
+    Fast perceptual hash for detecting visual screen changes. Pass ``box`` as
+    ``(left, top, right, bottom)`` in image pixels, or ``box_frac`` as the same
+    four values expressed as fractions of the image, to hash one region -- a
+    gallery's image area without the toolbar that fades over it, say -- so a
+    chrome animation is not mistaken for a change of content. Prefer
+    ``box_frac`` when the coordinates come from the accessibility tree: a
+    screenshot is not guaranteed to be in the same pixel space as the tree's
+    bounds, and a pixel box computed in the wrong space silently crops to
+    nothing.
     """
     if not image_bytes:
         return None
@@ -459,6 +469,16 @@ def compute_dhash(image_bytes: bytes, hash_size: int = 8) -> Optional[int]:
         import io
         from PIL import Image
         with Image.open(io.BytesIO(image_bytes)) as img:
+            if box_frac is not None:
+                box = (box_frac[0] * img.width, box_frac[1] * img.height,
+                       box_frac[2] * img.width, box_frac[3] * img.height)
+            if box is not None:
+                left, top, right, bottom = (int(v) for v in box)
+                left, top = max(0, left), max(0, top)
+                right, bottom = min(img.width, right), min(img.height, bottom)
+                if right - left < 2 or bottom - top < 2:
+                    return None
+                img = img.crop((left, top, right, bottom))
             img = img.convert("L").resize((hash_size + 1, hash_size), Image.Resampling.BILINEAR)
             pixels = list(img.getdata())
             diff_bits = 0
@@ -496,5 +516,10 @@ def attach(screen: Screen) -> Screen:
     screen.exact_id = exact_id(screen)
     if screen.screenshot and screen.dhash is None:
         screen.dhash = compute_dhash(screen.screenshot)
+    # Item identity is a fifth level, and the only one that survives `mask_text`
+    # collapsing every gallery item onto the same hash. Imported here because
+    # `pager` needs the hashes above.
+    from .pager import attach_item
+    attach_item(screen)
     return screen
 
