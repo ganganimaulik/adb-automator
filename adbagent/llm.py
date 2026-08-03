@@ -517,7 +517,8 @@ class LLMClient:
     # -- the two things the agent loop actually calls -----------------------
 
     def analyze_image(self, screenshot: bytes, *, goal: str = "", rendered: str = "",
-                      step: int = 0, recorder: Optional[Any] = None) -> str:
+                      step: int = 0, recorder: Optional[Any] = None,
+                      on_event: Optional[Callable[..., None]] = None) -> str:
         """Use the vision model (self.model_image) ONLY to analyze the image content."""
         from . import prompts
 
@@ -534,9 +535,20 @@ class LLMClient:
             recorder.dump_messages(step, messages, purpose="analyze_image")
         log.info("submitting screenshot (%d bytes) to image model (%s) for visual analysis",
                  len(screenshot), self.model_image)
+        if on_event:
+            on_event("llm_start", step=step, purpose="analyze_image", model=self.model_image, screenshot=True)
+        t0 = time.monotonic()
         raw, _ = self._post(messages, model=self.model_image, schema=None,
                              max_tokens=self.cfg.llm.max_tokens, purpose="analyze_image")
-        return raw.strip()
+        elapsed = time.monotonic() - t0
+        result = raw.strip()
+        last_call = self.ledger.calls[-1] if self.ledger.calls else None
+        if on_event:
+            on_event("llm_end", step=step, purpose="analyze_image", elapsed=elapsed, call=last_call)
+            on_event("image_analysis", step=step, model=self.model_image, elapsed=elapsed, result=result)
+        if recorder is not None and hasattr(recorder, "event"):
+            recorder.event("image_analysis", step=step, model=self.model_image, result=result)
+        return result
 
     def decide(self, *, goal: str, rendered: str, history: Sequence[str],
                width: int, height: int, package: str = "",
@@ -544,13 +556,14 @@ class LLMClient:
                scratchpad: str = "", progress: str = "",
                step: int = 0, recorder: Optional[Any] = None,
                purpose: str = "decide",
-               image_analysis: Optional[str] = None):
+               image_analysis: Optional[str] = None,
+               on_event: Optional[Callable[..., None]] = None):
         from . import prompts
         from .actions import AgentAction
 
         if screenshot and not image_analysis:
             image_analysis = self.analyze_image(
-                screenshot, goal=goal, rendered=rendered, step=step, recorder=recorder
+                screenshot, goal=goal, rendered=rendered, step=step, recorder=recorder, on_event=on_event
             )
 
         content: List[Dict[str, Any]] = [

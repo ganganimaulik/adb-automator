@@ -334,7 +334,8 @@ class Agent:
                 screenshot=screenshot, note=notes,
                 scratchpad="\n".join(state.scratchpad),
                 progress="\n".join(state.progress_log),
-                step=state.step, recorder=rec)
+                step=state.step, recorder=rec,
+                on_event=self.on_event)
             t_llm = time.monotonic() - t0_llm
             last_call = self.llm.ledger.calls[-1] if (self.llm and self.llm.ledger.calls) else None
             self.on_event("llm_end", step=state.step, purpose="decide", elapsed=t_llm, call=last_call)
