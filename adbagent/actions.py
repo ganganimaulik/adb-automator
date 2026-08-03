@@ -349,6 +349,20 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
         dev.press(action.key or "back")
     elif action.action in ("scroll", "swipe"):
         box = None
+        if action.direction in ("left", "right"):
+            # A pager has exactly one right answer, and its #N moves around as
+            # the app fades its overlay chrome in and out -- the same media
+            # viewer lists the image as #1, #4 or #11 depending on what else is
+            # on screen. Snap to it rather than flinging whatever index the model
+            # named last turn, which is how a "next photo" swipe ends up landing
+            # on a toolbar and silently doing nothing.
+            from .pager import pager_element
+            pager = pager_element(screen)
+            if pager is not None and (element is None or not element.is_horizontal):
+                if element is not None:
+                    log.info("horizontal %s retargeted from #%d to pager #%d",
+                             action.action, element.index, pager.index)
+                element = pager
         if element is not None:
             box = element.bounds
             # Only remap vertical->horizontal if element is explicitly horizontal and direction is up/down
@@ -560,7 +574,16 @@ def _scroll_changed(before: Screen, after: Screen,
                     action: Optional[AgentAction] = None) -> bool:
     """Multi-signal check for whether a scroll actually revealed new content.
 
-    Three signals, cheapest first:
+    Four signals, cheapest first:
+
+    0b. **Pager item identity** -- on a gallery or carousel this is the only
+       trustworthy signal and it outranks everything below, including the
+       perceptual hash: a media viewer fades its toolbar in and out over the
+       image, which moves the whole-screen dhash by far more than four bits
+       while the item underneath is unchanged. Asked the other way round, the
+       hierarchy is *identical* between two different photos because
+       ``mask_text`` rewrites the caption's timestamp -- so without this signal
+       an advancing swipe and a dropped swipe are indistinguishable.
 
     1. **exact_id identity** -- the hierarchy hash is byte-identical, so nothing
        changed at all.
@@ -573,7 +596,13 @@ def _scroll_changed(before: Screen, after: Screen,
        the case where the hierarchy drifted more but the user is seeing the
        same list content.
     """
-    # Signal 0: Perceptual Image Fingerprinting
+    # Signal 0a: pager item identity. Authoritative when available.
+    from .pager import same_item
+    identical_item = same_item(before, after)
+    if identical_item is not None:
+        return not identical_item
+
+    # Signal 0b: Perceptual Image Fingerprinting
     if before.dhash is not None and after.dhash is not None:
         from .fingerprint import dhash_distance
         dist = dhash_distance(before.dhash, after.dhash)
@@ -583,9 +612,12 @@ def _scroll_changed(before: Screen, after: Screen,
             if dist < 4 and after.exact_id == before.exact_id:
                 return False
 
-    # Swipe gestures or horizontal swipe/scroll (e.g. left/right) in photo galleries,
-    # carousels, viewpagers, or card stacks operate on images/views where accessibility
-    # XML hierarchy nodes often remain identical. Treat swipe and horizontal actions as changed.
+    # Last resort for a swipe or a horizontal scroll with no identity signal at
+    # all: galleries, carousels and card stacks page between bitmaps that the
+    # accessibility tree does not describe, so an unchanged hierarchy is not
+    # evidence the gesture failed. Answer "changed" rather than punish a swipe
+    # that probably worked -- but note this branch is now only reached when the
+    # screen is not a recognised pager and no screenshot was taken.
     if action is not None:
         if action.action == "swipe" or action.direction in ("left", "right"):
             return True

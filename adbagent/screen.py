@@ -215,6 +215,14 @@ class Screen:
     tokens: Tuple[str, ...] = ()
     screenshot: Optional[bytes] = None
     dhash: Optional[int] = None
+    #: Populated by pager.attach_item() via fingerprint.attach(). A pager shows
+    #: one item of a sequence, so the screen's identity does not distinguish
+    #: photo 7 from photo 8 -- these fields do. See `pager.py`.
+    is_pager: bool = False
+    item_label: str = ""
+    item_key: str = ""
+    item_position: int = 0
+    item_total: int = 0
 
     def by_index(self, i: int) -> Optional[Element]:
         for el in self.elements:

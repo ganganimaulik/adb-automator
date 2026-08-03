@@ -28,8 +28,12 @@
       "steps": "1. Open target chat or group. 2. Check thumbnails for undownloaded images (showing download arrow/icon or file size overlay) and tap them to trigger download first. 3. Tap the group/chat title at the top bar to open Chat/Group Info. 4. Tap 'Media, links, and docs'. 5. In the 'Media' tab, tap any undownloaded thumbnails to download, then tap a photo to view and swipe left/right to browse sequentially."
     },
     {
+      "name": "review_every_photo_in_an_album",
+      "steps": "1. Open the chat and find the album bubble (it reads 'Photo album, N items' or offers 'View all N media'). 2. Tap the FIRST thumbnail in the bubble to open MediaViewActivity on item 1 — do NOT go via MediaAlbumActivity, whose grid exposes only two tiles to the accessibility tree and cannot be scrolled to the rest. 3. Read the title bar: it reads '<sender> Today, H:MM am' and is the current photo's identity. If it is missing, the overlay has auto-hidden — tap the photo once to bring it back. 4. Read the photo, state its content in `observation`, then swipe left ONCE on the full-screen image element to advance. 5. Repeat until a swipe left no longer changes the title/photo: that is the end of the album. 6. Two photos sent in the same minute share a title, so an unchanged title is not proof the swipe failed — the NOTE block's item ledger is authoritative."
+    },
+    {
       "name": "view_multiple_images_in_chat",
-      "steps": "1. Open target chat or group. 2. Scan chat history for undownloaded images (marked with a download arrow icon) and tap each download icon to download images first. 3. Tap an image thumbnail directly to open full-screen media viewer (avoid tapping sender avatar or name). 4. In full-screen viewer, swipe left (action='swipe', direction='left') for next photo or right for previous photo. If an image displays a central download button, tap it to load the photo before swiping further. 5. If swiping fails, press back and use 'Media, links, and docs' from Chat Info."
+      "steps": "1. Open target chat or group. 2. Scan chat history for undownloaded images (marked with a download arrow icon) and tap each download icon to download images first. 3. Tap an image thumbnail directly to open full-screen media viewer (avoid tapping sender avatar or name). 4. In full-screen viewer, swipe left (action='swipe', direction='left') for next photo or right for previous photo. If an image displays a central download button, tap it to load the photo before swiping further. 5. Do NOT press back to the album grid to 'pick the next photo' — the grid cannot reach past the second tile and you will restart the album from the beginning."
     }
   ],
   "nuances": [
@@ -38,6 +42,10 @@
     "CRITICAL: Do NOT tap sender profile avatars or sender names on the left side of message bubbles in group chats. Tapping them opens the Contact Info sheet instead of message content.",
     "CONTACT SHEET LOOP PITFALL: If a Contact Info bottom sheet or Profile Photo Viewer opens accidentally, use system back key ('press_key action=\"back\"') to dismiss it. Tapping the center of the sheet or avatar toggles between full-screen profile photo viewer and contact card in an endless loop.",
     "Tapping an image thumbnail opens full-screen media viewer. Swiping left/right in media viewer navigates through images.",
+    "MEDIA VIEWER OVERLAY: in MediaViewActivity the toolbar auto-hides after a few seconds. With it visible the tree has ~21 elements and the photo's identity is the title button reading '<sender> Today, H:MM am'; once it hides, the tree collapses to just the image scroller and there is NO way to tell which photo is shown from the tree. Tap the photo once to toggle the overlay back on.",
+    "MEDIA VIEWER INDEX DRIFT: because the overlay comes and goes, the full-screen image is listed as #1, #4 or #11 on different turns. It is always the element rendered as [Scroller] \"Image\" scrollable-h — swipe that one, whatever its number.",
+    "ALBUM GRID DEAD END: MediaAlbumActivity ('N photos') publishes only the first two 'Enlarge photo' tiles to the accessibility tree, and scrolling the grid usually reports no change. It cannot be used to reach photo 3 onwards. Open one photo and swipe through the album instead.",
+    "SAME-MINUTE DUPLICATES: consecutive photos are often sent within the same minute and then share the identical 'Today, H:MM am' title. Do not conclude a swipe failed just because the title repeated.",
     "Undownloaded images show a download arrow icon / file size overlay on blurred thumbnails. Tapping the download button explicitly downloads the image.",
     "Tapping Group/Chat Header -> 'Media, links, and docs' opens grid view of all shared photos, avoiding chat history scrolling delays.",
     "Do NOT tap 'Jump to latest message' or 'Scroll to bottom' floating arrow while searching past messages as it resets your search position.",
@@ -45,6 +53,7 @@
     "WhatsApp Web / Linked Device notifications may appear as popups; press back or tap outside to dismiss."
   ],
   "recommendations": [
+    "To check every photo of an album, open the first one and swipe left through the whole album in one pass, recording each photo's content in `observation` as you go. Leaving the viewer and coming back restarts you at photo 1 or 2.",
     "Always tap download arrow icons on undownloaded media thumbnails in chat history or in 'Media, links, and docs' before attempting sequential full-screen viewing or swiping.",
     "To view all photos or shared media efficiently without missing items or getting stuck in message bubbles, navigate to Chat Header -> 'Media, links, and docs'.",
     "Avoid tapping sender avatars/names in group chats; tap image thumbnails in the center of message bubbles.",
