@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import __version__
+from . import __version__, scratchpad
 
 try:
     from rich.console import Console
@@ -27,6 +27,18 @@ except ImportError:
 log = logging.getLogger("adbagent.cli")
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+
+
+def _notes_text(notes: Any) -> str:
+    """One line for the records an action wrote.
+
+    `notes` is a list of ``{key, value}`` now, from either a live `Note` or a
+    recorded dict, and printing the list itself puts a pydantic repr on the
+    user's terminal.
+    """
+    pairs = scratchpad.as_records(notes)
+    return "; ".join(f"{key}: {value}" if value else str(key)
+                     for key, value in pairs) or ""
 
 
 # ---------------------------------------------------------------------------
@@ -713,7 +725,7 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             if getattr(action, "progress", None):
                 out.say(out.dim(f"        Progress:  {action.progress}"))
             if getattr(action, "notes", None):
-                out.say(out.dim(f"        Notes:     {action.notes}"))
+                out.say(out.dim(f"        Notes:     {_notes_text(action.notes)}"))
 
         elif kind == "act_end":
             elapsed = kw.get("elapsed", 0.0)
@@ -813,8 +825,8 @@ def cmd_run(args) -> int:
                 out.say()
                 out.say(out.bold("  ── Collected Data ──"))
                 out.say()
-                for chunk in state.scratchpad:
-                    out.say(f"  {chunk}")
+                for line in state.scratchpad.plain().splitlines():
+                    out.say(f"  {line}")
                 out.say()
             out.say(f"  {colour(outcome.upper())}  "
                     f"{state.step} steps, {state.llm_calls} LLM calls, "
@@ -978,7 +990,7 @@ def cmd_report(args) -> int:
             if action.get("progress"):
                 out.say(out.dim(f"        Progress:  {action.get('progress')}"))
             if action.get("notes"):
-                notes_text = action.get("notes")
+                notes_text = _notes_text(action.get("notes"))
                 last_notes = notes_text
                 out.say(out.dim(f"        Notes:     {notes_text}"))
         elif event["kind"] == "image_analysis":
@@ -1127,26 +1139,28 @@ def cmd_scratchpad(args) -> int:
         out.bad(f"no events at {events_file}")
         return 1
 
-    last_notes = None
+    # `notes` in an event is a delta, not the whole ledger, so the records are
+    # replayed rather than read off the last decide -- see `scratchpad.replay`.
+    events = []
     last_vision = None
     for line in events_file.read_text().splitlines():
         if not line.strip():
             continue
         try:
             event = json.loads(line)
-            action = event.get("action", {})
-            if isinstance(action, dict) and action.get("notes"):
-                last_notes = action["notes"]
+            events.append(event)
             if event.get("kind") == "image_analysis" and event.get("result"):
                 last_vision = event.get("result")
         except Exception:
             pass
+    collected = scratchpad.replay(events).plain()
 
-    if last_notes or last_vision:
+    if collected or last_vision:
         out.say(out.bold(f"  ── Scratchpad ({path.name}) ──"))
-        if last_notes:
+        if collected:
             out.say()
-            out.say(f"  Notes: {last_notes}")
+            for line in collected.splitlines():
+                out.say(f"  {line}")
         if last_vision:
             out.say()
             out.say(f"  Latest Vision Analysis: {last_vision}")

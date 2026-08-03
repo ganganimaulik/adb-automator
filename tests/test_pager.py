@@ -404,3 +404,34 @@ def test_a_sweep_is_summarised_as_one_history_line():
 
 def test_a_one_step_sweep_does_not_render_a_range():
     assert pager.sweep_summary(9, 9, "right", 1, 1, "x").startswith("9. ")
+
+
+# ---------------------------------------------------------------------------
+# A label the app did not put in the tree
+# ---------------------------------------------------------------------------
+
+def test_a_supplied_label_fills_in_for_a_caption_the_app_hides():
+    """The image model can usually still see a caption the accessibility tree
+    omits, and a ledger line reading "a4f9c1..." tells the model nothing."""
+    ledger = pager.ItemLedger()
+    screen = viewer(chrome=False)               # no caption in the tree
+    assert not screen.item_label
+    ledger.note("pixels:a4f9c1", screen, 1, label="Today, 9:33 am", read=True)
+    assert "Today, 9:33 am" in ledger.render()
+
+
+def test_a_supplied_label_never_overrides_the_app_s_own_caption():
+    ledger = pager.ItemLedger()
+    ledger.note("key1", viewer("9:33 am"), 1, label="a guess from the pixels",
+                read=True)
+    rendered = ledger.render()
+    assert "9:33 am" in rendered
+    assert "a guess" not in rendered
+
+
+def test_a_supplied_label_is_not_identity():
+    """Two photos given the same vision label stay two records: the key decides."""
+    ledger = pager.ItemLedger()
+    ledger.note("key1", viewer(chrome=False), 1, label="a scale", read=True)
+    ledger.note("key2", viewer(chrome=False), 2, label="a scale", read=True)
+    assert len(ledger.items) == 2

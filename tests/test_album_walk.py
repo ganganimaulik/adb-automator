@@ -379,3 +379,40 @@ def _events(cfg, run_id):
     path = Path(cfg.run.artifacts_dir) / run_id / "events.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines()
             if line.strip()]
+
+
+# ---------------------------------------------------------------------------
+# What the image model read goes into the ledger, not just into the prompt
+# ---------------------------------------------------------------------------
+
+def test_a_vision_reading_is_filed_against_the_item_it_was_taken_from(cfg, mem):
+    """`reading` is the fact the run is collecting, so it belongs on the item
+    record -- routing it through prose for the decider to re-extract loses it the
+    moment the decider paraphrases.
+
+    Only the items the *decider* looks at come through this path; the ones the
+    sweep walks are read by `read_item`, which was already terse.
+    """
+    dev = AlbumDevice(cfg)
+    llm = fake.FakeLLM(dev, album_walker())
+    llm.vision_reading = "chicken breast on scale, 428 g"
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    details = [r.detail for r in state.items.items.values() if r.read]
+    assert details, "no item was read at all"
+    assert any("428 g" in detail for detail in details), (
+        f"the vision reading reached no item record: {details}")
+    assert all(detail for detail in details), "an item was read but recorded nothing"
+
+
+def test_the_decider_does_not_overwrite_the_reading_with_its_paraphrase(cfg, mem):
+    """The album policy's `observation` is a restatement of the same photo, and a
+    restatement is where a figure gets rounded away."""
+    dev = AlbumDevice(cfg)
+    llm = fake.FakeLLM(dev, album_walker())
+    llm.vision_reading = "428 g"
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    details = [r.detail for r in state.items.items.values() if r.read]
+    assert any(detail == "428 g" for detail in details), (
+        f"the direct reading was replaced by a paraphrase: {details}")
