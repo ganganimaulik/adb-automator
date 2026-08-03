@@ -19,9 +19,12 @@ try:
     from rich.console import Console
     from rich.live import Live
     from rich.panel import Panel
+    from rich.text import Text
     _HAS_RICH = True
 except ImportError:
     _HAS_RICH = False
+
+log = logging.getLogger("adbagent.cli")
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 
@@ -448,6 +451,97 @@ def cmd_dump(args) -> int:
 # run
 # ---------------------------------------------------------------------------
 
+def _tail_rows(text: str, max_rows: int, width: int) -> tuple:
+    """The newest `max_rows` display rows of `text`, and whether older rows were cut.
+
+    Rows, not lines: reasoning usually streams as a handful of very long
+    paragraphs, so counting newlines lets one logical line overrun the panel.
+    Once the live region is taller than the terminal, rich keeps its *top* and
+    the visible text stops moving -- which reads as the stream having died.
+    Hard-wrapping here also pins the panel height, so the maths below holds.
+    """
+    if max_rows <= 0:
+        return [], bool(text)
+    w = max(1, width)
+    lines = text.splitlines() or [""]
+    rows: List[str] = []
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i]
+        wrapped = [line[j:j + w] for j in range(0, len(line), w)] or [""]
+        room = max_rows - len(rows)
+        if len(wrapped) > room:
+            rows[:0] = wrapped[len(wrapped) - room:] if room else []
+            return rows, True
+        rows[:0] = wrapped
+    return rows, False
+
+
+def _row_count(text: str, width: int) -> int:
+    """How many display rows `text` needs at `width` columns."""
+    w = max(1, width)
+    return sum(max(1, (len(line) + w - 1) // w)
+               for line in (text.splitlines() or [""]))
+
+
+def _stream_panel(thinking: str, content: str, width: int, height: int) -> Any:
+    """The LLM stream panel, tailed to fit a `width` x `height` terminal."""
+    # A panel spends 2 rows on borders and 4 columns on borders plus padding.
+    # Leave one row spare so the live region never outgrows the screen.
+    body_rows = max(3, height - 3)
+    text_width = max(20, width - 4)
+
+    thinking = thinking.strip()
+    content = content.strip()
+
+    # (label, label style, text, body style, row budget)
+    sections: List[tuple] = []
+    if thinking and content:
+        avail = max(2, body_rows - 3)  # two headers plus a blank separator
+        t_want = _row_count(thinking, text_width)
+        c_want = _row_count(content, text_width)
+        if t_want + c_want <= avail:
+            t_budget = t_want
+        elif t_want <= avail // 2:
+            t_budget = t_want  # thinking fits; the response can have the rest
+        elif c_want < avail - avail // 2:
+            t_budget = avail - c_want  # response fits; thinking takes the rest
+        else:
+            t_budget = max(1, avail // 2)  # both are long, so split evenly
+        sections.append(("[Thinking]", "dim italic", thinking, "dim italic", t_budget))
+        sections.append(("[Response]", "cyan bold", content, "dim", avail - t_budget))
+    elif thinking:
+        sections.append(("[Thinking]", "dim italic", thinking, "dim italic",
+                         max(1, body_rows - 1)))
+    elif content:
+        sections.append(("[Response]", "cyan bold", content, "dim",
+                         max(1, body_rows - 1)))
+
+    if not sections:
+        body: Any = Text("thinking...", style="dim")
+    else:
+        # Built as Text, never markup: model output is full of bracketed
+        # fragments, and rich either swallows them as styles or raises
+        # MarkupError from inside the refresh thread, killing the panel.
+        body = Text(no_wrap=True, overflow="crop", end="")
+        for i, (label, label_style, text, body_style, budget) in enumerate(sections):
+            if i:
+                body.append("\n\n")
+            rows, cut = _tail_rows(text, budget, text_width)
+            body.append(label, style=label_style)
+            if cut:
+                body.append("  (earlier output scrolled off)", style="dim")
+            body.append("\n")
+            body.append("\n".join(rows), style=body_style)
+
+    return Panel(body, title="[cyan]LLM Stream[/cyan]", border_style="dim", expand=False)
+
+
+#: Live panel frame rate. Chunks arriving between frames only accumulate text;
+#: rebuilding the panel for a frame that is never drawn is wasted work on the
+#: thread reading the LLM stream.
+_STREAM_FPS = 12
+
+
 def _live_reporter(out: Out, max_steps: Optional[int] = None):
     stream_state: Dict[str, Any] = {
         "active": False,
@@ -457,25 +551,19 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
         "live": None,
         "console": None,
         "using_rich": False,
+        "rich_broken": False,
+        "last_frame": 0.0,
     }
-
-    def _tail_text(text: str, max_visual_lines: int, width: int) -> str:
-        return text
 
     def _render_live_panel() -> Any:
         if not _HAS_RICH:
             return ""
-        thinking = stream_state["thinking_text"].strip()
-        content = stream_state["content_text"].strip()
-
-        parts = []
-        if thinking:
-            parts.append(f"[dim italic][Thinking]\n{thinking}[/dim italic]")
-        if content:
-            parts.append(f"[cyan bold][Response][/cyan bold]\n[dim]{content}[/dim]")
-
-        body = "\n\n".join(parts) if parts else "[dim]thinking...[/dim]"
-        return Panel(body, title="[cyan]LLM Stream[/cyan]", border_style="dim", expand=False)
+        console = stream_state.get("console")
+        # Read the size every render so a mid-stream resize is picked up.
+        width = getattr(console, "width", None) or 80
+        height = getattr(console, "height", None) or 24
+        return _stream_panel(stream_state["thinking_text"],
+                             stream_state["content_text"], width, height)
 
     def report(kind: str, **kw) -> None:
         if kind != "llm_stream" and stream_state["active"]:
@@ -521,7 +609,8 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             if not text:
                 return
 
-            use_rich_live = _HAS_RICH and sys.stdout.isatty() and not out.quiet
+            use_rich_live = (_HAS_RICH and sys.stdout.isatty() and not out.quiet
+                             and not stream_state.get("rich_broken"))
 
             if use_rich_live:
                 if stream_type == "thinking":
@@ -533,18 +622,39 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
                 stream_state["type"] = stream_type
                 stream_state["using_rich"] = True
 
-                if stream_state["live"] is None:
-                    console = Console()
-                    stream_state["console"] = console
-                    stream_state["live"] = Live(
-                        _render_live_panel(),
-                        console=console,
-                        transient=True,
-                        refresh_per_second=12,
-                    )
-                    stream_state["live"].start()
-                else:
-                    stream_state["live"].update(_render_live_panel())
+                # A panel that fails to render must not take the run with it:
+                # give up on the live view and keep streaming as plain text.
+                now = time.monotonic()
+                try:
+                    if stream_state["live"] is None:
+                        console = Console()
+                        stream_state["console"] = console
+                        stream_state["live"] = Live(
+                            _render_live_panel(),
+                            console=console,
+                            transient=True,
+                            # Draw from this thread on our own clock. A rich
+                            # refresh thread would redraw stale text and, if a
+                            # render ever raised, die there unnoticed.
+                            auto_refresh=False,
+                            vertical_overflow="crop",
+                        )
+                        stream_state["live"].start(refresh=True)
+                        stream_state["last_frame"] = now
+                    elif now - stream_state["last_frame"] >= 1.0 / _STREAM_FPS:
+                        stream_state["live"].update(_render_live_panel(), refresh=True)
+                        stream_state["last_frame"] = now
+                except Exception as exc:  # pragma: no cover - defensive
+                    log.warning("live LLM panel failed (%s); falling back to plain output", exc)
+                    with contextlib.suppress(Exception):
+                        if stream_state["live"] is not None:
+                            stream_state["live"].stop()
+                    stream_state["live"] = None
+                    stream_state["console"] = None
+                    stream_state["using_rich"] = False
+                    stream_state["active"] = False
+                    stream_state["type"] = None
+                    stream_state["rich_broken"] = True
             else:
                 if stream_state["type"] != stream_type:
                     if stream_state["active"]:
