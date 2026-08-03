@@ -582,6 +582,106 @@ def test_live_reporter_long_thinking_tailing(capsys, monkeypatch):
     assert "LLM responded in 2.50s" in captured.out
 
 
+def _render_stream_panel(thinking, content, width=80, height=24):
+    """The stream panel as the rows a `width` x `height` terminal would show."""
+    from rich.console import Console
+
+    from adbagent.cli import _stream_panel
+
+    console = Console(width=width, height=height, force_terminal=False,
+                      legacy_windows=False)
+    with console.capture() as cap:
+        console.print(_stream_panel(thinking, content, width, height), end="")
+    return cap.get().rstrip("\n").split("\n")
+
+
+def test_stream_panel_tails_long_thinking():
+    # Long reasoning must keep showing its newest lines. Before the panel was
+    # tailed it outgrew the terminal, and rich cropped it to the *oldest* lines
+    # -- so the stream looked frozen.
+    thinking = "\n".join(f"Step {i}: thinking" for i in range(1, 201))
+    rows = _render_stream_panel(thinking, "", height=24)
+
+    assert len(rows) <= 23, "panel must leave the live region room on screen"
+    body = "\n".join(rows)
+    assert "Step 200: thinking" in body
+    assert "Step 1: thinking\n" not in body
+    assert "scrolled off" in body
+
+
+def test_stream_panel_tails_within_one_long_paragraph():
+    # Reasoning often arrives as a single unbroken paragraph, so tailing has to
+    # count wrapped rows rather than newlines.
+    paragraph = "".join(f"I should check element {i} first. " for i in range(1, 400))
+    rows = _render_stream_panel(paragraph, "", height=24)
+
+    assert len(rows) <= 23
+    assert "element 399" in "\n".join(rows)
+
+
+def test_stream_panel_fits_every_terminal_size():
+    thinking = "\n".join(f"Step {i}: thinking" for i in range(1, 201))
+    content = "\n".join(f'  "field_{i}": {i},' for i in range(200))
+    for width, height in ((40, 8), (60, 12), (80, 24), (120, 50)):
+        rows = _render_stream_panel(thinking, content, width, height)
+        assert len(rows) <= height - 1, f"too tall at {width}x{height}"
+        assert max(len(r) for r in rows) <= width, f"too wide at {width}x{height}"
+        body = "\n".join(rows)
+        assert "[Thinking]" in body and "[Response]" in body
+
+
+def test_stream_panel_gives_spare_rows_to_the_longer_half():
+    thinking = "\n".join(f"Step {i}: thinking" for i in range(1, 201))
+    rows = _render_stream_panel(thinking, '{"action": "tap"}', height=24)
+
+    assert len(rows) == 23, "a short response should not strand rows"
+    assert '{"action": "tap"}' in "\n".join(rows)
+
+
+def test_stream_panel_keeps_bracketed_model_text_verbatim():
+    # Model text is not rich markup: '[/data/app]' used to raise MarkupError
+    # from the refresh thread and kill the panel, and '[foo]' was swallowed.
+    hostile = "checking [/data/app] and [foo] and [/dim] plus [bold red]x"
+    body = "\n".join(_render_stream_panel(hostile, ""))
+
+    for fragment in ("[/data/app]", "[foo]", "[/dim]", "[bold red]x"):
+        assert fragment in body
+
+
+def test_live_reporter_keeps_drawing_a_long_stream_on_a_terminal(monkeypatch):
+    # The whole bug in one test: 400 chunks of reasoning, then one more after a
+    # frame boundary, and that newest chunk has to reach the terminal.
+    import io
+    import sys
+    import time
+
+    from adbagent.cli import _STREAM_FPS, Out, _live_reporter
+
+    class FakeTTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    buf = FakeTTY()
+    monkeypatch.setattr(sys, "stdout", buf)
+    try:
+        reporter = _live_reporter(Out(), max_steps=20)
+        reporter("llm_start", purpose="decide", model="deepseek-r1")
+        for i in range(400):
+            reporter("llm_stream", stream_type="thinking",
+                     text=f"chunk {i} at [/data/app] node [foo] ... ")
+        time.sleep(1.5 / _STREAM_FPS)  # let the frame throttle open
+        reporter("llm_stream", stream_type="thinking", text="the newest thought")
+        reporter("llm_stream", stream_type="content", text='{"action": "tap"}')
+        reporter("llm_end", purpose="decide", elapsed=2.5)
+    finally:
+        monkeypatch.undo()
+
+    written = buf.getvalue()
+    assert "Traceback" not in written
+    assert "the newest thought" in written
+    assert "[/data/app]" in written
+
+
 def test_prevent_sleep():
     from adbagent.cli import prevent_sleep
     with prevent_sleep():
