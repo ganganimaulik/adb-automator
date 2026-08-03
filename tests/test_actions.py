@@ -393,6 +393,56 @@ def test_textless_photo_screen_scroll_changed():
     assert outcome.grade != "no_change"
 
 
+def test_swipe_or_horizontal_scroll_on_identical_exact_id_is_not_no_change():
+    """Swipe/horizontal scroll on identical XML trees (e.g. image gallery Bitmaps) should NOT grade as no_change."""
+    xml_photo = """
+    <hierarchy rotation="0">
+      <node index="0" text="" content-desc="" resource-id="com.whatsapp:id/photo" class="android.widget.ImageView" package="com.whatsapp" bounds="[0,0][1080,1920]" enabled="true" clickable="true" scrollable="false" />
+    </hierarchy>
+    """
+    before = s(xml_photo)
+    after = s(xml_photo)
+    assert before.exact_id == after.exact_id
+
+    action_swipe = act(action="swipe", direction="left")
+    outcome_swipe = verify(action_swipe, before, after)
+    assert outcome_swipe.grade == "success"
+
+    action_hscroll = act(action="scroll", direction="right")
+    outcome_hscroll = verify(action_hscroll, before, after)
+    assert outcome_hscroll.grade == "success"
+
+    action_vscroll = act(action="scroll", direction="down")
+    outcome_vscroll = verify(action_vscroll, before, after)
+    assert outcome_vscroll.grade == "no_change"
+
+
+def test_perceptual_dhash_signal_0_in_scroll_changed():
+    """Signal 0: If dHash perceptual distance >= 4, verify visual change even if exact_id is identical."""
+    from adbagent.actions import _scroll_changed
+    xml_photo = """
+    <hierarchy rotation="0">
+      <node index="0" text="" content-desc="" resource-id="com.whatsapp:id/photo" class="android.widget.ImageView" package="com.whatsapp" bounds="[0,0][1080,1920]" enabled="true" clickable="true" scrollable="false" />
+    </hierarchy>
+    """
+    before = s(xml_photo)
+    after = s(xml_photo)
+    assert before.exact_id == after.exact_id
+
+    # Simulated distinct image dHashes (e.g. Photo 1 vs Photo 2)
+    before.dhash = 0b1111000011110000111100001111000011110000111100001111000011110000
+    after.dhash  = 0b0000111100001111000011110000111100001111000011110000111100001111
+
+    # Visual bitmap change detected via dHash distance
+    assert _scroll_changed(before, after) is True
+
+    # Same visual image dHash
+    after.dhash = before.dhash
+    assert _scroll_changed(before, after) is False
+
+
+
+
 def test_scroll_base_scale_validation():
     a = act(action="scroll", direction="down", base_scale=0.8)
     assert a.base_scale == 0.8
@@ -520,6 +570,38 @@ def test_condition_based_wait():
     dev.observe.return_value = screen
 
     action = act(action="wait", wait_for_text="Option 1", timeout=2.0)
+    execute(dev, action, screen)
+
+    assert "found" in getattr(action, "_result_summary")
+    assert verify(action, screen, screen).grade == "success"
+
+
+def test_sleep_action():
+    from unittest.mock import MagicMock, patch
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    screen = s(X.settings_screen())
+
+    action = act(action="sleep", duration=2.0)
+    with patch("time.sleep") as mock_sleep:
+        execute(dev, action, screen)
+        mock_sleep.assert_called_once_with(2.0)
+
+    assert getattr(action, "_result_summary") == "slept for 2.0s"
+    assert verify(action, screen, screen).grade == "success"
+    assert synthesise_postcondition(action, None).kind == "noop_ok"
+
+
+def test_condition_based_sleep():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    screen = s(X.settings_screen())
+    dev.observe.return_value = screen
+
+    action = act(action="sleep", wait_for_text="Option 1", timeout=2.0)
     execute(dev, action, screen)
 
     assert "found" in getattr(action, "_result_summary")

@@ -52,7 +52,7 @@ and "right" for previous photo/item. Supports `target` (element box), `scroll_am
 - list_apps       list or search installed app packages on the device. Set `text` to a search query (e.g. "whatsapp" or "spotify") or leave empty to list installed apps.
 - get_clipboard   read text currently stored in device clipboard.
 - set_clipboard   copy text into device clipboard. Give text in `text`.
-- wait            let a slow screen finish loading. Supports optional `wait_for_text` and `timeout` (seconds) to wait dynamically until text appears.
+- wait, sleep      pause execution or wait for a slow screen to load. Supports optional `duration` (seconds, default 1.0), `wait_for_text`, and `timeout` (seconds) to wait dynamically until text appears.
 - ask_user        stop and ask the person for something only they can supply.
 - done            the goal is achieved. Say how you know, in `text`.
 - fail            the goal cannot be achieved. Say why, in `text`.
@@ -237,23 +237,27 @@ JUDGE_SYSTEM = """\
 You are checking whether an Android automation run actually achieved its goal.
 
 You are given the goal, a compact trace of what the agent did, the final \
-screen, and optionally a scratchpad of data the agent collected across turns. \
-Reply with a single JSON object: {"satisfied": bool, "evidence": str}.
+screen, the agent's done summary / output (if provided), and optionally a \
+scratchpad of data collected across turns and progress log. Reply with a single \
+JSON object: {"satisfied": bool, "evidence": str}.
 
-Be strict. Agents routinely claim success too early. "satisfied" means the goal \
-is demonstrably true from what is on screen right now (and collected data, if \
-present) -- not that the agent took plausible steps towards it. If a \
-scratchpad is provided, check that it looks complete and consistent. If you \
-cannot see proof, say false and explain what is missing.
+Evaluation guidelines:
+1. For goals requiring in-app state changes (e.g., toggling a setting, sending a message), verify the action was taken or completed.
+2. For goals requiring information retrieval, advice, recommendations, analysis, or answering a question (e.g., "tell me how to improve my chat", "find X", "summarize messages"), the final answer/advice/result is provided as text in the agent's done output/summary, scratchpad, or action history. The mobile screen DOES NOT need to display the answer or advice itself.
+3. If the agent collected the required data from the app and/or provided the answer/advice/output in text or scratchpad, or completed the requested task, mark satisfied: true.
+4. Do NOT reject 'done' simply because output/advice/results appear in text/scratchpad rather than on the mobile UI screen.
+5. Only mark satisfied: false if the agent clearly stopped prematurely without gathering necessary data or completing the requested task.
 """
 
 
 def judge_user(goal: str, history: Sequence[str], rendered: str,
                scratchpad: str = "", progress: str = "",
-               image_analysis: str = "") -> str:
+               image_analysis: str = "", done_text: str = "") -> str:
     parts = (f"GOAL: {goal}\n\n"
              f"WHAT THE AGENT DID:\n" + "\n".join(history or ["(nothing)"]) +
              f"\n\nFINAL SCREEN:\n{rendered}")
+    if done_text:
+        parts += (f"\n\nAGENT DONE SUMMARY / OUTPUT:\n{done_text}")
     if image_analysis:
         parts += (f"\n\nVISUAL SCREEN ANALYSIS (from image model):\n{image_analysis}")
     if scratchpad:

@@ -32,7 +32,7 @@ log = logging.getLogger("adbagent.actions")
 
 ActionName = Literal[
     "tap", "long_press", "input_text", "press_key", "scroll", "swipe",
-    "open_app", "list_apps", "get_clipboard", "set_clipboard", "wait", "ask_user", "done", "fail",
+    "open_app", "list_apps", "get_clipboard", "set_clipboard", "wait", "sleep", "ask_user", "done", "fail",
 ]
 
 #: Only names the on-device server actually accepts.
@@ -145,12 +145,12 @@ class AgentAction(BaseModel):
         None, description="For scroll: base drag scale per step (default 0.6, range 0.1 to 1.0; use 0.8 for larger page coverage per swipe).",
         ge=0.1, le=1.0)
     duration: Optional[float] = Field(
-        None, description="For swipe/scroll/wait: duration in seconds (e.g. 0.15 for fast flick, 0.3 for scroll, 1.0 for wait).",
+        None, description="For swipe/scroll/wait/sleep: duration in seconds (e.g. 0.15 for fast flick, 0.3 for scroll, 1.0 for wait/sleep).",
         ge=0.05, le=30.0)
     wait_for_text: Optional[str] = Field(
-        None, description="For wait: text to wait for on screen before returning.")
+        None, description="For wait/sleep: text to wait for on screen before returning.")
     timeout: Optional[float] = Field(
-        None, description="For wait: max seconds to wait (0.5 to 30.0).", ge=0.5, le=30.0)
+        None, description="For wait/sleep: max seconds to wait (0.5 to 30.0).", ge=0.5, le=30.0)
     confidence: Literal["high", "low"] = Field(
         "high", description="Use 'low' when unsure; you will be shown a screenshot.")
     notes: Optional[str] = Field(
@@ -414,8 +414,9 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
         summary = f"set clipboard to {val!r}"
         log.info("set_clipboard -> %s", summary)
         setattr(action, "_result_summary", summary)
-    elif action.action == "wait":
+    elif action.action in ("wait", "sleep"):
         import time
+        past_verb = "slept" if action.action == "sleep" else "waited"
         timeout = action.timeout if action.timeout is not None else (action.duration or (5.0 if action.wait_for_text else 1.0))
         if action.wait_for_text:
             wanted = action.wait_for_text.strip().lower()
@@ -428,10 +429,12 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
                     found = True
                     break
                 time.sleep(0.1)
-            summary = f"waited for {action.wait_for_text!r} -> {'found' if found else 'timed out'}"
+            summary = f"{past_verb} for {action.wait_for_text!r} -> {'found' if found else 'timed out'}"
             setattr(action, "_result_summary", summary)
         else:
-            time.sleep(min(timeout, 5.0))
+            time.sleep(min(timeout, 30.0))
+            summary = f"{past_verb} for {timeout:.1f}s"
+            setattr(action, "_result_summary", summary)
     else:
         raise ActionError(f"{action.action} is terminal and is not executed here")
     return element
@@ -475,7 +478,7 @@ def synthesise_postcondition(action: AgentAction,
     if action.action == "open_app":
         pkg = getattr(action, "_resolved_package", (action.text or "").strip())
         return Postcondition(kind="app_is", package=pkg)
-    if action.action in ("wait", "list_apps", "get_clipboard", "set_clipboard"):
+    if action.action in ("wait", "sleep", "list_apps", "get_clipboard", "set_clipboard", "scroll", "swipe"):
         return Postcondition(kind="noop_ok")
     return Postcondition(kind="screen_changed")
 
@@ -553,7 +556,8 @@ def _scroller_texts(screen: Screen) -> frozenset:
     )
 
 
-def _scroll_changed(before: Screen, after: Screen) -> bool:
+def _scroll_changed(before: Screen, after: Screen,
+                    action: Optional[AgentAction] = None) -> bool:
     """Multi-signal check for whether a scroll actually revealed new content.
 
     Three signals, cheapest first:
@@ -569,6 +573,23 @@ def _scroll_changed(before: Screen, after: Screen) -> bool:
        the case where the hierarchy drifted more but the user is seeing the
        same list content.
     """
+    # Signal 0: Perceptual Image Fingerprinting
+    if before.dhash is not None and after.dhash is not None:
+        from .fingerprint import dhash_distance
+        dist = dhash_distance(before.dhash, after.dhash)
+        if dist is not None:
+            if dist >= 4:
+                return True
+            if dist < 4 and after.exact_id == before.exact_id:
+                return False
+
+    # Swipe gestures or horizontal swipe/scroll (e.g. left/right) in photo galleries,
+    # carousels, viewpagers, or card stacks operate on images/views where accessibility
+    # XML hierarchy nodes often remain identical. Treat swipe and horizontal actions as changed.
+    if action is not None:
+        if action.action == "swipe" or action.direction in ("left", "right"):
+            return True
+
     # Signal 1: byte-identical hierarchy.
     if after.exact_id == before.exact_id:
         return False
@@ -599,9 +620,9 @@ def verify(action: AgentAction, before: Screen, after: Screen,
            post: Optional[Postcondition] = None,
            expected_skeleton: Optional[str] = None) -> VerifyOutcome:
     """Grade what actually happened."""
-    if action.action == "wait":
+    if action.action in ("wait", "sleep"):
         result_text = getattr(action, "_result_summary", "")
-        return VerifyOutcome(grade="success", reason=result_text or "waited")
+        return VerifyOutcome(grade="success", reason=result_text or ("slept" if action.action == "sleep" else "waited"))
     if action.action in ("get_clipboard", "set_clipboard"):
         result_text = getattr(action, "_result_summary", "")
         return VerifyOutcome(grade="success", reason=result_text)
@@ -613,7 +634,7 @@ def verify(action: AgentAction, before: Screen, after: Screen,
     condition = post or synthesise_postcondition(action, None)
 
     # Scroll/swipe that didn't move = end of list or edge of gallery, not a hard failure.
-    if action.action in ("scroll", "swipe") and not _scroll_changed(before, after):
+    if action.action in ("scroll", "swipe") and not _scroll_changed(before, after, action=action):
         return VerifyOutcome(grade="no_change",
                              reason=f"{action.action}ing did not reveal new content")
 

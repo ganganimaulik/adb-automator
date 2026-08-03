@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import __version__
+
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.panel import Panel
+    _HAS_RICH = True
+except ImportError:
+    _HAS_RICH = False
 
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 
@@ -439,13 +449,45 @@ def cmd_dump(args) -> int:
 # ---------------------------------------------------------------------------
 
 def _live_reporter(out: Out, max_steps: Optional[int] = None):
-    stream_state = {"active": False, "type": None}
+    stream_state: Dict[str, Any] = {
+        "active": False,
+        "type": None,
+        "thinking_text": "",
+        "content_text": "",
+        "live": None,
+        "using_rich": False,
+    }
+
+    def _render_live_panel() -> Any:
+        if not _HAS_RICH:
+            return ""
+        thinking = stream_state["thinking_text"].strip()
+        content = stream_state["content_text"].strip()
+
+        parts = []
+        if thinking:
+            parts.append(f"[dim italic][Thinking]\n{thinking}[/dim italic]")
+        if content:
+            parts.append(f"[cyan bold][Response][/cyan bold]\n[dim]{content}[/dim]")
+
+        body = "\n\n".join(parts) if parts else "[dim]...thinking...[/dim]"
+        return Panel(body, title="[cyan]LLM Stream[/cyan]", border_style="dim", expand=False)
 
     def report(kind: str, **kw) -> None:
         if kind != "llm_stream" and stream_state["active"]:
-            out.write("\n")
+            if stream_state["live"] is not None:
+                try:
+                    stream_state["live"].stop()
+                except Exception:
+                    pass
+                stream_state["live"] = None
+            elif not stream_state.get("using_rich"):
+                out.write("\n")
             stream_state["active"] = False
             stream_state["type"] = None
+            stream_state["thinking_text"] = ""
+            stream_state["content_text"] = ""
+            stream_state["using_rich"] = False
 
         step = kw.get("step")
         if step is None and "state" in kw:
@@ -473,16 +515,53 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             text = kw.get("text", "")
             if not text:
                 return
-            if stream_state["type"] != stream_type:
-                if stream_state["active"]:
-                    out.write("\n")
-                prefix = "        [Thinking] " if stream_type == "thinking" else "        [Response] "
-                out.write(out.dim(prefix))
-                stream_state["type"] = stream_type
+
+            use_rich_live = _HAS_RICH and sys.stdout.isatty() and not out.quiet
+
+            if use_rich_live:
+                if stream_type == "thinking":
+                    stream_state["thinking_text"] += text
+                else:
+                    stream_state["content_text"] += text
+
                 stream_state["active"] = True
-            out.write(out.dim(text))
+                stream_state["type"] = stream_type
+                stream_state["using_rich"] = True
+
+                if stream_state["live"] is None:
+                    console = Console()
+                    stream_state["live"] = Live(
+                        _render_live_panel(),
+                        console=console,
+                        transient=True,
+                        refresh_per_second=12,
+                    )
+                    stream_state["live"].start()
+                else:
+                    stream_state["live"].update(_render_live_panel())
+            else:
+                if stream_state["type"] != stream_type:
+                    if stream_state["active"]:
+                        out.write("\n")
+                    prefix = "        [Thinking] " if stream_type == "thinking" else "        [Response] "
+                    out.write(out.dim(prefix))
+                    stream_state["type"] = stream_type
+                    stream_state["active"] = True
+                out.write(out.dim(text))
 
         elif kind == "llm_end":
+            if stream_state["live"] is not None:
+                try:
+                    stream_state["live"].stop()
+                except Exception:
+                    pass
+                stream_state["live"] = None
+                stream_state["active"] = False
+                stream_state["type"] = None
+                stream_state["thinking_text"] = ""
+                stream_state["content_text"] = ""
+                stream_state["using_rich"] = False
+
             elapsed = kw.get("elapsed", 0.0)
             call = kw.get("call")
             purpose = kw.get("purpose", "decide")
@@ -1037,20 +1116,44 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@contextlib.contextmanager
+def prevent_sleep():
+    """Prevent macOS system sleep while adbagent runs."""
+    proc = None
+    if sys.platform == "darwin":
+        try:
+            proc = subprocess.Popen(
+                ["caffeinate", "-w", str(os.getpid()), "-d", "-i", "-s"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+    try:
+        yield
+    finally:
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     setup_logging(getattr(args, "verbose", 0))
-    try:
-        return args.func(args)
-    except KeyboardInterrupt:
-        print("\ninterrupted", file=sys.stderr)
-        return 130
-    except Exception as exc:  # noqa: BLE001
-        if getattr(args, "verbose", 0) >= 2:
-            raise
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    with prevent_sleep():
+        try:
+            return args.func(args)
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
+            return 130
+        except Exception as exc:  # noqa: BLE001
+            if getattr(args, "verbose", 0) >= 2:
+                raise
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
 
 
 if __name__ == "__main__":

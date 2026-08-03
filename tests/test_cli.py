@@ -342,6 +342,13 @@ def test_live_reporter_llm_stream(capsys):
     assert "LLM responded in 1.20s" in captured.out
 
 
+def test_prevent_sleep():
+    from adbagent.cli import prevent_sleep
+    with prevent_sleep():
+        pass
+
+
+
 
 
 

@@ -262,3 +262,40 @@ def test_verb_polarity_no_match_returns_empty():
     assert fp.normalize_verb_polarity("check the weather") == ""
     assert fp.normalize_verb_polarity("") == ""
     assert fp.normalize_verb_polarity("find my phone") == ""
+
+
+def test_compute_dhash_and_distance():
+    import io
+    from PIL import Image, ImageDraw
+
+    # Create two different test images with diagonal spatial gradients
+    img1 = Image.new("RGB", (100, 100), color=(255, 255, 255))
+    draw1 = ImageDraw.Draw(img1)
+    draw1.line([0, 0, 100, 100], fill=(0, 0, 0), width=20)
+
+    img2 = Image.new("RGB", (100, 100), color=(255, 255, 255))
+    draw2 = ImageDraw.Draw(img2)
+    draw2.line([0, 100, 100, 0], fill=(0, 0, 0), width=20)
+
+    buf1 = io.BytesIO()
+    img1.save(buf1, format="PNG")
+    bytes1 = buf1.getvalue()
+
+    buf2 = io.BytesIO()
+    img2.save(buf2, format="PNG")
+    bytes2 = buf2.getvalue()
+
+    hash1 = fp.compute_dhash(bytes1)
+    hash2 = fp.compute_dhash(bytes2)
+
+    assert hash1 is not None
+    assert hash2 is not None
+    # Identical image dhash distance is 0
+    assert fp.dhash_distance(hash1, hash1) == 0
+    # Different pattern image dhash distance > 0
+    assert fp.dhash_distance(hash1, hash2) > 0
+    # None returns None
+    assert fp.dhash_distance(None, hash1) is None
+
+
+

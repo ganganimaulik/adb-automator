@@ -427,5 +427,53 @@ def test_llm_streaming_inline_think_tags(monkeypatch):
     assert '{"action": "home"}' in content_text
 
 
+def test_judge_user_includes_done_text_and_system_prompt_guidelines():
+    from adbagent import prompts
+
+    prompt = prompts.judge_user(
+        goal="let me know how i can improve my chat",
+        history=["1. tap chat"],
+        rendered="Screen XML",
+        scratchpad="Collected 5 match message histories",
+        done_text="Here are 3 tips to improve your chat response rate..."
+    )
+
+    assert "GOAL: let me know how i can improve my chat" in prompt
+    assert "AGENT DONE SUMMARY / OUTPUT:\nHere are 3 tips to improve your chat response rate..." in prompt
+    assert "COLLECTED DATA (agent's scratchpad):\nCollected 5 match message histories" in prompt
+
+    # Verify JUDGE_SYSTEM guidelines prohibit rejecting done solely because output is text-based
+    assert "Do NOT reject 'done' simply because output/advice/results appear in text/scratchpad" in prompts.JUDGE_SYSTEM
+    assert "information retrieval, advice, recommendations, analysis" in prompts.JUDGE_SYSTEM
+
+
+def test_judge_passes_done_text_to_prompt(monkeypatch):
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = Config()
+    client = LLMClient(cfg)
+
+    captured_messages = []
+    def mock_post(messages, *, model, schema, max_tokens, purpose):
+        captured_messages.extend(messages)
+        return '{"satisfied": true, "evidence": "advice provided"}', None
+
+    monkeypatch.setattr(client, "_post", mock_post)
+
+    verdict = client.judge(
+        goal="give me chat advice",
+        rendered="Chat List",
+        history=[],
+        done_text="Your chat advice summary"
+    )
+
+    assert verdict.satisfied is True
+    user_msg = captured_messages[1]["content"][0]["text"]
+    assert "AGENT DONE SUMMARY / OUTPUT:\nYour chat advice summary" in user_msg
+
+
+
 
 

@@ -320,6 +320,9 @@ class Agent:
             want, note = needs_screenshot(state, screen, cfg)
             if want:
                 screenshot = self.dev.screenshot()
+                screen.screenshot = screenshot
+                from .fingerprint import compute_dhash
+                screen.dhash = compute_dhash(screenshot)
             banned_actions = state.loops.bans_for(screen.skeleton_id)
             ban_note = ""
             if banned_actions:
@@ -490,6 +493,11 @@ class Agent:
             t0_verify = time.monotonic()
             try:
                 after = self.dev.observe(settle=True)
+                if want or action.action in ("scroll", "swipe") or state.want_screenshot:
+                    shot_after = self.dev.screenshot()
+                    after.screenshot = shot_after
+                    from .fingerprint import compute_dhash
+                    after.dhash = compute_dhash(shot_after)
             except (DeviceTimeout, DeviceLost) as exc:
                 if not self._recover_device(state, exc):
                     state.finished = "aborted"
@@ -517,7 +525,8 @@ class Agent:
                 state.last_failure = ""
                 state.loops.consecutive_backs = 0
             if outcome.grade == "no_change":
-                state.loops.ban(screen.skeleton_id, action.signature())
+                if action.action not in ("scroll", "swipe"):
+                    state.loops.ban(screen.skeleton_id, action.signature())
                 if action.action in ("scroll", "swipe"):
                     h_dir = action.direction in ("left", "right")
                     axis = "horizontal" if h_dir else "vertical"
@@ -582,6 +591,7 @@ class Agent:
                                  history=state.history, screenshot=shot,
                                  scratchpad="\n".join(state.scratchpad),
                                  progress="\n".join(state.progress_log),
+                                 done_text=action.text or "",
                                  step=state.step, recorder=rec,
                                  on_event=self.on_event)
         t_judge = time.monotonic() - t0_judge

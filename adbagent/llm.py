@@ -733,7 +733,7 @@ class LLMClient:
     def judge(self, *, goal: str, rendered: str, history: Sequence[str],
               screenshot: Optional[bytes] = None,
               max_tokens: int = 0, scratchpad: str = "",
-              progress: str = "",
+              progress: str = "", done_text: str = "",
               step: int = 0, recorder: Optional[Any] = None,
               image_analysis: Optional[str] = None,
               on_event: Optional[Callable[..., None]] = None) -> "Verdict":
@@ -746,7 +746,8 @@ class LLMClient:
 
         content: List[Dict[str, Any]] = [
             text_part(prompts.judge_user(goal, history, rendered, scratchpad,
-                                        progress, image_analysis=image_analysis or ""))]
+                                        progress, image_analysis=image_analysis or "",
+                                        done_text=done_text))]
         messages = [
             {"role": "system", "content": prompts.JUDGE_SYSTEM},
             {"role": "user", "content": content},
