@@ -1,14 +1,25 @@
-"""Run tracking, screen corpus, transitions, and dead-end storage."""
+"""Run tracking and dead-end storage -- what the agent learns across runs.
+
+Only two things live here, and both are read. Anything written and never read
+was removed rather than kept in case it became useful: a per-step SQLite commit
+feeding a table with no reader is a cost with no upside, and it reads to the next
+person like a feature.
+
+The dead-end table is the whole of the cross-run memory. A tap that changed
+nothing on a screen is knowledge that survives the process, so the agent does not
+rediscover the same dud control on the same screen in every run. It is keyed by
+intent as well as by screen, because "the Wi-Fi row does nothing" can be true of
+one goal and false of another, and it expires, because an app that was broken
+last night may be fixed this morning.
+"""
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional
 
 from .config import Config
 from .fingerprint import mask_goal, normalize_verb_polarity
@@ -16,7 +27,7 @@ from .screen import Screen
 
 log = logging.getLogger("adbagent.memory")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -26,24 +37,6 @@ PRAGMA synchronous=NORMAL;
 CREATE TABLE IF NOT EXISTS meta (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS transition (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    app_key      TEXT NOT NULL,
-    from_skeleton TEXT NOT NULL,
-    to_skeleton  TEXT NOT NULL,
-    action_sig   TEXT NOT NULL,
-    n_seen       INTEGER NOT NULL DEFAULT 1,
-    updated_at   REAL NOT NULL,
-    UNIQUE(app_key, from_skeleton, to_skeleton, action_sig)
-);
-
-CREATE TABLE IF NOT EXISTS screen_seen (
-    app_key     TEXT NOT NULL,
-    skeleton_id TEXT NOT NULL,
-    token       TEXT NOT NULL,
-    PRIMARY KEY (app_key, skeleton_id, token)
 );
 
 CREATE TABLE IF NOT EXISTS run (
@@ -74,13 +67,18 @@ CREATE INDEX IF NOT EXISTS dead_end_lookup
     ON dead_end(app_key, skeleton_id, intent_id);
 """
 
-# -- Schema migration from v2 to v3 -----------------------------------------
+#: Tables from schema versions that no longer have a reader. Dropped rather than
+#: left in place: an unused table is indistinguishable from a broken feature to
+#: whoever opens the database next.
+_DROPPED_TABLES = (
+    # v2: the fingerprint cache and its trust scoring, removed in 78f50a7.
+    "entry_outcome", "entry", "app_tuning",
+    # v3: written on every step and every transition, read by nothing.
+    # `screen_seen` fed an IDF that no caller ever computed; `transition` had no
+    # reader at all.
+    "screen_seen", "transition",
+)
 
-_MIGRATE_V2_TO_V3 = [
-    "DROP TABLE IF EXISTS entry_outcome",
-    "DROP TABLE IF EXISTS entry", 
-    "DROP TABLE IF EXISTS app_tuning",
-]
 
 def intent_key(goal: str) -> str:
     """Normalised goal, so trivial rewording still hits the cache.
@@ -95,15 +93,8 @@ def intent_key(goal: str) -> str:
     return hashlib.blake2b(combined.encode("utf-8"), digest_size=8).hexdigest()
 
 
-def _to_sqlite_int(val: int) -> int:
-    """Ensure 64-bit integer fits into SQLite signed 64-bit INTEGER bounds."""
-    if val >= (1 << 63):
-        return val - (1 << 64)
-    return val
-
-
 class Memory:
-    """SQLite-backed store of learned steps."""
+    """SQLite-backed store of what the agent learned across runs."""
 
     def __init__(self, cfg: Config, path: Optional[Path] = None):
         self.cfg = cfg
@@ -117,15 +108,15 @@ class Memory:
         """Create tables, migrate from older schema versions."""
         self.db.executescript(DDL)
 
-        # -- Detect existing schema version and migrate --------------------
+        # -- Drop what older versions wrote and nothing reads ---------------
         row = self.db.execute(
             "SELECT v FROM meta WHERE k='schema_version'").fetchone()
         old_version = int(row["v"]) if row else 0
 
-        if old_version < 3:
-            for stmt in _MIGRATE_V2_TO_V3:
+        if old_version < SCHEMA_VERSION:
+            for table in _DROPPED_TABLES:
                 try:
-                    self.db.execute(stmt)
+                    self.db.execute(f"DROP TABLE IF EXISTS {table}")
                 except sqlite3.OperationalError:
                     pass
 
@@ -143,46 +134,6 @@ class Memory:
 
     def __exit__(self, *exc) -> None:
         self.close()
-
-    # -- corpus, for discriminative tokens ---------------------------------
-
-    def note_screen(self, screen: Screen) -> None:
-        """Record which tokens this screen has, so IDF can be computed later."""
-        rows = [(screen.package, screen.skeleton_id, token)
-                for token in set(screen.tokens)]
-        if not rows:
-            return
-        self.db.executemany(
-            "INSERT OR IGNORE INTO screen_seen(app_key, skeleton_id, token) "
-            "VALUES(?,?,?)", rows)
-        self.db.commit()
-
-    def idf(self, app_key: str) -> Dict[str, float]:
-        import math
-        total = self.db.execute(
-            "SELECT COUNT(DISTINCT skeleton_id) AS n FROM screen_seen WHERE app_key=?",
-            (app_key,)).fetchone()["n"] or 0
-        if total <= 1:
-            return {}
-        out: Dict[str, float] = {}
-        for row in self.db.execute(
-                "SELECT token, COUNT(DISTINCT skeleton_id) AS df FROM screen_seen "
-                "WHERE app_key=? GROUP BY token", (app_key,)):
-            out[row["token"]] = math.log(total / max(1, row["df"]))
-        return out
-
-    def note_transition(self, before: Screen, after: Screen,
-                        action: Any) -> None:
-        if before.skeleton_id == after.skeleton_id:
-            return
-        self.db.execute(
-            "INSERT INTO transition(app_key, from_skeleton, to_skeleton, "
-            " action_sig, updated_at) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(app_key, from_skeleton, to_skeleton, action_sig) "
-            "DO UPDATE SET n_seen = n_seen + 1, updated_at = excluded.updated_at",
-            (before.package, before.skeleton_id, after.skeleton_id,
-             action.signature(), time.time()))
-        self.db.commit()
 
     # -- runs --------------------------------------------------------------
 
@@ -206,9 +157,9 @@ class Memory:
 
     def record_dead_end(self, screen: Screen, intent_id: str,
                         action_sig: str, reason: str) -> None:
-        """Remember that an action on this screen is a dead end.
+        """Remember that an action on this screen led nowhere.
 
-        Future lookups will automatically ban this action signature for 24 hours.
+        Read back by `dead_ends` for 24 hours, in this run and in any later one.
         """
         now = time.time()
         self.db.execute(
@@ -221,12 +172,16 @@ class Memory:
              reason, now, now + self._DEAD_END_TTL_S))
         self.db.commit()
 
-    def _dead_end_sigs(self, app_key: str, skeleton_id: str,
-                       intent_id: str) -> set:
-        """Active dead-end action signatures for a screen."""
-        now = time.time()
+    def dead_ends(self, screen: Screen, intent_id: str) -> Dict[str, str]:
+        """Action signature -> why it led nowhere, for this screen and intent.
+
+        Keyed by intent as well as by screen because "this row does nothing" can
+        be true of one goal and false of another, and time-limited because an app
+        that was broken last night may be fixed this morning.
+        """
         rows = self.db.execute(
-            "SELECT action_sig FROM dead_end WHERE app_key=? AND skeleton_id=? "
-            "AND intent_id=? AND expires_at > ?",
-            (app_key, skeleton_id, intent_id, now)).fetchall()
-        return {r["action_sig"] for r in rows}
+            "SELECT action_sig, reason FROM dead_end WHERE app_key=? "
+            "AND skeleton_id=? AND intent_id=? AND expires_at > ?",
+            (screen.package, screen.skeleton_id, intent_id,
+             time.time())).fetchall()
+        return {row["action_sig"]: row["reason"] for row in rows}

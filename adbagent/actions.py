@@ -26,7 +26,6 @@ from pydantic import (BaseModel, ConfigDict, Field, field_validator,
                       model_validator)
 
 from .screen import Element, Screen
-from .fingerprint import DESTRUCTIVE_TEXT
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters for typing
     from .device import Device
@@ -51,33 +50,6 @@ PostKind = Literal["screen_changed", "element_state", "text_present",
 TERMINAL_ACTIONS = frozenset({"done", "fail", "ask_user"})
 #: Actions whose whole purpose is to move to a different screen.
 NAVIGATIONAL = frozenset({"tap", "long_press", "press_key", "open_app"})
-
-
-def is_navigation_action(action: AgentAction, element: Optional[Element] = None) -> bool:
-    """Return True if the action represents pure navigation (no state mutation)."""
-    if element is not None and element.checkable:
-        return False
-        
-    texts_to_check = []
-    if action.text:
-        texts_to_check.append(action.text)
-    if action.target and action.target.text:
-        texts_to_check.append(action.target.text)
-    if element and element.best_text:
-        texts_to_check.append(element.best_text)
-        
-    for text in texts_to_check:
-        if DESTRUCTIVE_TEXT.search(text):
-            return False
-            
-    if action.action == "tap":
-        return True
-    if action.action == "press_key" and action.key in ("back", "home"):
-        return True
-    if action.action == "open_app":
-        return True
-        
-    return False
 
 
 class Target(BaseModel):

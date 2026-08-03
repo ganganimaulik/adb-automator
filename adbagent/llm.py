@@ -583,10 +583,16 @@ class LLMClient:
             started = time.monotonic()
             try:
                 stream_kwargs = dict(kwargs)
+                stream_kwargs["stream_options"] = {"include_usage": True}
                 try:
-                    stream_kwargs["stream_options"] = {"include_usage": True}
                     resp = self._client.chat.completions.create(**stream_kwargs)
-                except (TypeError, Exception):
+                except TypeError:
+                    # An SDK old enough not to know `stream_options` rejects it
+                    # before the request leaves the process, so retrying without
+                    # it costs nothing. `except Exception` here caught the real
+                    # API errors too -- a 400 or a 401 was silently reissued, so
+                    # every hard failure cost two calls and the retry's exception
+                    # was the one that got reported.
                     stream_kwargs.pop("stream_options", None)
                     resp = self._client.chat.completions.create(**stream_kwargs)
             except (APIConnectionError, APITimeoutError) as exc:

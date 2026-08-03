@@ -462,11 +462,6 @@ class ItemLedger:
             record.detail = detail.strip()[:MAX_DETAIL_CHARS]
         return False
 
-    def mark_read(self, key: str) -> None:
-        record = self.items.get(key)
-        if record is not None:
-            record.read = True
-
     def was_read(self, key: str) -> bool:
         record = self.items.get(key)
         return bool(record and record.read)

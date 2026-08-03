@@ -476,50 +476,6 @@ class LoopDetector:
 
 
 # ---------------------------------------------------------------------------
-# Explore mode
-# ---------------------------------------------------------------------------
-
-#: Explore may press these; anything else needs the user's blessing.
-def is_read_only(action: AgentAction, screen: Screen) -> Tuple[bool, str]:
-    """Would this action only navigate, or could it change something?
-
-    Explore mode runs on a real, logged-in phone. Every published system that
-    explored by tapping freely reported sending messages, deleting data or
-    spending money by accident, so the default here is to refuse anything that
-    is not plainly navigational.
-    """
-    if action.action in ("scroll", "swipe", "wait", "done", "fail", "ask_user"):
-        return True, ""
-    if action.action == "press_key":
-        if action.key in ("back", "home", "recent"):
-            return True, ""
-        return False, f"key {action.key} may commit something"
-    if action.action == "input_text":
-        return False, "typing can submit a form or send a message"
-    if action.action == "open_app":
-        return True, ""
-    if action.action == "long_press":
-        return False, "long press usually opens a destructive context menu"
-    if action.action != "tap":
-        return False, f"{action.action} is not a navigation action"
-
-    if action.target is None:
-        return False, "no target"
-    element = resolve_target(action.target, screen)
-    if element is None:
-        return False, "target not on screen"
-
-    label = element.best_text
-    if label and DESTRUCTIVE_TEXT.search(label):
-        return False, f"{label!r} names an irreversible action"
-    if element.checkable:
-        return False, "toggling a setting changes state"
-    if element.editable:
-        return False, "focusing a text field leads to typing"
-    return True, ""
-
-
-# ---------------------------------------------------------------------------
 # Confirmation
 # ---------------------------------------------------------------------------
 

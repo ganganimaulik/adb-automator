@@ -5,9 +5,10 @@ whose transitions are driven by tap coordinates -- so the loop under test does
 the same parsing, pruning, fingerprinting and anchoring it would do against a
 real phone, deterministically and in milliseconds.
 
-`FakeLLM` answers with whatever policy the test gives it and counts its calls.
-Counting calls is the point: the headline claim of the project is "run it twice,
-the second run makes zero LLM calls", and that is an assertion about this number.
+`FakeLLM` answers with whatever policy the test gives it and counts its calls,
+keeping decide calls apart from the vision reads a sweep makes. Counting them is
+the point: what a change to the loop is usually for is spending fewer reasoning
+turns on the same goal, and that is an assertion about these numbers.
 """
 
 from __future__ import annotations
@@ -143,12 +144,6 @@ class FakeDevice:
         if press_enter:
             self.actions.append("press(enter)")
 
-    def clear_text(self) -> None:
-        self.actions.append("clear_text")
-
-    def hide_keyboard(self) -> None:
-        pass
-
     def get_clipboard(self) -> str:
         self.actions.append("get_clipboard")
         return getattr(self, "clipboard_text", "sample clipboard text")
@@ -169,7 +164,6 @@ class FakeDevice:
             pkgs = [p for p in pkgs if q in p.lower()]
         return sorted(pkgs)
 
-    list_packages = list_apps
 
     # -- misc --------------------------------------------------------------
 

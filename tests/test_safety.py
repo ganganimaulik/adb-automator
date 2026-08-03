@@ -209,52 +209,6 @@ def test_element_history_tracking_and_hints():
 
 
 # ---------------------------------------------------------------------------
-# Explore mode: read-only classification
-# ---------------------------------------------------------------------------
-
-def test_navigation_is_read_only():
-    row = next(e for e in BASE.elements if e.resource_id == "row_item")
-    ok, _ = safety.is_read_only(act(action="tap", target=Target(index=row.index)),
-                                BASE)
-    assert ok
-    assert safety.is_read_only(act(action="scroll", direction="down"), BASE)[0]
-    assert safety.is_read_only(act(action="press_key", key="back"), BASE)[0]
-
-
-def test_typing_is_never_read_only():
-    ok, why = safety.is_read_only(
-        act(action="input_text", target=Target(index=1), text="hello"), BASE)
-    assert not ok and "typing" in why
-
-
-def test_toggling_a_setting_is_not_read_only():
-    toggle = next(e for e in BASE.elements if e.kind() == "Toggle")
-    ok, why = safety.is_read_only(
-        act(action="tap", target=Target(index=toggle.index)), BASE)
-    assert not ok and "state" in why
-
-
-def test_pressing_an_irreversible_button_is_not_read_only():
-    screen = s(X.detail_screen())
-    target = next(e for e in screen.elements if e.best_text == "Forget network")
-    ok, why = safety.is_read_only(
-        act(action="tap", target=Target(index=target.index)), screen)
-    assert not ok and "irreversible" in why
-
-
-def test_long_press_is_not_read_only():
-    ok, why = safety.is_read_only(
-        act(action="long_press", target=Target(index=1)), BASE)
-    assert not ok and "context menu" in why
-
-
-def test_enter_key_is_not_read_only():
-    """Enter submits forms."""
-    ok, _ = safety.is_read_only(act(action="press_key", key="enter"), BASE)
-    assert not ok
-
-
-# ---------------------------------------------------------------------------
 # Horizontal scroll oscillation
 # ---------------------------------------------------------------------------
 
