@@ -255,3 +255,18 @@ def test_decide_messages_cache_friendly_structure(monkeypatch):
     assert "YOUR PROGRESS" in msgs[4]["content"]
     assert "CURRENT SCREEN:\nscreen 1" in msgs[5]["content"][0]["text"]
 
+
+def test_service_tier_extra_body(monkeypatch):
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = Config()
+    cfg.llm.service_tier = "priority"
+    client = LLMClient(cfg)
+
+    extra = client._extra_body()
+    assert extra.get("service_tier") == "priority"
+    assert extra.get("prompt_cache_key") is not None
+
+

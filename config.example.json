@@ -8,6 +8,7 @@
     "max_tokens": 128000,
     "rpm": 120,
     "max_retries": 10,
+    "service_tier": "",
     "api_key_env": "FIREWORKS_API_KEY"
   },
 

@@ -234,6 +234,7 @@ class Agent:
 
             # ---- 1. perceive (no LLM) -----------------------------------
             if screen is None:
+                t0_perceive = time.monotonic()
                 try:
                     screen = self.dev.observe()
                 except (DeviceTimeout, DeviceLost) as exc:
@@ -241,6 +242,7 @@ class Agent:
                         state.finished = "aborted"
                         return
                     continue
+                self.on_event("perceive", step=state.step, elapsed=time.monotonic() - t0_perceive)
             self.mem.note_screen(screen)
             self._last_package = screen.package
 
@@ -322,6 +324,9 @@ class Agent:
                 ban_note = (f"BANNED ACTIONS on this screen (these produced NO change - DO NOT REPEAT): "
                             f"{', '.join(sorted(banned_actions))}.")
             notes = " ".join(filter(None, (note, hint, ban_note, state.last_failure)))
+            model_name = (self.llm.model_image if screenshot else self.llm.model) if self.llm else ""
+            self.on_event("llm_start", step=state.step, purpose="decide", model=model_name, screenshot=bool(screenshot))
+            t0_llm = time.monotonic()
             action = self.llm.decide(                      ### LLM ###
                 goal=state.goal, rendered=render(screen), history=state.history,
                 width=screen.width, height=screen.height, package=screen.package,
@@ -329,6 +334,9 @@ class Agent:
                 scratchpad="\n".join(state.scratchpad),
                 progress="\n".join(state.progress_log),
                 step=state.step, recorder=rec)
+            t_llm = time.monotonic() - t0_llm
+            last_call = self.llm.ledger.calls[-1] if (self.llm and self.llm.ledger.calls) else None
+            self.on_event("llm_end", step=state.step, purpose="decide", elapsed=t_llm, call=last_call)
             state.llm_calls += 1
             state.want_screenshot = action.confidence == "low"
             source = "llm"
@@ -439,6 +447,7 @@ class Agent:
                 continue
 
             # ---- 6. act -------------------------------------------------
+            t0_act = time.monotonic()
             try:
                 element = execute(self.dev, action, screen)
             except (ActionError, ValueError) as exc:
@@ -459,8 +468,11 @@ class Agent:
                     state.finished = "aborted"
                     return
                 continue
+            self.on_event("act_end", step=state.step, action=action, elapsed=time.monotonic() - t0_act)
 
             # ---- 7. verify (no LLM) -------------------------------------
+            self.on_event("settle_start", step=state.step, budget=cfg.device.settle_budget_s)
+            t0_verify = time.monotonic()
             try:
                 after = self.dev.observe(settle=True)
             except (DeviceTimeout, DeviceLost) as exc:
@@ -468,9 +480,11 @@ class Agent:
                     state.finished = "aborted"
                     return
                 continue
+            t_settle = time.monotonic() - t0_verify
             post = synthesise_postcondition(action, element)
             expected = ""
             outcome = verify(action, screen, after, post, None)
+            self.on_event("verify_end", step=state.step, elapsed=t_settle, grade=outcome.grade, reason=outcome.reason)
 
             rec.event("verify", step=state.step, grade=outcome.grade,
                       reason=outcome.reason, after=after.skeleton_id)
@@ -543,11 +557,17 @@ class Agent:
             return "success"
 
         shot = self.dev.screenshot()
+        model_name = (self.llm.model_image if shot else self.llm.model_small) if self.llm else ""
+        self.on_event("llm_start", step=state.step, purpose="judge", model=model_name, screenshot=bool(shot))
+        t0_judge = time.monotonic()
         verdict = self.llm.judge(goal=state.goal, rendered=render(screen),  ### LLM ###
                                  history=state.history, screenshot=shot,
                                  scratchpad="\n".join(state.scratchpad),
                                  progress="\n".join(state.progress_log),
                                  step=state.step, recorder=rec)
+        t_judge = time.monotonic() - t0_judge
+        last_call = self.llm.ledger.calls[-1] if (self.llm and self.llm.ledger.calls) else None
+        self.on_event("llm_end", step=state.step, purpose="judge", elapsed=t_judge, call=last_call, verdict=verdict)
         state.llm_calls += 1
         rec.event("judge", satisfied=verdict.satisfied, evidence=verdict.evidence)
         if verdict.satisfied:

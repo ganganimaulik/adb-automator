@@ -81,6 +81,7 @@ OVERRIDES = {
     "model_small": "llm.model_small",
     "model_image": "llm.model_image",
     "provider": "llm.provider",
+    "service_tier": "llm.service_tier",
     "rpm": "llm.rpm",
     "max_tokens": "llm.max_tokens",
     "device": "device.serial",
@@ -180,6 +181,8 @@ def cmd_doctor(args) -> int:
         problems += 1
     if cfg.llm.model:
         out.ok(f"model {cfg.llm.model}")
+        if cfg.llm.service_tier:
+            out.ok(f"service tier {cfg.llm.service_tier}")
         if cfg.llm.model_small:
             out.ok(f"small model {cfg.llm.model_small}")
         if cfg.llm.model_image:
@@ -429,29 +432,69 @@ def cmd_dump(args) -> int:
 
 def _live_reporter(out: Out, max_steps: Optional[int] = None):
     def report(kind: str, **kw) -> None:
-        if kind == "loop_warning":
+        step = kw.get("step")
+        if step is None and "state" in kw:
+            step = kw["state"].step
+        step_hdr = f"  [{step:>2}/{max_steps}]" if (step and max_steps) else (f"  [{step:>2}]" if step else "     ")
+
+        if kind == "perceive":
+            elapsed = kw.get("elapsed", 0.0)
+            out.say(f"{step_hdr} Perceiving screen... {out.dim(f'({elapsed:.2f}s)')}")
+
+        elif kind == "llm_start":
+            purpose = kw.get("purpose", "decide")
+            model = kw.get("model", "")
+            shot = " +img" if kw.get("screenshot") else ""
+            label = "LLM judge" if purpose == "judge" else "LLM"
+            out.say(out.cyan(f"        calling {label} ({model}{shot})..."))
+
+        elif kind == "llm_end":
+            elapsed = kw.get("elapsed", 0.0)
+            call = kw.get("call")
+            purpose = kw.get("purpose", "decide")
+            tokens_info = ""
+            if call and getattr(call, "prompt_tokens", 0):
+                tokens_info = f" ({call.prompt_tokens} prompt tokens, {call.completion_tokens} completion tokens)"
+            tag = "LLM judge responded" if purpose == "judge" else "LLM responded"
+            out.say(out.dim(f"        {tag} in {elapsed:.2f}s{tokens_info}"))
+
+        elif kind == "step":
+            state = kw["state"]
+            action = kw["action"]
+            screenshot = kw.get("screenshot", False)
+            shot = " +img" if screenshot else ""
+            conf = " (confidence: low)" if getattr(action, "confidence", None) == "low" else ""
+            out.say(f"{step_hdr}{shot} {out.bold(action.describe())}{conf}")
+            if getattr(action, "observation", None):
+                out.say(out.dim(f"        Obs:       {action.observation}"))
+            if getattr(action, "reasoning", None):
+                out.say(out.dim(f"        Reasoning: {action.reasoning}"))
+            if getattr(action, "progress", None):
+                out.say(out.dim(f"        Progress:  {action.progress}"))
+
+        elif kind == "act_end":
+            elapsed = kw.get("elapsed", 0.0)
+            out.say(out.dim(f"        executed action in {elapsed:.2f}s"))
+
+        elif kind == "settle_start":
+            budget = kw.get("budget", 2.0)
+            out.say(out.dim(f"        waiting for settle (budget max {budget:.1f}s)..."))
+
+        elif kind == "verify_end":
+            elapsed = kw.get("elapsed", 0.0)
+            grade = kw.get("grade", "")
+            reason = kw.get("reason", "")
+            r_str = f": {reason}" if reason else ""
+            out.say(out.dim(f"        settled & verified in {elapsed:.2f}s -> grade: {grade}{r_str}"))
+
+        elif kind == "loop_warning":
             msg = kw.get("message", "")
             out.say(out.yellow(f"        [Loop Warning] {msg}"))
-            return
-        if kind == "safety_warning":
+
+        elif kind == "safety_warning":
             msg = kw.get("message", "")
             out.say(out.yellow(f"        [Safety Warning] {msg}"))
-            return
-        if kind != "step":
-            return
-        state = kw["state"]
-        action = kw["action"]
-        screenshot = kw.get("screenshot", False)
-        shot = " +img" if screenshot else ""
-        step_hdr = f"  [{state.step:>2}/{max_steps}]" if max_steps else f"  {state.step:>3}"
-        conf = " (confidence: low)" if getattr(action, "confidence", None) == "low" else ""
-        out.say(f"{step_hdr}{shot} {action.describe()}{conf}")
-        if getattr(action, "observation", None):
-            out.say(out.dim(f"        Obs:       {action.observation}"))
-        if getattr(action, "reasoning", None):
-            out.say(out.dim(f"        Reasoning: {action.reasoning}"))
-        if getattr(action, "progress", None):
-            out.say(out.dim(f"        Progress:  {action.progress}"))
+
     return report
 
 
@@ -578,6 +621,8 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-c", "--config", help="path to config.json")
     parser.add_argument("-v", "--verbose", action="count", default=0)
     parser.add_argument("--provider", help="llm provider (default fireworks)")
+    parser.add_argument("--service-tier", dest="service_tier",
+                        help="service tier for LLM requests (e.g. priority)")
     parser.add_argument("--model", help="model id")
     parser.add_argument("--model-small", dest="model_small",
                         help="cheaper model for judging and repair")
