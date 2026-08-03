@@ -205,27 +205,36 @@ class FakeLLM:
         self.seen_screenshots = 0
         self.notes: List[str] = []
 
+    def analyze_image(self, screenshot: bytes, *, goal: str = "", rendered: str = "", **kwargs) -> str:
+        self.ledger.record(Call(model=self.model_image, prompt_tokens=500,
+                                completion_tokens=100, purpose="analyze_image"))
+        return "fake visual analysis"
+
     def decide(self, *, goal: str, rendered: str, history, width: int, height: int,
                package: str = "", screenshot: Optional[bytes] = None,
                note: str = "", scratchpad: str = "",
-               progress: str = "", **kwargs) -> AgentAction:
+               progress: str = "", image_analysis: Optional[str] = None, **kwargs) -> AgentAction:
         self.calls += 1
-        model_used = self.model_image if screenshot else self.model
         if screenshot:
             self.seen_screenshots += 1
+            if not image_analysis:
+                image_analysis = self.analyze_image(screenshot, goal=goal, rendered=rendered)
         self.notes.append(note)
-        self.ledger.record(Call(model=model_used, prompt_tokens=1000,
-                                completion_tokens=50))
+        self.ledger.record(Call(model=self.model, prompt_tokens=1000,
+                                completion_tokens=50, purpose="decide"))
         return self.policy(self.dev.observe(), self)
 
     def judge(self, *, goal: str, rendered: str, history,
               screenshot: Optional[bytes] = None,
               scratchpad: str = "",
-              progress: str = "", **kwargs) -> Verdict:
+              progress: str = "", image_analysis: Optional[str] = None, **kwargs) -> Verdict:
         self.judges += 1
         self.calls += 1
+        if screenshot and not image_analysis:
+            image_analysis = self.analyze_image(screenshot, goal=goal, rendered=rendered)
         return Verdict(satisfied=self.judge_result,
                        evidence="fake judge" if self.judge_result else "not yet")
+
 
 
 # ---------------------------------------------------------------------------

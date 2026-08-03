@@ -323,8 +323,9 @@ class Agent:
             if banned_actions:
                 ban_note = (f"BANNED ACTIONS on this screen (these produced NO change - DO NOT REPEAT): "
                             f"{', '.join(sorted(banned_actions))}.")
-            notes = " ".join(filter(None, (note, hint, ban_note, state.last_failure)))
-            model_name = (self.llm.model_image if screenshot else self.llm.model) if self.llm else ""
+            elem_hint = state.loops.element_history_hint(screen.skeleton_id)
+            notes = " ".join(filter(None, (note, hint, elem_hint, ban_note, state.last_failure)))
+            model_name = self.llm.model if self.llm else ""
             self.on_event("llm_start", step=state.step, purpose="decide", model=model_name, screenshot=bool(screenshot))
             t0_llm = time.monotonic()
             action = self.llm.decide(                      ### LLM ###
@@ -517,6 +518,9 @@ class Agent:
                         f"{action.direction} again here.{extra_tip}")
 
             state.loops.record(screen.exact_id, action.signature())
+            state.loops.record_element_action(
+                screen.skeleton_id, state.step, action.signature(), action.describe(element=element)
+            )
             state.history.append(
                 format_history_entry(
                     state.step, action, screen=screen, element=element,

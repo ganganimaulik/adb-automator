@@ -158,6 +158,8 @@ class LoopDetector:
 
     history: List[Tuple[str, str]] = field(default_factory=list)
     banned: Dict[str, Set[str]] = field(default_factory=dict)
+    #: Element-level history per screen identity (skeleton_id): list of (step, signature, action_desc)
+    element_actions: Dict[str, List[Tuple[int, str, str]]] = field(default_factory=dict)
     #: Every scroll direction across the entire run, not cleared by taps.
     #: Used to detect direction reversals even when taps break the
     #: consecutive-scroll counter.
@@ -172,6 +174,28 @@ class LoopDetector:
     def record(self, exact_id: str, signature: str) -> None:
         self.history.append((exact_id, signature))
         del self.history[:-WINDOW]
+
+    def record_element_action(self, skeleton_id: str, step: int, signature: str, action_desc: str) -> None:
+        """Record an action performed on an element for a specific screen identity."""
+        actions = self.element_actions.setdefault(skeleton_id, [])
+        if not any(s == step for s, _, _ in actions):
+            actions.append((step, signature, action_desc))
+            del actions[:-10]
+
+    def element_history_hint(self, skeleton_id: str) -> Optional[str]:
+        """Contextual hint summarizing previous element actions performed on this screen identity."""
+        actions = self.element_actions.get(skeleton_id, [])
+        if not actions:
+            return None
+        recent = actions[-5:]
+        formatted = [f"step {step}: {desc}" for step, _, desc in recent]
+        summary = "; ".join(formatted)
+        return (
+            f"PREVIOUS ACTIONS ON THIS SCREEN: {summary}. "
+            f"If you are reviewing multiple items or photos in a list or grid, "
+            f"do NOT repeat an element index (#N) you already tapped. "
+            f"Select the next uninspected element index or take a different action."
+        )
 
     def repeats(self, exact_id: str) -> int:
         return sum(1 for seen, _ in self.history if seen == exact_id)

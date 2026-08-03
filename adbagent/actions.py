@@ -139,10 +139,10 @@ class AgentAction(BaseModel):
     direction: Optional[ScrollDir] = Field(
         None, description="For scroll and swipe: which direction to move content or gesture ('down', 'up', 'left', 'right').")
     scroll_amount: float = Field(
-        1, description="For scroll/swipe: distance or scale multiplier (0.25 for quarter page/small swipe, 1 for full page/swipe, up to 5).",
+        1, description="For scroll/swipe: distance or step multiplier (0.25 for small scroll, 1 for single page, 2-5 for fast multi-step scroll when searching long feeds/history).",
         ge=0.25, le=5)
     base_scale: Optional[float] = Field(
-        None, description="For scroll: base drag scale per step (default 0.6, range 0.1 to 1.0).",
+        None, description="For scroll: base drag scale per step (default 0.6, range 0.1 to 1.0; use 0.8 for larger page coverage per swipe).",
         ge=0.1, le=1.0)
     duration: Optional[float] = Field(
         None, description="For swipe/scroll/wait: duration in seconds (e.g. 0.15 for fast flick, 0.3 for scroll, 1.0 for wait).",

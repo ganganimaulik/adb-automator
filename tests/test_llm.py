@@ -270,3 +270,47 @@ def test_service_tier_extra_body(monkeypatch):
     assert extra.get("prompt_cache_key") is not None
 
 
+def test_image_model_used_for_image_analysis_and_main_model_decides_action(monkeypatch):
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+    from adbagent.actions import Target
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = Config()
+    cfg.llm.model = "main-action-model"
+    cfg.llm.model_image = "vision-analysis-model"
+    client = LLMClient(cfg)
+
+    posted_models = []
+    def mock_post(messages, *, model, schema, max_tokens, purpose):
+        posted_models.append((model, purpose))
+        return "Visual analysis: pop up detected showing Allow button", None
+
+    structured_models = []
+    def mock_structured(messages, model_cls, model, purpose):
+        structured_models.append((model, purpose))
+        # Ensure visual analysis was passed to main model
+        last_msg = messages[-1]["content"][0]["text"]
+        assert "VISUAL SCREEN ANALYSIS (from image model)" in last_msg
+        assert "Allow button" in last_msg
+        return AgentAction(observation="popup", reasoning="tap allow", action="tap", target=Target(index=1))
+
+    monkeypatch.setattr(client, "_post", mock_post)
+    monkeypatch.setattr(client, "structured", mock_structured)
+
+    action = client.decide(
+        goal="allow permission",
+        width=720, height=1600,
+        rendered="screen 1",
+        history=[],
+        screenshot=b"fake-image-bytes"
+    )
+
+    # _post should be called with vision-analysis-model for purpose analyze_image
+    assert ("accounts/fireworks/models/vision-analysis-model", "analyze_image") in posted_models
+    # structured decision should be called with main-action-model for purpose decide
+    assert ("accounts/fireworks/models/main-action-model", "decide") in structured_models
+    assert action.action == "tap"
+
+
+

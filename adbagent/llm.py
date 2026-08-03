@@ -516,22 +516,45 @@ class LLMClient:
 
     # -- the two things the agent loop actually calls -----------------------
 
+    def analyze_image(self, screenshot: bytes, *, goal: str = "", rendered: str = "",
+                      step: int = 0, recorder: Optional[Any] = None) -> str:
+        """Use the vision model (self.model_image) ONLY to analyze the image content."""
+        from . import prompts
+
+        prompt_text = prompts.image_analysis_user(goal=goal, rendered=rendered)
+        content: List[Dict[str, Any]] = [
+            text_part(prompt_text),
+            image_part(screenshot),
+        ]
+        messages = [
+            {"role": "system", "content": prompts.IMAGE_ANALYSIS_SYSTEM},
+            {"role": "user", "content": content},
+        ]
+        if recorder is not None:
+            recorder.dump_messages(step, messages, purpose="analyze_image")
+        log.info("submitting screenshot (%d bytes) to image model (%s) for visual analysis",
+                 len(screenshot), self.model_image)
+        raw, _ = self._post(messages, model=self.model_image, schema=None,
+                             max_tokens=self.cfg.llm.max_tokens, purpose="analyze_image")
+        return raw.strip()
+
     def decide(self, *, goal: str, rendered: str, history: Sequence[str],
                width: int, height: int, package: str = "",
                screenshot: Optional[bytes] = None, note: str = "",
                scratchpad: str = "", progress: str = "",
                step: int = 0, recorder: Optional[Any] = None,
-               purpose: str = "decide"):
+               purpose: str = "decide",
+               image_analysis: Optional[str] = None):
         from . import prompts
         from .actions import AgentAction
 
+        if screenshot and not image_analysis:
+            image_analysis = self.analyze_image(
+                screenshot, goal=goal, rendered=rendered, step=step, recorder=recorder
+            )
+
         content: List[Dict[str, Any]] = [
-            text_part(prompts.screen_block(rendered, note))]
-        if screenshot:
-            # Text before image: it measurably improves grounding, and the image
-            # is the most volatile block so it must come last for cache reuse.
-            content.append(image_part(screenshot))
-            log.info("submitting screenshot (%d bytes) to LLM", len(screenshot))
+            text_part(prompts.screen_block(rendered, note, image_analysis=image_analysis or ""))]
 
         state_text = prompts.state_block(scratchpad, progress)
         messages = [
@@ -547,29 +570,33 @@ class LLMClient:
         messages.append({"role": "user", "content": content})
         if recorder is not None:
             recorder.dump_messages(step, messages, purpose=purpose)
-        target = self.model_image if screenshot else self.model
+        # Next action steps are ALWAYS decided by the main model (self.model)!
+        target = self.model
         return self.structured(messages, AgentAction, model=target, purpose=purpose)
 
     def judge(self, *, goal: str, rendered: str, history: Sequence[str],
               screenshot: Optional[bytes] = None,
               max_tokens: int = 0, scratchpad: str = "",
               progress: str = "",
-              step: int = 0, recorder: Optional[Any] = None) -> "Verdict":
+              step: int = 0, recorder: Optional[Any] = None,
+              image_analysis: Optional[str] = None) -> "Verdict":
         from . import prompts
+
+        if screenshot and not image_analysis:
+            image_analysis = self.analyze_image(
+                screenshot, goal=goal, rendered=rendered, step=step, recorder=recorder
+            )
 
         content: List[Dict[str, Any]] = [
             text_part(prompts.judge_user(goal, history, rendered, scratchpad,
-                                        progress))]
-        if screenshot:
-            content.append(image_part(screenshot))
-            log.info("submitting screenshot (%d bytes) to LLM", len(screenshot))
+                                        progress, image_analysis=image_analysis or ""))]
         messages = [
             {"role": "system", "content": prompts.JUDGE_SYSTEM},
             {"role": "user", "content": content},
         ]
         if recorder is not None:
             recorder.dump_messages(step, messages, purpose="judge")
-        target = self.model_image if screenshot else self.model_small
+        target = self.model_small
         return self.structured(messages, Verdict, model=target,
                                max_tokens=max_tokens, purpose="judge")
 
