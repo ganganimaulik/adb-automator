@@ -22,7 +22,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Type, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -412,7 +412,8 @@ class LLMClient:
 
     def _post(self, messages: List[Dict[str, Any]], *, model: str,
               schema: Optional[Dict[str, Any]], max_tokens: int,
-              purpose: str) -> Tuple[str, Call]:
+              purpose: str,
+              on_event: Optional[Callable[..., None]] = None) -> Tuple[str, Call]:
         from openai import APIStatusError, APIConnectionError, APITimeoutError
 
         if self.ledger.total_usd > self.cfg.safety.budget_usd:
@@ -425,6 +426,7 @@ class LLMClient:
             "messages": messages,
             "temperature": self.cfg.llm.temperature,
             "max_tokens": max_tokens,
+            "stream": True,
         }
         if schema is not None:
             kwargs["response_format"] = {
@@ -441,7 +443,13 @@ class LLMClient:
             self.limiter.wait()
             started = time.monotonic()
             try:
-                resp = self._client.chat.completions.create(**kwargs)
+                stream_kwargs = dict(kwargs)
+                try:
+                    stream_kwargs["stream_options"] = {"include_usage": True}
+                    resp = self._client.chat.completions.create(**stream_kwargs)
+                except (TypeError, Exception):
+                    stream_kwargs.pop("stream_options", None)
+                    resp = self._client.chat.completions.create(**stream_kwargs)
             except (APIConnectionError, APITimeoutError) as exc:
                 last = exc
             except APIStatusError as exc:
@@ -451,21 +459,143 @@ class LLMClient:
                         f"{getattr(exc, 'message', exc)}") from exc
                 last = exc
             else:
-                choice = resp.choices[0]
-                usage = getattr(resp, "usage", None)
+                # Handle non-stream response object if returned (e.g. in mocks)
+                if hasattr(resp, "choices") and not hasattr(resp, "__iter__"):
+                    choice = resp.choices[0]
+                    usage = getattr(resp, "usage", None)
+                    raw_text = choice.message.content or ""
+                    reasoning = (
+                        getattr(choice.message, "reasoning_content", None)
+                        or getattr(choice.message, "reasoning", None)
+                        or getattr(choice.message, "thinking", None)
+                    )
+                    if not reasoning and hasattr(choice.message, "model_extra") and choice.message.model_extra:
+                        reasoning = (
+                            choice.message.model_extra.get("reasoning_content")
+                            or choice.message.model_extra.get("reasoning")
+                            or choice.message.model_extra.get("thinking")
+                        )
+                    if reasoning and on_event:
+                        on_event("llm_stream", stream_type="thinking", text=reasoning, purpose=purpose)
+                    if raw_text and on_event:
+                        on_event("llm_stream", stream_type="content", text=raw_text, purpose=purpose)
+                    call = self.ledger.record(Call(
+                        model=model,
+                        prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                        completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+                        latency_s=time.monotonic() - started,
+                        purpose=purpose,
+                        request_id=getattr(resp, "id", "") or "",
+                    ))
+                    if choice.finish_reason == "length":
+                        raise TruncatedResponse(
+                            f"reply hit max_tokens={max_tokens}; raise it")
+                    return raw_text, call
+
+                # Handle streaming generator/iterator response
+                full_content: List[str] = []
+                full_reasoning: List[str] = []
+                usage_obj = None
+                finish_reason = None
+                request_id = ""
+                in_think_tag = False
+
+                try:
+                    for chunk in resp:
+                        if hasattr(chunk, "id") and chunk.id:
+                            request_id = chunk.id
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            usage_obj = chunk.usage
+
+                        if not getattr(chunk, "choices", None):
+                            continue
+
+                        choice = chunk.choices[0]
+                        if getattr(choice, "finish_reason", None):
+                            finish_reason = choice.finish_reason
+
+                        delta = getattr(choice, "delta", None)
+                        if not delta:
+                            continue
+
+                        # Check for explicit reasoning/thinking field
+                        reasoning_chunk = (
+                            getattr(delta, "reasoning_content", None)
+                            or getattr(delta, "reasoning", None)
+                            or getattr(delta, "thinking", None)
+                        )
+                        if not reasoning_chunk and hasattr(delta, "model_extra") and delta.model_extra:
+                            reasoning_chunk = (
+                                delta.model_extra.get("reasoning_content")
+                                or delta.model_extra.get("reasoning")
+                                or delta.model_extra.get("thinking")
+                            )
+
+                        if reasoning_chunk:
+                            full_reasoning.append(reasoning_chunk)
+                            if on_event:
+                                on_event("llm_stream", stream_type="thinking", text=reasoning_chunk, purpose=purpose)
+
+                        # Check for content chunk
+                        content_chunk = getattr(delta, "content", None)
+                        if content_chunk:
+                            full_content.append(content_chunk)
+
+                            if not reasoning_chunk:
+                                text_to_process = content_chunk
+                                while text_to_process:
+                                    if not in_think_tag:
+                                        if "<think>" in text_to_process:
+                                            before, after = text_to_process.split("<think>", 1)
+                                            if before and on_event:
+                                                on_event("llm_stream", stream_type="content", text=before, purpose=purpose)
+                                            in_think_tag = True
+                                            text_to_process = after
+                                        else:
+                                            if on_event:
+                                                on_event("llm_stream", stream_type="content", text=text_to_process, purpose=purpose)
+                                            text_to_process = ""
+                                    else:
+                                        if "</think>" in text_to_process:
+                                            think_part, after = text_to_process.split("</think>", 1)
+                                            if think_part:
+                                                full_reasoning.append(think_part)
+                                                if on_event:
+                                                    on_event("llm_stream", stream_type="thinking", text=think_part, purpose=purpose)
+                                            in_think_tag = False
+                                            text_to_process = after
+                                        else:
+                                            full_reasoning.append(text_to_process)
+                                            if on_event:
+                                                on_event("llm_stream", stream_type="thinking", text=text_to_process, purpose=purpose)
+                                            text_to_process = ""
+                            else:
+                                if on_event:
+                                    on_event("llm_stream", stream_type="content", text=content_chunk, purpose=purpose)
+                except (APIConnectionError, APITimeoutError) as exc:
+                    last = exc
+                    delay = min(30.0, 0.8 * (2 ** attempt)) + random.uniform(0, 0.5)
+                    log.warning("LLM stream failed (%s); retrying in %.1fs", last, delay)
+                    time.sleep(delay)
+                    continue
+
+                raw_text = "".join(full_content)
+                prompt_tokens = getattr(usage_obj, "prompt_tokens", 0) or 0
+                comp_tokens = getattr(usage_obj, "completion_tokens", 0) or max(1, len(raw_text) // 4)
+
                 call = self.ledger.record(Call(
                     model=model,
-                    prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-                    completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=comp_tokens,
                     latency_s=time.monotonic() - started,
                     purpose=purpose,
-                    request_id=getattr(resp, "id", "") or "",
+                    request_id=request_id,
                 ))
-                if choice.finish_reason == "length":
-                    # Not a soft problem: a truncated reply is invalid JSON.
+
+                if finish_reason == "length":
                     raise TruncatedResponse(
                         f"reply hit max_tokens={max_tokens}; raise it")
-                return (choice.message.content or ""), call
+                return raw_text, call
 
             delay = min(30.0, 0.8 * (2 ** attempt)) + random.uniform(0, 0.5)
             log.warning("LLM call failed (%s); retrying in %.1fs", last, delay)
@@ -477,7 +607,8 @@ class LLMClient:
 
     def structured(self, messages: List[Dict[str, Any]], model_cls: Type[M], *,
                    model: str = "", max_tokens: int = 0,
-                   purpose: str = "decide") -> M:
+                   purpose: str = "decide",
+                   on_event: Optional[Callable[..., None]] = None) -> M:
         """One schema-constrained call, with a bounded repair loop."""
         from .prompts import REPAIR
 
@@ -486,11 +617,16 @@ class LLMClient:
         budget = max_tokens or self.cfg.llm.max_tokens
         conversation = list(messages)
 
+        kw = {}
+        if on_event is not None:
+            kw["on_event"] = on_event
+
         last_error = ""
         for attempt in range(3):
             try:
                 raw, _ = self._post(conversation, model=target, schema=schema,
-                                    max_tokens=budget, purpose=purpose)
+                                    max_tokens=budget, purpose=purpose,
+                                    **kw)
             except TruncatedResponse as exc:
                 # Asking again with the same ceiling would truncate again. Give
                 # the model more room instead, once.
@@ -538,8 +674,12 @@ class LLMClient:
         if on_event:
             on_event("llm_start", step=step, purpose="analyze_image", model=self.model_image, screenshot=True)
         t0 = time.monotonic()
+        kw = {}
+        if on_event is not None:
+            kw["on_event"] = on_event
         raw, _ = self._post(messages, model=self.model_image, schema=None,
-                             max_tokens=self.cfg.llm.max_tokens, purpose="analyze_image")
+                             max_tokens=self.cfg.llm.max_tokens, purpose="analyze_image",
+                             **kw)
         elapsed = time.monotonic() - t0
         result = raw.strip()
         last_call = self.ledger.calls[-1] if self.ledger.calls else None
@@ -585,19 +725,23 @@ class LLMClient:
             recorder.dump_messages(step, messages, purpose=purpose)
         # Next action steps are ALWAYS decided by the main model (self.model)!
         target = self.model
-        return self.structured(messages, AgentAction, model=target, purpose=purpose)
+        kw = {}
+        if on_event is not None:
+            kw["on_event"] = on_event
+        return self.structured(messages, AgentAction, model=target, purpose=purpose, **kw)
 
     def judge(self, *, goal: str, rendered: str, history: Sequence[str],
               screenshot: Optional[bytes] = None,
               max_tokens: int = 0, scratchpad: str = "",
               progress: str = "",
               step: int = 0, recorder: Optional[Any] = None,
-              image_analysis: Optional[str] = None) -> "Verdict":
+              image_analysis: Optional[str] = None,
+              on_event: Optional[Callable[..., None]] = None) -> "Verdict":
         from . import prompts
 
         if screenshot and not image_analysis:
             image_analysis = self.analyze_image(
-                screenshot, goal=goal, rendered=rendered, step=step, recorder=recorder
+                screenshot, goal=goal, rendered=rendered, step=step, recorder=recorder, on_event=on_event
             )
 
         content: List[Dict[str, Any]] = [
@@ -610,8 +754,11 @@ class LLMClient:
         if recorder is not None:
             recorder.dump_messages(step, messages, purpose="judge")
         target = self.model_small
+        kw = {}
+        if on_event is not None:
+            kw["on_event"] = on_event
         return self.structured(messages, Verdict, model=target,
-                               max_tokens=max_tokens, purpose="judge")
+                               max_tokens=max_tokens, purpose="judge", **kw)
 
 
 class Verdict(BaseModel):

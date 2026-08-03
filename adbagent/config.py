@@ -43,6 +43,9 @@ class LLMConfig:
     #: Multimodal model used when a screenshot is provided.
     #: Falls back to `model` when empty.
     model_image: str = ""
+    #: Dedicated model used for app skill generation and exploration.
+    #: Falls back to `model` when empty.
+    model_skill: str = ""
     temperature: float = 0.0
     max_tokens: int = 1500
     #: Client-side request throttle. Fireworks free accounts are capped at 10 RPM;
@@ -62,6 +65,9 @@ class LLMConfig:
 
     def image(self) -> str:
         return self.model_image or self.model
+
+    def skill(self) -> str:
+        return self.model_skill or self.model
 
 
 @dataclass
@@ -86,7 +92,6 @@ class MemoryConfig:
     db: str = "memory.db"
 
 
-
 @dataclass
 class SafetyConfig:
     #: Empty means "any package". A run with --app pins this to that package.
@@ -97,7 +102,6 @@ class SafetyConfig:
     #: Never prompt; abort instead of asking. For unattended runs.
     unattended: bool = False
     allow_shell: bool = False
-
 
 
 @dataclass
@@ -116,12 +120,19 @@ class RunConfig:
 
 
 @dataclass
+class SkillsConfig:
+    enabled: bool = True
+    skills_dir: str = "skills"
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     device: DeviceConfig = field(default_factory=DeviceConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     run: RunConfig = field(default_factory=RunConfig)
+    skills: SkillsConfig = field(default_factory=SkillsConfig)
 
     # -- derived -----------------------------------------------------------
 
@@ -151,6 +162,7 @@ _ENV_MAP = {
     "ADBAGENT_MODEL": "llm.model",
     "ADBAGENT_MODEL_SMALL": "llm.model_small",
     "ADBAGENT_MODEL_IMAGE": "llm.model_image",
+    "ADBAGENT_MODEL_SKILL": "llm.model_skill",
     "ADBAGENT_PROVIDER": "llm.provider",
     "ADBAGENT_SERVICE_TIER": "llm.service_tier",
     "ADBAGENT_BASE_URL": "llm.base_url",
@@ -159,6 +171,7 @@ _ENV_MAP = {
     "ADBAGENT_DB": "memory.db",
     "ADBAGENT_BUDGET_USD": "safety.budget_usd",
     "ADBAGENT_MAX_STEPS": "run.max_steps",
+    "ADBAGENT_SKILLS_DIR": "skills.skills_dir",
     "ANDROID_SERIAL": "device.serial",
 }
 

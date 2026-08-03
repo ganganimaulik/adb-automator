@@ -323,5 +323,25 @@ def test_live_reporter_displays_image_analysis(capsys):
     assert "Vision (vision-v1): Photo shows 100g oats on scale" in captured.out
 
 
+def test_live_reporter_llm_stream(capsys):
+    from adbagent.cli import Out, _live_reporter
+
+    out = Out()
+    reporter = _live_reporter(out)
+    reporter("llm_start", purpose="decide", model="deepseek-r1")
+    reporter("llm_stream", stream_type="thinking", text="Analyzing element 5...")
+    reporter("llm_stream", stream_type="content", text='{"action": "tap"}')
+    reporter("llm_end", purpose="decide", elapsed=1.2)
+
+    captured = capsys.readouterr()
+    assert "calling LLM (deepseek-r1)..." in captured.out
+    assert "[Thinking]" in captured.out
+    assert "Analyzing element 5..." in captured.out
+    assert "[Response]" in captured.out
+    assert '{"action": "tap"}' in captured.out
+    assert "LLM responded in 1.20s" in captured.out
+
+
+
 
 
