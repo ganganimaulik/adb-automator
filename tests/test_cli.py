@@ -342,12 +342,29 @@ def test_live_reporter_llm_stream(capsys):
     assert "LLM responded in 1.20s" in captured.out
 
 
+def test_live_reporter_long_thinking_tailing(capsys, monkeypatch):
+    from adbagent.cli import Out, _live_reporter
+
+    out = Out()
+    reporter = _live_reporter(out)
+    reporter("llm_start", purpose="decide", model="deepseek-r1")
+    
+    # Stream 50 lines of thinking
+    long_thinking = "\n".join([f"Step {i}: thinking deeply..." for i in range(1, 51)])
+    reporter("llm_stream", stream_type="thinking", text=long_thinking)
+
+    # Trigger end
+    reporter("llm_end", purpose="decide", elapsed=2.5)
+
+    captured = capsys.readouterr()
+    assert "calling LLM (deepseek-r1)..." in captured.out
+    assert "LLM responded in 2.50s" in captured.out
+
+
 def test_prevent_sleep():
     from adbagent.cli import prevent_sleep
     with prevent_sleep():
         pass
-
-
 
 
 
