@@ -48,6 +48,11 @@ class Out:
     def cyan(self, text: str) -> str:
         return self._c("36", text)
 
+    def write(self, text: str = "") -> None:
+        if not self.quiet:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
     def say(self, text: str = "") -> None:
         if not self.quiet:
             print(text)
@@ -60,6 +65,7 @@ class Out:
 
     def bad(self, text: str) -> None:
         self.say(f"  {self.red('FAIL')}  {text}")
+
 
 
 def setup_logging(verbosity: int) -> None:
@@ -80,6 +86,7 @@ OVERRIDES = {
     "model": "llm.model",
     "model_small": "llm.model_small",
     "model_image": "llm.model_image",
+    "model_skill": "llm.model_skill",
     "provider": "llm.provider",
     "service_tier": "llm.service_tier",
     "rpm": "llm.rpm",
@@ -89,6 +96,7 @@ OVERRIDES = {
     "budget_usd": "safety.budget_usd",
     "max_steps": "run.max_steps",
     "artifacts_dir": "run.artifacts_dir",
+    "skills_dir": "skills.skills_dir",
     "dry_run": "run.dry_run",
     "always_screenshot": "run.always_screenshot",
     "never_screenshot": "run.never_screenshot",
@@ -431,7 +439,14 @@ def cmd_dump(args) -> int:
 # ---------------------------------------------------------------------------
 
 def _live_reporter(out: Out, max_steps: Optional[int] = None):
+    stream_state = {"active": False, "type": None}
+
     def report(kind: str, **kw) -> None:
+        if kind != "llm_stream" and stream_state["active"]:
+            out.write("\n")
+            stream_state["active"] = False
+            stream_state["type"] = None
+
         step = kw.get("step")
         if step is None and "state" in kw:
             step = kw["state"].step
@@ -452,6 +467,20 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             else:
                 label = "LLM"
             out.say(out.cyan(f"        calling {label} ({model}{shot})..."))
+
+        elif kind == "llm_stream":
+            stream_type = kw.get("stream_type", "content")
+            text = kw.get("text", "")
+            if not text:
+                return
+            if stream_state["type"] != stream_type:
+                if stream_state["active"]:
+                    out.write("\n")
+                prefix = "        [Thinking] " if stream_type == "thinking" else "        [Response] "
+                out.write(out.dim(prefix))
+                stream_state["type"] = stream_type
+                stream_state["active"] = True
+            out.write(out.dim(text))
 
         elif kind == "llm_end":
             elapsed = kw.get("elapsed", 0.0)
@@ -512,6 +541,12 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
         elif kind == "safety_warning":
             msg = kw.get("message", "")
             out.say(out.yellow(f"        [Safety Warning] {msg}"))
+
+        elif kind == "skill_loaded":
+            name = kw.get("name", "")
+            pkg = kw.get("package", "")
+            pkg_str = f" ({pkg})" if pkg else ""
+            out.say(out.cyan(f"        [Skill Loaded] Active App Skill: '{name}'{pkg_str}"))
 
     return report
 
@@ -732,6 +767,143 @@ def cmd_apps(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# skills
+# ---------------------------------------------------------------------------
+
+def cmd_skills(args) -> int:
+    from .skills import SkillRegistry, SkillGenerator, Skill
+    from .llm import LLMClient
+    from .device import Device
+
+    out = Out()
+    cfg = build_config(args)
+    registry = SkillRegistry(cfg.skills.skills_dir)
+
+    action = getattr(args, "skills_action", "") or "list"
+
+    if action == "list":
+        skills = registry.list_skills()
+        out.say(out.bold(f"  App Skills in {registry.skills_dir} ({len(skills)})"))
+        out.say()
+        for sk in skills:
+            pkgs = f" [{', '.join(sk.packages)}]" if sk.packages else ""
+            out.say(f"  - {out.bold(sk.name)}{pkgs}: {sk.description[:60] if sk.description else 'No description'}")
+        if not skills:
+            out.say("  (no skills found in skills directory)")
+        return 0
+
+    if action == "view":
+        name_or_pkg = getattr(args, "target", "")
+        if not name_or_pkg:
+            out.bad("Please specify an app name or package for 'view'. Example: adbagent skills view whatsapp")
+            return 1
+        skill = registry.find_by_name_or_alias(name_or_pkg) or registry.find_by_package(name_or_pkg)
+        if not skill:
+            out.bad(f"No skill found for '{name_or_pkg}'. Run 'adbagent skills list' to view available skills.")
+            return 1
+        out.say(skill.to_markdown())
+        return 0
+
+    if action == "create":
+        name = getattr(args, "target", "")
+        if not name:
+            out.bad("Please specify an app name for 'create'. Example: adbagent skills create MyApp")
+            return 1
+        skill = Skill(
+            name=name,
+            packages=[f"com.example.{name.lower()}"],
+            aliases=[name.lower()],
+            description=f"App skill for {name}.",
+            workflows=[],
+            nuances=["First nuance or UI quirk."],
+            recommendations=["First action recommendation."]
+        )
+        saved_path = registry.save_skill(skill)
+        out.ok(f"Created new skill template: {saved_path}")
+        return 0
+
+    if action == "generate":
+        from .agent import Agent
+        from .memory import Memory
+
+        app_target = getattr(args, "app", "") or getattr(args, "target", "")
+        user_tasks = getattr(args, "tasks", "") or "Explore key screens and workflows in the app"
+
+        if not app_target:
+            out.bad("Please specify an app name or package via --app or argument. Example: adbagent skills generate --app com.whatsapp --tasks 'search contact, send message'")
+            return 1
+
+        api_key = cfg.api_key()
+        model_name = cfg.llm.skill()
+        llm = LLMClient(cfg, api_key=api_key) if api_key else None
+
+        out.say(out.bold(f"  Exploring app '{app_target}' live on device & generating Skill using model '{model_name}'..."))
+        out.say(out.dim(f"  Tasks to perform and verify: {user_tasks}"))
+        out.say()
+
+        screen_summaries: List[str] = []
+        actions_taken: List[str] = []
+        screenshots: List[bytes] = []
+
+        try:
+            with Device(cfg, getattr(args, "device", "") or "") as dev, Memory(cfg) as mem:
+                dev.open_app(app_target)
+                screen_init = dev.observe()
+                try:
+                    shot_init = dev.screenshot()
+                    if shot_init:
+                        screenshots.append(shot_init)
+                except Exception:  # noqa: BLE001
+                    pass
+
+                screen_summaries.append(f"Initial Package: {screen_init.package}, Title/Elements: {[e.best_text for e in screen_init.elements[:15] if e.best_text]}")
+                actions_taken.append(f"Opened target app {app_target}")
+
+                if llm:
+                    live_reporter = _live_reporter(out, max_steps=cfg.run.max_steps)
+
+                    def exploration_tracer(kind: str, **kw: Any) -> None:
+                        live_reporter(kind, **kw)
+                        if kind == "step":
+                            s = kw.get("screen")
+                            act = kw.get("action")
+                            if s:
+                                elems = [e.best_text for e in s.elements[:15] if e.best_text]
+                                screen_summaries.append(f"Package: {s.package}, Elements: {elems}")
+                            if act:
+                                desc = act.describe() if hasattr(act, "describe") else str(act)
+                                obs = getattr(act, "observation", "")
+                                actions_taken.append(f"Executed action: {desc}" + (f" (Observed: {obs})" if obs else ""))
+                            try:
+                                shot = dev.screenshot()
+                                if shot and len(screenshots) < 10:
+                                    screenshots.append(shot)
+                            except Exception as shot_exc:  # noqa: BLE001
+                                log.warning("Could not capture screenshot during exploration step: %s", shot_exc)
+
+                    goal_text = f"Explore app {app_target} and perform the following tasks: {user_tasks}"
+                    agent = Agent(dev, mem, llm, cfg, on_event=exploration_tracer)
+                    out.say(out.bold("  ── Live App Exploration Run ──"))
+                    agent.run(goal_text)
+        except Exception as exc:  # noqa: BLE001
+            out.warn(f"Live device interaction encounters warning: {exc}. Proceeding with LLM synthesis based on available trace.")
+
+        generator = SkillGenerator(registry)
+        skill = generator.generate_from_exploration(
+            app_target, user_tasks, screen_summaries, actions_taken, llm or cfg, screenshots=screenshots
+        )
+        saved_path = registry.save_skill(skill)
+        out.say()
+        out.ok(f"Verified live actions and saved skill for '{skill.name}' to {saved_path}")
+        out.say()
+        out.say(skill.to_markdown())
+        return 0
+
+    out.bad(f"Unknown skills action '{action}'. Use list, view, create, or generate.")
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -746,6 +918,10 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
                         help="cheaper model for judging and repair")
     parser.add_argument("--model-image", dest="model_image",
                         help="model for vision calls with screenshots")
+    parser.add_argument("--model-skill", dest="model_skill",
+                        help="dedicated model for app skill generation and exploration")
+    parser.add_argument("--skills-dir", dest="skills_dir",
+                        help="directory for app skills (default ./skills)")
     parser.add_argument("--rpm", type=int, help="client-side request throttle")
     parser.add_argument("--max-tokens", dest="max_tokens", type=int,
                         help="max completion tokens for LLM calls")
@@ -847,6 +1023,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p)
     _add_device(p)
     p.set_defaults(func=cmd_apps)
+
+    p = sub.add_parser("skills", help="manage app skills (list, view, create, generate)")
+    p.add_argument("skills_action", nargs="?", choices=["list", "view", "create", "generate"],
+                   default="list", help="action to perform (default: list)")
+    p.add_argument("target", nargs="?", help="app name or package for view, create, or generate")
+    p.add_argument("--app", help="app package or name for skill generation")
+    p.add_argument("--tasks", help="user-defined task instructions to perform in app during exploration")
+    _add_common(p)
+    _add_device(p)
+    p.set_defaults(func=cmd_skills)
 
     return parser
 

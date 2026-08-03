@@ -313,4 +313,119 @@ def test_image_model_used_for_image_analysis_and_main_model_decides_action(monke
     assert action.action == "tap"
 
 
+def test_llm_streaming_reasoning_and_content_events(monkeypatch):
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+    from dataclasses import dataclass
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = Config()
+    client = LLMClient(cfg)
+
+    @dataclass
+    class MockDelta:
+        content: str = None
+        reasoning_content: str = None
+
+    @dataclass
+    class MockChoice:
+        delta: MockDelta
+        finish_reason: str = None
+
+    @dataclass
+    class MockChunk:
+        choices: list
+        id: str = "chunk-1"
+        usage: object = None
+
+    chunks = [
+        MockChunk(choices=[MockChoice(delta=MockDelta(reasoning_content="Thinking step 1... "))]),
+        MockChunk(choices=[MockChoice(delta=MockDelta(reasoning_content="Thinking step 2."))]),
+        MockChunk(choices=[MockChoice(delta=MockDelta(content='{"observation": "home", "}'), finish_reason=None)]),
+        MockChunk(choices=[MockChoice(delta=MockDelta(content='"reasoning": "tap home", "action": "home"}'), finish_reason="stop")]),
+    ]
+
+    class MockCompletions:
+        def create(self, **kwargs):
+            return iter(chunks)
+
+    class MockChat:
+        completions = MockCompletions()
+
+    class MockClient:
+        chat = MockChat()
+
+    monkeypatch.setattr(client, "_client", MockClient())
+
+    events = []
+    def on_event(kind, **kw):
+        events.append((kind, kw))
+
+    raw, call = client._post([], model="test-model", schema=None, max_tokens=100, purpose="decide", on_event=on_event)
+    assert '{"observation": "home"' in raw
+
+    stream_events = [e for e in events if e[0] == "llm_stream"]
+    assert len(stream_events) == 4
+    assert stream_events[0][1]["stream_type"] == "thinking"
+    assert stream_events[0][1]["text"] == "Thinking step 1... "
+    assert stream_events[2][1]["stream_type"] == "content"
+    assert '{"observation": "home", ' in stream_events[2][1]["text"]
+
+
+def test_llm_streaming_inline_think_tags(monkeypatch):
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+    from dataclasses import dataclass
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = Config()
+    client = LLMClient(cfg)
+
+    @dataclass
+    class MockDelta:
+        content: str = None
+
+    @dataclass
+    class MockChoice:
+        delta: MockDelta
+        finish_reason: str = None
+
+    @dataclass
+    class MockChunk:
+        choices: list
+
+    chunks = [
+        MockChunk(choices=[MockChoice(delta=MockDelta(content="<think>\nAnalyzing screen...\n"))]),
+        MockChunk(choices=[MockChoice(delta=MockDelta(content="Target element is 3.\n</think>\n"))]),
+        MockChunk(choices=[MockChoice(delta=MockDelta(content='{"action": "home"}'))]),
+    ]
+
+    class MockCompletions:
+        def create(self, **kwargs):
+            return iter(chunks)
+
+    class MockChat:
+        completions = MockCompletions()
+
+    class MockClient:
+        chat = MockChat()
+
+    monkeypatch.setattr(client, "_client", MockClient())
+
+    events = []
+    def on_event(kind, **kw):
+        events.append((kind, kw))
+
+    raw, call = client._post([], model="test-model", schema=None, max_tokens=100, purpose="decide", on_event=on_event)
+
+    stream_events = [e for e in events if e[0] == "llm_stream"]
+    thinking_text = "".join(e[1]["text"] for e in stream_events if e[1]["stream_type"] == "thinking")
+    content_text = "".join(e[1]["text"] for e in stream_events if e[1]["stream_type"] == "content")
+
+    assert "Analyzing screen..." in thinking_text
+    assert "Target element is 3." in thinking_text
+    assert '{"action": "home"}' in content_text
+
+
+
 
