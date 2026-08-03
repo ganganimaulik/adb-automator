@@ -445,6 +445,45 @@ DESTRUCTIVE_TEXT = re.compile(
 
 
 # ---------------------------------------------------------------------------
+# Perceptual Image Fingerprinting (dHash)
+# ---------------------------------------------------------------------------
+
+def compute_dhash(image_bytes: bytes, hash_size: int = 8) -> Optional[int]:
+    """Compute 64-bit difference hash (dHash) for an image.
+
+    Fast perceptual hash for detecting visual screen changes.
+    """
+    if not image_bytes:
+        return None
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            img = img.convert("L").resize((hash_size + 1, hash_size), Image.Resampling.BILINEAR)
+            pixels = list(img.getdata())
+            diff_bits = 0
+            bit_index = 0
+            for y in range(hash_size):
+                row_start = y * (hash_size + 1)
+                for x in range(hash_size):
+                    left = pixels[row_start + x]
+                    right = pixels[row_start + x + 1]
+                    if left > right:
+                        diff_bits |= (1 << bit_index)
+                    bit_index += 1
+            return diff_bits
+    except Exception:
+        return None
+
+
+def dhash_distance(h1: Optional[int], h2: Optional[int]) -> Optional[int]:
+    """Compute Hamming distance between two 64-bit dHash integers."""
+    if h1 is None or h2 is None:
+        return None
+    return bin(h1 ^ h2).count("1")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -455,4 +494,7 @@ def attach(screen: Screen) -> Screen:
     screen.skeleton_id = skeleton_id(screen, tokens)
     screen.simhash = simhash(screen)
     screen.exact_id = exact_id(screen)
+    if screen.screenshot and screen.dhash is None:
+        screen.dhash = compute_dhash(screen.screenshot)
     return screen
+

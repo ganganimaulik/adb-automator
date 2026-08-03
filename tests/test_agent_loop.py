@@ -337,3 +337,24 @@ def test_list_apps_in_agent_loop(cfg, mem):
     assert "list_apps('whatsapp')" in dev.actions
     assert "open_app(com.whatsapp)" in dev.actions
 
+
+def test_scroll_swipe_no_change_does_not_ban_action(cfg, mem):
+    """When a scroll or swipe action encounters no_change, it must not be added to the ban list."""
+    dev = fake.FakeDevice(cfg)
+    step_count = {"n": 0}
+
+    def policy(screen, llm):
+        step_count["n"] += 1
+        if step_count["n"] == 1:
+            return AgentAction(observation="feed", reasoning="scroll down",
+                               action="scroll", direction="down")
+        return AgentAction(observation="feed", reasoning="done",
+                           action="done", text="finished")
+
+    llm = fake.FakeLLM(dev, policy)
+    outcome, state = Agent(dev, mem, llm, cfg).run("scroll feed")
+    assert outcome == "success"
+    # Even if scroll down was graded no_change, scroll/down must not be in banned
+    assert "scroll/down" not in state.loops.bans_for(dev.observe().skeleton_id)
+
+
