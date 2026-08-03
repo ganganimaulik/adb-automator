@@ -25,11 +25,11 @@
     },
     {
       "name": "browse_chat_media_grid",
-      "steps": "1. Open target chat or group. 2. Tap the group/chat title at the top bar to open Chat/Group Info. 3. Tap 'Media, links, and docs'. 4. In the 'Media' tab, view all photos in a clean grid grouped by date. 5. Tap any photo to inspect details, then swipe left/right to browse photos sequentially."
+      "steps": "1. Open target chat or group and make sure all photos are downloaded first. 2. Tap the group/chat title at the top bar to open Chat/Group Info. 3. Tap 'Media, links, and docs'. 4. In the 'Media' tab, view all photos in a clean grid grouped by date. 5. Tap any photo to inspect details, then swipe left/right to browse photos sequentially."
     },
     {
       "name": "view_multiple_images_in_chat",
-      "steps": "1. Open target chat. 2. Tap image thumbnail directly (avoid tapping sender profile picture or sender name on message bubbles). 3. In full-screen media viewer, swipe left (action='swipe', direction='left') to move to next photo or swipe right for previous photo. 4. If swiping fails to change images, press back button to return to chat or use 'Media, links, and docs' from Chat Info."
+      "steps": "1. Open target chat or group and make sure all photos are downloaded first. 2. Tap image thumbnail directly (avoid tapping sender profile picture or sender name on message bubbles). 3. In full-screen media viewer, swipe left (action='swipe', direction='left') to move to next photo or swipe right for previous photo. 4. If swiping fails to change images, press back button to return to chat or use 'Media, links, and docs' from Chat Info."
     }
   ],
   "nuances": [
