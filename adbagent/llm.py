@@ -166,10 +166,32 @@ class Call:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cached_tokens: int = 0
+    #: Reasoning tokens, when the provider reports them separately.
+    reasoning_tokens: int = 0
+    #: Characters of reasoning we actually saw on the wire. Providers do not all
+    #: report `reasoning_tokens`, but a reasoning model's thinking still arrives
+    #: as `reasoning_content` deltas or inside `<think>` tags -- and on a fast
+    #: model the reasoning length *is* the step latency, so it has to be
+    #: measurable without depending on the usage block being generous.
+    reasoning_chars: int = 0
     latency_s: float = 0.0
     usd: float = 0.0
     purpose: str = "decide"
     request_id: str = ""
+
+    def metrics(self) -> Dict[str, Any]:
+        """Compact record for `events.jsonl`."""
+        return {
+            "purpose": self.purpose,
+            "model": self.model,
+            "prompt_tokens": self.prompt_tokens,
+            "cached_tokens": self.cached_tokens,
+            "completion_tokens": self.completion_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "reasoning_chars": self.reasoning_chars,
+            "latency_s": round(self.latency_s, 3),
+            "usd": round(self.usd, 6),
+        }
 
 
 #: USD per 1M tokens, (input, output), keyed by a substring of the model id.
@@ -236,6 +258,18 @@ class Ledger:
     def tokens(self) -> Tuple[int, int]:
         return (sum(c.prompt_tokens for c in self.calls),
                 sum(c.completion_tokens for c in self.calls))
+
+    # -- attribution -------------------------------------------------------
+    #
+    # One agent step can be several calls (a screenshot turn is an image
+    # analysis *then* a decision), so "the last call" is not the cost of the
+    # step. Mark before, read after.
+
+    def mark(self) -> int:
+        return len(self.calls)
+
+    def since(self, mark: int) -> List[Call]:
+        return self.calls[mark:]
 
 
 class RateLimiter:
@@ -348,6 +382,29 @@ def extract_json(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504, 520})
+
+
+def usage_detail(usage: Any, group: str, field_name: str) -> int:
+    """Read `usage.<group>.<field>`, whether it arrives typed or as a dict.
+
+    `prompt_tokens_details.cached_tokens` and
+    `completion_tokens_details.reasoning_tokens` are the two numbers that say
+    whether prompt caching is working and where the latency went. Both are
+    optional in the OpenAI protocol and both land in `model_extra` when the
+    installed SDK predates the field, so neither can be read directly.
+    """
+    if usage is None:
+        return 0
+    details = getattr(usage, group, None)
+    if details is None:
+        extra = getattr(usage, "model_extra", None)
+        if extra:
+            details = extra.get(group)
+    if details is None:
+        return 0
+    if isinstance(details, dict):
+        return int(details.get(field_name) or 0)
+    return int(getattr(details, field_name, 0) or 0)
 
 
 def image_part(jpeg: bytes) -> Dict[str, Any]:
@@ -483,6 +540,11 @@ class LLMClient:
                         model=model,
                         prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
                         completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+                        cached_tokens=usage_detail(usage, "prompt_tokens_details",
+                                                   "cached_tokens"),
+                        reasoning_tokens=usage_detail(usage, "completion_tokens_details",
+                                                      "reasoning_tokens"),
+                        reasoning_chars=len(reasoning or ""),
                         latency_s=time.monotonic() - started,
                         purpose=purpose,
                         request_id=getattr(resp, "id", "") or "",
@@ -580,13 +642,23 @@ class LLMClient:
                     continue
 
                 raw_text = "".join(full_content)
+                reasoning_text = "".join(full_reasoning)
                 prompt_tokens = getattr(usage_obj, "prompt_tokens", 0) or 0
-                comp_tokens = getattr(usage_obj, "completion_tokens", 0) or max(1, len(raw_text) // 4)
+                # The fallback must count the reasoning too: on a reasoning model
+                # the thinking is most of the completion, and a `completion_tokens`
+                # estimated from the JSON alone understates the call by ~20x.
+                comp_tokens = (getattr(usage_obj, "completion_tokens", 0)
+                               or max(1, (len(raw_text) + len(reasoning_text)) // 4))
 
                 call = self.ledger.record(Call(
                     model=model,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=comp_tokens,
+                    cached_tokens=usage_detail(usage_obj, "prompt_tokens_details",
+                                               "cached_tokens"),
+                    reasoning_tokens=usage_detail(usage_obj, "completion_tokens_details",
+                                                  "reasoning_tokens"),
+                    reasoning_chars=len(reasoning_text),
                     latency_s=time.monotonic() - started,
                     purpose=purpose,
                     request_id=request_id,
