@@ -382,6 +382,8 @@ class _Restore:
     transition_scale: Optional[str] = None
     animator_scale: Optional[str] = None
     screen_off_timeout: Optional[str] = None
+    accelerometer_rotation: Optional[str] = None
+    user_rotation: Optional[str] = None
 
 
 #: Names the on-device server accepts for `press`. Anything else silently
@@ -423,6 +425,8 @@ class Device:
         self._snapshot_state()
         if self.cfg.device.disable_animations:
             self._set_animations("0")
+        if self.cfg.device.disable_auto_rotate:
+            self._disable_auto_rotate()
         self._keep_screen_awake()
         return self
 
@@ -433,6 +437,7 @@ class Device:
         d, self._d = self._d, None
         for label, fn in (
             ("animations", lambda: self._restore_animations()),
+            ("auto-rotate", lambda: self._restore_auto_rotate()),
             ("ime", lambda: self._restore_ime()),
             ("screen timeout", lambda: self._restore_screen_timeout()),
             ("stay-awake", lambda: d.adb_device.shell("svc power stayon false", timeout=10)),
@@ -442,6 +447,7 @@ class Device:
                 fn()
             except Exception as exc:  # noqa: BLE001 - teardown must not mask errors
                 log.warning("teardown: could not restore %s: %s", label, exc)
+
 
     def __enter__(self) -> "Device":
         return self.open()
@@ -468,6 +474,8 @@ class Device:
         self._restore.transition_scale = get("global", "transition_animation_scale")
         self._restore.animator_scale = get("global", "animator_duration_scale")
         self._restore.screen_off_timeout = get("system", "screen_off_timeout")
+        self._restore.accelerometer_rotation = get("system", "accelerometer_rotation")
+        self._restore.user_rotation = get("system", "user_rotation")
 
     def _setting_get(self, namespace: str, key: str) -> Optional[str]:
         out = self._safe(lambda: self.shell(f"settings get {namespace} {key}", timeout=10))
@@ -490,6 +498,23 @@ class Device:
                            ("animator_duration_scale", self._restore.animator_scale)):
             if saved:
                 self.shell(f"settings put global {key} {saved}", timeout=10)
+
+    def _disable_auto_rotate(self) -> None:
+        self._safe(lambda: self.shell("settings put system accelerometer_rotation 0", timeout=10))
+        self._safe(lambda: self.shell("settings put system user_rotation 0", timeout=10))
+
+    def _restore_auto_rotate(self) -> None:
+        if not self.cfg.device.disable_auto_rotate:
+            return
+        if self._restore.accelerometer_rotation:
+            self.shell(
+                f"settings put system accelerometer_rotation "
+                f"{self._restore.accelerometer_rotation}", timeout=10)
+        if self._restore.user_rotation:
+            self.shell(
+                f"settings put system user_rotation "
+                f"{self._restore.user_rotation}", timeout=10)
+
 
     def _restore_ime(self) -> None:
         """u2's `set_input_ime` permanently rewrites the default keyboard.
