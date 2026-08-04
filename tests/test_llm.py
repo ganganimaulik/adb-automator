@@ -728,8 +728,26 @@ def test_a_supplied_analysis_is_never_recomputed(monkeypatch):
     assert "already analysed" in seen["messages"][-1]["content"][0]["text"]
 
 
+def test_the_vision_pass_spends_the_configured_budget(monkeypatch):
+    """A private ceiling here truncated long screen descriptions, and the repair
+    paid for the same screenshot a second time at double the budget."""
+    client = _client(monkeypatch, max_tokens=9000)
+    captured = {}
+
+    def post(messages, *, model, schema, max_tokens, purpose, **kw):
+        captured.update(max_tokens=max_tokens, purpose=purpose)
+        return '{"reading":"428 g","item_label":"","blocking_dialog":"","notable":""}', Call(model=model)
+
+    monkeypatch.setattr(client, "_post", post)
+    analysis = client.analyze_image(b"jpeg", goal="read the weight")
+
+    assert analysis.reading == "428 g"
+    assert captured["purpose"] == "analyze_image"
+    assert captured["max_tokens"] == 9000               # config, not a literal
+
+
 def test_reading_one_item_asks_for_a_fact_not_a_screen_description(monkeypatch):
-    client = _client(monkeypatch)
+    client = _client(monkeypatch, max_tokens=2222)
     captured = {}
 
     def post(messages, *, model, schema, max_tokens, purpose, **kw):
@@ -745,7 +763,7 @@ def test_reading_one_item_asks_for_a_fact_not_a_screen_description(monkeypatch):
     assert captured["model"] == client.model_image       # fully qualified
     assert captured["model"].endswith("vision-model")
     assert captured["purpose"] == "read_item"
-    assert captured["max_tokens"] <= 400                 # a line, not an essay
+    assert captured["max_tokens"] == 2222                # config, not a literal
     assert "read the weight" in captured["messages"][1]["content"][0]["text"]
     assert "Today, 9:52 am" in captured["messages"][1]["content"][0]["text"]
     assert len(_image_parts(captured["messages"])) == 1

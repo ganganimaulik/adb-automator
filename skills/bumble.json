@@ -8,7 +8,7 @@
     "BumbleApp",
     "Bumble Date"
   ],
-  "description": "Bumble is a dating/social app organized around five bottom-navigation tabs: Profile, Discover, People, Liked You, and Chats. The People tab is the default landing screen and shows a swipeable card deck of profiles. Liked You lists people who liked the user, Chats lists match conversations with search and per-conversation detail screens, Profile shows the user's own profile with completeness status, horizontal sub-tabs (Pay plan, Photo insights, Safety and wellbeing) and plan/consumable promos, and Settings (reached from the Profile tab gear) exposes account, mode, location, notification, payment, legal and privacy options.",
+  "description": "Bumble is a dating/social app organized around five bottom-navigation tabs: Profile, Discover, People, Liked You, and Chats. The People tab is the default landing screen and shows a swipeable card deck of profiles. Liked You lists people who liked the user, Chats lists match conversations (recent section plus an expandable Older chats section) with search and per-conversation detail screens that show the message thread with date separators, call/video actions and a message input row, Profile shows the user's own profile with completeness status, horizontal sub-tabs (Pay plan, Photo insights, Safety and wellbeing) and plan/consumable promos, and Settings (reached from the Profile tab gear) exposes account, mode, location, notification, payment, legal and privacy options.",
   "workflows": [
     {
       "name": "navigate_main_tabs",
@@ -20,7 +20,7 @@
     },
     {
       "name": "browse_chats_list",
-      "steps": "Tap the 'Chats' tab in the bottom navigation bar. The screen shows a 'Your matches' section, a Spotlight promo banner ('Be seen up to 10x more', 'Shine a Spotlight and be seen first.'), a filter control reading 'Conversations are filtered by Recent', one row per match with last-message previews and status chips like 'Your move', and an 'Older chats (N)' expander at the bottom that reveals archived conversations when tapped. A Search (magnifier) icon sits at the top of the screen."
+      "steps": "Tap the 'Chats' tab in the bottom navigation bar. The screen shows a 'Your matches' section, a Spotlight promo banner ('Be seen up to 10x more', 'Shine a Spotlight and be seen first.'), a filter control reading 'Conversations are filtered by Recent', one row per match with the match's name, last-message preview and status chips like 'Your move', and an 'Older chats (N)' expander at the bottom. Tapping the expander reveals the older conversations inline below it, and those rows open the same way as recent ones. A Search (magnifier) icon sits at the top of the screen."
     },
     {
       "name": "search_connections",
@@ -28,7 +28,7 @@
     },
     {
       "name": "open_conversation_detail",
-      "steps": "From the Chats tab, tap a match row to open ConversationActivity showing the message thread with the match's name/photo at top, call and video icons, and a message input row. To leave, tap the Back arrow at top-left - this returns to the Chats list."
+      "steps": "From the Chats tab, tap a match row to open the conversation screen (observed under two activity names: com.bumble.app.chat.conversation.ConversationActivity and com.bumble.app.Conversation). The header shows a Back arrow, the match's photo and name, 'View profile', 'Voice call', 'Video call' and an 'Options' overflow menu. Messages are grouped under date separators (full dates, 'Yesterday', 'Today') and own messages can show a 'Delivered' status. The bottom input row has 'Camera', an 'Aa' text field, 'GIF' and 'Voice message'. If the element list shows only system UI on entry, re-read the screen or go Back and re-open - the thread usually populates. Tap the Back arrow at top-left to return to the Chats list."
     },
     {
       "name": "view_own_profile",
@@ -45,6 +45,10 @@
     {
       "name": "view_safety_wellbeing",
       "steps": "From the Profile tab, tap the horizontal sub-tab 'Safety and wellbeing' below the profile photo. The screen shows cards 'Mental exhaustion' (Help with dating anxiety, uncertainty or burnout), 'Feelings of rejection' (Overcome low moments like ghosting), a 'Get Help' button, 'Your safety' (Trusted organisations to help keep you safe and well), and 'Your emotional wellbeing' (Resources for a healthy state of mind)."
+    },
+    {
+      "name": "read_recent_matches_and_history",
+      "steps": "To report the last N matches and their message history: Step 1, open the Chats tab - the 'Chats' section (filtered by 'Recent') lists the most recent matches, one row each with name, last-message preview and sometimes a 'Your move' chip. Step 2, note the previews from the list. Step 3, tap a row to open the conversation and read the thread from the element tree (see open_conversation_detail). Step 4, tap the Back arrow to return to the list and repeat for the next match. Step 5, if the recent section has fewer than N matches, tap the 'Older chats (N)' expander at the bottom to reveal older conversations inline and open those rows the same way."
     }
   ],
   "nuances": [
@@ -52,19 +56,23 @@
     "Settings screen content does not appear in the element list on first open - only system UI, Back, and the 'Settings' title are listed. The content lives in a scrollable list (settingsV2_recycler); scroll down to populate and reveal all rows.",
     "The bottom of the Settings list contains destructive 'Log out' and 'Delete account' buttons - never tap them during recon or unless the task explicitly demands it.",
     "Tapping a profile photo in the 'Liked You' tab opens the card deck/profile card, leaving the list context.",
-    "The Chats search screen shows 'No results' both when the field is empty and when a query matches nothing; a system clipboard popup may briefly overlay the bottom of the screen after typing.",
     "The People tab is the default landing screen and shows a swipeable card deck (profile photo, name, age, tagline, 'New here' badges, 'Send a compliment' and 'Send SuperSwipe' buttons, Filters button top-right). Swiping or tapping a card acts on real profiles - avoid unless the task requires it.",
-    "The Chats search screen shows 'No results' both when the field is empty and when a query matches nothing, so an empty field can be mistaken for a failed search; the soft keyboard also opens automatically when the screen appears.",
     "The Chats list hides older conversations behind an 'Older chats (N)' expander that must be tapped to reveal them; the count N can change between visits (observed 28 and 29), so do not assert an exact number.",
-    "The Photo insights graph on the Profile tab is blurred and locked behind Premium+ with the prompt 'Double tap to upgrade to Premium+ to unlock' - double-tapping it starts an upgrade flow."
+    "The Photo insights graph on the Profile tab is blurred and locked behind Premium+ with the prompt 'Double tap to upgrade to Premium+ to unlock' - double-tapping it starts an upgrade flow.",
+    "The conversation screen's element list is not always populated on first open - in one case it showed only system UI (Back, status bar) while the thread was visibly on screen, and the full thread (match name, 'View profile', 'Voice call', 'Video call', 'Options', date separators, message bubbles, 'Camera'/'Aa'/'GIF'/'Voice message' input row) appeared on later opens. If the tree is empty, re-read the screen or go Back and re-open before concluding messages cannot be read.",
+    "The conversation screen has been reported under two activity names for the same kind of view: com.bumble.app.chat.conversation.ConversationActivity and com.bumble.app.Conversation - either one confirms a conversation is open.",
+    "Match names are not unique: the same name/initial can appear in both the recent list and the expanded Older chats section as different people. Use row position or the last-message preview, not the name alone, to tell matches apart.",
+    "The Chats search screen shows 'No results' both when the field is empty and when a query matches nothing, so an empty field can be mistaken for a failed search; the soft keyboard opens automatically when the screen appears and a system clipboard popup may briefly overlay the bottom of the screen after typing."
   ],
   "recommendations": [
     "Navigate between main sections only via the bottom nav labels 'Profile', 'Discover', 'People', 'Liked You', 'Chats' - they are consistently present on all main-tab screens.",
     "On the Settings screen, always scroll at least once before concluding a row is missing; the full row set (including Security and Privacy, Log out, Delete account) only appears after scrolling.",
     "Treat the conversation detail screen as a dead end for element-tree interaction: verify entry by the activity name (ConversationActivity), then exit with the Back button rather than hunting for message elements.",
-    "When a task only requires touring lists (Liked You, Chats), avoid tapping profile photos or cards, since they navigate into the card deck or a conversation and change context.",
     "Use the 'Clear text' (X) button in the search field to reset a query, and the top-left Back arrow to exit Search, Conversation, and Settings screens.",
-    "On the Profile tab, switch content with the horizontal sub-tab buttons 'Pay plan', 'Photo insights', 'Safety and wellbeing' below the photo; avoid double-tapping locked Premium+ content such as the Photo insights graph."
+    "On the Profile tab, switch content with the horizontal sub-tab buttons 'Pay plan', 'Photo insights', 'Safety and wellbeing' below the photo; avoid double-tapping locked Premium+ content such as the Photo insights graph.",
+    "For 'last N matches and their messages' tasks, collect rows from the recent 'Chats' section first, open each conversation, read the thread, and exit with the top-left Back arrow; if the recent section has fewer than N matches, expand 'Older chats (N)' and continue with those rows.",
+    "When reading a conversation, if the element list shows only system UI on entry, re-check the screen or re-open the conversation rather than giving up - the thread (messages, date separators, input row) usually populates on retry.",
+    "When a task only requires touring lists (Liked You, Chats), avoid tapping profile photos or cards unless needed, since they navigate into the card deck or a conversation and change context."
   ],
   "custom_prompt": ""
 }
