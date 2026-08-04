@@ -209,7 +209,7 @@ def test_judge_uses_config_max_tokens(monkeypatch):
     client = LLMClient(cfg)
 
     recorded_max_tokens = []
-    def mock_post(messages, *, model, schema, max_tokens, purpose):
+    def mock_post(messages, *, model, schema, max_tokens, purpose, **kw):
         recorded_max_tokens.append(max_tokens)
         return '{"satisfied": true, "evidence": "all good"}', None
 
@@ -230,7 +230,7 @@ def test_decide_messages_cache_friendly_structure(monkeypatch):
 
     from adbagent.actions import Target
     captured_messages = []
-    def mock_structured(messages, model_cls, model, purpose):
+    def mock_structured(messages, model_cls, model, purpose, **kw):
         captured_messages.append(messages)
         return AgentAction(observation="on home", reasoning="tap home", action="tap", target=Target(index=1))
 
@@ -454,7 +454,7 @@ def test_judge_passes_done_text_to_prompt(monkeypatch):
     client = LLMClient(cfg)
 
     captured_messages = []
-    def mock_post(messages, *, model, schema, max_tokens, purpose):
+    def mock_post(messages, *, model, schema, max_tokens, purpose, **kw):
         captured_messages.extend(messages)
         return '{"satisfied": true, "evidence": "advice provided"}', None
 
@@ -892,3 +892,200 @@ def test_the_blocks_stack_when_they_all_apply():
                              scrolls=3, packages_seen=2)
     assert all(block in note for block in
                ("BROWSING A GALLERY", "SCROLLING STRATEGY", "SWITCHING APPS"))
+
+
+# ---------------------------------------------------------------------------
+# Reasoning depth
+# ---------------------------------------------------------------------------
+#
+# Reasoning tokens are the run's wall clock, so this is the largest single lever
+# there is. It is also the easiest to get silently wrong: two conventions exist
+# on the OpenAI wire protocol, and a model that does not know the one you sent
+# ignores it -- which looks exactly like a fix while nothing has changed.
+
+def test_an_unset_depth_sends_nothing():
+    """The feature is off by default. Nothing about the request may change."""
+    from adbagent.llm import reasoning_body
+
+    for style in ("auto", "effort", "thinking", "off"):
+        assert reasoning_body("gpt-oss-120b", "", style) == {}
+
+
+def test_an_effort_family_gets_reasoning_effort():
+    from adbagent.llm import reasoning_body
+
+    assert reasoning_body("accounts/fireworks/models/gpt-oss-120b", "medium") == {
+        "reasoning_effort": "medium"}
+    assert reasoning_body("gpt-5", "high") == {"reasoning_effort": "high"}
+
+
+def test_an_effort_family_floors_none_rather_than_inventing_a_level():
+    """No family exposes an "off", so "none" becomes the lowest real setting.
+    Sending `reasoning_effort: "none"` would be a 400."""
+    from adbagent.llm import reasoning_body
+
+    assert reasoning_body("gpt-oss-120b", "none") == {"reasoning_effort": "low"}
+
+
+def test_a_hybrid_family_gets_a_thinking_switch():
+    """These models have one switch, not a dial, so any real depth turns it on."""
+    from adbagent.llm import reasoning_body
+
+    off = {"chat_template_kwargs": {"thinking": False}}
+    on = {"chat_template_kwargs": {"thinking": True}}
+    assert reasoning_body("accounts/fireworks/models/deepseek-v4-flash", "none") == off
+    assert reasoning_body("accounts/fireworks/models/deepseek-v4-flash", "high") == on
+    assert reasoning_body("qwen3p7-plus", "low") == on
+
+
+def test_an_unrecognised_model_sends_nothing_rather_than_guessing():
+    """The fail-safe. A wrong field either 400s mid-run or is ignored, and being
+    ignored is worse: the latency and the bill say nothing changed while the
+    config says it was capped."""
+    from adbagent.llm import reasoning_body, reasoning_style_for
+
+    assert reasoning_style_for("brand-new-model-2027") == "off"
+    assert reasoning_body("brand-new-model-2027", "none") == {}
+
+
+def test_the_style_can_be_forced_when_the_guess_is_wrong():
+    from adbagent.llm import reasoning_body
+
+    unknown = "brand-new-model-2027"
+    assert reasoning_body(unknown, "low", "effort") == {"reasoning_effort": "low"}
+    assert reasoning_body(unknown, "low", "thinking") == {
+        "chat_template_kwargs": {"thinking": True}}
+    # And silenced even for a model that would otherwise take one.
+    assert reasoning_body("deepseek-v4-flash", "low", "off") == {}
+
+
+def test_a_nonsense_depth_is_ignored_not_forwarded():
+    from adbagent.llm import reasoning_body
+
+    for junk in ("very high", "0.5", "NONE", "maximum"):
+        assert reasoning_body("deepseek-v4-flash", junk) == {}, junk
+
+
+def test_the_depth_reaches_the_request_body(monkeypatch):
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = Config()
+    cfg.llm.model = "deepseek-v4-flash"
+    cfg.llm.reasoning_effort = "none"
+    client = LLMClient(cfg)
+
+    body = client._extra_body(client.model, "none")
+    assert body["chat_template_kwargs"] == {"thinking": False}
+    # And the settings that were already there survive alongside it.
+    assert "prompt_cache_key" in body
+
+
+# ---------------------------------------------------------------------------
+# Which call gets which depth
+# ---------------------------------------------------------------------------
+
+def cfg_with(effort="low", hard="high"):
+    from adbagent.config import Config
+
+    cfg = Config()
+    cfg.llm.reasoning_effort = effort
+    cfg.llm.reasoning_effort_hard = hard
+    return cfg
+
+
+def test_nothing_is_capped_until_the_feature_is_switched_on():
+    from adbagent.config import Config
+
+    cfg = Config()
+    for purpose in ("decide", "judge", "analyze_image", "read_item"):
+        assert cfg.llm.effort_for(purpose) == ""
+        assert cfg.llm.effort_for(purpose, hard=True) == ""
+
+
+def test_a_routine_turn_gets_the_shallow_depth():
+    assert cfg_with().llm.effort_for("decide") == "low"
+
+
+def test_a_hard_turn_gets_the_deep_one():
+    assert cfg_with().llm.effort_for("decide", hard=True) == "high"
+
+
+def test_the_hard_depth_falls_back_to_the_routine_one():
+    assert cfg_with(hard="").llm.effort_for("decide", hard=True) == "low"
+
+
+def test_vision_calls_never_pay_for_reasoning():
+    """"What does this scale read" has no chain of thought worth buying, so a
+    transcription is pinned to the floor even when the run is struggling."""
+    cfg = cfg_with(effort="high", hard="high")
+    for purpose in ("analyze_image", "read_item"):
+        assert cfg.llm.effort_for(purpose) == "none"
+        assert cfg.llm.effort_for(purpose, hard=True) == "none"
+
+
+def test_a_vision_call_is_capped_without_the_caller_threading_it(monkeypatch):
+    """`_post` derives the depth from the purpose, so a call site that forgets to
+    pass one cannot accidentally buy a chain of thought."""
+    from adbagent.llm import LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = cfg_with(effort="high")
+    cfg.llm.model_image = "deepseek-v4-flash"
+    client = LLMClient(cfg)
+
+    seen = {}
+
+    def create(**kwargs):
+        seen.update(kwargs)
+        raise RuntimeError("stop here; the body is what matters")
+
+    monkeypatch.setattr(client._client.chat.completions, "create", create)
+    with pytest.raises(Exception):
+        client._post([{"role": "user", "content": "hi"}],
+                     model=client.model_image, schema=None, max_tokens=100,
+                     purpose="read_item")
+    assert seen["extra_body"]["chat_template_kwargs"] == {"thinking": False}
+
+
+def test_the_judge_always_thinks_properly(monkeypatch):
+    """One call, at the end, and a wrong verdict throws away the whole run."""
+    from adbagent.llm import LLMClient, Verdict
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    client = LLMClient(cfg_with(effort="none", hard="high"))
+
+    seen = {}
+
+    def structured(messages, model_cls, **kw):
+        seen.update(kw)
+        return Verdict(satisfied=True, evidence="fine")
+
+    monkeypatch.setattr(client, "structured", structured)
+    client.judge(goal="g", rendered="screen", history=[])
+    assert seen["effort"] == "high"
+
+
+def test_a_schema_violation_escalates_its_own_repair(monkeypatch):
+    """Retrying a malformed answer at the same shallow depth tends to reproduce
+    it, and three of those cost far more than one deeper call."""
+    from adbagent.llm import Call, LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    client = LLMClient(cfg_with(effort="none", hard="high"))
+
+    efforts = []
+
+    def post(messages, *, model, schema, max_tokens, purpose, effort="", **kw):
+        efforts.append(effort)
+        if len(efforts) == 1:
+            return "not json at all", Call(model=model)
+        return ('{"observation":"o","reasoning":"r","action":"press_key",'
+                '"key":"back"}'), Call(model=model)
+
+    monkeypatch.setattr(client, "_post", post)
+    action = client.structured([{"role": "user", "content": "go"}], AgentAction,
+                               effort="none")
+    assert action.action == "press_key"
+    assert efforts == ["none", "high"]

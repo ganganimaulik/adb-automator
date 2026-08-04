@@ -50,6 +50,35 @@ class LLMConfig:
     #: the catalogue flag that would settle it (`adbagent models --vision`) is not
     #: consulted at run time.
     vision_in_decider: bool = False
+    #: How hard to think on a routine turn: "", "none", "low", "medium", "high".
+    #: Empty leaves the model's own default alone and switches the whole feature
+    #: off. This is the largest single lever on latency there is -- a reasoning
+    #: model spends ~4,200 of its ~4,400 output tokens thinking, and on a step
+    #: whose answer is "swipe left again" almost all of that is waste.
+    reasoning_effort: str = ""
+    #: How hard to think on a turn the agent is struggling with. Falls back to
+    #: `reasoning_effort`. The point of the pair is that "think less" is only safe
+    #: when the turn is easy, and the loop already knows when it is not.
+    reasoning_effort_hard: str = "high"
+    #: How to say it on the wire: "auto" picks by model family, "effort" sends
+    #: `reasoning_effort`, "thinking" sends `chat_template_kwargs`, "off" sends
+    #: nothing. See `llm.reasoning_body`.
+    reasoning_style: str = "auto"
+
+    def effort_for(self, purpose: str = "decide", hard: bool = False) -> str:
+        """Reasoning depth for one call. Empty means "send nothing".
+
+        Vision calls transcribe rather than reason -- "what does this scale read"
+        has no chain of thought worth paying for -- so they are pinned to the
+        floor whenever the feature is on at all.
+        """
+        if not self.reasoning_effort:
+            return ""
+        if purpose in ("analyze_image", "read_item"):
+            return "none"
+        if hard:
+            return self.reasoning_effort_hard or self.reasoning_effort
+        return self.reasoning_effort
 
     def small(self) -> str:
         return self.model_small or self.model
@@ -130,6 +159,11 @@ class RunConfig:
 class SkillsConfig:
     enabled: bool = True
     skills_dir: str = "skills"
+    #: After each run, fold what it learned about the app back into that app's
+    #: skill. One extra call per run, on `llm.model_skill`, and the reason the
+    #: agent gets better at an app the more it is driven there. `--no-learn`
+    #: turns it off for a run whose trace is not worth keeping.
+    learn_after_run: bool = True
 
 
 @dataclass

@@ -9,13 +9,58 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:  # pragma: no cover - `agent` imports this module at run time
+    from .screen import Screen
 
 log = logging.getLogger("adbagent.skills")
 
 DEFAULT_SKILLS_DIR = "skills"
+
+
+#: How much smaller a restatement may be than the entry that swallows it. At
+#: 0.34 the richer entry can say roughly three times as much before containment
+#: stops being restatement -- below that, a short generic line is being eaten by
+#: a long unrelated one that happens to share two words.
+_RESTATEMENT_FLOOR = 0.34
+
+
+def collapse_restatements(entries: List[str]) -> List[str]:
+    """Drop entries that say strictly less than another entry in the list.
+
+    Two runs describing the same quirk word it differently, so exact-match
+    dedup keeps both, and a skill regenerated twenty times carries twenty
+    phrasings of one nuance into every prompt from then on. A skill that grows
+    like that gets worse with use, which is the opposite of the point.
+
+    An entry whose distinctive tokens all appear in a longer entry adds nothing
+    that entry does not already say, so it goes. Containment rather than a
+    similarity score, because containment loses no information by construction:
+    two entries that merely overlap -- each carrying a detail the other lacks --
+    are both kept.
+    """
+    from .scratchpad import distinctive
+
+    tokens = [distinctive(e) for e in entries]
+    kept: List[str] = []
+    for i, entry in enumerate(entries):
+        mine = tokens[i]
+        swallowed = mine and any(
+            mine <= tokens[j]
+            and len(mine) >= _RESTATEMENT_FLOOR * len(tokens[j])
+            # On identical token sets only one may go, or both would.
+            and (len(tokens[j]) > len(mine) or j < i)
+            for j in range(len(entries)) if j != i and tokens[j])
+        if swallowed:
+            log.info("skill: dropped a restatement -- %.70s", entry)
+            continue
+        if entry not in kept:
+            kept.append(entry)
+    return kept
 
 
 @dataclass
@@ -211,8 +256,10 @@ class Skill:
                 wf_map[wf.name] = wf
 
         merged_workflows = list(wf_map.values())
-        merged_nuances = list(dict.fromkeys([n.strip() for n in (self.nuances + other.nuances) if n.strip()]))
-        merged_recommendations = list(dict.fromkeys([r.strip() for r in (self.recommendations + other.recommendations) if r.strip()]))
+        merged_nuances = collapse_restatements(
+            [n.strip() for n in (self.nuances + other.nuances) if n.strip()])
+        merged_recommendations = collapse_restatements(
+            [r.strip() for r in (self.recommendations + other.recommendations) if r.strip()])
 
         merged_description = self.description
         if not merged_description or (other.description and len(other.description) > len(merged_description)):
@@ -325,13 +372,461 @@ class SkillRegistry:
                     return skill
         return None
 
+    def path_for(self, skill: Skill) -> Path:
+        """Where this skill lives on disk, saved or not."""
+        return self.skills_dir / f"{re.sub(r'[^a-z0-9_]', '_', skill.name.lower())}.json"
+
     def save_skill(self, skill: Skill) -> Path:
         self.skills_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{re.sub(r'[^a-z0-9_]', '_', skill.name.lower())}.json"
-        target_path = self.skills_dir / filename
+        target_path = self.path_for(skill)
         target_path.write_text(json.dumps(skill.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
         self.skills[skill.name.lower()] = skill
         return target_path
+
+
+# ---------------------------------------------------------------------------
+# Live exploration
+# ---------------------------------------------------------------------------
+
+#: Step budget for an exploration when the caller names none. A tour of an app's
+#: main screens is tens of steps; `run.max_steps` is sized for a collection run
+#: -- 550 in the config this was written against -- and letting an open-ended
+#: "look around" inherit that is how a whole budget goes on one app's launcher.
+DEFAULT_EXPLORE_STEPS = 40
+
+#: What to do in the app when the caller names no tasks. Breadth, because the
+#: skill a later run needs is "where does this app keep things", and a run given
+#: no instructions at all answers `done` on the first frame.
+DEFAULT_EXPLORE_TASKS = ("tour the main screens: every tab or nav destination, "
+                         "the search entry point, and one item opened from a list")
+
+#: How many screenshots the synthesis prompt carries. Each one is paid for, so
+#: they are spent on distinct screens rather than on the first N steps.
+MAX_EXPLORE_SHOTS = 12
+
+#: The phone itself, not an app worth a skill. Used only to reject an empty
+#: target -- an explicitly named launcher is the caller's business.
+_NOT_AN_APP = frozenset({
+    "com.android.systemui", "android", "com.android.settings.intelligence",
+})
+
+
+class ExplorationBlocked(RuntimeError):
+    """The phone cannot be explored, and retrying will not change that."""
+
+
+def is_app_package(package: str) -> bool:
+    return bool(package) and package not in _NOT_AN_APP and "launcher" not in package.lower()
+
+
+#: Splits a typed app name into words, camelCase included, so "BumbleApp" can
+#: reach `com.bumble.app`. Two-letter fragments match half the phone, so they
+#: are dropped.
+_NAME_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|\d+")
+
+#: Words that sit in half of all package names. Matching on one identifies
+#: nothing, and picking the "best" of everything installed is a wrong answer
+#: delivered confidently.
+_TOO_COMMON = frozenset({
+    "com", "org", "net", "app", "apps", "android", "google", "mobile", "free",
+    "client", "the",
+})
+
+#: Words that carry no app identity when they turn up in an instruction. They
+#: are what a task is *made of*, so leaving them in means "tap the chats tab"
+#: goes looking for an app called Tab.
+_INSTRUCTION_WORDS = frozenset({
+    "open", "tour", "explore", "check", "read", "look", "list", "lists", "view",
+    "visit", "browse", "find", "search", "scroll", "swipe", "tap", "press",
+    "screen", "screens", "tab", "tabs", "page", "pages", "menu", "main", "each",
+    "every", "then", "from", "into", "only", "these", "this", "that", "your",
+    "own", "and", "for", "with", "back", "down", "one", "item", "items", "note",
+    "notes", "record", "detail", "details", "bottom", "top", "nav", "navigation",
+    "bar", "button", "buttons", "not", "dont", "avoid", "skip", "entirely",
+    "reached", "opened", "destination", "destinations", "anything", "without",
+})
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def resolve_package(dev: Any, query: str) -> str:
+    """The installed package `query` names, or "" when nothing matches.
+
+    The first two rules are the ones the ``open_app`` action uses -- an exact
+    package, else a substring of one, picked between by `_best_app_match` -- so
+    that ``skills generate whatsapp`` and a model deciding to
+    ``open_app("whatsapp")`` land on the same package. They have to: a skill
+    filed under a name the agent never reports as its foreground package is a
+    skill that never loads.
+
+    Two more rules follow, for the names people actually type. Both only ever
+    run when the shared rules found nothing, and neither runs for a query with a
+    dot in it -- that is someone naming a package, and a package they got wrong
+    should be reported wrong rather than quietly swapped for a near neighbour:
+
+    * punctuation dropped from both sides, so ``BumbleApp`` finds
+      ``com.bumble.app`` -- the dot between the words is what defeats a plain
+      substring search;
+    * the query's longest distinctive word, so ``Bumble App`` finds it too.
+    """
+    from .actions import _best_app_match
+
+    q = (query or "").strip()
+    if not q:
+        return ""
+    installed = dev.list_apps()
+
+    for pkg in installed:
+        if pkg.lower() == q.lower():
+            return pkg
+
+    matches = [p for p in installed if q.lower() in p.lower()]
+
+    if not matches and "." not in q:
+        if _squash(q):
+            matches = [p for p in installed if _squash(q) in _squash(p)]
+        words = sorted((w.lower() for w in _NAME_WORD.findall(q)
+                        if len(w) > 2 and w.lower() not in _TOO_COMMON),
+                       key=len, reverse=True)
+        for word in words:
+            if matches:
+                break
+            # A dotted segment, or the start of one -- not any substring. "store"
+            # sits inside `com.google.android.apps.restore`, and answering that
+            # for "PlayStore" is worse than answering nothing, because nothing
+            # says so and a wrong package quietly explores the wrong app.
+            matches = [p for p in installed
+                       if any(seg.startswith(word) for seg in p.lower().split("."))]
+
+    return _best_app_match(matches, q) if matches else ""
+
+
+def package_from_text(dev: Any, text: str) -> Tuple[str, List[str]]:
+    """The installed app a free-text instruction names.
+
+    Saves naming the app twice: ``--tasks "open Bumble and read the matches"``
+    already says which app, and repeating it as an argument is a second chance
+    to get it wrong.
+
+    Returns ``(package, candidates)``. An empty package alongside several
+    candidates means the text named more than one installed app and only the
+    caller can settle it; empty for both means it named none.
+
+    Matching is on whole package segments, not substrings -- free text has far
+    too many words to let ``store`` reach ``...restore``.
+    """
+    # Whole words *and* their camelCase parts. "WhatsApp" splits to "whats" and
+    # "app", neither of which is a segment of `com.whatsapp`, so splitting alone
+    # would find nothing; squashing alone would miss "spotify's".
+    raw = {_squash(token) for token in re.split(r"\s+", text or "")}
+    raw |= {w.lower() for w in _NAME_WORD.findall(text or "")}
+    words = {w for w in raw
+             if len(w) > 2 and w not in _TOO_COMMON and w not in _INSTRUCTION_WORDS}
+    if not words:
+        return "", []
+
+    hits = {p for p in dev.list_apps()
+            if any(seg in words for seg in p.lower().split("."))}
+    if len(hits) <= 1:
+        return (next(iter(hits)) if hits else ""), sorted(hits)
+
+    # Several apps named. One installed by the user beats one that shipped with
+    # the phone: "tour the settings screen in Bumble" is about Bumble, and the
+    # phone's own Settings is what the sentence describes, not what it means.
+    third_party = hits & set(dev.list_apps(third_party_only=True))
+    if len(third_party) == 1:
+        return next(iter(third_party)), sorted(hits)
+    return "", sorted(hits)
+
+
+def ready_for_exploration(dev: Any) -> str:
+    """"" when the phone can be driven, otherwise why it cannot."""
+    try:
+        dev.wake()
+    except Exception as exc:  # noqa: BLE001 - a wake that fails is not fatal yet
+        log.warning("could not wake the phone: %s", exc)
+    if dev.is_locked():
+        return ("the phone is on the lock screen. A PIN, pattern or fingerprint "
+                "is yours to enter -- unlock it and run this again")
+    return ""
+
+
+def open_app_verified(dev: Any, package: str, *, timeout_s: float = 10.0) -> "Screen":
+    """Launch `package` and wait until it is really the app in front.
+
+    ``app_start`` is fire-and-forget: handed a package that is not installed it
+    returns happily having done nothing, and handed a real one it returns before
+    the first frame is drawn. Both used to read as success, so an exploration
+    could spend its entire budget describing the lock screen. The returned
+    screen is the caller's evidence -- check its ``package``.
+    """
+    dev.open_app(package)
+    deadline = time.monotonic() + timeout_s
+    screen = dev.observe()
+    while screen.package != package and time.monotonic() < deadline:
+        time.sleep(0.4)
+        screen = dev.observe()
+    return screen
+
+
+def exploration_goal(package: str, tasks: str) -> str:
+    """The brief handed to the agent for a skill-generating run.
+
+    Exploration is not a normal goal: nothing on screen can satisfy it. So the
+    brief has to say what counts as covered and what to write down, or the model
+    answers `done` on the app's first frame -- which is exactly what the old
+    one-line goal ("Explore app X and perform the following tasks: ...") got,
+    leaving the synthesis to invent a skill from a single screen.
+    """
+    return f"""\
+Explore the Android app {package} and write down how to drive it, so a later run
+can work in this app without getting lost. This is read-only reconnaissance: the
+notes you leave behind are the deliverable, not a task finished on screen.
+
+What to do in the app: {tasks}
+
+Record what you learn as you go, using `notes` -- one or two records per new
+screen, keyed so they do not overwrite each other:
+  - "flow:<short name>"   the tap-by-tap steps you just performed, naming each
+                          control exactly as it is labelled on screen.
+  - "screen:<short name>" what a screen is for and how you got to it.
+  - "quirk:<short name>"  anything that would mislead a later run: a control that
+                          opens something other than its label suggests, a screen
+                          `back` does not leave, a list whose items never appear
+                          in the element list, an index that moves between turns.
+  - "tip:<short name>"    what to do instead of that quirk.
+
+How to cover the app:
+  - Visit each top-level destination -- bottom tabs, top tabs, the nav drawer --
+    and return with `press_key back` before trying the next one.
+  - Open the search entry point, and open one item from the main list so you see
+    a detail screen as well as the lists.
+  - Do NOT send, post, buy, pay, delete, log out, or change a setting. When a
+    control would do any of those, record what it is and leave it alone.
+  - Do NOT swipe, like, pass, match, react to or vote on a card, profile or post.
+    In some apps that gesture is not navigation -- it is a message delivered to a
+    real person, and it cannot be taken back. Read such a screen, record how it
+    works, and leave with `press_key back`.
+  - Decline permission prompts and dismiss rate-this-app popups.
+
+Answer `done` once you have covered the main screens, or finished the tasks
+above, and summarise what you covered in `text`. Stop when the screens start
+repeating -- there is nothing left to learn from a fourth pass over the same list.
+"""
+
+
+@dataclass
+class AppTrace:
+    """What one run saw inside one app. The input to skill synthesis.
+
+    Filled the same way whether the run was a skill exploration or an ordinary
+    goal: both are a phone being driven through an app, and what a skill wants
+    to know from them is identical.
+    """
+
+    query: str = ""
+    #: The package actually driven, resolved from `query` and verified in front.
+    package: str = ""
+    tasks: str = ""
+    #: One line per *distinct* screen reached, not per step.
+    screens: List[str] = field(default_factory=list)
+    #: Every step, in order, with what the model said it saw.
+    actions: List[str] = field(default_factory=list)
+    screenshots: List[bytes] = field(default_factory=list)
+    #: The run's collected-data ledger -- the explorer's own findings.
+    notes: str = ""
+    #: How the app was picked: "named", "tasks" or "foreground". Reported,
+    #: because two of the three are the harness guessing.
+    chosen_by: str = ""
+    outcome: str = ""
+    steps: int = 0
+    llm_calls: int = 0
+
+    @property
+    def looked_around(self) -> bool:
+        """Did the run actually move through the app?
+
+        Synthesis fed one screen invents the other nine, and the invention gets
+        filed under the right app name, which is worse than having no skill at
+        all. Callers report this rather than presenting the result as learned.
+        """
+        return len(self.screens) > 1
+
+
+def _summarise(screen: "Screen", step: int) -> str:
+    labels = [e.best_text for e in screen.elements if e.best_text][:18]
+    head = f"step {step}: {screen.package}{screen.activity}"
+    return f"{head} | {', '.join(labels)}" if labels else f"{head} | (nothing labelled)"
+
+
+def _describe(action: Any, step: int) -> str:
+    parts = [f"step {step}: {action.describe() if hasattr(action, 'describe') else action}"]
+    for label, value in (("saw", getattr(action, "observation", "")),
+                         ("result", getattr(action, "_result_summary", ""))):
+        if value:
+            parts.append(f"{label}: {value}")
+    return " | ".join(parts)
+
+
+class TraceCollector:
+    """An `on_event` hook that turns the agent's event stream into an `AppTrace`.
+
+    Wrap whatever reporter the caller already has -- events pass straight
+    through -- then read `.trace` once the run is over. Attach it to any run,
+    not just an exploration: a goal pursued in an app is a tour of that app too,
+    and `learn_from_run` is what makes the second one count.
+
+    Screens are kept once per distinct structure rather than once per step: a
+    40-step tour crosses the same list a dozen times, and a prompt that pays per
+    screenshot should carry twelve *different* screens -- which is not what a
+    "first N steps" cap collects.
+    """
+
+    def __init__(self, dev: Any, trace: Optional[AppTrace] = None,
+                 on_event: Optional[Callable[..., None]] = None):
+        self.dev = dev
+        self.trace = trace or AppTrace()
+        self.on_event = on_event or (lambda *a, **k: None)
+        self.seen: set = set()
+        #: Steps spent in each package, so a run that crosses apps can say which
+        #: one it was mostly working in.
+        self.steps_in: Dict[str, int] = {}
+
+    def __call__(self, kind: str, **kw: Any) -> None:
+        self.on_event(kind, **kw)
+        if kind != "step":
+            return
+        state = kw.get("state")
+        step = kw.get("step") or (state.step if state is not None else 0)
+        screen = kw.get("screen")
+        action = kw.get("action")
+        if screen is not None:
+            self.record(screen, step)
+        if action is not None:
+            self.trace.actions.append(_describe(action, step))
+
+    def record(self, screen: "Screen", step: int) -> None:
+        if screen.package:
+            self.steps_in[screen.package] = self.steps_in.get(screen.package, 0) + 1
+        key = screen.skeleton_id or f"{screen.package}{screen.activity}"
+        if key in self.seen:
+            return
+        self.seen.add(key)
+        self.trace.screens.append(_summarise(screen, step))
+        if len(self.trace.screenshots) >= MAX_EXPLORE_SHOTS:
+            return
+        # Verification already grabbed a frame of this screen most turns; reuse
+        # it rather than paying a second round trip for the same pixels.
+        shot = screen.screenshot
+        if shot is None:
+            try:
+                shot = self.dev.screenshot()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("no screenshot for step %d: %s", step, exc)
+                return
+        if shot:
+            self.trace.screenshots.append(shot)
+
+    @property
+    def main_package(self) -> str:
+        """The app this run mostly worked in.
+
+        A goal like "open WhatsApp and share it to Drive" touches three
+        packages; the skill worth updating is the one the steps were spent in,
+        not whichever happened to be in front when the run ended.
+        """
+        app_steps = {p: n for p, n in self.steps_in.items() if is_app_package(p)}
+        if not app_steps:
+            return ""
+        return max(app_steps.items(), key=lambda kv: kv[1])[0]
+
+    def finish(self, outcome: str, state: Any) -> AppTrace:
+        """Close the trace off with what the finished run knows."""
+        self.trace.outcome = outcome
+        self.trace.steps = getattr(state, "step", 0)
+        self.trace.llm_calls = getattr(state, "llm_calls", 0)
+        scratchpad = getattr(state, "scratchpad", None)
+        if scratchpad is not None:
+            self.trace.notes = scratchpad.plain()
+        if not self.trace.package:
+            self.trace.package = self.main_package
+        return self.trace
+
+
+def explore_app(dev: Any, mem: Any, llm: Any, cfg: Any, *, query: str = "",
+                tasks: str = "",
+                on_event: Optional[Callable[..., None]] = None) -> AppTrace:
+    """Drive an app on the phone and record what a skill needs to know.
+
+    `query` is a package, an app name, or empty for whatever is in front.
+
+    Raises `ExplorationBlocked` when the phone cannot be driven: a locked
+    screen, an app that is not installed, an app that will not come forward.
+    The command this replaces folded all three into one warning and then
+    synthesised a skill from whatever happened to be on screen.
+    """
+    from .agent import Agent
+
+    if llm is None:
+        raise ExplorationBlocked("exploring needs a model; none was configured")
+
+    exp = AppTrace(query=query, tasks=(tasks or "").strip() or DEFAULT_EXPLORE_TASKS)
+
+    blocked = ready_for_exploration(dev)
+    if blocked:
+        raise ExplorationBlocked(blocked)
+
+    target, exp.chosen_by = query, "named"
+    if not target:
+        # No app argument. The tasks usually name one already -- "open Bumble and
+        # read the matches" -- and saying it a second time is only a second
+        # chance to get it wrong. An app the tasks name beats whatever happens to
+        # be on screen; the foreground is the fallback when they name none.
+        named, candidates = package_from_text(dev, tasks)
+        if not named and len(candidates) > 1:
+            raise ExplorationBlocked(
+                "the tasks name more than one installed app ("
+                + ", ".join(candidates) + "), so which to explore is your call: "
+                "`adbagent skills generate <app> --tasks ...`")
+        target, exp.chosen_by = named, ("tasks" if named else "foreground")
+
+    if target:
+        package = resolve_package(dev, target)
+        if not package:
+            hint = target.split(".")[0]
+            raise ExplorationBlocked(
+                f"no installed app matches {target!r}. "
+                f"`adbagent apps -s {hint}` lists what the phone actually has")
+        screen = open_app_verified(dev, package)
+        if screen.package != package:
+            raise ExplorationBlocked(
+                f"{package} would not come to the foreground "
+                f"({screen.package or 'nothing'} is in front). Open it by hand once, "
+                "then run this again")
+    else:
+        # Nothing named anywhere: explore whatever the phone is showing. Saves
+        # naming an app you are already looking at, and is the only way to build
+        # a skill for a screen you cannot reach from a cold launch.
+        screen = dev.observe()
+        package = screen.package
+        if not is_app_package(package):
+            raise ExplorationBlocked(
+                f"the app in front is {package or 'nothing'}, which is the phone "
+                "rather than an app. Name one, or say which app the tasks are "
+                "about: `adbagent skills generate whatsapp`")
+
+    exp.package = package
+    exp.actions.append(f"opened {package}"
+                       + (f" (resolved from {query!r})" if query and package != query else ""))
+
+    collector = TraceCollector(dev, exp, on_event)
+    collector.record(screen, 0)
+
+    agent = Agent(dev, mem, llm, cfg, on_event=collector)
+    outcome, state = agent.run(exploration_goal(package, exp.tasks))
+    return collector.finish(outcome, state)
 
 
 SKILL_SYNTHESIS_SYSTEM = """\
@@ -362,6 +857,21 @@ The skill specification must be a single valid JSON object with the following sc
 
 If an existing skill definition is provided, incorporate any new workflows, nuances, or recommendations discovered during exploration into the output while preserving existing valid items.
 Be precise, actionable, and focus on practical automation hints that help an AI driver avoid getting stuck.
+
+Ground every workflow, nuance and recommendation in the exploration below. Name the
+controls with the labels the exploration actually saw. If the exploration only reached
+a few screens, write a short skill about those screens -- do NOT fill the gaps with
+what an app of this kind usually looks like. An invented step filed under the right app
+name is worse than a missing one: the next run will follow it.
+
+"packages" must list the RESOLVED PACKAGE exactly as given, since that is what the
+agent matches a skill against at run time.
+
+When the run failed or got stuck, the trace is evidence about the app wherever it shows
+why -- a control that does nothing, a screen `back` will not leave, a list the element
+tree never shows. Record those as nuances with the way around them. Do not record a
+one-off as a rule: a slow load, a single mistap or a popup that appeared once is not a
+property of the app.
 Reply with ONLY the JSON object.
 """
 
@@ -372,22 +882,64 @@ class SkillGenerator:
     def __init__(self, registry: Optional[SkillRegistry] = None):
         self.registry = registry or SkillRegistry()
 
+    @staticmethod
+    def _ask(llm_client: Any, user_content: Any, model: str) -> str:
+        """One synthesis call, returned as bare JSON text.
+
+        Fences come back whatever the prompt asks for, so they are stripped here
+        rather than at each call site.
+        """
+        messages = [{"role": "system", "content": SKILL_SYNTHESIS_SYSTEM},
+                    {"role": "user", "content": user_content}]
+        if hasattr(llm_client, "_post"):
+            cfg = getattr(llm_client, "cfg", None)
+            raw_text, _ = llm_client._post(
+                messages, model=model, schema=None,
+                max_tokens=cfg.llm.max_tokens if cfg is not None else 1500,
+                purpose="skill_generation")
+            content = raw_text.strip()
+        elif hasattr(llm_client, "_post_chat"):
+            raw_resp = llm_client._post_chat(messages, model=model)
+            content = raw_resp["choices"][0]["message"]["content"].strip()
+        else:
+            raise RuntimeError("Unsupported LLM client interface")
+
+        if content.startswith("```"):
+            content = re.sub(r"^```[a-z]*\n?", "", content)
+            content = re.sub(r"\n?```$", "", content)
+        return content.strip()
+
     def generate_from_exploration(self, app_name_or_pkg: str, tasks: str,
                                  screen_summaries: List[str],
                                  actions_taken: List[str],
                                  llm_client: Any,
-                                 screenshots: Optional[List[bytes]] = None) -> Skill:
-        """Synthesize exploration observations into a Skill object, updating existing skill if present."""
-        existing_skill = (self.registry.find_by_name_or_alias(app_name_or_pkg) or
+                                 screenshots: Optional[List[bytes]] = None,
+                                 *, package: str = "", notes: str = "",
+                                 outcome: str = "") -> Skill:
+        """Synthesize exploration observations into a Skill object, updating existing skill if present.
+
+        `package` is the package the exploration verifiably drove, which is not
+        always what the caller asked for: ``generate whatsapp`` explores
+        ``com.whatsapp``, and a skill that does not say so never loads, because
+        `find_by_package` is what the agent matches on.
+        """
+        existing_skill = ((self.registry.find_by_package(package) if package else None) or
+                          self.registry.find_by_name_or_alias(app_name_or_pkg) or
                           self.registry.find_by_package(app_name_or_pkg))
 
         prompt_parts = [f"APP NAME OR PACKAGE: {app_name_or_pkg}"]
+        if package:
+            prompt_parts.append(f"RESOLVED PACKAGE: {package}")
         if existing_skill:
             prompt_parts.append(f"EXISTING SKILL DEFINITION:\n{json.dumps(existing_skill.to_dict(), indent=2)}")
         prompt_parts.append(f"USER TASKS PERFORMED: {tasks}")
-        prompt_parts.append("SCREEN STATES OBSERVED:\n" + "\n".join(screen_summaries or ["(none)"]))
+        if notes:
+            prompt_parts.append("FINDINGS THE EXPLORER RECORDED (its own words, the primary source):\n" + notes)
+        prompt_parts.append("DISTINCT SCREENS REACHED:\n" + "\n".join(screen_summaries or ["(none)"]))
         prompt_parts.append("ACTIONS TAKEN DURING EXPLORATION:\n" + "\n".join(actions_taken or ["(none)"]))
-        prompt_parts.append(f"Generate an updated, complete App Skill JSON object for {app_name_or_pkg} combining existing skill information and new exploration findings.")
+        if outcome:
+            prompt_parts.append(f"HOW THE EXPLORATION ENDED: {outcome}")
+        prompt_parts.append(f"Generate an updated, complete App Skill JSON object for {package or app_name_or_pkg} combining existing skill information and new exploration findings.")
 
         prompt = "\n\n".join(prompt_parts)
 
@@ -396,47 +948,38 @@ class SkillGenerator:
         else:
             model_to_use = getattr(llm_client, "model", "")
 
-        user_content: Any = prompt
+        # Attempts, best first. A text-only `model_skill` fails the *whole* call
+        # when it is handed an image part -- the same trap `llm.vision_in_decider`
+        # documents -- and losing a run's whole trace to that is far worse than
+        # losing the pictures, so the words get a second chance on their own.
+        attempts: List[Any] = [prompt]
         if screenshots:
             from .llm import image_part, text_part
-            content_list: List[Dict[str, Any]] = [text_part(prompt)]
+            with_images: List[Dict[str, Any]] = [text_part(prompt)]
             for shot in screenshots:
                 if shot:
-                    content_list.append(image_part(shot))
-            user_content = content_list
+                    with_images.append(image_part(shot))
+            attempts.insert(0, with_images)
 
-        messages = [
-            {"role": "system", "content": SKILL_SYNTHESIS_SYSTEM},
-            {"role": "user", "content": user_content}
-        ]
+        generated_skill: Optional[Skill] = None
+        for content in attempts:
+            try:
+                data = json.loads(self._ask(llm_client, content, model_to_use))
+                generated_skill = Skill.from_dict(data)
+                break
+            except Exception as exc:  # noqa: BLE001
+                log.warning("skill synthesis %s failed: %s",
+                            "with screenshots" if isinstance(content, list) else "on text alone",
+                            exc)
 
-        try:
-            if hasattr(llm_client, "_post"):
-                raw_text, _ = llm_client._post(
-                    messages, model=model_to_use, schema=None,
-                    max_tokens=getattr(getattr(llm_client, "cfg", None), "llm", None).max_tokens if hasattr(llm_client, "cfg") else 1500,
-                    purpose="skill_generation"
-                )
-                content = raw_text.strip()
-            elif hasattr(llm_client, "_post_chat"):
-                raw_resp = llm_client._post_chat(messages, model=model_to_use)
-                content = raw_resp["choices"][0]["message"]["content"].strip()
-            else:
-                raise RuntimeError("Unsupported LLM client interface")
-
-            # Clean JSON codeblock wrappers if present
-            if content.startswith("```"):
-                content = re.sub(r"^```[a-z]*\n?", "", content)
-                content = re.sub(r"\n?```$", "", content)
-            data = json.loads(content.strip())
-            generated_skill = Skill.from_dict(data)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Skill synthesis model call failed or returned invalid JSON: %s. Using fallback template.", exc)
+        if generated_skill is None:
+            log.warning("no usable skill JSON; falling back to a template")
+            anchor = package or app_name_or_pkg
             generated_skill = Skill(
-                name=existing_skill.name if existing_skill else app_name_or_pkg.replace(".", "_").capitalize(),
-                packages=[app_name_or_pkg] if ("." in app_name_or_pkg and not existing_skill) else [],
+                name=existing_skill.name if existing_skill else anchor.replace(".", "_").capitalize(),
+                packages=[anchor] if ("." in anchor and not existing_skill) else [],
                 aliases=[app_name_or_pkg.lower()],
-                description=f"App skill for {app_name_or_pkg} based on user tasks: {tasks}",
+                description=f"App skill for {anchor} based on user tasks: {tasks}",
                 workflows=[Workflow(name="user_tasks", steps=tasks)],
                 nuances=["Observe screen element indices carefully before tapping."],
                 recommendations=["Use input_text with clear=true when editing fields."]
@@ -447,5 +990,52 @@ class SkillGenerator:
         else:
             final_skill = generated_skill
 
+        # The binding the agent matches on, whatever the model chose to write.
+        if package and not final_skill.matches_package(package):
+            final_skill.packages.append(package)
+        # And the name the caller typed, so `skills view <that>` finds it again.
+        alias = app_name_or_pkg.strip().lower()
+        if (alias and "." not in alias and alias != final_skill.name.lower()
+                and alias not in (a.lower() for a in final_skill.aliases)):
+            final_skill.aliases.append(alias)
+
         self.registry.save_skill(final_skill)
         return final_skill
+
+
+# ---------------------------------------------------------------------------
+# Learning from an ordinary run
+# ---------------------------------------------------------------------------
+
+#: A run has to have got somewhere before it can teach anything. One step into an
+#: app and out again leaves nothing a skill did not already say, and paying a
+#: synthesis call to hear it back only dilutes what is there.
+MIN_LEARNABLE_STEPS = 3
+
+
+def learn_from_run(trace: AppTrace, llm: Any, registry: SkillRegistry, *,
+                   goal: str = "") -> Optional[Skill]:
+    """Fold what a finished run learned into that app's skill, and save it.
+
+    This is what makes the agent better at an app the more it is used there: any
+    run is a tour of the app it ran in, the skill it read at the start comes back
+    as the baseline, and `Skill.merge` keeps what was already known rather than
+    replacing it. Returns the updated skill, or None when the run has nothing to
+    teach.
+
+    A failed run is not skipped. "Tapping this row does nothing" and "back leaves
+    the app from here" are exactly what a skill is for, and they are only ever
+    learned by a run that went wrong -- the synthesis is told how the run ended
+    so it can tell a dead end from a one-off.
+    """
+    if not is_app_package(trace.package):
+        log.info("nothing to learn: %r is not an app", trace.package)
+        return None
+    if trace.steps < MIN_LEARNABLE_STEPS or not trace.looked_around:
+        log.info("nothing to learn from %s: %d step(s), %d screen(s)",
+                 trace.package, trace.steps, len(trace.screens))
+        return None
+    return SkillGenerator(registry).generate_from_exploration(
+        trace.package, goal or trace.tasks, trace.screens, trace.actions, llm,
+        screenshots=trace.screenshots, package=trace.package,
+        notes=trace.notes, outcome=trace.outcome)
