@@ -30,6 +30,13 @@ from typing import Any, Dict, Iterator, List, Optional
 #: The file, inside `runs/<id>/`.
 LOG_NAME = "run.log"
 
+#: The raw LLM stream of a run, inside `runs/<id>/`: one line per `llm_start`,
+#: `llm_stream` chunk and `llm_end`. Kept out of `events.jsonl` on purpose --
+#: a reasoning turn is ~4,000 tokens arriving as hundreds of chunks, and that
+#: file is what `report`, `replay` and the run history parse. This one is what
+#: the web UI tails to show the model thinking live.
+STREAM_NAME = "stream.jsonl"
+
 #: The logger every module in the package hangs off.
 ROOT = "adbagent"
 

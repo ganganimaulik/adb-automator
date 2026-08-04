@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from ..config import Config, _set_path, find_config_file, load_config
+from ..runlog import STREAM_NAME
 from ..skills import Skill, SkillRegistry
 from . import runparse
 from .runner import JobManager, RunManager, sse
@@ -298,7 +299,13 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
 
 
 def _event_stream(manager: RunManager) -> Generator[str, None, None]:
-    """Replay then follow the active run's events.jsonl as SSE frames."""
+    """Replay then follow the active run's event files as SSE frames.
+
+    Two files, two frame types: `events.jsonl` (what was decided) arrives as
+    `event`, and `stream.jsonl` (the model's raw thinking and response as they
+    happen) arrives as `llm`. A run recorded before the stream file existed
+    just yields the first.
+    """
     yield sse(manager.state(), "state")
     state = manager.state()
     if not state["running"] and not state["run_id"]:
@@ -311,48 +318,53 @@ def _event_stream(manager: RunManager) -> Generator[str, None, None]:
                    "output_tail": manager.state()["output_tail"]}, "end")
         return
 
-    events_file = run_dir / runparse.EVENTS_NAME
     yield sse({"run_id": run_dir.name}, "run")
 
-    offset = 0
-    carry = b""  # an appended-to file's last line may not have its newline yet
+    tails = [(run_dir / runparse.EVENTS_NAME, "event"),
+             (run_dir / STREAM_NAME, "llm")]
+    offsets = [0] * len(tails)
+    carries = [b""] * len(tails)  # an appended-to file's last line may be torn
     drain_passes = 0  # once the child exits, read twice more to catch the tail
     last_heartbeat = time.monotonic()
     while True:
-        try:
-            with events_file.open("rb") as fh:
-                fh.seek(0, 2)
-                if fh.tell() < offset:
-                    offset = 0  # truncated: start over rather than lose events
-                fh.seek(offset)
-                data = fh.read()
-        except OSError:
-            data = b""
-        offset += len(data)
-
-        data = carry + data
-        parts = data.split(b"\n")
-        carry = parts.pop() if parts else b""
-        for line in parts:
-            line = line.strip()
-            if not line:
-                continue
+        flowed = False
+        for i, (path, frame) in enumerate(tails):
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            yield sse(event, "event")
+                with path.open("rb") as fh:
+                    fh.seek(0, 2)
+                    if fh.tell() < offsets[i]:
+                        offsets[i] = 0  # truncated: start over, not lose events
+                    fh.seek(offsets[i])
+                    data = fh.read()
+            except OSError:
+                data = b""
+            offsets[i] += len(data)
+
+            data = carries[i] + data
+            parts = data.split(b"\n")
+            carries[i] = parts.pop() if parts else b""
+            for line in parts:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                flowed = True
+                yield sse(event, frame)
 
         if manager.state()["running"]:
             drain_passes = 0
         else:
             drain_passes += 1
             if drain_passes >= 2:
-                if carry.strip():  # a final line that never got its newline
-                    try:
-                        yield sse(json.loads(carry), "event")
-                    except json.JSONDecodeError:
-                        pass
+                for i, (path, frame) in enumerate(tails):
+                    if carries[i].strip():  # a final line without its newline
+                        try:
+                            yield sse(json.loads(carries[i]), frame)
+                        except json.JSONDecodeError:
+                            pass
                 state = manager.state()
                 yield sse(state, "state")
                 yield sse({"reason": "finished",
@@ -361,4 +373,6 @@ def _event_stream(manager: RunManager) -> Generator[str, None, None]:
         if time.monotonic() - last_heartbeat > 15:
             yield sse({"t": time.time()}, "ping")
             last_heartbeat = time.monotonic()
-        time.sleep(0.5)
+        # Poll briskly while the model is talking so the stream reads as live;
+        # fall back to a lazy cadence when the run is quiet.
+        time.sleep(0.15 if flowed else 0.5)

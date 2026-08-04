@@ -146,6 +146,35 @@ def test_read_events_tolerates_torn_tail(tmp_path):
     assert len(runparse.read_events(d)) == 4
 
 
+def write_stream(d: Path, records) -> None:
+    with (d / "stream.jsonl").open("w", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record) + "\n")
+
+
+def test_run_detail_merges_the_llm_stream(tmp_path):
+    d = make_run_dir(tmp_path)
+    write_stream(d, [
+        {"t": 1000.5, "kind": "llm_start", "step": 1, "purpose": "decide",
+         "model": "m"},
+        {"t": 1000.6, "kind": "llm_stream", "stream_type": "thinking",
+         "text": "wifi is under network"},
+        {"t": 1000.7, "kind": "llm_stream", "stream_type": "content",
+         "text": '{"action": "tap"}'},
+        {"t": 1000.9, "kind": "llm_end", "step": 1, "purpose": "decide",
+         "elapsed": 1.8, "completion_tokens": 40},
+    ])
+    detail = runparse.run_detail(d)
+    kinds = [e["kind"] for e in detail["events"]]
+    # Interleaved by timestamp: the stream brackets the decision it produced.
+    assert kinds == ["run_start", "llm_start", "llm_stream", "llm_stream",
+                     "llm_end", "decide", "verify", "run_end"]
+    # Stats still read the decision events alone.
+    assert detail["stats"]["decisions"] == 1
+    assert detail["stats"]["completion_tokens"] == 10
+    assert detail["summary"]["n_events"] == 4
+
+
 def test_list_runs_newest_first(tmp_path):
     older = make_run_dir(tmp_path, run_id="aaa")
     newer = make_run_dir(tmp_path, run_id="bbb")
@@ -345,6 +374,31 @@ def test_stream_replays_and_finishes(web, tmp_path, monkeypatch):
     assert '"run_id": "live1"' in body
     assert "turn on wifi" in body           # run_start replayed
     assert "run_end" in body
+    assert "event: end" in body
+
+
+def test_stream_includes_llm_frames(web, tmp_path, monkeypatch):
+    runs = tmp_path / "runs"
+
+    def fake_popen(argv, **kwargs):
+        def on_spawn(_argv):
+            d = make_run_dir(runs, run_id="live2")
+            write_stream(d, [
+                {"t": 1000.5, "kind": "llm_start", "step": 1,
+                 "purpose": "decide", "model": "m"},
+                {"t": 1000.6, "kind": "llm_stream", "stream_type": "thinking",
+                 "text": "wifi is under network"},
+            ])
+        return FakeProc(argv, on_spawn=on_spawn, **kwargs)
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", fake_popen)
+    assert web.post("/api/runs", json={"goal": "turn on wifi"}).status_code == 200
+
+    body = web.get("/api/runs/stream").text
+    assert "event: event" in body            # the decisions still flow
+    assert "event: llm" in body              # and the raw stream beside them
+    assert '"kind": "llm_start"' in body
+    assert "wifi is under network" in body
     assert "event: end" in body
 
 

@@ -148,6 +148,9 @@ class Recorder:
         self.dir = runlog.run_dir(cfg, run_id)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.events = (self.dir / "events.jsonl").open("a", encoding="utf-8")
+        # The live LLM stream, for the web UI to tail. Append mode for the same
+        # reason as events.jsonl: a resumed run continues its own directory.
+        self.stream = (self.dir / runlog.STREAM_NAME).open("a", encoding="utf-8")
         # Opened here rather than by the caller, so that every entry point which
         # runs an agent -- `run`, `skills generate`, an embedding program -- gets
         # a debuggable log without having to remember to ask for one.
@@ -160,6 +163,23 @@ class Recorder:
         # And into the run log, so that one file reads in order: the decision
         # next to the adb traffic, the retries and the warnings around it.
         runlog.event(kind, fields)
+
+    def stream_event(self, kind: str, **fields: Any) -> None:
+        """One line of the raw LLM stream. A best-effort side channel: a disk
+        that cannot take it must not kill the run over the live view."""
+        if self.stream is None:
+            return
+        record = {"t": round(time.time(), 3), "kind": kind, **fields}
+        try:
+            self.stream.write(json.dumps(record, default=str) + "\n")
+            self.stream.flush()
+        except (OSError, ValueError) as exc:
+            log.warning("stream log failed (%s); dropping it", exc)
+            try:
+                self.stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.stream = None
 
     def blob(self, name: str, data: bytes) -> str:
         path = self.dir / name
@@ -194,8 +214,45 @@ class Recorder:
             self.events.close()
         except Exception:  # noqa: BLE001
             pass
+        if self.stream is not None:
+            try:
+                self.stream.close()
+            except Exception:  # noqa: BLE001
+                pass
         if self.log is not None:
             self.log.close()
+
+
+def _stream_tap(rec: Recorder, inner: Any) -> Any:
+    """Fan the live LLM stream out to the run's ``stream.jsonl``.
+
+    The terminal reporter renders these events and throws them away; the web UI
+    can only follow a file, so every `llm_start`/`llm_stream`/`llm_end` is
+    mirrored here as it happens. Fields are whitelisted rather than passed
+    through: `llm_end` also carries the `Call` and sometimes a verdict object,
+    and the stream file stays flat JSON.
+    """
+    def tap(kind: str, **kw: Any) -> None:
+        if kind == "llm_start":
+            rec.stream_event(kind, step=kw.get("step") or 0,
+                             purpose=kw.get("purpose") or "decide",
+                             model=kw.get("model") or "",
+                             screenshot=bool(kw.get("screenshot")),
+                             effort=kw.get("effort") or "")
+        elif kind == "llm_stream":
+            rec.stream_event(kind, stream_type=kw.get("stream_type") or "content",
+                             purpose=kw.get("purpose") or "",
+                             text=kw.get("text") or "")
+        elif kind == "llm_end":
+            call = kw.get("call")
+            rec.stream_event(kind, step=kw.get("step") or 0,
+                             purpose=kw.get("purpose") or "decide",
+                             elapsed=round(kw.get("elapsed") or 0.0, 3),
+                             prompt_tokens=getattr(call, "prompt_tokens", 0) or 0,
+                             completion_tokens=getattr(call, "completion_tokens", 0) or 0,
+                             reasoning_tokens=getattr(call, "reasoning_tokens", 0) or 0)
+        inner(kind, **kw)
+    return tap
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +429,11 @@ class Agent:
             recorder.event("run_start", goal=goal,
                            model=getattr(self.llm, "model", ""))
 
+        # Mirror the live LLM stream into the run directory as it happens, so
+        # the web UI can show the model thinking rather than just its verdicts.
+        on_event = self.on_event
+        self.on_event = _stream_tap(recorder, on_event)
+
         try:
             self._loop(state, recorder)
         except (BudgetExceeded, LLMError) as exc:
@@ -403,6 +465,7 @@ class Agent:
                            traceback=traceback.format_exc())
             raise
         finally:
+            self.on_event = on_event
             outcome = state.finished or "failed"
             # A checkpoint is unfinished business: keep it current on every way
             # out but success, so `--resume` can put the run back where it

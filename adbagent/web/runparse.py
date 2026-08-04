@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from ..checkpoint import NAME as CHECKPOINT_NAME
+from ..runlog import STREAM_NAME
 
 EVENTS_NAME = "events.jsonl"
 
@@ -33,10 +34,10 @@ def _percentile(values: List[float], pct: float) -> float:
     return values[min(len(values) - 1, int(len(values) * pct))]
 
 
-def read_events(path: Path) -> List[Dict[str, Any]]:
+def read_events(path: Path, name: str = EVENTS_NAME) -> List[Dict[str, Any]]:
     """Every parseable event in the file, oldest first. Tolerant of a torn
     last line, which is what a file being appended to looks like when read."""
-    events_file = path / EVENTS_NAME if path.is_dir() else path
+    events_file = path / name if path.is_dir() else path
     events: List[Dict[str, Any]] = []
     try:
         lines = events_file.read_text(encoding="utf-8").splitlines()
@@ -131,7 +132,13 @@ def summarise(path: Path) -> Dict[str, Any]:
 
 def run_detail(path: Path) -> Dict[str, Any]:
     """Everything the history detail view renders: summary, cost-of-thinking
-    stats (mirroring `adbagent report`), scratchpad, and the events."""
+    stats (mirroring `adbagent report`), scratchpad, and the events.
+
+    The feed itself is the decision events merged with the raw LLM stream,
+    so a finished run shows the same per-call thinking panels the live view
+    did -- all of them collapsed. Stats keep reading the decision events
+    alone: stream lines carry no cost block and would only dilute them.
+    """
     events = read_events(path)
     summary = summarise(path)
 
@@ -155,8 +162,10 @@ def run_detail(path: Path) -> Dict[str, Any]:
         "llm_calls": int(totals["n_calls"]),
         "usd": round(totals["usd"], 6),
     }
+    feed = sorted(events + read_events(path, STREAM_NAME),
+                  key=lambda e: e.get("t", 0.0))
     return {"summary": summary, "stats": stats,
-            "scratchpad": _scratchpad_text(events), "events": events}
+            "scratchpad": _scratchpad_text(events), "events": feed}
 
 
 def list_runs(artifacts_dir: Path) -> List[Dict[str, Any]]:
