@@ -5,41 +5,48 @@
   ],
   "aliases": [
     "instagram",
-    "insta"
+    "insta",
+    "ig"
   ],
-  "description": "Instagram is a social media app for sharing photos, videos, and reels. Primary workflows include browsing the home feed, exploring content via a grid, watching and interacting with reels, searching for users, and following accounts.",
+  "description": "Instagram is a social media app for sharing photos, videos, and stories. Primary workflows include browsing the home feed, exploring content via the Explore grid, watching and interacting with Reels, searching for users, viewing profiles, following accounts, and using Direct Messages.",
   "workflows": [
     {
-      "name": "navigate_to_explore",
-      "steps": "From the home feed, tap the 'Search and explore' tab (magnifying glass icon) in the bottom navigation bar. The explore page shows a 3-column grid of reels and photos with view-count overlays and a 'Search with Meta AI' bar at the top."
+      "name": "open_explore_and_like_posts",
+      "steps": "Tap the 'Search and explore' tab (magnifying glass icon) in the bottom nav to open the Explore grid. Tap a reel/post thumbnail in the grid to open the full-screen Reel viewer. Tap the Like button (heart icon, resource id=like_button) in the UFI row to like it; the heart turns red/selected. To like multiple posts, press Back to return to the Explore grid and tap the next thumbnail, then like again. Do NOT rely on swiping left to advance between explore reels (see nuances)."
     },
     {
-      "name": "like_posts_from_explore",
-      "steps": "On the explore page, tap a grid tile to open the post in the full-screen reel viewer. Tap the 'Like' button (heart icon, id=like_button) on the right side. The heart turns red when liked. To like the next post, swipe left on the pager (clips_viewer_view_pager) to advance to the next reel, then tap 'Like' again. Repeat for the desired number of posts."
+      "name": "open_reels_tab_and_like_reels",
+      "steps": "Tap the 'Reels' tab (play icon) in the bottom nav to open the full-screen Reels viewer directly. Tap the Like button (heart icon, resource id=like_button) to like the current reel. To advance to the next reel, swipe UP on the inner recycler view (swipeable_nav_view_pager_inner_recycler_view), NOT left. Repeat like + swipe up for each reel."
     },
     {
-      "name": "navigate_to_reels",
-      "steps": "From the home feed or explore page, tap the 'Reels' tab (clapperboard icon) in the bottom navigation bar to open the reels feed."
+      "name": "search_for_user",
+      "steps": "Tap the 'Search and explore' tab in the bottom nav. Tap the search bar at the top labeled 'Search with Meta AI'. Type the username using input_text. Wait for the results list to populate under the 'Accounts' section. Tap the matching result row (resource id=row_search_user_container) to open the user's profile."
     },
     {
-      "name": "like_reels",
-      "steps": "In the reels feed or reel viewer, tap the 'Like' button (heart icon, id=like_button) on the right side to like the current reel. The heart turns red when liked. Swipe left on the pager (clips_viewer_view_pager) to advance to the next reel and repeat."
+      "name": "follow_user_from_profile",
+      "steps": "On the user profile screen, tap the Follow button (resource id=profile_header_follow_button). The button changes to 'Following' and becomes a dropdown menu, confirming the follow succeeded."
     },
     {
-      "name": "search_and_follow_user",
-      "steps": "Tap the 'Search and explore' tab in the bottom navigation. Tap the 'Search with Meta AI' bar at the top, type the username, and tap the correct result. On the user's profile, tap the 'Follow' button."
+      "name": "open_direct_messages",
+      "steps": "Tap the 'Message' tab (paper plane / messenger icon) in the bottom nav to open the Direct inbox. The inbox shows Primary/Requests/General filter tabs, a search bar labeled 'Search or ask Meta AI', and a list of conversation threads."
     }
   ],
   "nuances": [
-    "The reel viewer's Like button (id=like_button) toggles and shows a selected state (red heart) when liked.",
-    "In the reel viewer, swipe left on clips_viewer_view_pager to advance to the next reel; the pager may not always advance on the first swipe.",
-    "The explore page grid tiles open directly into the full-screen reel viewer, not a separate post detail screen.",
-    "The bottom navigation bar has 5 tabs: Home, Reels, Message, Search and explore, Profile."
+    "In the Explore reel viewer, swiping LEFT on clips_viewer_view_pager does NOT advance to the next reel (the same reel stays on screen even with amount=2). To like multiple explore reels, press Back to return to the grid and tap each thumbnail individually.",
+    "In the Reels tab, swiping LEFT on the outer pager (swipeable_tab_view_pager) switches to the Message tab instead of advancing to the next reel. To advance reels in the Reels tab, swipe UP on the inner recycler (swipeable_nav_view_pager_inner_recycler_view).",
+    "The Like button's element index shifts between turns and reels (e.g., was #21 on one reel, #20 on another). Always locate it by resource id 'like_button', never by a fixed index.",
+    "The Explore grid shows reel thumbnails with view counts overlaid; tapping any thumbnail opens the full-screen Reel viewer for that specific reel, with a Back button and 'Explore' title at top.",
+    "The Reels tab opens directly into a full-screen reel viewer (not a grid). The top shows 'Reels' and 'Friends' tabs; the bottom nav remains visible.",
+    "Search results may show a 'Searching…' spinner briefly before populating. Wait for the Accounts section to load before tapping a result row.",
+    "After following a user, the Follow button label changes to 'Following' and gains a dropdown arrow; tapping it again would open an unfollow menu, so do not tap it again to confirm."
   ],
   "recommendations": [
-    "When liking multiple posts or reels, verify the Like button state (red heart) after each tap to confirm the action succeeded.",
-    "If a swipe does not advance the reel pager, retry the swipe before concluding the app is stuck.",
-    "Use the bottom navigation tabs to switch between Home, Reels, and Explore; do not rely on back button to exit the reel viewer."
+    "Always locate interactive buttons (Like, Follow, Comment) by their resource ids (like_button, profile_header_follow_button) rather than by element index, as indices shift between screens and turns.",
+    "When liking multiple reels from the Explore page, use the pattern: tap thumbnail -> like -> press Back -> tap next thumbnail -> like. Avoid swiping left in the explore reel viewer.",
+    "When liking multiple reels in the Reels tab, use the pattern: like -> swipe UP on inner recycler -> like -> swipe UP. Never swipe left in the Reels tab.",
+    "After typing a search query, wait one turn for results to load before attempting to tap a result row, as the list populates asynchronously.",
+    "To verify a like succeeded, check that the heart icon appears red/selected in the next observation rather than re-tapping it (which would unlike).",
+    "Use the bottom navigation bar (Home, Reels, Message, Search and explore, Profile) as the primary navigation mechanism; it is present on most main screens."
   ],
   "custom_prompt": ""
 }

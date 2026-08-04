@@ -821,7 +821,7 @@ class Agent:
             # it is free, whereas varying the system message evicts the whole
             # prompt prefix from the provider's cache.
             situational = prompts.situational_notes(
-                goal=state.goal, is_pager=screen.is_pager,
+                goal=state.goal,
                 scrolls=state.loops.total_scroll_count,
                 has_scroller=any(el.scrollable and not el.is_horizontal
                                  for el in screen.elements),
