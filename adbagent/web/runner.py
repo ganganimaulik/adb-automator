@@ -9,6 +9,12 @@ launched with `--unattended` (refuse) or `--allow-destructive`.
 
 One run at a time: there is one phone, and two agents driving it at once
 would each read the other's actions as their own.
+
+`--repeat` makes one subprocess into several runs: the CLI pursues the goal
+again from scratch each iteration, in a *new* `runs/<id>` directory, holding
+one device connection and one spend ledger for the whole session. So the
+manager tracks a list of directories rather than one, and keeps looking for
+them for as long as the child lives.
 """
 
 from __future__ import annotations
@@ -32,7 +38,9 @@ class RunManager:
         self._proc: Optional[subprocess.Popen] = None
         self._goal = ""
         self._started_at = 0.0
-        self._run_dir: Optional[Path] = None
+        #: One entry per iteration, oldest first. `--repeat 1` leaves one.
+        self._run_dirs: List[Path] = []
+        self._repeat = "1"
         self._returncode: Optional[int] = None
         self._output: List[str] = []  # ring buffer of the child's stdout
         self._dirs_before: set = set()
@@ -45,7 +53,9 @@ class RunManager:
             return {
                 "running": running,
                 "goal": self._goal,
-                "run_id": self._run_dir.name if self._run_dir else "",
+                "run_id": self._run_dirs[-1].name if self._run_dirs else "",
+                "iteration": len(self._run_dirs),
+                "repeat": self._repeat,
                 "pid": self._proc.pid if self._proc and running else None,
                 "started_at": self._started_at if running else 0.0,
                 "returncode": None if running else self._returncode,
@@ -53,8 +63,13 @@ class RunManager:
             }
 
     def run_dir(self) -> Optional[Path]:
+        """The iteration being written now -- the newest directory seen."""
         with self._lock:
-            return self._run_dir
+            return self._run_dirs[-1] if self._run_dirs else None
+
+    def run_dirs(self) -> List[Path]:
+        with self._lock:
+            return list(self._run_dirs)
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -94,9 +109,11 @@ class RunManager:
             self._dirs_before = {d.name for d in self.artifacts_dir.iterdir()
                                  if d.is_dir()}
             # A resumed run reuses its existing directory, which the new-dir
-            # discovery below would never report as fresh -- so it is set
-            # directly, and discovery has nothing left to do.
-            self._run_dir = self.artifacts_dir / resume if resume else None
+            # sweep would never report as fresh -- so it is seeded directly.
+            # A repeat *after* a resume still gets fresh directories, and the
+            # sweep goes on finding those.
+            self._run_dirs = [self.artifacts_dir / resume] if resume else []
+            self._repeat = str(repeat or "1")
             self._returncode = None
             self._output = []
             self._goal = goal
@@ -111,6 +128,7 @@ class RunManager:
                 errors="replace",
             )
             threading.Thread(target=self._watch, daemon=True).start()
+            threading.Thread(target=self._follow_dirs, daemon=True).start()
             return {"pid": self._proc.pid, "argv": argv}
 
     def stop(self, timeout_s: float = 10.0) -> bool:
@@ -127,7 +145,7 @@ class RunManager:
         return True
 
     def _watch(self) -> None:
-        """Reap the child, drain its output, and locate its run directory."""
+        """Reap the child and drain its output."""
         proc = self._proc
         assert proc is not None
         assert proc.stdout is not None
@@ -136,32 +154,50 @@ class RunManager:
                 self._output.append(line.rstrip("\n"))
                 self._output = self._output[-200:]
         self._returncode = proc.wait()
-        # The run directory may appear a beat after the last stdout line on a
-        # short run; give discovery one last sweep before declaring failure.
-        self._discover_run_dir(deadline=time.monotonic() + 2.0)
 
-    def _discover_run_dir(self, deadline: float) -> None:
+    def _follow_dirs(self) -> None:
+        """Notice each iteration's directory for as long as the child lives.
+
+        Discovery cannot stop at the first one it finds. Under `--repeat` the
+        agent moves to a new directory per iteration, and a watcher that
+        latched onto the first would leave the live view tailing files that
+        had stopped growing while the phone was still being driven.
+        """
+        proc = self._proc
+        while proc is not None and proc.poll() is None:
+            self._sweep()
+            time.sleep(0.25)
+        # The last directory may appear a beat after the child's final line on
+        # a short run, so keep sweeping briefly past the exit.
+        deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
-            with self._lock:
-                if self._run_dir is not None:
-                    return
-            try:
-                current = {d.name: d for d in self.artifacts_dir.iterdir() if d.is_dir()}
-            except OSError:
-                current = {}
-            fresh = [d for name, d in current.items() if name not in self._dirs_before]
-            if fresh:
-                newest = max(fresh, key=lambda d: d.stat().st_mtime)
-                with self._lock:
-                    self._run_dir = newest
-                return
+            self._sweep()
             time.sleep(0.25)
 
-    def wait_for_run_dir(self, timeout_s: float = 60.0) -> Optional[Path]:
-        """The new run's artifact directory, once the agent has created it."""
-        self._discover_run_dir(deadline=time.monotonic() + timeout_s)
+    def _sweep(self) -> None:
+        """Fold whatever directories have appeared since the last look into
+        the iteration list, oldest first."""
+        try:
+            found = sorted(
+                ((d.stat().st_mtime, d) for d in self.artifacts_dir.iterdir()
+                 if d.is_dir()),
+                key=lambda pair: pair[0])
+        except OSError:
+            return
         with self._lock:
-            return self._run_dir
+            known = {d.name for d in self._run_dirs} | self._dirs_before
+            self._run_dirs.extend(d for _, d in found if d.name not in known)
+
+    def wait_for_run_dir(self, timeout_s: float = 60.0) -> Optional[Path]:
+        """The current iteration's artifact directory, once it exists."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            self._sweep()
+            with self._lock:
+                if self._run_dirs:
+                    return self._run_dirs[-1]
+            time.sleep(0.25)
+        return self.run_dir()
 
 
 class JobManager:
