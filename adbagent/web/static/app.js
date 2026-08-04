@@ -890,6 +890,40 @@ $("btn-skill-save").addEventListener("click", async () => {
   }
 });
 
+/* A job's output arrives as the last 50 lines, re-sent whole on every poll -- a
+   window that slides as the generator talks. Rewriting the box from it would
+   slide the text out from under a reader who scrolled up, so keep the log
+   append-only instead: stitch each window onto what is already shown, and their
+   lines stay where they were. */
+function growLog(pre, tail) {
+  if (!tail || !tail.length) return;
+  const shown = pre._lines || (pre._lines = []);
+
+  /* The longest suffix of the log that the new window repeats is where the two
+     agree; everything after it is what the generator has said since. */
+  let overlap = 0;
+  for (let n = Math.min(shown.length, tail.length); n > 0; n--) {
+    let same = true;
+    for (let i = 0; i < n && same; i++) same = shown[shown.length - n + i] === tail[i];
+    if (same) { overlap = n; break; }
+  }
+  const fresh = tail.slice(overlap);
+  if (!fresh.length) return;
+  // No overlap with a non-empty log means the window slid past what we have:
+  // more than 50 lines in one poll. Say so rather than splicing them together.
+  if (!overlap && shown.length) fresh.unshift("… earlier lines went by unseen …");
+
+  const first = shown.length === 0;
+  shown.push(...fresh);
+  pre.appendChild(document.createTextNode((first ? "" : "\n") + fresh.join("\n")));
+}
+
+function clearLog(pre) {
+  pre.style.display = "block";
+  pre.textContent = "";
+  pre._lines = null;
+}
+
 $("btn-gen").addEventListener("click", async () => {
   let jobId;
   try {
@@ -902,14 +936,12 @@ $("btn-gen").addEventListener("click", async () => {
     notice(err.message);
     return;
   }
-  $("gen-log").style.display = "block";
-  $("gen-log").textContent = "";
+  clearLog($("gen-log"));
   $("gen-status").textContent = "exploring…";
   const poll = setInterval(async () => {
     try {
       const job = await api("/api/jobs/" + jobId);
-      followTail($("gen-log"),
-                 () => { $("gen-log").textContent = job.output_tail.join("\n"); });
+      followTail($("gen-log"), () => growLog($("gen-log"), job.output_tail));
       if (!job.running) {
         clearInterval(poll);
         $("gen-status").textContent =
