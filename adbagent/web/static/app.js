@@ -413,12 +413,16 @@ function paintCounters() {
   $("c-calls").textContent = live.calls;
   $("c-cost").textContent = "$" + live.cost.toFixed(4);
   $("c-skill").textContent = live.skill || "—";
+  // Only worth the space once there is more than one: a single run has no
+  // iteration to speak of.
+  $("c-iter-wrap").style.display = live.iteration > 1 ? "" : "none";
+  $("c-iter").textContent = live.iteration;
 }
 
 /* ------------------------------------------------------------ run tab */
 
 const live = { step: 0, calls: 0, cost: 0, skill: "", source: null,
-               startedAt: 0, timer: null };
+               startedAt: 0, timer: null, iteration: 1 };
 
 function setRunningUI(running) {
   $("btn-start").disabled = running;
@@ -441,9 +445,28 @@ function openStream() {
 
   source.addEventListener("run", (e) => {
     const data = JSON.parse(e.data);
+    const feed = $("feed");
+    // Sent again for every `--repeat` iteration, each of which is a separate
+    // run in its own directory. Rule off rather than letting the next one's
+    // step 1 land under the last one's step 40.
+    if (feed._runId && feed._runId !== data.run_id) {
+      finalizeLlm(feed, null);        // an iteration can end mid-call
+      const rule = document.createElement("div");
+      rule.className = "banner";
+      rule.innerHTML = `<b>iteration ${esc(data.iteration || "?")}</b>` +
+        `<br><span class="small">${esc(data.run_id)}</span>`;
+      followPageTail(feed, () => feed.appendChild(rule));
+      // Steps are per iteration; calls and spend are the session's, because
+      // that is what --budget-usd bounds.
+      live.step = 0;
+      feed._llm = null;
+      feed._skill = "";
+    }
+    live.iteration = data.iteration || 1;
     $("c-runid").textContent = data.run_id;
-    $("feed")._runId = data.run_id;   // sent before any llm frame, so the
-  });                                 // screenshots have a run to come from
+    feed._runId = data.run_id;        // sent before any llm frame, so the
+    paintCounters();                  // screenshots have a run to come from
+  });
   source.addEventListener("event", (e) => {
     const ev = JSON.parse(e.data);
     const feed = $("feed");
@@ -499,6 +522,7 @@ function runOptions() {
 
 function beginLive() {
   live.step = 0; live.calls = 0; live.cost = 0; live.skill = "";
+  live.iteration = 1;
   live.startedAt = Date.now() / 1000;
   $("feed").innerHTML = "";
   armPageTail();  // a new run is followed however the last one was left

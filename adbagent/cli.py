@@ -162,13 +162,14 @@ def build_config(args: argparse.Namespace):
 # ---------------------------------------------------------------------------
 
 #: Every job a run gives a model, the config field it comes from, and the depths
-#: that job asks for. The decider is the only one with two, because it is the only
-#: one whose difficulty varies from turn to turn.
+#: that job asks for. Deciding is the only job with two, because it is the only one
+#: whose difficulty varies from turn to turn -- and the skill model decides for the
+#: whole of `skills generate`, so it asks for both as well.
 _REASONING_JOBS = (
     ("deciding", "model", (("decide", False), ("decide", True))),
     ("judging", "small", (("judge", True),)),
     ("vision", "image", (("analyze_image", False),)),
-    ("skills", "skill", (("decide", False),)),
+    ("skills", "skill", (("decide", False), ("decide", True))),
 )
 
 
@@ -1527,6 +1528,11 @@ def cmd_skills(args) -> int:
         app_target = (getattr(args, "target", "") or getattr(args, "app", "") or "").strip()
         user_tasks = (getattr(args, "tasks", "") or "").strip()
 
+        # The whole command is skill work, so `llm.model_skill` drives it: the
+        # tour as well as the write-up. Done before the check below because an
+        # empty `llm.model` is no obstacle when `llm.model_skill` is set.
+        blinded = skillmod.use_skill_model(cfg)
+
         if not cfg.llm.model:
             out.bad("no model chosen. Run `adbagent models` and pass --model.")
             return 1
@@ -1551,8 +1557,13 @@ def cmd_skills(args) -> int:
         out.say(out.bold(f"  Exploring {app_target or 'the app your tasks name'} live on the phone"))
         out.say(out.dim(f"  tasks:     {user_tasks or skillmod.DEFAULT_EXPLORE_TASKS}"))
         out.say(out.dim(f"  budget:    up to {cfg.run.max_steps} steps, ${cfg.safety.budget_usd:.2f}"))
-        out.say(out.dim(f"  synthesis: {cfg.llm.skill()} "
-                        f"(screenshots: {cfg.llm.skill_image()})"))
+        out.say(out.dim(f"  model:     {cfg.llm.skill()} explores and writes the skill"))
+        out.say(out.dim(f"  screens:   {cfg.llm.image()} while exploring, "
+                        f"{cfg.llm.skill_image()} while writing"))
+        if blinded:
+            out.say(out.dim("             (vision_in_decider off for this run: a skill "
+                            "model that cannot see would fail every step it was "
+                            "handed a screenshot)"))
         out.say()
 
         llm = LLMClient(cfg, run_id=f"skill-{int(time.time())}")

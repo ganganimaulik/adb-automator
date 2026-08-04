@@ -532,6 +532,88 @@ def test_generate_skill_job(web, monkeypatch):
 # RunManager unit behaviour
 # ---------------------------------------------------------------------------
 
+def test_repeat_reaches_the_cli(web, tmp_path, monkeypatch):
+    spawned = []
+
+    def fake_popen(argv, **kwargs):
+        proc = FakeProc(argv, stay_running=True, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", fake_popen)
+    assert web.post("/api/runs", json={"goal": "compare prices",
+                                       "repeat": "inf",
+                                       "budget_usd": 5.0}).status_code == 200
+    argv = spawned[0].argv
+    assert argv[argv.index("--repeat") + 1] == "inf"
+    # The ceiling is what makes an unbounded repeat safe to start from a
+    # browser, so it must survive the trip.
+    assert argv[argv.index("--budget-usd") + 1] == "5.0"
+    assert web.get("/api/status").json()["run"]["repeat"] == "inf"
+    web.post("/api/runs/stop")
+
+
+class RepeatProc(FakeProc):
+    """A child that writes two iteration directories and then exits, the way
+    `--repeat 2` does: one subprocess, two runs, two directories."""
+
+    def __init__(self, argv, runs: Path, **kwargs):
+        super().__init__(argv, stay_running=True, **kwargs)
+        make_run_dir(runs, run_id="iter1")
+        threading.Thread(target=self._rest, args=(runs,), daemon=True).start()
+
+    def _rest(self, runs: Path) -> None:
+        time.sleep(0.5)
+        make_run_dir(runs, run_id="iter2", events=[
+            {"t": 2000.0, "kind": "run_start", "goal": "second sitting",
+             "model": "m"},
+            {"t": 2003.0, "kind": "run_end", "outcome": "success", "steps": 1,
+             "llm_calls": 1, "usd": 0.002},
+        ])
+        time.sleep(0.5)
+        self._done.set()
+
+
+def test_run_manager_follows_every_iteration(tmp_path, monkeypatch):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: RepeatProc(argv, runs, **kw))
+    mgr = RunManager(runs)
+    mgr.start("goal", repeat="2")
+    assert mgr.wait_for_run_dir(timeout_s=5) == runs / "iter1"
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and len(mgr.run_dirs()) < 2:
+        time.sleep(0.05)
+    # Discovery does not stop at the first: the phone was still being driven.
+    assert [d.name for d in mgr.run_dirs()] == ["iter1", "iter2"]
+    assert mgr.run_dir() == runs / "iter2"
+    assert mgr.state()["run_id"] == "iter2"
+    assert mgr.state()["iteration"] == 2
+
+
+def test_stream_follows_a_repeat_into_its_next_iteration(web, tmp_path,
+                                                         monkeypatch):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: RepeatProc(argv, runs, **kw))
+    assert web.post("/api/runs", json={"goal": "compare prices",
+                                       "repeat": "2"}).status_code == 200
+
+    body = web.get("/api/runs/stream").text
+    # Both sittings arrive on the one connection, each announced by its own
+    # `run` frame -- without which the feed would go silent after iter1.
+    assert '"run_id": "iter1"' in body
+    assert '"run_id": "iter2"' in body
+    assert body.index('"run_id": "iter1"') < body.index('"run_id": "iter2"')
+    assert '"iteration": 2' in body
+    assert "turn on wifi" in body        # iter1's events
+    assert "second sitting" in body      # iter2's, after the move
+    assert "event: end" in body
+
+
 def test_run_manager_discovers_run_dir(tmp_path):
     def on_spawn(_argv):
         make_run_dir(tmp_path, run_id="newrun")

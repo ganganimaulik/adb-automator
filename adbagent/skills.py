@@ -522,6 +522,36 @@ class ExplorationBlocked(RuntimeError):
     """The phone cannot be explored, and retrying will not change that."""
 
 
+def use_skill_model(cfg: Any) -> bool:
+    """Point the exploring agent at `llm.model_skill`, in place.
+
+    A skill run is skill work from its first step, not just at the end: the tour
+    is where the workflows, the quirks and the dead ends are actually found, and
+    the synthesis call can only write down what the tour thought to look at. So
+    `llm.model_skill` decides the exploration too -- which is what its own
+    docstring promises and what `doctor` reports for the "skills" job, and what
+    nothing before this actually did: every step of `skills generate` went to
+    `llm.model`, and the dedicated model only ever saw the write-up.
+
+    Set on the config rather than on the client so everything downstream agrees
+    with what is being called -- the run log's preamble, the reasoning-style
+    guess (which is made per model family), and the `model_small` / `model_image`
+    fallbacks for a config that names neither.
+
+    Returns True when `llm.vision_in_decider` had to be turned off: a model that
+    writes a good skill is not always one that can see, and a text-only model
+    handed an image part fails the whole call rather than the picture -- the trap
+    `llm.model_skill_image` exists for. The screenshot goes the long way round,
+    through `llm.model_image`, instead.
+    """
+    explorer = cfg.llm.skill()
+    blinded = bool(cfg.llm.vision_in_decider) and explorer != cfg.llm.model
+    cfg.llm.model = explorer
+    if blinded:
+        cfg.llm.vision_in_decider = False
+    return blinded
+
+
 def is_app_package(package: str) -> bool:
     return bool(package) and package not in _NOT_AN_APP and "launcher" not in package.lower()
 
@@ -1179,8 +1209,25 @@ class SkillGenerator:
             text_model = (llm_client.cfg.llm.skill() or llm_client.cfg.llm.image()
                           or llm_client.model)
             image_model = llm_client.cfg.llm.skill_image() or text_model
+            # The client qualifies the models it was built with; these two are
+            # read off the config here, so they are qualified here. Without it
+            # `model_skill: "kimi-k3"` -- the short form every other model
+            # setting accepts -- 404s, both attempts fail, and the run's whole
+            # trace is quietly replaced by the template skill below.
+            provider = getattr(llm_client, "provider", None)
+            if provider is not None:
+                from .llm import qualify
+                text_model = qualify(provider, text_model)
+                image_model = qualify(provider, image_model)
         else:
             text_model = image_model = getattr(llm_client, "model", "")
+
+        # Which model wrote the skill is not otherwise recoverable: synthesis is
+        # one unrecorded call after the run's last event, so a skill that came
+        # back thin has nothing on disk saying who to blame.
+        log.info("writing the skill with %s%s", text_model or "(no model)",
+                 f", {len(screenshots)} screenshot(s) to {image_model}"
+                 if screenshots else "")
 
         # Attempts, best first. The pictures go to `model_skill_image` -- the
         # model that writes a skill well is not always one that can see, and a
