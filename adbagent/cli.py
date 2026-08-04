@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import __version__, scratchpad
+from . import __version__, runlog, scratchpad
 
 try:
     from rich.console import Console
@@ -97,6 +97,13 @@ def setup_logging(verbosity: int) -> None:
     level = logging.WARNING if verbosity <= 0 else (
         logging.INFO if verbosity == 1 else logging.DEBUG)
     logging.basicConfig(level=level, format=LOG_FORMAT, datefmt="%H:%M:%S")
+    # The verbosity belongs on the console *handler*, not on the logger: a run
+    # writes every debug record to `runs/<id>/run.log` regardless of what the
+    # terminal was asked to show, and a logger left at WARNING drops those
+    # records before any handler -- including that one -- can see them. See
+    # `runlog.attach`, which lowers the logger and puts it back.
+    for handler in logging.getLogger().handlers:
+        handler.setLevel(level)
     # These are chatty at DEBUG and drown out our own logs.
     for noisy in ("urllib3", "httpx", "httpcore", "openai", "adbutils", "PIL"):
         logging.getLogger(noisy).setLevel(max(level, logging.WARNING))
@@ -956,8 +963,17 @@ def cmd_run(args) -> int:
             out.say(f"  {colour(outcome.upper())}  "
                     f"{state.step} steps, {state.llm_calls} LLM calls, "
                     f"{tilde}${spent:.4f}, {elapsed:.1f}s")
+            run_path = runlog.run_dir(cfg, state.run_id)
+            # Said on every run, not just a failing one: the run you want the
+            # trace of is rarely the one you thought to note the id of.
+            out.say(out.dim(f"  trace: {run_path} "
+                            f"(events.jsonl, {runlog.LOG_NAME}, step prompts)"))
             if cfg.skills.enabled and cfg.skills.learn_after_run:
-                _learn(out, trace.finish(outcome, state), llm, cfg, args.goal)
+                # Inside the run's own log: this spends a call and rewrites the
+                # file the next run obeys, on this run's behalf, and it happens
+                # after the loop has closed its log.
+                with runlog.capture(run_path):
+                    _learn(out, trace.finish(outcome, state), llm, cfg, args.goal)
             if outcome != "success":
                 exit_code = 1
             if outcome in ("aborted", "needs_user"):
@@ -1098,6 +1114,33 @@ def _cost_summary(out: Out, events: List[Dict[str, Any]]) -> None:
         out.say(out.dim(f"  {line}"))
 
 
+#: Warnings shown inline by `report` before it stops listing them. Enough to see
+#: what kind of trouble a run had; the file has the rest, in context.
+_MAX_PROBLEMS = 8
+
+
+def _log_summary(out: Out, run_dir: Path) -> None:
+    """Point at the run log, and say up front whether anything went wrong in it.
+
+    A trace nobody can find is a trace nobody reads, and the warnings that
+    explain a bad run -- the settle timeout, the retargeted swipe, the dropped
+    request field -- are a few dozen lines among many thousands.
+    """
+    path = runlog.log_path(run_dir)
+    if not path.is_file():
+        return
+    out.say()
+    size = path.stat().st_size
+    shown = f"{size / 1024:.0f} KB" if size >= 1024 else f"{size} B"
+    found = runlog.problems(path)
+    out.say(f"  {out.bold('── Run log ──')}  {path} ({shown}, "
+            f"{len(found)} warning(s) or worse)")
+    for line in found[:_MAX_PROBLEMS]:
+        out.say(out.dim(f"  {line}"))
+    if len(found) > _MAX_PROBLEMS:
+        out.say(out.dim(f"  ... {len(found) - _MAX_PROBLEMS} more in the file"))
+
+
 def cmd_report(args) -> int:
     out = Out()
     path = resolve_run(getattr(args, "run", None),
@@ -1155,6 +1198,7 @@ def cmd_report(args) -> int:
         out.say()
         out.say(f"  {last_notes}")
     _cost_summary(out, events)
+    _log_summary(out, events_file.parent)
     out.say()
     if end:
         out.say(f"  {end.get('outcome', '?').upper()}: {end.get('steps')} steps, "
@@ -1460,11 +1504,18 @@ def cmd_skills(args) -> int:
                      "one screen. Give --tasks something concrete to do in the app.")
         out.say()
 
-        skill = SkillGenerator(registry).generate_from_exploration(
-            app_target or exp.package, exp.tasks, exp.screens, exp.actions, llm,
-            screenshots=exp.screenshots, package=exp.package,
-            notes=exp.notes, outcome=exp.outcome,
-            history=skillmod.run_history(cfg, exp.package))
+        # Synthesis belongs in the tour's own log: it is one more call spent on
+        # that run, and when the skill comes back thin the reason is in the
+        # exploration above it rather than anywhere else.
+        trace_dir = runlog.run_dir(cfg, exp.run_id) if exp.run_id else None
+        with runlog.capture(trace_dir):
+            skill = SkillGenerator(registry).generate_from_exploration(
+                app_target or exp.package, exp.tasks, exp.screens, exp.actions, llm,
+                screenshots=exp.screenshots, package=exp.package,
+                notes=exp.notes, outcome=exp.outcome,
+                history=skillmod.run_history(cfg, exp.package))
+        if trace_dir:
+            out.say(out.dim(f"  trace: {trace_dir}"))
         out.ok(f"saved skill '{skill.name}' to {registry.path_for(skill)}")
         out.say()
         out.say(skill.to_markdown())

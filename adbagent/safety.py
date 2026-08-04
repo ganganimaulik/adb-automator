@@ -101,14 +101,26 @@ def irreversible(action: AgentAction, screen: Screen) -> Optional[str]:
 # Interstitials
 # ---------------------------------------------------------------------------
 
-#: Buttons that only ever dismiss noise -- rating nags, feature tours, "what's
-#: new" cards. Deliberately excludes "Allow", "Accept" and "Agree": granting a
-#: permission or accepting terms is a decision, not noise, so it goes to the
-#: model (and to the user, if it is irreversible) rather than being auto-tapped.
+#: Buttons that only ever *decline* or *acknowledge* noise -- rating nags,
+#: feature tours, "what's new" cards. Tapping one can turn an offer down; it
+#: cannot advance a flow or throw work away.
+#:
+#: Deliberately excludes "Allow", "Accept" and "Agree": granting a permission or
+#: accepting terms is a decision, not noise, so it goes to the model (and to the
+#: user, if it is irreversible) rather than being auto-tapped.
+#:
+#: "Continue", "Next" and "Close" used to be here and are decisions by that same
+#: test. They are the primary control of an onboarding wizard, a checkout step or
+#: a permission rationale, so an app that opens on one had its CTA pressed on
+#: every turn until the step budget ran out, without the model being consulted
+#: once. "Close" was worse than wasted steps: a compose screen whose X is
+#: described as "Close" offers exactly one dismiss-shaped candidate, so the
+#: single-candidate rule below fired and discarded the draft -- and `irreversible`
+#: never saw it, because that only grades actions the *model* chose. The model
+#: can press any of the three itself when it wants them.
 DISMISS_LABELS = re.compile(
-    r"^\s*(?:no thanks|not now|maybe later|later|skip|skip for now|dismiss|"
-    r"got it|ok, got it|close|no, thanks|remind me later|don't show again|"
-    r"continue|next)\s*$",
+    r"^\s*(?:no thanks|no, thanks|not now|maybe later|later|remind me later|"
+    r"don't show again|skip|skip for now|dismiss|got it|ok, got it)\s*$",
     re.I,
 )
 

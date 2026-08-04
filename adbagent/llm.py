@@ -1103,9 +1103,15 @@ class LLMClient:
         from . import prompts
 
         if screenshot and not image_analysis:
+            # `.render()`, as `decide` does. Without it the prompt carried the
+            # model's repr -- `reading='428 g' item_label='' ...` -- and, because
+            # a pydantic model is always truthy, an analysis with nothing in it
+            # still injected four empty fields into the block that decides
+            # whether the run succeeded. `render()` returns "" for that case.
             image_analysis = self.analyze_image(
-                screenshot, goal=goal, rendered=rendered, step=step, recorder=recorder, on_event=on_event
-            )
+                screenshot, goal=goal, rendered=rendered, step=step,
+                recorder=recorder, on_event=on_event
+            ).render()
 
         content: List[Dict[str, Any]] = [
             text_part(prompts.judge_user(goal, history, rendered, scratchpad,

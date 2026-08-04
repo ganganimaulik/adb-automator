@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import json
 import logging
+import platform
+import sys
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import prompts, safety
+from . import __version__, prompts, runlog, safety
 from .actions import (ActionError, AgentAction, append_history, execute,
                       format_history_entry, synthesise_postcondition, verify)
 from .config import Config
@@ -39,6 +41,12 @@ from .skills import SkillRegistry
 log = logging.getLogger("adbagent.agent")
 
 Outcome = str  # "success" | "failed" | "aborted" | "needs_user"
+
+#: How many times the harness will tap one dismiss control on one screen before
+#: accepting that it does not dismiss anything. Two rather than one, because the
+#: turn after a dismissal re-observes without settling, so a dialog still
+#: animating out reads as an unchanged screen.
+MAX_DISMISS_TRIES = 2
 
 
 @dataclass
@@ -112,6 +120,12 @@ class RunState:
     item_moved: Optional[bool] = None
     #: Key of the item on screen this turn, once resolved.
     item_key: str = ""
+    #: ``exact_id/label`` of the control the harness last auto-dismissed, and how
+    #: many times it has tried it on that screen. A dismissal that changes
+    #: nothing means the control is part of the screen rather than a popup over
+    #: it, and repeating it is how a whole step budget goes on one button.
+    last_dismiss: str = ""
+    dismiss_tries: int = 0
 
     @property
     def elapsed(self) -> float:
@@ -128,17 +142,24 @@ class RunState:
 
 
 class Recorder:
-    """Per-run artifacts: one JSONL of events, blobs alongside."""
+    """Per-run artifacts: one JSONL of events, the run log, blobs alongside."""
 
     def __init__(self, cfg: Config, run_id: str):
-        self.dir = Path(cfg.run.artifacts_dir).expanduser() / run_id
+        self.dir = runlog.run_dir(cfg, run_id)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.events = (self.dir / "events.jsonl").open("a", encoding="utf-8")
+        # Opened here rather than by the caller, so that every entry point which
+        # runs an agent -- `run`, `skills generate`, an embedding program -- gets
+        # a debuggable log without having to remember to ask for one.
+        self.log = runlog.attach(self.dir)
 
     def event(self, kind: str, **fields: Any) -> None:
         record = {"t": round(time.time(), 3), "kind": kind, **fields}
         self.events.write(json.dumps(record, default=str) + "\n")
         self.events.flush()
+        # And into the run log, so that one file reads in order: the decision
+        # next to the adb traffic, the retries and the warnings around it.
+        runlog.event(kind, fields)
 
     def blob(self, name: str, data: bytes) -> str:
         path = self.dir / name
@@ -173,6 +194,8 @@ class Recorder:
             self.events.close()
         except Exception:  # noqa: BLE001
             pass
+        if self.log is not None:
+            self.log.close()
 
 
 # ---------------------------------------------------------------------------
@@ -301,8 +324,9 @@ class Agent:
         swipe advanced the item.
 
         Every path that acts on the device between the two points -- dismissing
-        an interstitial, breaking a loop with `back` -- clears `screen` to None
-        and re-observes, so a screen carrying a screenshot is always current.
+        an interstitial, breaking a loop with `back`, recovering from a device
+        error after the action already went out -- clears `screen` to None and
+        re-observes, so a screen carrying a screenshot is always current.
         """
         if screen.screenshot is None:
             screen.screenshot = self.dev.screenshot()
@@ -317,6 +341,7 @@ class Agent:
         run_id = run_id or uuid.uuid4().hex[:12]
         state = RunState(goal=goal, run_id=run_id, intent_id=intent_key(goal))
         recorder = Recorder(self.cfg, run_id)
+        self._log_header(goal, recorder)
         self.mem.begin_run(run_id, goal, state.intent_id)
         recorder.event("run_start", goal=goal, model=getattr(self.llm, "model", ""))
 
@@ -324,10 +349,15 @@ class Agent:
             self._loop(state, recorder)
         except (BudgetExceeded, LLMError) as exc:
             log.error("%s", exc)
+            # The message on the console, the stack in the run log: which of the
+            # dozen `_ask` paths raised is the whole question a day later, and
+            # printing a traceback for an expected abort is noise on the day.
+            log.debug("aborting on %s", type(exc).__name__, exc_info=True)
             state.finished = "aborted"
             recorder.event("error", error=str(exc))
         except (DeviceLost, DeviceTimeout) as exc:
             log.error("device: %s", exc)
+            log.debug("aborting on %s", type(exc).__name__, exc_info=True)
             state.finished = "aborted"
             recorder.event("error", error=str(exc))
         except Aborted as exc:
@@ -336,6 +366,15 @@ class Agent:
         except KeyboardInterrupt:
             log.warning("interrupted")
             state.finished = "aborted"
+        except Exception as exc:  # noqa: BLE001 -- re-raised immediately
+            # Not handling it, only recording it. `finally` closes the run log
+            # below, so a crash that reached the top of the loop has this one
+            # chance to leave the traceback where the run's own files are; the
+            # console gets Python's copy on the way out.
+            log.debug("unhandled %s", type(exc).__name__, exc_info=True)
+            recorder.event("error", error=str(exc),
+                           traceback=traceback.format_exc())
+            raise
         finally:
             outcome = state.finished or "failed"
             usd = self.llm.ledger.total_usd if self.llm else 0.0
@@ -357,6 +396,49 @@ class Agent:
         return state.finished or "failed", state
 
     # -- internals ---------------------------------------------------------
+
+    def _log_header(self, goal: str, rec: Recorder) -> None:
+        """Write who, what and with which settings at the top of the run log.
+
+        All of it is knowable the moment a run starts and none of it is
+        recoverable a week later. "Was this the run with `never_screenshot` set?"
+        decides whether the rest of the file is surprising or expected, and a
+        shell history that has since scrolled away cannot answer it.
+        """
+        cfg = self.cfg
+        runlog.preamble(
+            run=rec.dir.name,
+            goal=goal,
+            artifacts=str(rec.dir),
+            # `events.jsonl` timestamps are epoch seconds and these lines are
+            # wall clock, so one run needs one number that converts between them.
+            epoch=f"{time.time():.3f}",
+            adbagent=f"{__version__} (python {sys.version.split()[0]} on "
+                     f"{platform.platform()})",
+            device=getattr(self.dev, "serial", "") or "(only attached device)",
+            model=cfg.llm.model,
+            model_image=cfg.llm.image(),
+            model_small=cfg.llm.small(),
+            model_skill=cfg.llm.skill(),
+            reasoning=f"effort={cfg.llm.reasoning_effort or '(model default)'} "
+                      f"hard={cfg.llm.reasoning_effort_hard} "
+                      f"style={cfg.llm.reasoning_style} "
+                      f"vision_in_decider={cfg.llm.vision_in_decider}",
+            limits=f"max_steps={cfg.run.max_steps} "
+                   f"max_wall_clock_s={cfg.run.max_wall_clock_s:g} "
+                   f"budget_usd={cfg.safety.budget_usd:g}",
+            vision=f"always={cfg.run.always_screenshot} "
+                   f"never={cfg.run.never_screenshot}",
+            pager=f"sweep={cfg.run.pager_sweep} max={cfg.run.pager_sweep_max}",
+            flags=f"dry_run={cfg.run.dry_run} "
+                  f"unattended={cfg.safety.unattended} "
+                  f"allow_destructive={cfg.safety.allow_destructive} "
+                  f"learn_after_run={cfg.skills.learn_after_run}",
+            # An assertion ends the run without a judge call, so a reader wonders
+            # why the last step has no verdict unless the file says one was set.
+            oracle=(f"shell={self.oracle.shell!r} equals={self.oracle.equals!r} "
+                    f"text={self.oracle.text!r}" if self.oracle.defined else ""),
+        )
 
     def _loop(self, state: RunState, rec: Recorder) -> None:
         cfg = self.cfg
@@ -404,12 +486,36 @@ class Agent:
 
             interstitial = safety.find_interstitial(screen, screen.package)
             if interstitial is not None:
-                log.info("step %d: dismissing %r", state.step,
-                         interstitial.best_text)
-                rec.event("dismiss", label=interstitial.best_text)
-                self.dev.tap(*interstitial.center)
-                screen = None
-                continue
+                label = interstitial.best_text
+                # Keyed on `exact_id` rather than `skeleton_id`: the skeleton is
+                # content-free, so a second, *different* nag card hashes the same
+                # as the one just dismissed and would be refused.
+                sig = f"{screen.exact_id}/{label}"
+                if sig != state.last_dismiss:
+                    state.last_dismiss, state.dismiss_tries = sig, 0
+                state.dismiss_tries += 1
+                if state.dismiss_tries <= MAX_DISMISS_TRIES:
+                    log.info("step %d: dismissing %r", state.step, label)
+                    rec.event("dismiss", label=label, attempt=state.dismiss_tries)
+                    # In the history too, not just the artifact: the model is
+                    # about to be handed a screen transition it did not cause,
+                    # and nothing else would tell it why.
+                    state.remember(f"{state.step}. the harness dismissed {label!r}")
+                    self.dev.tap(*interstitial.center)
+                    screen = None
+                    continue
+                if state.dismiss_tries == MAX_DISMISS_TRIES + 1:
+                    # Said once, on the way in. Repeating it every turn would
+                    # overwrite whatever the model's own last action had to say.
+                    log.warning("step %d: %r dismisses nothing; handing the "
+                                "screen to the model", state.step, label)
+                    rec.event("dismiss_failed", label=label,
+                              tries=MAX_DISMISS_TRIES)
+                    state.last_failure = (
+                        f"the harness tapped {label!r} to dismiss it and the "
+                        f"screen did not change, so it is part of this screen "
+                        f"rather than a popup over it. Decide what to do with "
+                        f"it yourself.")
 
             # ---- 2b. where are we in a gallery? -------------------------
             # Resolved before anything else needs it: the screenshot policy, the
@@ -768,6 +874,12 @@ class Agent:
                 if not self._recover_device(state, exc):
                     state.finished = "aborted"
                     return
+                # The gesture went out before the device went quiet, and
+                # `recover` may have restarted the uiautomator server on top of
+                # that, so the frame in hand is at least one action out of date.
+                # Dropping it is what sends the next turn back through
+                # `observe` -- deciding from it taps coordinates that moved.
+                screen = None
                 continue
             self.on_event("act_end", step=state.step, action=action, elapsed=time.monotonic() - t0_act)
 
@@ -784,6 +896,7 @@ class Agent:
                 if not self._recover_device(state, exc):
                     state.finished = "aborted"
                     return
+                screen = None       # the action landed; re-read the phone
                 continue
             t_settle = time.monotonic() - t0_verify
             post = synthesise_postcondition(action, element)
@@ -814,6 +927,7 @@ class Agent:
                     if not self._recover_device(state, exc):
                         state.finished = "aborted"
                         return
+                    screen = None   # the retry landed; re-read the phone
                     continue
 
             # Whether the item advanced is what the next turn's ledger keys off.
@@ -1002,7 +1116,7 @@ class Agent:
             except (DeviceTimeout, DeviceLost) as exc:
                 if not self._recover_device(state, exc):
                     state.finished = "aborted"
-                return screen
+                return self._screen_after_recovery(state, screen)
 
             moved = verify(gesture, screen, after,
                            synthesise_postcondition(gesture, None),
@@ -1029,7 +1143,7 @@ class Agent:
                 except (DeviceTimeout, DeviceLost) as exc:
                     if not self._recover_device(state, exc):
                         state.finished = "aborted"
-                    return screen
+                    return self._screen_after_recovery(state, screen)
 
             # -- collect the reading, against the item it was taken of -----
             # Filed before `screen` moves on, because `note` reads the label and
@@ -1115,9 +1229,8 @@ class Agent:
             log.warning("the agent said done but the assertion disagrees")
             state.remember(
                 f"{state.step}. claimed done, but the success check failed")
-            state.last_failure = ("your 'done' was rejected: the success condition "
-                                 "is still not met")
-            return None
+            return self._reject_done(state, "the success condition is still "
+                                            "not met")
 
         if self.llm is None:
             return "success"
@@ -1152,7 +1265,27 @@ class Agent:
             return "success"
         log.warning("premature 'done': %s", verdict.evidence)
         state.remember(f"{state.step}. claimed done; rejected: {verdict.evidence}")
-        state.last_failure = f"your 'done' was rejected: {verdict.evidence}"
+        return self._reject_done(state, verdict.evidence)
+
+    def _reject_done(self, state: RunState, why: str) -> Optional[Outcome]:
+        """Send a `done` back to the model. Returns the run's outcome, or None.
+
+        A rejected completion is a failed step and has to be counted as one. It
+        was not: `consecutive_failures` stayed at zero through every rejection,
+        so `max_consecutive_failures` never fired and a model that answered
+        `done` on every turn ran to the step budget -- paying for a screenshot,
+        a vision pass and a high-effort judge call each time round.
+
+        Counted here rather than in `_loop` because `_maybe_give_up` writes
+        `state.finished`, which the terminal path is about to overwrite with
+        this function's return value.
+        """
+        state.consecutive_failures += 1
+        state.last_failure = f"your 'done' was rejected: {why}"
+        if state.consecutive_failures >= self.cfg.run.max_consecutive_failures:
+            log.error("giving up after %d rejected completion(s)",
+                      state.consecutive_failures)
+            return "failed"
         return None
 
     def _hand_over(self, state: RunState, reason: str) -> None:
@@ -1169,6 +1302,24 @@ class Agent:
             if self.dev.recover(tier):
                 return True
         return False
+
+    def _screen_after_recovery(self, state: RunState, fallback: Screen) -> Screen:
+        """What is on the phone once recovery has finished.
+
+        `_loop` answers this by dropping its screen and letting the next turn
+        re-observe. A sweep cannot: it has to hand a screen back. Returning the
+        one it is holding returns a frame from before a fling that already went
+        out, so it is re-read instead. `fallback` is only for when the run is
+        ending anyway and the value is about to be discarded.
+        """
+        if state.finished is not None:
+            return fallback
+        try:
+            return self.dev.observe()
+        except (DeviceTimeout, DeviceLost) as exc:
+            log.error("device still unusable after recovery: %s", exc)
+            state.finished = "aborted"
+            return fallback
 
     def _maybe_give_up(self, state: RunState) -> None:
         if state.consecutive_failures >= self.cfg.run.max_consecutive_failures:
