@@ -8,6 +8,7 @@ $ adbagent run "turn on airplane mode"
     1 tap #12 "Network & internet"
     2 tap #7 "Airplane mode"
   SUCCESS  2 steps, 3 LLM calls, $0.0091, 11.4s
+  trace: runs/8f21c0a4e1b9 (events.jsonl, run.log, step prompts)
 ```
 
 It reads the accessibility tree rather than pixels, and only pays for a
@@ -190,8 +191,10 @@ adbagent report                  # the most recent run
 adbagent report runs/<id>
 ```
 
-Every run writes `runs/<id>/events.jsonl` plus the exact messages sent at each
-step. `report` replays that as a readable trace and ends with where the time went:
+Every run writes a directory of its own: `events.jsonl` (what it decided, one
+structured line per step), `run.log` (what it did, in full detail) and the exact
+messages sent at each step. `report` replays the events as a readable trace and
+ends with where the time went:
 
 ```
   ── Cost of thinking ──
@@ -209,6 +212,37 @@ against 3.4s to act, settle and verify — so the reasoning line is the one wort
 attacking. Sweep reads are counted separately: at ~25 output tokens against a
 reasoning turn's ~4,400, pooling them would drag the median to 25 and hide the
 turns that actually cost something.
+
+### The run log
+
+There are two thresholds rather than one. `-v` sets what the terminal shows;
+`runs/<id>/run.log` always takes DEBUG. So the adb call that timed out, the
+screen that never settled, the swipe retargeted onto a pager, the LLM retry, the
+request field the provider rejected and the recovery tier a lost device needed
+are all on disk for the run you have already paid for. Re-running with `-vv` is
+not an option for a run that took twenty minutes, cost real money, or only
+misbehaves every third time.
+
+It opens with the run's id, goal, models, phone and every setting that changes
+how the loop behaves — `never_screenshot` decides whether the rest of the file is
+surprising or expected, and a shell history that has scrolled away cannot answer
+that. Then the decisions from `events.jsonl` are interleaved with the device
+traffic around them, so one file reads in order rather than two correlated by
+timestamp. A crash writes its traceback there before the file closes, which is
+the whole point: the run you cannot reproduce on request is the one that crashed.
+
+`report` ends with the path and everything in it at WARNING or worse, so "did
+anything go wrong in this run" needs no `grep`:
+
+```
+  ── Run log ──  runs/<id>/run.log (412 KB, 3 warning(s) or worse)
+  07:16:34 warning: adbagent.device: screen never settled within 2.0s
+  07:16:34 warning: adbagent.llm: LLM stream failed (timeout); retrying in 2.0s
+  07:16:34 error: adbagent.device: recovery tier 2 failed: device offline
+```
+
+Only the agent's own logging is captured. `httpx` and `openai` at DEBUG print
+request bodies, which on a vision turn means a base64 screenshot per line.
 
 ## Replay
 
@@ -288,12 +322,38 @@ will not come to the foreground. `--max-steps` bounds the tour (40 by default,
 rather than the `run.max_steps` you set for collection runs) and `--budget-usd`
 bounds the spend.
 
-Skills are plain JSON or Markdown; edit them by hand. Running `generate` again
-merges into the existing skill rather than replacing it — and a nuance whose
-distinctive words all appear in a longer one is dropped as a restatement, so a
-skill regenerated twenty times does not carry twenty phrasings of one quirk into
-every prompt. Containment, not similarity: two entries that merely overlap, each
-holding a detail the other lacks, are both kept.
+Skills are plain JSON or Markdown; edit them by hand.
+
+### An existing skill is merged into, never overwritten
+
+`generate` and the after-run learning both hand the current skill to the model as
+the baseline and then merge the result over it, field by field. Nothing you wrote
+is dropped because a later run did not happen to mention it:
+
+| field | on conflict |
+|---|---|
+| packages, aliases | union, order preserved |
+| nuances, recommendations | union, minus restatements |
+| workflows | matched by name; the version that **says more** wins |
+| description | the longer one |
+| custom\_prompt | appended if not already there |
+
+A restatement is an entry whose distinctive words all appear in a longer entry —
+it adds nothing that entry does not already say, so a skill regenerated twenty
+times does not carry twenty phrasings of one quirk into every prompt. Containment
+rather than similarity, because containment loses nothing by construction: two
+entries that merely overlap, each holding a detail the other lacks, are both kept.
+Entries too short to identify are never collapsed at all, since a two-word overlap
+is coincidence, not repetition.
+
+The whole thing is additive, so a correction that *shortens* something has to be
+made by hand — that is the deliberate trade for never regressing the file the next
+run obeys. Re-merging a skill into itself is a fixed point.
+
+Two files naming the same skill (a hand-written `whatsapp.md` alongside a generated
+`whatsapp.json`) are merged as well, with a warning, so consolidating them stays
+your choice. `generate` only ever writes JSON, and before this the first run that
+learned anything silently shadowed the Markdown.
 
 ### Learning from every run
 

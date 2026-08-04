@@ -13,6 +13,7 @@ import pytest
 from adbagent.actions import AgentAction
 from adbagent.agent import Agent, Oracle, RunState, needs_screenshot
 from adbagent.config import Config
+from adbagent.device import DeviceTimeout
 from adbagent.memory import Memory
 
 from . import fake
@@ -721,3 +722,184 @@ def test_the_chosen_depth_is_recorded_for_every_decision(cfg, mem, tmp_path):
         if event["kind"] == "decide":
             assert event["effort"] in ("none", "high")
             assert "hard_because" in event
+
+
+# ---------------------------------------------------------------------------
+# Device recovery
+# ---------------------------------------------------------------------------
+#
+# The perceive-path handler sets `screen = None`, so the next turn re-observes.
+# The three handlers that fire *after* the action has gone out did not, and a
+# recovered device was then driven from the frame that predated the action --
+# tapping element centres that had already moved.
+
+class _FlakyDevice(fake.FakeDevice):
+    """Raises `DeviceTimeout` once, from whichever observe the test names."""
+
+    def __init__(self, *a, fail_settled: bool = True, **kw):
+        super().__init__(*a, **kw)
+        self.fail_settled = fail_settled
+        self.blew_up = False
+
+    def observe(self, settle: bool = False):
+        if settle == self.fail_settled and not self.blew_up:
+            self.blew_up = True
+            raise DeviceTimeout("dump_hierarchy exceeded 60s")
+        return super().observe(settle=settle)
+
+
+def _rendered_per_turn(dev, mem, cfg, policy):
+    """(device state, rendered activity) for every decide call of a run."""
+    seen = []
+
+    class _Spy(fake.FakeLLM):
+        def decide(self, *, rendered, **kw):
+            seen.append((self.dev.state, rendered.splitlines()[0]))
+            return super().decide(rendered=rendered, **kw)
+
+    llm = _Spy(dev, policy)
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    return outcome, seen
+
+
+def test_a_recovered_device_is_re_observed_before_the_next_decision(cfg, mem):
+    dev = _FlakyDevice(cfg)          # the post-action settle blows up
+    outcome, seen = _rendered_per_turn(
+        dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+
+    assert dev.blew_up               # the recovery path really was taken
+    assert outcome == "success"
+    for state_name, header in seen:
+        # The phone moved to `wifi`; the model must not still be shown `home`.
+        assert f".{state_name.title()}Activity" in header, seen
+
+
+def test_recovery_during_the_act_call_also_re_observes(cfg, mem):
+    """`execute` can raise after the gesture reached the phone."""
+    dev = fake.FakeDevice(cfg)
+    real_tap = dev.tap
+    fired = {"n": 0}
+
+    def tap(x, y):
+        real_tap(x, y)               # the tap lands...
+        fired["n"] += 1
+        if fired["n"] == 1:
+            raise DeviceTimeout("click exceeded 60s")   # ...then the call dies
+
+    dev.tap = tap
+    outcome, seen = _rendered_per_turn(
+        dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+
+    assert fired["n"] >= 1
+    for state_name, header in seen:
+        assert f".{state_name.title()}Activity" in header, seen
+
+
+# ---------------------------------------------------------------------------
+# Rejected completions
+# ---------------------------------------------------------------------------
+
+def test_repeated_rejected_dones_give_up_instead_of_burning_the_budget(cfg, mem):
+    """Each rejection costs a screenshot, a vision pass and a high-effort judge
+    call. They were not counted as failures, so `max_consecutive_failures` never
+    fired and the run went all the way to the step budget."""
+    cfg.run.max_consecutive_failures = 3
+    dev = fake.FakeDevice(cfg)
+
+    def policy(screen, llm):
+        return AgentAction(observation="home", reasoning="claiming early",
+                           action="done", text="I think it's done")
+
+    llm = fake.FakeLLM(dev, policy, judge_result=False)
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert outcome == "failed"
+    assert state.step == cfg.run.max_consecutive_failures < cfg.run.max_steps
+    assert llm.judges == cfg.run.max_consecutive_failures
+
+
+def test_progress_between_rejections_resets_the_give_up_counter(cfg, mem):
+    """A run that keeps working after a premature `done` is not a stuck one."""
+    cfg.run.max_consecutive_failures = 2
+    dev = fake.FakeDevice(cfg)
+    calls = {"n": 0}
+
+    def policy(screen, llm):
+        calls["n"] += 1
+        if calls["n"] in (1, 3):     # premature, real work, premature, ...
+            return AgentAction(observation="home", reasoning="too early",
+                               action="done", text="premature")
+        for el in screen.elements:
+            if el.best_text == "Wi-Fi" and el.interactive:
+                return AgentAction(observation="home", reasoning="go",
+                                   action="tap", target={"index": el.index})
+        return AgentAction(observation="?", reasoning="back",
+                           action="press_key", key="back")
+
+    llm = fake.FakeLLM(dev, policy, judge_result=False)
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert state.step > cfg.run.max_consecutive_failures
+
+
+# ---------------------------------------------------------------------------
+# Dismissing interstitials
+# ---------------------------------------------------------------------------
+
+def _nag_screen(label: str, package: str = X.PKG) -> str:
+    """A settings screen with one dismiss-shaped control over it."""
+    return X.settings_screen(extra_roots=[
+        X.N("android.widget.FrameLayout", (60, 800, 1020, 1400),
+            package=package, rid="nag", children=[
+                X.N("android.widget.Button", (620, 1240, 980, 1380),
+                    package=package, text=label, rid="dismiss", clickable=True)])])
+
+
+def test_a_dismiss_that_never_works_hands_the_screen_to_the_model(cfg, mem):
+    """A "Skip" that is disabled, or sits on a WebView where the tap lands
+    nowhere, used to be pressed until the step budget ran out with the model
+    never consulted once."""
+    dev = fake.FakeDevice(cfg)
+    dev.app["home"] = fake.FakeScreen(xml=_nag_screen("Skip"), taps={})
+    dev._xml = lambda: dev.app[dev.state].xml  # type: ignore[assignment]
+
+    def policy(screen, llm):
+        return AgentAction(observation="the nag is part of this screen",
+                           reasoning="nothing else to do", action="done",
+                           text="fin")
+
+    llm = fake.FakeLLM(dev, policy)
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    from adbagent.agent import MAX_DISMISS_TRIES
+    assert len(dev.taps) == MAX_DISMISS_TRIES
+    assert llm.calls >= 1                       # the model did get a turn
+    assert state.step < cfg.run.max_steps
+    assert any("harness dismissed 'Skip'" in line for line in state.history)
+
+
+def test_a_dismissal_that_works_is_not_held_against_the_next_one(cfg, mem):
+    """Two nags in a row are two dismissals, not one dismissal and a refusal.
+
+    The memo is keyed on `exact_id` for this: `skeleton_id` is content-free, so
+    a second card with different text hashes the same as the first.
+    """
+    dev = fake.FakeDevice(cfg)
+    nags = ["Not now", "Got it"]
+    dev.app["home"] = fake.FakeScreen(xml=_nag_screen(nags[0]), taps={})
+
+    def tap(x, y):
+        dev.taps.append((x, y))
+        if nags:
+            nags.pop(0)
+            dev.app["home"] = fake.FakeScreen(
+                xml=_nag_screen(nags[0]) if nags else X.settings_screen(), taps={})
+
+    dev._xml = lambda: dev.app["home"].xml    # type: ignore[assignment]
+    dev.tap = tap                             # type: ignore[assignment]
+
+    llm = fake.FakeLLM(dev, lambda s, l: AgentAction(
+        observation="clear", reasoning="done", action="done", text="fin"))
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert len(dev.taps) == 2, "both nags should have been dismissed"

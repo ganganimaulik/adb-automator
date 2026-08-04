@@ -472,6 +472,52 @@ def test_judge_passes_done_text_to_prompt(monkeypatch):
     assert "AGENT DONE SUMMARY / OUTPUT:\nYour chat advice summary" in user_msg
 
 
+def _judge_prompt_with_analysis(monkeypatch, analysis) -> str:
+    """The judge's user message when the vision pass returns `analysis`."""
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    client = LLMClient(Config())
+
+    captured = []
+
+    def mock_post(messages, *, model, schema, max_tokens, purpose, **kw):
+        captured.extend(messages)
+        return '{"satisfied": true, "evidence": "ok"}', None
+
+    monkeypatch.setattr(client, "_post", mock_post)
+    monkeypatch.setattr(client, "analyze_image", lambda *a, **kw: analysis)
+    client.judge(goal="weigh the chicken", rendered="Photo viewer",
+                 history=[], screenshot=b"jpeg")
+    return captured[1]["content"][0]["text"]
+
+
+def test_judge_is_shown_the_rendered_analysis_not_the_object(monkeypatch):
+    """`decide` renders it; `judge` used to interpolate the model itself, so the
+    prompt that grades the run carried `reading='428 g' item_label=''` instead of
+    the named lines."""
+    from adbagent.llm import ScreenAnalysis
+
+    prompt = _judge_prompt_with_analysis(
+        monkeypatch, ScreenAnalysis(reading="428 g", item_label="9:33 am"))
+
+    assert "Reading: 428 g" in prompt
+    assert "Item label: 9:33 am" in prompt
+    assert "reading=" not in prompt          # no pydantic repr
+    assert "blocking_dialog" not in prompt   # nor its empty fields
+
+
+def test_an_empty_analysis_adds_no_section_to_the_judge_prompt(monkeypatch):
+    """A pydantic model is always truthy, so an analysis that found nothing used
+    to inject four empty fields under a heading saying the image was analysed."""
+    from adbagent.llm import ScreenAnalysis
+
+    prompt = _judge_prompt_with_analysis(monkeypatch, ScreenAnalysis())
+
+    assert "VISUAL SCREEN ANALYSIS" not in prompt
+
+
 
 
 

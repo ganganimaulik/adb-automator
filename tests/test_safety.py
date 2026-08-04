@@ -131,6 +131,53 @@ def test_permission_dialogs_are_left_to_the_model():
     assert safety.find_interstitial(screen, "com.android.settings") is None
 
 
+def _lone_button(text: str, package: str = X.PKG):
+    """A screen whose only dismiss-shaped candidate reads `text`."""
+    return with_extra(X.N("android.widget.FrameLayout", (60, 800, 1020, 1400),
+                          package=package, rid="overlay", children=[
+                              X.N("android.widget.Button", (620, 1240, 980, 1380),
+                                  package=package, text=text, rid="cta",
+                                  clickable=True)]))
+
+
+@pytest.mark.parametrize("label", ["Continue", "Next", "Close"])
+def test_a_flow_control_is_left_to_the_model(label):
+    """These advance or exit a flow rather than declining an offer.
+
+    An app opening on an onboarding screen had its CTA pressed on every turn
+    until the step budget ran out, with the model never consulted.
+    """
+    assert safety.find_interstitial(_lone_button(label), X.PKG) is None
+
+
+def test_a_compose_screens_close_button_is_not_auto_tapped():
+    """The sharpest case: one X described as "Close" next to a "Send" is a
+    single dismiss-shaped candidate, so the old rule fired and discarded the
+    draft -- and `irreversible` never saw it, since that grades only the actions
+    the model chose."""
+    screen = with_extra(X.N("android.widget.FrameLayout", (0, 600, X.W, 900),
+                            rid="compose", children=[
+                                X.N("android.widget.ImageButton", (24, 620, 144, 740),
+                                    desc="Close", rid="close", clickable=True),
+                                X.N("android.widget.Button", (860, 620, 1040, 740),
+                                    text="Send", rid="send", clickable=True)]))
+    assert safety.find_interstitial(screen, X.PKG) is None
+
+
+@pytest.mark.parametrize("label", ["Not now", "No thanks", "Skip", "Got it",
+                                   "Maybe later", "Don't show again"])
+def test_declines_and_acknowledgements_are_still_dismissed(label):
+    found = safety.find_interstitial(_lone_button(label), X.PKG)
+    assert found is not None and found.best_text == label
+
+
+def test_a_flow_control_from_another_package_is_left_alone_too():
+    """The cross-package branch skips the foreground app's own controls, so a
+    Play billing sheet's "Continue" was reachable there as well."""
+    screen = _lone_button("Continue", package="com.android.vending")
+    assert safety.find_interstitial(screen, X.PKG) is None
+
+
 def test_nothing_to_dismiss_on_a_normal_screen():
     assert safety.find_interstitial(BASE, "com.android.settings") is None
 
