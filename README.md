@@ -203,8 +203,10 @@ adbagent report runs/<id>
 ```
 
 Every run writes a directory of its own: `events.jsonl` (what it decided, one
-structured line per step), `run.log` (what it did, in full detail) and the exact
-messages sent at each step. `report` replays the events as a readable trace and
+structured line per step), `run.log` (what it did, in full detail),
+`stream.jsonl` (the raw LLM stream — every `llm_start`/chunk/`llm_end`, which
+the web UI tails to show the model thinking live) and the exact messages sent
+at each step. `report` replays the events as a readable trace and
 ends with where the time went:
 
 ```
@@ -300,7 +302,11 @@ adbagent ui --port 9000
 
 Five tabs. **Run** takes a goal and streams the run live — every decision,
 verification, vision read and the running cost — over the same `events.jsonl`
-the CLI writes, so what you see is exactly what `report` would replay. **History**
+the CLI writes, so what you see is exactly what `report` would replay. While a
+call is in flight its raw stream is shown too: the model's thinking and
+response arrive live in a panel per call (from `stream.jsonl`, below), which
+folds itself away the moment the call ends and leaves the decision card as the
+record. **History**
 lists recorded runs with their outcome, cost and duration, and opens the full
 trace, stats and scratchpad for any of them — and a failed or interrupted one
 has a **resume** button, continuing it from its checkpoint exactly like

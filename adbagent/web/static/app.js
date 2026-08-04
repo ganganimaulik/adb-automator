@@ -163,6 +163,85 @@ function updateCountersFromEvent(ev) {
   paintCounters();
 }
 
+/* --------------------------------------------------------- llm stream */
+
+/* One collapsible panel per LLM call: it opens when the call starts, the
+   model's raw thinking and response stream into it live, and it folds itself
+   away the moment the call ends -- the decide/verify cards carry the result.
+   Panels are keyed off order, not step: calls within a step are sequential
+   (a vision read, then the decision), so at most one is ever open per feed,
+   tracked as feed._llm. */
+
+const LLM_PURPOSES = { decide: "decide", judge: "judge",
+  analyze_image: "vision read", read_item: "item read" };
+
+function fmtTok(n) {
+  n = n || 0;
+  return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, "") + "k" : String(n);
+}
+
+function llmSummary(start, end) {
+  let s = `LLM ${LLM_PURPOSES[start.purpose] || start.purpose || "decide"}`;
+  if (start.step) s += ` · step ${esc(start.step)}`;
+  if (start.model) s += ` · ${esc(String(start.model).split("/").pop())}`;
+  if (start.screenshot) s += " · +img";
+  if (end) {
+    if (end.elapsed) s += ` · ${end.elapsed.toFixed(1)}s`;
+    if (end.completion_tokens) {
+      s += ` · ${fmtTok(end.prompt_tokens)}→${fmtTok(end.completion_tokens)} tok`;
+      if (end.reasoning_tokens) s += ` (${fmtTok(end.reasoning_tokens)} thinking)`;
+    }
+  } else if (end === null) {
+    s += " · interrupted";
+  }
+  return s;
+}
+
+function finalizeLlm(feed, end) {
+  const p = feed._llm;
+  if (!p) return;
+  feed._llm = null;
+  p.details.open = false;  // auto-hide: the stream is over, the verdict follows
+  p.summary.textContent = llmSummary(p.start, end);
+}
+
+function handleLlmEvent(ev, feed) {
+  if (ev.kind === "llm_start") {
+    finalizeLlm(feed, null);  // a panel the last stream never closed
+    const card = document.createElement("div");
+    card.className = "card llm-live";
+    card.innerHTML =
+      `<details open><summary><span class="pulse"></span> ${llmSummary(ev)}</summary>` +
+      `<div class="llm-sec thinking"><div class="llm-sec-label">thinking</div>` +
+      `<div class="llm-text"></div></div>` +
+      `<div class="llm-sec response"><div class="llm-sec-label">response</div>` +
+      `<div class="llm-text"></div></div></details>`;
+    feed.appendChild(card);
+    feed._llm = {
+      start: ev,
+      details: card.querySelector("details"),
+      summary: card.querySelector("summary"),
+      thinking: "", response: "",
+      thinkingSec: card.querySelector(".llm-sec.thinking"),
+      thinkingText: card.querySelector(".llm-sec.thinking .llm-text"),
+      responseSec: card.querySelector(".llm-sec.response"),
+      responseText: card.querySelector(".llm-sec.response .llm-text"),
+    };
+  } else if (ev.kind === "llm_stream" && feed._llm) {
+    const p = feed._llm;
+    const thinking = ev.stream_type === "thinking";
+    const key = thinking ? "thinking" : "response";
+    p[key] += ev.text || "";
+    const sec = thinking ? p.thinkingSec : p.responseSec;
+    const text = thinking ? p.thinkingText : p.responseText;
+    if (sec.style.display !== "block") sec.style.display = "block";
+    text.textContent = p[key];
+    text.scrollTop = text.scrollHeight;
+  } else if (ev.kind === "llm_end") {
+    finalizeLlm(feed, ev);
+  }
+}
+
 function paintCounters() {
   $("c-step").textContent = live.step;
   $("c-calls").textContent = live.calls;
@@ -202,6 +281,11 @@ function openStream() {
     $("feed").lastElementChild.scrollIntoView({ block: "nearest" });
     updateCountersFromEvent(ev);
   });
+  source.addEventListener("llm", (e) => {
+    const feed = $("feed");
+    handleLlmEvent(JSON.parse(e.data), feed);
+    feed.lastElementChild.scrollIntoView({ block: "nearest" });
+  });
   source.addEventListener("state", (e) => {
     const st = JSON.parse(e.data);
     if (st.started_at) live.startedAt = st.started_at;
@@ -214,6 +298,7 @@ function openStream() {
     source.close();
     live.source = null;
     setRunningUI(false);
+    finalizeLlm($("feed"), null);  // a run can end mid-call
     loadedTabs.delete("history");  // a new run may have appeared
   });
   source.onerror = () => {
@@ -245,6 +330,7 @@ function runOptions() {
 function beginLive() {
   live.step = 0; live.calls = 0; live.cost = 0; live.startedAt = Date.now() / 1000;
   $("feed").innerHTML = "";
+  $("feed")._llm = null;
   $("c-runid").textContent = "starting…";
   paintCounters();
   setRunningUI(true);
@@ -355,6 +441,7 @@ async function openRunDetail(id) {
   $("detail-title").textContent = id;
   const feed = $("detail-feed");
   feed.innerHTML = "";
+  feed._llm = null;
   try {
     const d = await api("/api/runs/" + encodeURIComponent(id));
     const s = d.summary, st = d.stats;
@@ -378,7 +465,15 @@ async function openRunDetail(id) {
     } else {
       $("detail-scratch").style.display = "none";
     }
-    for (const ev of d.events) feed.appendChild(renderEvent(ev));
+    for (const ev of d.events) {
+      // Stream records render as the same live panels, long since collapsed.
+      if (typeof ev.kind === "string" && ev.kind.startsWith("llm_")) {
+        handleLlmEvent(ev, feed);
+      } else {
+        feed.appendChild(renderEvent(ev));
+      }
+    }
+    finalizeLlm(feed, null);  // a run that died mid-call has no llm_end
   } catch (err) {
     notice(err.message);
     return;
