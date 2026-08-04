@@ -36,7 +36,7 @@ from .pager import (ItemLedger, attach_item, browsing_note, can_sweep, loop_id,
 from .safety import Aborted, LoopDetector
 from .scratchpad import NoteLedger
 from .screen import Screen, render
-from .skills import SkillRegistry
+from .skills import Skill, SkillRegistry, goal_app_candidates
 
 log = logging.getLogger("adbagent.agent")
 
@@ -335,11 +335,27 @@ class Agent:
             screen.dhash = compute_dhash(screen.screenshot)
         return screen.screenshot
 
+    def _skill_for_run(self, package: str, goal: str) -> Optional[Skill]:
+        """The app skill for this step, picked by what the task needs.
+
+        Which apps the goal names is settled once per run -- one
+        `pm list packages` -- rather than per step: the answer cannot change
+        while the run is on, and a per-step lookup would pay an adb round trip
+        for it every turn.
+        """
+        if not self.skills.skills:
+            return None
+        if self._goal_apps is None:
+            self._goal_apps = goal_app_candidates(self.dev, goal)
+        return self.skills.find_for_run(package, goal,
+                                        goal_names_app=bool(self._goal_apps))
+
     # -- public ------------------------------------------------------------
 
     def run(self, goal: str, run_id: str = "") -> Tuple[Outcome, RunState]:
         run_id = run_id or uuid.uuid4().hex[:12]
         state = RunState(goal=goal, run_id=run_id, intent_id=intent_key(goal))
+        self._goal_apps: Optional[List[str]] = None
         recorder = Recorder(self.cfg, run_id)
         self._log_header(goal, recorder)
         self.mem.begin_run(run_id, goal, state.intent_id)
@@ -671,13 +687,20 @@ class Agent:
             # Check for active app skill guidance
             skill_note = ""
             if cfg.skills.enabled:
-                active_skill = self.skills.find_for_run(screen.package, state.goal)
+                active_skill = self._skill_for_run(screen.package, state.goal)
                 if active_skill:
                     skill_note = active_skill.to_prompt_text()
-                    rec.event("active_skill", name=active_skill.name, package=screen.package)
+                    # The skill's own package, not the screen's: a goal-named
+                    # skill loads before the run reaches its app, and reporting
+                    # the foreground here reads as "this skill is about the app
+                    # on screen" -- the misattribution history.packages_in
+                    # warns about.
+                    skill_pkg = (active_skill.packages[0] if active_skill.packages
+                                 else screen.package)
+                    rec.event("active_skill", name=active_skill.name, package=skill_pkg)
                     if getattr(self, "_active_skill_name", None) != active_skill.name:
                         self._active_skill_name = active_skill.name
-                        self.on_event("skill_loaded", name=active_skill.name, package=screen.package)
+                        self.on_event("skill_loaded", name=active_skill.name, package=skill_pkg)
 
             elem_hint = state.loops.element_history_hint(
                 screen.skeleton_id,

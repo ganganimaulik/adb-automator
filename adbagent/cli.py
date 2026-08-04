@@ -877,8 +877,11 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
     return report
 
 
-def _learn(out: Out, trace, llm, cfg, goal: str) -> None:
-    """Fold what the finished run learned into that app's skill.
+def _learn(out: Out, traces, llm, cfg, goal: str) -> None:
+    """Fold what the finished run learned into each app's skill it worked in.
+
+    `traces` is one trace per app the run toured -- a price check across two
+    apps teaches both, not just the one more steps happened to land in.
 
     Reported rather than done quietly: it spends a call and rewrites a file the
     next run will obey, and a silent rewrite of the agent's own instructions is
@@ -889,18 +892,29 @@ def _learn(out: Out, trace, llm, cfg, goal: str) -> None:
 
     try:
         registry = SkillRegistry(cfg.skills.skills_dir)
-        skill = learn_from_run(trace, llm, registry, goal=goal, cfg=cfg)
     except Exception as exc:  # noqa: BLE001
         out.warn(f"could not update the app skill: {exc}")
         return
-    if skill is None:
+    learned = []
+    for trace in traces:
+        try:
+            skill = learn_from_run(trace, llm, registry, goal=goal, cfg=cfg)
+        except Exception as exc:  # noqa: BLE001
+            out.warn(f"could not update the {trace.package or 'app'} skill: {exc}")
+            continue
+        if skill is not None:
+            learned.append(skill)
+    if not learned:
+        main = traces[0] if traces else None
         out.say(out.dim(f"  learned nothing new about "
-                        f"{trace.package or 'this run'} ({trace.steps} steps, "
-                        f"{len(trace.screens)} screens)"))
+                        f"{(main.package if main else '') or 'this run'} "
+                        f"({main.steps if main else 0} steps, "
+                        f"{len(main.screens) if main else 0} screens)"))
         return
-    out.say(out.cyan(f"  skill '{skill.name}' updated from this run "
-                     f"({len(skill.workflows)} workflows, {len(skill.nuances)} nuances) "
-                     f"-> {registry.path_for(skill)}"))
+    for skill in learned:
+        out.say(out.cyan(f"  skill '{skill.name}' updated from this run "
+                         f"({len(skill.workflows)} workflows, {len(skill.nuances)} nuances) "
+                         f"-> {registry.path_for(skill)}"))
 
 
 def cmd_run(args) -> int:
@@ -974,7 +988,8 @@ def cmd_run(args) -> int:
                 # file the next run obeys, on this run's behalf, and it happens
                 # after the loop has closed its log.
                 with runlog.capture(run_path):
-                    _learn(out, trace.finish(outcome, state), llm, cfg, args.goal)
+                    trace.finish(outcome, state)
+                    _learn(out, trace.app_traces(), llm, cfg, args.goal)
             if outcome != "success":
                 exit_code = 1
             if outcome in ("aborted", "needs_user"):
