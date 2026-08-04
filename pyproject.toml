@@ -19,6 +19,8 @@ dependencies = [
     "qrcode>=7.0",
     "zeroconf>=0.130.0",
     "rich>=13.0.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
 ]
 
 [project.optional-dependencies]
