@@ -731,7 +731,7 @@ def test_a_supplied_analysis_is_never_recomputed(monkeypatch):
 def test_the_vision_pass_spends_the_configured_budget(monkeypatch):
     """A private ceiling here truncated long screen descriptions, and the repair
     paid for the same screenshot a second time at double the budget."""
-    client = _client(monkeypatch, max_tokens=9000)
+    client = _client(monkeypatch, max_tokens=9000, max_tokens_image=9000)
     captured = {}
 
     def post(messages, *, model, schema, max_tokens, purpose, **kw):
@@ -746,8 +746,39 @@ def test_the_vision_pass_spends_the_configured_budget(monkeypatch):
     assert captured["max_tokens"] == 9000               # config, not a literal
 
 
+def test_image_max_tokens_falls_back_to_max_tokens():
+    from adbagent.config import LLMConfig
+    cfg = LLMConfig()
+    cfg.max_tokens = 5000
+    cfg.max_tokens_image = 0
+    assert cfg.image_max_tokens() == 5000
+
+
+def test_image_max_tokens_used_when_set():
+    from adbagent.config import LLMConfig
+    cfg = LLMConfig()
+    cfg.max_tokens = 5000
+    cfg.max_tokens_image = 1500
+    assert cfg.image_max_tokens() == 1500
+
+
+def test_analyze_image_uses_image_max_tokens(monkeypatch):
+    """max_tokens_image, when set, overrides max_tokens for the vision pass."""
+    client = _client(monkeypatch, max_tokens=9000, max_tokens_image=2000)
+    captured = {}
+
+    def post(messages, *, model, schema, max_tokens, purpose, **kw):
+        captured.update(max_tokens=max_tokens, purpose=purpose)
+        return '{"reading":"428 g","item_label":"","blocking_dialog":"","notable":""}', Call(model=model)
+
+    monkeypatch.setattr(client, "_post", post)
+    client.analyze_image(b"jpeg", goal="read the weight")
+
+    assert captured["max_tokens"] == 2000               # image-specific, not 9000
+
+
 def test_reading_one_item_asks_for_a_fact_not_a_screen_description(monkeypatch):
-    client = _client(monkeypatch, max_tokens=2222)
+    client = _client(monkeypatch, max_tokens=2222, max_tokens_image=2222)
     captured = {}
 
     def post(messages, *, model, schema, max_tokens, purpose, **kw):
@@ -767,6 +798,21 @@ def test_reading_one_item_asks_for_a_fact_not_a_screen_description(monkeypatch):
     assert "read the weight" in captured["messages"][1]["content"][0]["text"]
     assert "Today, 9:52 am" in captured["messages"][1]["content"][0]["text"]
     assert len(_image_parts(captured["messages"])) == 1
+
+
+def test_read_item_uses_image_max_tokens(monkeypatch):
+    """max_tokens_image, when set, overrides max_tokens for read_item too."""
+    client = _client(monkeypatch, max_tokens=2222, max_tokens_image=800)
+    captured = {}
+
+    def post(messages, *, model, schema, max_tokens, purpose, **kw):
+        captured.update(max_tokens=max_tokens, purpose=purpose)
+        return "  chicken breast on scale, 428 g\n", Call(model=model)
+
+    monkeypatch.setattr(client, "_post", post)
+    client.read_item(b"jpeg", goal="read the weight", label="Today, 9:52 am")
+
+    assert captured["max_tokens"] == 800                # image-specific, not 2222
 
 
 # ---------------------------------------------------------------------------

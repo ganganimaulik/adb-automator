@@ -431,6 +431,22 @@ def test_max_tokens_cli_and_env_precedence(monkeypatch, tmp_path):
     assert cfg.llm.max_tokens == 4000
 
 
+def test_max_tokens_image_cli_and_env_precedence(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ADBAGENT_MAX_TOKENS_IMAGE", "1500")
+    assert build_config(parse(["run", "g"])).llm.max_tokens_image == 1500
+
+    cfg = build_config(parse(["run", "g", "--max-tokens-image", "3000"]))
+    assert cfg.llm.max_tokens_image == 3000
+
+
+def test_max_tokens_image_defaults_to_4096(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    cfg = build_config(parse(["run", "g"]))
+    assert cfg.llm.max_tokens_image == 4096
+    assert cfg.llm.image_max_tokens() == 4096
+
+
 def test_live_reporter_terminal_output(capsys):
     from adbagent.cli import Out, _live_reporter
     from adbagent.actions import AgentAction, Target
