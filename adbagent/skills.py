@@ -747,7 +747,7 @@ How to cover the app:
     a detail screen as well as the lists.
   - Do NOT send, post, buy, pay, delete, log out, or change a setting. When a
     control would do any of those, record what it is and leave it alone.
-  - Do NOT swipe, like, pass, match, react to or vote on a card, profile or post.
+  - Do NOT swipe, like, pass, match, react to or vote on a card, profile or post (unless mentioned in goal).
     In some apps that gesture is not navigation -- it is a message delivered to a
     real person, and it cannot be taken back. Read such a screen, record how it
     works, and leave with `press_key back`.
@@ -1176,27 +1176,31 @@ class SkillGenerator:
         prompt = "\n\n".join(prompt_parts)
 
         if hasattr(llm_client, "cfg"):
-            model_to_use = llm_client.cfg.llm.skill() or llm_client.cfg.llm.image() or llm_client.model
+            text_model = (llm_client.cfg.llm.skill() or llm_client.cfg.llm.image()
+                          or llm_client.model)
+            image_model = llm_client.cfg.llm.skill_image() or text_model
         else:
-            model_to_use = getattr(llm_client, "model", "")
+            text_model = image_model = getattr(llm_client, "model", "")
 
-        # Attempts, best first. A text-only `model_skill` fails the *whole* call
-        # when it is handed an image part -- the same trap `llm.vision_in_decider`
-        # documents -- and losing a run's whole trace to that is far worse than
-        # losing the pictures, so the words get a second chance on their own.
-        attempts: List[Any] = [prompt]
+        # Attempts, best first. The pictures go to `model_skill_image` -- the
+        # model that writes a skill well is not always one that can see, and a
+        # text-only `model_skill` fails the *whole* call when it is handed an
+        # image part, the same trap `llm.vision_in_decider` documents. Losing a
+        # run's whole trace to that is far worse than losing the pictures, so
+        # the words get a second chance on their own, on `model_skill`.
+        attempts: List[Tuple[Any, str]] = [(prompt, text_model)]
         if screenshots:
             from .llm import image_part, text_part
             with_images: List[Dict[str, Any]] = [text_part(prompt)]
             for shot in screenshots:
                 if shot:
                     with_images.append(image_part(shot))
-            attempts.insert(0, with_images)
+            attempts.insert(0, (with_images, image_model))
 
         generated_skill: Optional[Skill] = None
-        for content in attempts:
+        for content, model in attempts:
             try:
-                data = json.loads(self._ask(llm_client, content, model_to_use))
+                data = json.loads(self._ask(llm_client, content, model))
                 generated_skill = Skill.from_dict(data)
                 break
             except Exception as exc:  # noqa: BLE001

@@ -31,6 +31,11 @@ class LLMConfig:
     #: Dedicated model used for app skill generation and exploration.
     #: Falls back to `model` when empty.
     model_skill: str = ""
+    #: Multimodal model for the screenshot pass of skill synthesis. The model
+    #: that writes a skill well is not always one that can see; a text-only
+    #: `model_skill` handed an image part fails the whole call. Falls back to
+    #: `model_image`, then `model`, when empty.
+    model_skill_image: str = ""
     temperature: float = 0.0
     #: Output ceiling for every call the agent makes -- deciding, judging,
     #: describing a screenshot, reading one item. The single source: no call site
@@ -106,6 +111,9 @@ class LLMConfig:
 
     def skill(self) -> str:
         return self.model_skill or self.model
+
+    def skill_image(self) -> str:
+        return self.model_skill_image or self.model_image or self.model
 
 
 @dataclass
@@ -219,6 +227,7 @@ _ENV_MAP = {
     "ADBAGENT_MODEL_SMALL": "llm.model_small",
     "ADBAGENT_MODEL_IMAGE": "llm.model_image",
     "ADBAGENT_MODEL_SKILL": "llm.model_skill",
+    "ADBAGENT_MODEL_SKILL_IMAGE": "llm.model_skill_image",
     "ADBAGENT_PROVIDER": "llm.provider",
     "ADBAGENT_SERVICE_TIER": "llm.service_tier",
     "ADBAGENT_BASE_URL": "llm.base_url",
