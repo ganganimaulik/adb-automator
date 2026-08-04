@@ -1,0 +1,39 @@
+{
+  "name": "Blinkit",
+  "packages": [
+    "com.grofers.customerapp"
+  ],
+  "aliases": [
+    "blinkit",
+    "grofers",
+    "com.grofers.customerapp"
+  ],
+  "description": "Blinkit (formerly Grofers) is a quick-commerce app for groceries and household essentials with delivery in minutes. The home screen shows delivery ETA and location at top, a search bar, category tabs (All, Electronics, Beauty, etc.), offer banners, and bestseller categories. Core automation flow observed: search for a product from the home search bar and read prices, pack sizes, and MRPs off the product cards in the search results grid.",
+  "workflows": [
+    {
+      "name": "search_product_and_read_price",
+      "steps": "1. On the home screen, tap the search bar (placeholder rotates, e.g. Search \"healthy snacks\" or 'Search for atta, dal, coke and more'). 2. A search screen opens showing 'Recent searches' chips and 'Trending in your city'; type the product name into the field, or tap a matching recent-search chip if one exists. 3. Press enter to submit. 4. On the results screen, scan the product cards: each card shows a pack-size label (e.g. '1 ltr', '200 ml Pack of 6'), a bold selling price, a struck-through MRP, the product name, rating, and delivery ETA. 5. Match both the brand/product name AND the pack-size label before reading the bold price as the answer."
+    },
+    {
+      "name": "compare_price_across_apps",
+      "steps": "1. Run search_product_and_read_price in Blinkit and record the selling price for the exact pack size (e.g. 1 ltr). 2. Switch to the other app (e.g. Zepto), search the same product, and record the price for the identical pack size. 3. Compare only like-for-like pack sizes; note the struck-through MRP is the same baseline on both, the bold price is what differs."
+    }
+  ],
+  "nuances": [
+    "The home search bar is a single tappable element whose placeholder text rotates; tapping it opens a separate search screen rather than focusing a field in place.",
+    "The search screen shows 'Recent searches' chips with a 'clear' link; tapping a chip fills that term, and pressing enter submits the search.",
+    "Search results are a multi-column grid mixing sponsored cards (marked 'Ad') with organic results, so the first card is not necessarily the target product.",
+    "The same brand appears in several variants (e.g. 200 ml, 1 ltr, Pack of 6, Combo); always verify the size label printed under the product image before reading the price.",
+    "Each card shows two prices: a bold selling price and a struck-through MRP. The bold figure is the actual price.",
+    "A 'Get FREE delivery on your order above ₹99' promo banner with a page indicator ('1/2') overlays the bottom of home and results screens and can cover the lowest row of content; it has an X to dismiss it.",
+    "The bottom navigation includes a red 'zomato' shortcut that leaves Blinkit for another app; avoid tapping it when the task is inside Blinkit."
+  ],
+  "recommendations": [
+    "Use the search bar for specific product lookups instead of browsing category tabs.",
+    "For price-comparison tasks, capture the pack-size label along with the price so the comparison is like-for-like across apps.",
+    "If the target product is not visible in the first results viewport, scroll the grid before concluding it is unavailable.",
+    "Dismiss the free-delivery banner via its X if it covers product cards you need to read.",
+    "Prefer typing the full product name (brand + product, e.g. 'yu coconut water') to surface the exact variant near the top of results."
+  ],
+  "custom_prompt": ""
+}

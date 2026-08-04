@@ -38,6 +38,10 @@
     {
       "name": "count_unread_chats_readonly",
       "steps": "1. Launch with open_app using the full package name 'com.whatsapp' and confirm the foreground screen is com.whatsapp.home.ui.HomeActivity; if only the Android home screen shows, run open_app again. 2. On the Chats tab, read the green numeric badge on the 'Chats' bottom-navigation tab — it is the aggregate unread total. 3. Scan each visible chat row: rows with unread messages include 'N unread message' in their accessibility text and show a green circular badge at the row's right edge with a green timestamp. 4. Scroll the chat list down to reveal more rows and keep counting rows carrying 'unread message' text. 5. Do NOT tap any chat row — opening a chat clears its badge and spoils a read-only count."
+    },
+    {
+      "name": "verify_photos_against_reference_message",
+      "steps": "1. Open the target group chat. 2. Locate the reference message (e.g. a menu or spec) in the chat history; if it is truncated, tap 'Read more' to expand it and record its full content in `observation` before moving on. 3. Find the photo album bubble ('Photo album, N items') and tap its FIRST thumbnail to open the full-screen viewer. 4. For each photo: read the scale/reading shown, note the title bar timestamp as the photo's identity, record both in `observation`, then swipe left once on the full-screen image element. 5. Continue until a swipe left no longer changes the photo — that is the end of the album. 6. Compare each recorded reading against the reference message and report mismatches, unreadable readings, and photos where no item name is visible to match against. 7. Do NOT send any message unless the task explicitly asks for it."
     }
   ],
   "nuances": [
@@ -58,7 +62,12 @@
     "HOME SEARCH BAR: the Chats home top bar is a search field reading 'Ask Meta AI or Search' (with a 'Swipe down to reveal additional actions' hint element beneath it). Tap that field to search; there may be no separate magnifying-glass icon.",
     "UNREAD BADGES IN CHAT LIST: a chat with unread messages shows a green circle with the count at the row's right edge and a green timestamp, and the row's accessibility text includes 'N unread message' (e.g. '01/08/26 1 unread message Reserve Bank of India ..'). The 'Chats' tab in the bottom navigation (Chats / Updates / Communities / Calls) carries a green badge with the aggregate total.",
     "READ-ONLY RULE: opening a chat marks it read and clears its unread badge. For badge-counting tasks, never tap a chat row — count from the list and the Chats tab badge only.",
-    "ASK META AI FLOATER: a transient 'Ask Meta AI' bubble can float over the chat list and move or vanish between turns; it is not a chat row — ignore it. A green '+' FAB (new chat) also sits at the bottom right."
+    "ASK META AI FLOATER: a transient 'Ask Meta AI' bubble can float over the chat list and move or vanish between turns; it is not a chat row — ignore it. A green '+' FAB (new chat) also sits at the bottom right.",
+    "LONG MESSAGE TRUNCATION: long text messages (menus, lists, specs) are truncated in the chat bubble with a 'Read more' link at the end. Tap 'Read more' to expand the full text before recording or comparing its contents — the collapsed bubble hides later lines.",
+    "UNREAD DIVIDER: when a chat with unread messages is opened, a 'N unread messages' divider pill appears inline in the history above the first unread message; it is a marker, not a tappable control.",
+    "ALBUM BUBBLE IN CHAT: a multi-photo message appears in the chat as a bubble labeled 'Photo album, N items' with per-item 'View photo, k of N' entries and per-thumbnail timestamps. Tapping a thumbnail opens the full-screen viewer at that item.",
+    "SCALE/LCD READINGS IN PHOTOS: when verifying photos of digital displays (e.g. kitchen scales), the LCD can be faint or unreadable in the photo. Record it as 'unreadable — cannot verify' rather than guessing the digit, and flag it in the final report.",
+    "SCROLL-DOWN FLAKINESS: scroll 'down' fails verification intermittently in this app (3 failures vs 5 passes across recent runs). If a scroll down reports no change, retry it once or twice before concluding the list ended."
   ],
   "recommendations": [
     "To check every photo of an album, open the first one and swipe left through the whole album in one pass, recording each photo's content in `observation` as you go. Leaving the viewer and coming back restarts you at photo 1 or 2.",
@@ -71,7 +80,9 @@
     "Clear search input before searching for a new contact.",
     "Verify target chat header text matches intended contact before sending messages.",
     "For read-only unread counts, combine the green badge on the 'Chats' bottom-nav tab with per-row 'N unread message' text; scroll the list to cover all rows and never open a chat, since that clears its badge.",
-    "After open_app, confirm com.whatsapp is actually in the foreground before acting: the frame captured mid-launch is com.android.systemui, not the app, and a check made on it fails. Retry or wait rather than concluding the launch went to the wrong app."
+    "After open_app, confirm com.whatsapp is actually in the foreground before acting: the frame captured mid-launch is com.android.systemui, not the app, and a check made on it fails. Retry or wait rather than concluding the launch went to the wrong app.",
+    "For photo-verification tasks (e.g. checking scale readings against a menu), first expand and record the reference message with 'Read more', then swipe through the album in one pass logging each photo's timestamp and reading in `observation`; report unreadable displays and photos lacking an identifiable item as issues instead of guessing.",
+    "If a scroll down reports no change, retry the same scroll once or twice before treating the position as the end of the list — scroll-down verification is intermittently flaky in this app."
   ],
   "custom_prompt": ""
 }

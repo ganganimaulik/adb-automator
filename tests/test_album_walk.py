@@ -370,6 +370,35 @@ def test_the_sweep_records_every_item_it_read(cfg, mem):
     assert len(labels) == len(readings)
 
 
+def test_every_sweep_reading_keeps_the_frame_it_was_read_from(cfg, mem):
+    """A sweep is most of a run's vision calls and gets no live panel, so the
+    reading and the frame it came off are the whole record of one -- and "what
+    did it read off photo 7" is not answerable from the text alone."""
+    from pathlib import Path
+
+    _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
+    directory = Path(cfg.run.artifacts_dir) / state.run_id
+    readings = [e for e in _events(cfg, state.run_id)
+                if e["kind"] == "item_reading"]
+
+    assert readings
+    assert all(e["shot"] for e in readings), "a reading with no frame kept"
+    assert all((directory / e["shot"]).is_file() for e in readings)
+    # One per read item, named for the step that read it.
+    for event in readings:
+        assert event["shot"].startswith(f"step_{event['step']:03d}_read_item_")
+
+
+def test_no_frames_are_kept_when_there_is_nothing_to_read_with(cfg, mem):
+    """`never_screenshot` takes the sweep's reads away entirely; it must not
+    leave the run writing frames nobody was shown."""
+    from pathlib import Path
+
+    cfg.run.never_screenshot = True
+    _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
+    assert not list((Path(cfg.run.artifacts_dir) / state.run_id).glob("*.jpg"))
+
+
 def test_the_sweep_marks_the_end_of_the_album(cfg, mem):
     _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
     assert "left" in state.items.edges

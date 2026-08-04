@@ -20,7 +20,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from ..config import Config, _set_path, find_config_file, load_config
-from ..runlog import STREAM_NAME
+from ..runlog import SHOT_RE, STREAM_NAME
 from ..skills import Skill, SkillRegistry
 from . import runparse
 from .runner import JobManager, RunManager, sse
@@ -229,6 +229,25 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         if path is None:
             raise HTTPException(status_code=404, detail="run not found")
         return runparse.run_detail(path)
+
+    @app.get("/api/runs/{run_id}/shot/{name}")
+    def run_shot(run_id: str, name: str) -> Response:
+        """One frame the run showed a model, by the name its `llm_start` carries.
+
+        The name is checked against the pattern the recorder writes rather than
+        sanitised, so nothing in this directory that is not one of our JPEGs can
+        be served -- `run.log` and the prompt dumps included.
+        """
+        path = runparse.find_run(runs_dir, run_id)
+        if path is None or not SHOT_RE.fullmatch(name):
+            raise HTTPException(status_code=404, detail="not found")
+        shot = path / name
+        if not shot.is_file():
+            raise HTTPException(status_code=404, detail="not found")
+        # Content-addressed: the bytes behind one of these names never change.
+        return Response(content=shot.read_bytes(), media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=31536000, "
+                                                  "immutable"})
 
     @app.get("/api/runs/{run_id}/log")
     def run_log(run_id: str, tail: int = 40000) -> Dict[str, Any]:

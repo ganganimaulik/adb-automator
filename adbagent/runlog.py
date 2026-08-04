@@ -18,6 +18,7 @@ request bodies, which on a vision turn means a base64 screenshot per line.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -36,6 +37,23 @@ LOG_NAME = "run.log"
 #: file is what `report`, `replay` and the run history parse. This one is what
 #: the web UI tails to show the model thinking live.
 STREAM_NAME = "stream.jsonl"
+
+#: A frame a run actually showed a model, inside `runs/<id>/`. Only the
+#: submitted ones are kept: the web UI shows the screenshot beside the call that
+#: saw it, which is the difference between reading a vision read and checking it.
+#:
+#: Named to sit next to the prompt dump it belongs to
+#: (`step_004_analyze_image_messages.json`), plus a digest of the bytes -- so one
+#: frame shown twice is one file, and two different frames on one step (the
+#: loop's vision read and the judge's) cannot overwrite each other.
+def shot_name(step: int, purpose: str, data: bytes) -> str:
+    slug = re.sub(r"[^a-z0-9_]+", "_", (purpose or "shot").lower())
+    return f"step_{step:03d}_{slug}_{hashlib.sha1(data).hexdigest()[:8]}.jpg"
+
+
+#: What `shot_name` produces. A server asked for one of these can tell whether
+#: the name is ours before it opens anything.
+SHOT_RE = re.compile(r"step_\d{3,}_[a-z0-9_]+_[0-9a-f]{8}\.jpg")
 
 #: The logger every module in the package hangs off.
 ROOT = "adbagent"
