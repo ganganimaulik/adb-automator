@@ -991,13 +991,15 @@ class LLMClient:
         if on_event is not None:
             kw["on_event"] = on_event
         try:
-            # Budget comes from `llm.max_tokens` and nowhere else. A private
-            # ceiling here used to clip long screen descriptions into a
-            # TruncatedResponse and a second, doubled call -- paying for the
-            # same screenshot twice to save output tokens the config already
-            # said were affordable. Keep the prompt short instead of the reply.
+            # Budget comes from `llm.max_tokens_image` (falling back to
+            # `llm.max_tokens`) and nowhere else. A private ceiling here used to
+            # clip long screen descriptions into a TruncatedResponse and a
+            # second, doubled call -- paying for the same screenshot twice to
+            # save output tokens the config already said were affordable. Keep
+            # the prompt short instead of the reply.
             analysis = self.structured(messages, ScreenAnalysis,
                                        model=self.model_image,
+                                       max_tokens=self.cfg.llm.image_max_tokens(),
                                        purpose="analyze_image", **kw)
         except LLMError as exc:
             # A vision model that cannot hold the schema is not worth failing the
@@ -1041,7 +1043,7 @@ class LLMClient:
         if on_event is not None:
             kw["on_event"] = on_event
         raw, _ = self._post(messages, model=self.model_image, schema=None,
-                            max_tokens=self.cfg.llm.max_tokens,
+                            max_tokens=self.cfg.llm.image_max_tokens(),
                             purpose="read_item", **kw)
         return " ".join(raw.split())
 
