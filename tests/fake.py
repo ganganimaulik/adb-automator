@@ -25,6 +25,12 @@ from adbagent.screen import Screen, parse
 from . import xmlgen as X
 
 
+#: What `pm list packages` would report. `com.android.settings` is the app the
+#: scripted screens below actually belong to; the rest give a name-resolving
+#: caller something to pick wrongly from.
+INSTALLED = ["com.android.settings", "com.whatsapp", "com.spotify.music"]
+
+
 @dataclass
 class FakeScreen:
     xml: str
@@ -66,11 +72,16 @@ class FakeDevice:
     """Implements exactly the surface `Agent` uses."""
 
     def __init__(self, cfg: Optional[Config] = None, start: str = "home",
-                 app: Optional[Dict[str, FakeScreen]] = None):
+                 app: Optional[Dict[str, FakeScreen]] = None,
+                 locked: bool = False):
         self.cfg = cfg or Config()
         self.app = app or build_app()
+        self.installed = list(INSTALLED)
+        #: Which of `installed` the user put there rather than the vendor.
+        self.third_party = ["com.whatsapp", "com.spotify.music"]
         self.state = start
         self.checked = False
+        self.locked = locked
         self.size = (X.W, X.H)
         self.taps: List[Tuple[int, int]] = []
         self.actions: List[str] = []
@@ -154,16 +165,31 @@ class FakeDevice:
 
     def open_app(self, package: str) -> None:
         self.actions.append(f"open_app({package})")
-        self.state = "home"
+        # A real `app_start` is fire-and-forget: it cannot launch what is not
+        # installed, and it reports nothing when it fails to. Same here, so a
+        # caller that does not verify the foreground gets caught.
+        if package in self.installed:
+            self.state = "home"
 
     def list_apps(self, query: str = "", third_party_only: bool = False) -> List[str]:
         self.actions.append(f"list_apps({query!r})")
-        pkgs = ["com.android.settings", "com.whatsapp", "com.spotify.music"]
+        pkgs = [p for p in self.installed
+                if not third_party_only or p in self.third_party]
         if query:
             q = query.lower()
             pkgs = [p for p in pkgs if q in p.lower()]
         return sorted(pkgs)
 
+    # -- lock state --------------------------------------------------------
+
+    def is_awake(self) -> bool:
+        return True
+
+    def is_locked(self) -> bool:
+        return self.locked
+
+    def wake(self) -> None:
+        self.actions.append("wake")
 
     # -- misc --------------------------------------------------------------
 

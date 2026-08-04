@@ -311,6 +311,22 @@ It costs one call on `llm.model_skill` per run and says what it did:
   skill 'WhatsApp' updated from this run (7 workflows, 15 nuances) -> skills/whatsapp.json
 ```
 
+Before writing, it reads the recorded runs for that app — `runs/*/events.jsonl`
+plus the dead-end table — and puts what **repeats** into the prompt: the action
+that keeps failing verification, the screen the loop detector keeps breaking out
+of, the control that keeps being refused, the goals people actually ask for. Only
+repeats, because a signal seen once is already in the current trace and
+forwarding it again as "history" would launder one observation into a trend.
+Failures are reported with their successes (`swipe 'left' failed 2 times, passed
+65`), since "failed 3 times" reads as broken and "failed 3 times, passed 40" reads
+as flaky, and only one of those belongs in a skill.
+
+Attribution is the part that has to be right — a run filed under the wrong app
+hands its failures to that app's skill as fact. It comes from where a run's steps
+actually went, recorded in `run_end`. (`active_skill` looks like it would do and
+does not: it records the package on screen when the skill loaded, which filed a
+WhatsApp run under Bumble because Bumble happened to be open.)
+
 A run that went nowhere teaches nothing and is skipped — fewer than three steps,
 or only one screen reached, or the steps were spent in the launcher rather than an
 app. A run that *failed* is not skipped: "tapping this row does nothing" and "back
