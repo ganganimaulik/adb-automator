@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>adbagent</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>adbagent</h1>
+  <div class="status" id="status">connecting…</div>
+</header>
+
+<nav id="tabs">
+  <button data-tab="run" class="active">Run</button>
+  <button data-tab="history">History</button>
+  <button data-tab="devices">Devices</button>
+  <button data-tab="config">Config</button>
+  <button data-tab="skills">Skills</button>
+</nav>
+
+<main>
+  <div class="notice" id="notice"></div>
+
+  <!-- ----------------------------------------------------------- Run -->
+  <section class="tab active" id="tab-run">
+    <form class="run-form" id="run-form">
+      <textarea id="goal" rows="2" placeholder="What should the phone do? e.g. turn on airplane mode"></textarea>
+      <div class="opts">
+        <label>max steps <input type="number" id="opt-max-steps" min="1" placeholder="60"></label>
+        <label>budget $ <input type="number" id="opt-budget" min="0" step="0.1" placeholder="2.0"></label>
+        <label>repeat <input type="text" id="opt-repeat" value="1" title="count or 'inf'"></label>
+        <label>device <input type="text" id="opt-serial" placeholder="default serial"></label>
+        <label><input type="checkbox" id="opt-dry-run"> dry run</label>
+        <label><input type="checkbox" id="opt-destructive"> allow destructive</label>
+        <label><input type="checkbox" id="opt-no-learn"> don't learn</label>
+      </div>
+      <div class="split">
+        <button type="submit" class="primary" id="btn-start">Start run</button>
+        <button type="button" class="danger" id="btn-stop" disabled>Stop</button>
+        <span class="small" id="run-hint"></span>
+      </div>
+    </form>
+
+    <div id="live" style="display:none">
+      <div class="counters">
+        <span>run <b id="c-runid">—</b></span>
+        <span>step <b id="c-step">0</b></span>
+        <span>llm calls <b id="c-calls">0</b></span>
+        <span>cost <b id="c-cost">$0.0000</b></span>
+        <span>elapsed <b id="c-elapsed">0s</b></span>
+        <span>status <b id="c-state">running</b></span>
+      </div>
+      <div class="feed" id="feed"></div>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------- History -->
+  <section class="tab" id="tab-history">
+    <div id="runs-list-view">
+      <table id="runs-table">
+        <thead>
+          <tr><th>run</th><th>goal</th><th>outcome</th><th>steps</th><th>cost</th><th>duration</th><th>date</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p class="small" id="runs-empty" style="display:none">No runs yet.</p>
+    </div>
+    <div id="run-detail-view" style="display:none">
+      <div class="split">
+        <button class="ghost" id="btn-back-runs">← all runs</button>
+        <span class="mono small" id="detail-title"></span>
+      </div>
+      <div class="panel" id="detail-stats"></div>
+      <div class="panel" id="detail-scratch" style="display:none">
+        <h3>Collected data</h3>
+        <pre class="log" id="detail-scratch-text"></pre>
+      </div>
+      <div class="feed" id="detail-feed"></div>
+      <details class="panel">
+        <summary>run.log tail</summary>
+        <pre class="log" id="detail-log">loading…</pre>
+      </details>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------- Devices -->
+  <section class="tab" id="tab-devices">
+    <div class="split">
+      <button class="ghost" id="btn-dev-reload">reload</button>
+      <span class="small" id="dev-error"></span>
+    </div>
+    <div class="panel">
+      <h3>Connected devices</h3>
+      <table id="dev-table">
+        <thead><tr><th>serial</th><th>model</th><th>android</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="small" id="dev-empty" style="display:none">No devices. Connect over USB, or pair over Wi-Fi from the CLI.</p>
+      <p class="small" id="dev-candidates"></p>
+    </div>
+    <div class="panel" id="shot-panel" style="display:none">
+      <h3>Screenshot <span class="mono small" id="shot-serial"></span></h3>
+      <img class="shot" id="shot-img" alt="device screenshot">
+    </div>
+  </section>
+
+  <!-- -------------------------------------------------------- Config -->
+  <section class="tab" id="tab-config">
+    <div class="split">
+      <button class="primary" id="btn-cfg-save">Save config</button>
+      <span class="small mono" id="cfg-path"></span>
+    </div>
+    <div id="cfg-form"></div>
+    <p class="small">The API key is read from the environment only and is never written here.</p>
+  </section>
+
+  <!-- -------------------------------------------------------- Skills -->
+  <section class="tab" id="tab-skills">
+    <div class="skills-layout">
+      <div>
+        <div class="split">
+          <button class="ghost" id="btn-skills-reload">reload</button>
+        </div>
+        <div class="skills-list" id="skills-list"></div>
+      </div>
+      <div>
+        <div id="skill-editor" style="display:none">
+          <div class="split">
+            <b id="skill-name"></b>
+            <button class="primary" id="btn-skill-save">Save</button>
+          </div>
+          <textarea id="skill-json" rows="22" spellcheck="false"></textarea>
+        </div>
+        <div class="panel" style="margin-top:16px">
+          <h3>Generate a skill</h3>
+          <div class="opts" style="margin-bottom:10px">
+            <label>app <input type="text" id="gen-name" placeholder="whatsapp (blank = foreground app)"></label>
+            <label>tasks <input type="text" id="gen-tasks" placeholder="open a chat and read the last message" style="width:280px"></label>
+          </div>
+          <div class="split">
+            <button class="ghost" id="btn-gen">Generate</button>
+            <span class="small" id="gen-status"></span>
+          </div>
+          <pre class="log" id="gen-log" style="display:none"></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

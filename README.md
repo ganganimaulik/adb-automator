@@ -278,6 +278,29 @@ is whether the phone would have been driven the same way.
 Replaying costs real tokens. `--limit` samples evenly across the run rather than
 truncating, because the interesting steps of a long run are at the end.
 
+## Web UI
+
+Everything above also works from a browser:
+
+```bash
+adbagent ui                 # http://127.0.0.1:8765
+adbagent ui --port 9000
+```
+
+Five tabs. **Run** takes a goal and streams the run live — every decision,
+verification, vision read and the running cost — over the same `events.jsonl`
+the CLI writes, so what you see is exactly what `report` would replay. **History**
+lists recorded runs with their outcome, cost and duration, and opens the full
+trace, stats and scratchpad for any of them. **Devices** shows what is attached
+and grabs a screenshot on demand. **Config** edits `config.json`. **Skills**
+lists, edits and generates app skills.
+
+Runs are spawned as ordinary CLI subprocesses, so Stop is a SIGINT and the
+phone's keyboard, animations and rotation are restored exactly as with Ctrl-C.
+A run started from the UI can never block on a confirmation prompt: it is
+launched with `--unattended` unless you tick "allow destructive". One run at a
+time — there is one phone.
+
 ## App skills
 
 A skill is per-app guidance — workflows, UI quirks, what to avoid — injected into
