@@ -200,6 +200,46 @@ def step_metrics(calls: List[Any], detail: bool = True) -> Dict[str, Any]:
     }
 
 
+def needs_reasoning(state: RunState, cfg: Config, *, visit: int,
+                    blocked: bool, hint: str) -> Tuple[str, str]:
+    """How hard to think about this turn, and why.
+
+    Reasoning tokens are the run's wall clock: ~4,200 of every ~4,400 output
+    tokens, at 26s median per step and 96s at the ninetieth percentile. Most of
+    those turns do not need it. "Swipe left again on the pager the note block
+    names" is not a problem, and thinking for a minute about it buys nothing.
+
+    But *some* turns are genuinely hard, and the cost of getting those wrong is a
+    wasted run. The loop already knows which: it knows the last action failed, it
+    knows this screen is new, it knows a loop was detected, and it knows the model
+    said it was guessing. So the depth follows the evidence rather than a global
+    setting -- shallow by default, deep the moment anything is off.
+
+    Returns ("", "") when the feature is switched off, which is the default:
+    `llm.reasoning_effort` has to be set before any of this applies.
+    """
+    if not cfg.llm.reasoning_effort:
+        return "", ""
+
+    reason = ""
+    if state.consecutive_failures:
+        reason = (f"the last {state.consecutive_failures} action(s) did not work")
+    elif state.last_failure:
+        reason = "the last action was rejected"
+    elif state.want_screenshot:
+        reason = "the model said it was unsure last turn"
+    elif visit == 0:
+        reason = "this screen has not been seen before in this run"
+    elif blocked:
+        reason = "actions here are already known to lead nowhere"
+    elif hint:
+        reason = "the loop detector has something to say"
+
+    if reason:
+        return cfg.llm.effort_for("decide", hard=True), reason
+    return cfg.llm.effort_for("decide"), ""
+
+
 def needs_screenshot(state: RunState, screen: Screen, cfg: Config) -> Tuple[bool, str]:
     """XML-first: pay for vision only when the tree cannot answer the question."""
     if cfg.run.never_screenshot:
@@ -537,8 +577,16 @@ class Agent:
                                              hint, elem_hint, ban_note,
                                              state.last_failure, skill_note,
                                              situational)))
+            effort, hard_because = needs_reasoning(
+                state, cfg, visit=visit,
+                blocked=bool(banned_actions or remembered), hint=hint)
+            if hard_because:
+                log.info("step %d: thinking harder (%s) because %s",
+                         state.step, effort, hard_because)
             model_name = self.llm.model if self.llm else ""
-            self.on_event("llm_start", step=state.step, purpose="decide", model=model_name, screenshot=bool(screenshot))
+            self.on_event("llm_start", step=state.step, purpose="decide", model=model_name,
+                          screenshot=bool(screenshot), effort=effort,
+                          hard_because=hard_because)
             t0_llm = time.monotonic()
             action = self.llm.decide(                      ### LLM ###
                 goal=state.goal, rendered=render(screen), history=state.history,
@@ -547,7 +595,7 @@ class Agent:
                 scratchpad=state.scratchpad.render(cfg.run.scratchpad_max_chars),
                 progress="\n".join(state.progress_log),
                 image_analysis=analysis.render() if analysis else None,
-                step=state.step, recorder=rec,
+                step=state.step, recorder=rec, effort=effort,
                 on_event=self.on_event)
             t_llm = time.monotonic() - t0_llm            # the decision alone
             t_step_llm = time.monotonic() - t0_step_llm  # + any vision pass
@@ -652,6 +700,7 @@ class Agent:
             rec.event("decide", step=state.step, source=source,
                       skeleton=screen.skeleton_id, action=action.model_dump(),
                       screenshot=bool(screenshot),
+                      effort=effort, hard_because=hard_because,
                       wall_s=round(t_step_llm, 3), llm=step_metrics(step_calls))
             self.on_event("step", state=state, screen=screen, action=action,
                           source=source, screenshot=bool(screenshot))

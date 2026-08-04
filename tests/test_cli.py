@@ -171,7 +171,9 @@ def test_report_summarises_where_the_time_went(tmp_path, capsys):
     assert "Cost of thinking" in out
     assert "56% served from cache" in out       # 6200 of 11000
     assert "95% of output" in out               # 8400 of 8800
-    assert "lower reasoning effort" in out      # the conclusion, spelled out
+    # The conclusion, spelled out. This run recorded no depth, so the advice is
+    # to start capping it rather than to look at the escalation policy.
+    assert "setting llm.reasoning_effort" in out
     # The metrics block is summarised, never dumped as a dict.
     assert "'reasoning_chars'" not in out
 

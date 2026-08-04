@@ -107,6 +107,9 @@ def test_documented_defaults_are_the_real_defaults(dotted, shown):
     assert hasattr(group, key), f"{dotted} is not a config setting"
 
     actual = getattr(group, key)
+    # A table cell cannot render an empty string, so `""` stands in for one.
+    if shown in ('""', "''"):
+        shown = ""
     expected = {"true": True, "false": False}.get(shown.lower(), shown)
     if isinstance(actual, bool):
         assert actual is expected, f"{dotted} is {actual}, README says {shown}"

@@ -389,6 +389,61 @@ def extract_json(text: str) -> str:
 RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504, 520})
 
 
+# ---------------------------------------------------------------------------
+# Reasoning depth
+# ---------------------------------------------------------------------------
+#
+# Nothing about this is standard. Two conventions are in use on the OpenAI wire
+# protocol and a model that does not know the one you sent either ignores it --
+# the worst case, because the bill and the latency say nothing changed while you
+# believe you fixed them -- or rejects the whole call.
+#
+# So the family table below is a *default*, not a detection: `llm.reasoning_style`
+# overrides it, an unrecognised model sends nothing at all rather than guessing,
+# and `adbagent doctor` prints the exact body that will go out so it can be
+# confirmed against the provider's docs before a long run depends on it.
+
+#: Accepted depths. "none" means "do not think", not "provider default" -- that
+#: is what an empty string is for.
+REASONING_LEVELS = ("none", "low", "medium", "high")
+
+#: Families taking `reasoning_effort: "low" | "medium" | "high"`.
+EFFORT_FAMILIES = ("gpt-oss", "gpt-5", "o1", "o3", "o4")
+#: Families taking `chat_template_kwargs: {"thinking": bool}` -- a hybrid model
+#: with one switch rather than a dial, so any non-"none" depth just turns it on.
+THINKING_FAMILIES = ("deepseek-v3", "deepseek-v4", "qwen3", "glm-4", "glm-5",
+                     "minimax-m", "kimi-k2-thinking", "kimi-k3")
+
+
+def reasoning_style_for(model: str) -> str:
+    """Which convention `model` is expected to take: "effort", "thinking", "off"."""
+    name = (model or "").lower()
+    if any(family in name for family in EFFORT_FAMILIES):
+        return "effort"
+    if any(family in name for family in THINKING_FAMILIES):
+        return "thinking"
+    return "off"
+
+
+def reasoning_body(model: str, effort: str, style: str = "auto") -> Dict[str, Any]:
+    """The request fields that ask `model` for `effort` worth of thinking.
+
+    Empty when the depth is unset, or when neither convention is known to apply:
+    sending a field the model does not understand is how you get a 400 mid-run, or
+    worse, a silent no-op that looks like a fix.
+    """
+    if effort not in REASONING_LEVELS:
+        return {}
+    resolved = style if style in ("effort", "thinking", "off") else \
+        reasoning_style_for(model)
+    if resolved == "effort":
+        # No family exposes an "off"; the floor is the closest thing to it.
+        return {"reasoning_effort": "low" if effort == "none" else effort}
+    if resolved == "thinking":
+        return {"chat_template_kwargs": {"thinking": effort != "none"}}
+    return {}
+
+
 def usage_detail(usage: Any, group: str, field_name: str) -> int:
     """Read `usage.<group>.<field>`, whether it arrives typed or as a dict.
 
@@ -530,7 +585,7 @@ class LLMClient:
 
     # -- transport ---------------------------------------------------------
 
-    def _extra_body(self) -> Dict[str, Any]:
+    def _extra_body(self, model: str = "", effort: str = "") -> Dict[str, Any]:
         extra: Dict[str, Any] = {}
         if self.provider.name == "fireworks":
             extra.update({
@@ -546,11 +601,13 @@ class LLMClient:
             })
         if self.cfg.llm.service_tier:
             extra["service_tier"] = self.cfg.llm.service_tier
+        extra.update(reasoning_body(model or self.model, effort,
+                                    self.cfg.llm.reasoning_style))
         return extra
 
     def _post(self, messages: List[Dict[str, Any]], *, model: str,
               schema: Optional[Dict[str, Any]], max_tokens: int,
-              purpose: str,
+              purpose: str, effort: str = "",
               on_event: Optional[Callable[..., None]] = None) -> Tuple[str, Call]:
         from openai import APIStatusError, APIConnectionError, APITimeoutError
 
@@ -572,7 +629,10 @@ class LLMClient:
                 "json_schema": {"name": schema.get("title") or "AgentAction",
                                 "schema": schema},
             }
-        extra = self._extra_body()
+        # A caller that says nothing gets the depth its purpose implies, so a
+        # vision transcription is never billed for a chain of thought just
+        # because nobody threaded the argument through.
+        extra = self._extra_body(model, effort or self.cfg.llm.effort_for(purpose))
         if extra:
             kwargs["extra_body"] = extra
 
@@ -767,7 +827,7 @@ class LLMClient:
 
     def structured(self, messages: List[Dict[str, Any]], model_cls: Type[M], *,
                    model: str = "", max_tokens: int = 0,
-                   purpose: str = "decide",
+                   purpose: str = "decide", effort: str = "",
                    on_event: Optional[Callable[..., None]] = None) -> M:
         """One schema-constrained call, with a bounded repair loop."""
         from .prompts import REPAIR
@@ -786,7 +846,7 @@ class LLMClient:
             try:
                 raw, _ = self._post(conversation, model=target, schema=schema,
                                     max_tokens=budget, purpose=purpose,
-                                    **kw)
+                                    effort=effort, **kw)
             except TruncatedResponse as exc:
                 # Asking again with the same ceiling would truncate again. Give
                 # the model more room instead, once.
@@ -807,6 +867,15 @@ class LLMClient:
                     {"role": "assistant", "content": raw[:2000]},
                     {"role": "user", "content": REPAIR.format(error=last_error)},
                 ]
+                # A reply that missed the schema is the clearest evidence there
+                # is that this turn was harder than the caller assumed, so the
+                # repair thinks properly. Retrying at the same shallow depth
+                # tends to reproduce the same malformed answer, and three of
+                # those cost far more than one deeper call.
+                escalated = self.cfg.llm.effort_for(purpose, hard=True)
+                if escalated and escalated != effort:
+                    log.info("repairing at reasoning effort %r", escalated)
+                    effort = escalated
         raise LLMError(f"model never produced a valid {model_cls.__name__}: "
                        f"{last_error}")
 
@@ -902,7 +971,7 @@ class LLMClient:
                screenshot: Optional[bytes] = None, note: str = "",
                scratchpad: str = "", progress: str = "",
                step: int = 0, recorder: Optional[Any] = None,
-               purpose: str = "decide",
+               purpose: str = "decide", effort: str = "",
                image_analysis: Optional[str] = None,
                on_event: Optional[Callable[..., None]] = None):
         from . import prompts
@@ -946,7 +1015,8 @@ class LLMClient:
         kw = {}
         if on_event is not None:
             kw["on_event"] = on_event
-        return self.structured(messages, AgentAction, model=target, purpose=purpose, **kw)
+        return self.structured(messages, AgentAction, model=target,
+                               purpose=purpose, effort=effort, **kw)
 
     def judge(self, *, goal: str, rendered: str, history: Sequence[str],
               screenshot: Optional[bytes] = None,
@@ -977,7 +1047,9 @@ class LLMClient:
         if on_event is not None:
             kw["on_event"] = on_event
         return self.structured(messages, Verdict, model=target,
-                               max_tokens=max_tokens, purpose="judge", **kw)
+                               max_tokens=max_tokens, purpose="judge",
+                               effort=self.cfg.llm.effort_for("judge", hard=True),
+                               **kw)
 
 
 class Verdict(BaseModel):
