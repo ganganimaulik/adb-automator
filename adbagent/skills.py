@@ -28,6 +28,13 @@ DEFAULT_SKILLS_DIR = "skills"
 #: a long unrelated one that happens to share two words.
 _RESTATEMENT_FLOOR = 0.34
 
+#: Overlap at which two entries are the same finding worded twice, even though
+#: neither contains the other. "Search top bar icon must be tapped before typing"
+#: and "Search top bar must be opened before typing" measured 0.75: each holds a
+#: word the other lacks, so containment alone kept both. Measured against real
+#: skills, genuine pairs that each carry a distinct detail sit around 0.4.
+_NEAR_IDENTICAL = 0.7
+
 
 def collapse_restatements(entries: List[str]) -> List[str]:
     """Drop entries that say strictly less than another entry in the list.
@@ -38,24 +45,36 @@ def collapse_restatements(entries: List[str]) -> List[str]:
     like that gets worse with use, which is the opposite of the point.
 
     An entry whose distinctive tokens all appear in a longer entry adds nothing
-    that entry does not already say, so it goes. Containment rather than a
-    similarity score, because containment loses no information by construction:
-    two entries that merely overlap -- each carrying a detail the other lacks --
-    are both kept.
+    that entry does not already say, so it goes. Containment first, because it
+    loses no information by construction -- two entries that merely overlap, each
+    carrying a detail the other lacks, are both kept.
+
+    Containment alone is not quite enough, though. Two wordings of one finding can
+    each hold a word the other lacks ("tapped" against "opened") while saying the
+    same thing, so entries that overlap almost entirely are collapsed too, keeping
+    the longer. That threshold is the one judgement call here; genuine pairs
+    measured well below it.
     """
     from .scratchpad import distinctive
 
     tokens = [distinctive(e) for e in entries]
+
+    def swallows(rich: int, weak: int) -> bool:
+        """Does `rich` already say everything `weak` does?"""
+        a, b = tokens[weak], tokens[rich]
+        if not a or not b:
+            return False
+        overlap = len(a & b) / len(a | b)
+        contained = a <= b and len(a) >= _RESTATEMENT_FLOOR * len(b)
+        if not contained and overlap < _NEAR_IDENTICAL:
+            return False
+        # Only one of a pair may go, or both would. The longer text wins; on a
+        # true tie the earlier one does.
+        return (len(b), -rich) > (len(a), -weak)
+
     kept: List[str] = []
     for i, entry in enumerate(entries):
-        mine = tokens[i]
-        swallowed = mine and any(
-            mine <= tokens[j]
-            and len(mine) >= _RESTATEMENT_FLOOR * len(tokens[j])
-            # On identical token sets only one may go, or both would.
-            and (len(tokens[j]) > len(mine) or j < i)
-            for j in range(len(entries)) if j != i and tokens[j])
-        if swallowed:
+        if any(swallows(j, i) for j in range(len(entries)) if j != i):
             log.info("skill: dropped a restatement -- %.70s", entry)
             continue
         if entry not in kept:
@@ -872,6 +891,18 @@ why -- a control that does nothing, a screen `back` will not leave, a list the e
 tree never shows. Record those as nuances with the way around them. Do not record a
 one-off as a rule: a slow load, a single mistap or a popup that appeared once is not a
 property of the app.
+
+Two traps in particular, both of which have produced confident and false nuances:
+
+* An action that failed once and then worked is a transition or timing artefact, not a
+  property of the app. Launching an app is the usual case: the screen mid-launch is
+  neither the old app nor the new one, and a check made on that frame fails. Never
+  write it up as the action doing the wrong thing.
+* What was on screen BEFORE an action is not what the action did. If the app you were
+  leaving is named in an observation, that is where the run started, not where the
+  action took it.
+
+Say only what the trace supports. "This failed once here" is not "this does not work".
 Reply with ONLY the JSON object.
 """
 
@@ -915,7 +946,7 @@ class SkillGenerator:
                                  llm_client: Any,
                                  screenshots: Optional[List[bytes]] = None,
                                  *, package: str = "", notes: str = "",
-                                 outcome: str = "") -> Skill:
+                                 outcome: str = "", history: str = "") -> Skill:
         """Synthesize exploration observations into a Skill object, updating existing skill if present.
 
         `package` is the package the exploration verifiably drove, which is not
@@ -939,6 +970,8 @@ class SkillGenerator:
         prompt_parts.append("ACTIONS TAKEN DURING EXPLORATION:\n" + "\n".join(actions_taken or ["(none)"]))
         if outcome:
             prompt_parts.append(f"HOW THE EXPLORATION ENDED: {outcome}")
+        if history:
+            prompt_parts.append(history)
         prompt_parts.append(f"Generate an updated, complete App Skill JSON object for {package or app_name_or_pkg} combining existing skill information and new exploration findings.")
 
         prompt = "\n\n".join(prompt_parts)
@@ -1014,7 +1047,7 @@ MIN_LEARNABLE_STEPS = 3
 
 
 def learn_from_run(trace: AppTrace, llm: Any, registry: SkillRegistry, *,
-                   goal: str = "") -> Optional[Skill]:
+                   goal: str = "", cfg: Any = None) -> Optional[Skill]:
     """Fold what a finished run learned into that app's skill, and save it.
 
     This is what makes the agent better at an app the more it is used there: any
@@ -1023,10 +1056,15 @@ def learn_from_run(trace: AppTrace, llm: Any, registry: SkillRegistry, *,
     replacing it. Returns the updated skill, or None when the run has nothing to
     teach.
 
+    Given `cfg`, the recorded runs for this app are read too, and what repeats
+    across them goes into the prompt alongside this run's trace. That is the
+    only way the "dead end, not a one-off" judgement the synthesis is asked for
+    can actually be made: one trace cannot distinguish a control that always
+    does nothing from one that was slow once.
+
     A failed run is not skipped. "Tapping this row does nothing" and "back leaves
     the app from here" are exactly what a skill is for, and they are only ever
-    learned by a run that went wrong -- the synthesis is told how the run ended
-    so it can tell a dead end from a one-off.
+    learned by a run that went wrong.
     """
     if not is_app_package(trace.package):
         log.info("nothing to learn: %r is not an app", trace.package)
@@ -1038,4 +1076,21 @@ def learn_from_run(trace: AppTrace, llm: Any, registry: SkillRegistry, *,
     return SkillGenerator(registry).generate_from_exploration(
         trace.package, goal or trace.tasks, trace.screens, trace.actions, llm,
         screenshots=trace.screenshots, package=trace.package,
-        notes=trace.notes, outcome=trace.outcome)
+        notes=trace.notes, outcome=trace.outcome,
+        history=run_history(cfg, trace.package))
+
+
+def run_history(cfg: Any, package: str) -> str:
+    """The digest of earlier runs in this app, or "" when there is none.
+
+    Never fatal: a skill written from this run alone is worth having, and losing
+    it to an unreadable run directory would not be.
+    """
+    if cfg is None or not package:
+        return ""
+    try:
+        from .history import for_package
+        return for_package(cfg, package).to_prompt_text()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not read run history for %s: %s", package, exc)
+        return ""

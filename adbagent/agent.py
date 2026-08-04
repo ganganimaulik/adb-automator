@@ -99,6 +99,10 @@ class RunState:
     #: Distinct packages this run has been in. Two or more means it is a
     #: multi-app run, which is when the app-switching advice earns its tokens.
     packages: set = field(default_factory=set)
+    #: Steps spent in each. The set alone cannot say which app a run was *about*
+    #: -- glancing at the launcher for one step reads the same as forty steps of
+    #: work -- and `history` needs that to find the recorded runs for one app.
+    package_steps: Dict[str, int] = field(default_factory=dict)
     #: Which items of a gallery / carousel have actually been looked at. Kept by
     #: code rather than by the model, because a ledger the model rewrites by hand
     #: every turn silently loses an entry the moment it forgets to repeat one.
@@ -339,6 +343,13 @@ class Agent:
             recorder.event("run_end", outcome=outcome, steps=state.step,
                            llm_calls=state.llm_calls,
                            usd=round(usd, 6),
+                           # Which apps this run was in and how long it spent in
+                           # each, so a later run can find the recorded runs for
+                           # *its* app. Nothing else in the file says, and the
+                           # signals `history.packages_in` falls back to for runs
+                           # recorded before this are much weaker.
+                           packages=sorted(state.packages),
+                           package_steps=state.package_steps,
                            llm=step_metrics(self.llm.ledger.calls if self.llm else [],
                                             detail=False))
             recorder.close()
@@ -374,6 +385,8 @@ class Agent:
                 self.on_event("perceive", step=state.step, elapsed=time.monotonic() - t0_perceive)
             if screen.package:
                 state.packages.add(screen.package)
+                state.package_steps[screen.package] = \
+                    state.package_steps.get(screen.package, 0) + 1
 
             # A programmatic assertion is the cheapest and most reliable way to
             # know we are done, so it is checked before anything else happens.
