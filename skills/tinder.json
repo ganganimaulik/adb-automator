@@ -1,0 +1,41 @@
+{
+  "name": "Tinder",
+  "packages": [
+    "com.tinder"
+  ],
+  "aliases": [
+    "Tinder",
+    "tinder"
+  ],
+  "description": "Dating app for swiping on profiles, matching, and messaging matches. Opens on the Swipe/Discovery screen with profile cards; the bottom navigation bar has Swipe, Explore, Likes, Chat, and Profile tabs. The Chat tab holds a searchable list of matches and conversation threads; each conversation screen shows the match date banner, inline activity entries (e.g. photo likes), and message bubbles.",
+  "workflows": [
+    {
+      "name": "open_chat_list",
+      "steps": "Launch Tinder (it lands on the Swipe/Discovery screen showing a profile card). Tap the 'Chat' tab in the bottom navigation bar. The Chat screen shows a 'Search N matches' field at top, a horizontal 'New Matches' carousel, and a scrollable 'Messages' list of conversations."
+    },
+    {
+      "name": "read_recent_match_conversations",
+      "steps": "Open the Chat tab. The 'Messages' list is ordered by most recent activity, with each row showing the match's name and a preview of the latest message. Tap a row to open the conversation. If no message bubbles are visible yet, wait briefly or tap once in the message area for the history to render. Read the 'You matched with <name> on DD/MM/YY' banner, inline activity entries such as '<name> liked your photo' / 'You liked <name>'s photo' with timestamps, and the message bubbles. Tap the back arrow labeled 'Exit chat' (top-left) to return to the Messages list, then repeat for the next match."
+    },
+    {
+      "name": "search_for_match",
+      "steps": "On the Chat tab, tap the 'Search N matches' field and type the match's name to filter the list instead of scrolling, then tap the matching row to open the conversation."
+    }
+  ],
+  "nuances": [
+    "Conversation content loads lazily: immediately after opening a chat, only the header and the 'Message…' input may be present with no bubbles rendered. A short wait or a tap in the message area causes the full history to appear -- do not conclude the thread is empty on first view.",
+    "Each row in the Messages list already shows a preview of the latest message, which is often enough to answer 'last message' questions without opening the thread.",
+    "The 'New Matches' horizontal carousel at the top of the Chat tab is separate from the 'Messages' list; matches with no conversation yet appear there, not in Messages.",
+    "Tinder opens on the Swipe/Discovery screen, not on Chat; the Chat tab must be tapped explicitly in the bottom navigation.",
+    "The chat screen's back control is labeled 'Exit chat' and returns to the Messages list.",
+    "Conversation history includes non-message entries: the match banner 'You matched with <name> on DD/MM/YY' and activity lines like '<name> liked your photo' with day/time stamps. These are part of the thread and should be included when reporting message history.",
+    "The chat input area has a 'GIF' / 'Search for a GIF …' control and a 'Message…' text field at the bottom."
+  ],
+  "recommendations": [
+    "For 'last N matches' tasks, take the top N rows of the Messages list (it is recency-ordered), open each conversation in turn, wait for bubbles to render before extracting text, and use 'Exit chat' between conversations.",
+    "Use the 'Search N matches' field to jump directly to a named match rather than scrolling the list.",
+    "When reporting a conversation, extract the match-date banner and inline activity entries in addition to message bubbles, since likes and photo interactions are part of the history.",
+    "Scroll the Messages list if the target conversation is off-screen; the list is fully scrollable."
+  ],
+  "custom_prompt": ""
+}

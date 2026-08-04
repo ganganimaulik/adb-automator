@@ -2,9 +2,10 @@
 
 Precedence, lowest to highest: built-in defaults < environment < config.json < CLI flags.
 
-The API key is deliberately NOT part of this structure -- it is read from the
-environment at call time only, so it can never be written into config.json or
-into a run artifact.
+The API key may be set in config.json (``llm.api_key``) or read from the
+environment variable named by ``llm.api_key_env``. config.json is gitignored,
+so the key is safe there; the env var remains as a fallback. The key is redacted
+in ``to_dict()`` so it can never leak into a run artifact or the web UI.
 """
 
 from __future__ import annotations
@@ -46,6 +47,10 @@ class LLMConfig:
     #: paid accounts go to 6000. 120 is a safe default for a paid account.
     rpm: int = 120
     base_url: str = ""
+    #: The API key itself. config.json is gitignored, so the key is safe here;
+    #: when set, it takes precedence over the env var below. Empty falls back to
+    #: the environment variable named by ``api_key_env``.
+    api_key: str = ""
     api_key_env: str = "FIREWORKS_API_KEY"
     #: Seconds. Agentic workloads are long; Fireworks recommends 5-30 min.
     read_timeout: float = 300.0
@@ -195,10 +200,13 @@ class Config:
         return Path(self.memory.db).expanduser()
 
     def api_key(self) -> str:
-        return os.environ.get(self.llm.api_key_env, "")
+        return self.llm.api_key or os.environ.get(self.llm.api_key_env, "")
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        # Never leak the key through the config dict (used by the web UI).
+        d["llm"]["api_key"] = "***" if d["llm"].get("api_key") else ""
+        return d
 
 
 # ---------------------------------------------------------------------------

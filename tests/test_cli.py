@@ -38,9 +38,12 @@ def test_every_subcommand_parses():
         assert parse(argv).func is not None
 
 
-def test_a_goal_is_required():
-    with pytest.raises(SystemExit):
-        parse(["run"])
+def test_a_goal_is_required(tmp_path, capsys):
+    # Not at parse time -- `--resume` supplies the goal from its checkpoint --
+    # but a run with neither goes nowhere.
+    from adbagent.cli import cmd_run
+    assert cmd_run(parse(["run"])) == 1
+    assert "no goal" in capsys.readouterr().out
 
 
 def test_unknown_command_exits():
@@ -104,14 +107,33 @@ def test_unknown_config_key_warns(tmp_path, capsys):
     assert "unknown config key" in capsys.readouterr().err
 
 
-def test_api_key_comes_only_from_the_environment(monkeypatch, tmp_path):
-    """A key must never be readable out of a config file that might be committed."""
+def test_api_key_from_config_takes_precedence_over_env(monkeypatch, tmp_path):
+    """config.json is gitignored, so llm.api_key there is the preferred source."""
     path = tmp_path / "config.json"
-    path.write_text(json.dumps({"llm": {"api_key": "sk-should-be-ignored"}}))
+    path.write_text(json.dumps({"llm": {"api_key": "fw-from-config"}}))
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-from-env")
+    cfg = build_config(parse(["run", "g", "-c", str(path)]))
+    assert cfg.api_key() == "fw-from-config"
+
+
+def test_api_key_falls_back_to_env_var(tmp_path, monkeypatch):
+    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"llm": {"api_key": ""}}))
+    cfg = build_config(parse(["run", "g", "-c", str(path)]))
+    assert cfg.api_key() == ""
     monkeypatch.setenv("FIREWORKS_API_KEY", "fw-from-env")
     cfg = build_config(parse(["run", "g", "-c", str(path)]))
     assert cfg.api_key() == "fw-from-env"
-    assert not hasattr(cfg.llm, "api_key")
+
+
+def test_api_key_is_redacted_in_to_dict(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"llm": {"api_key": "fw-secret"}}))
+    cfg = build_config(parse(["run", "g", "-c", str(path)]))
+    d = cfg.to_dict()
+    assert d["llm"]["api_key"] == "***"
+    assert cfg.api_key() == "fw-secret"
 
 
 # ---------------------------------------------------------------------------
