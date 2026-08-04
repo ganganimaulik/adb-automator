@@ -43,7 +43,8 @@ RUN_EVENTS = [
 
 
 def make_run_dir(base: Path, run_id: str = RUN_ID,
-                 events=RUN_EVENTS, with_log: bool = True) -> Path:
+                 events=RUN_EVENTS, with_log: bool = True,
+                 with_checkpoint: bool = False) -> Path:
     d = base / run_id
     d.mkdir(parents=True)
     with (d / "events.jsonl").open("w", encoding="utf-8") as fh:
@@ -51,6 +52,11 @@ def make_run_dir(base: Path, run_id: str = RUN_ID,
             fh.write(json.dumps(event) + "\n")
     if with_log:
         (d / "run.log").write_text("line one\nline two\n", encoding="utf-8")
+    if with_checkpoint:
+        from adbagent import checkpoint
+        (d / checkpoint.NAME).write_text(json.dumps(
+            {"goal": "turn on wifi", "run_id": run_id, "step": 1}),
+            encoding="utf-8")
     return d
 
 
@@ -263,6 +269,59 @@ def test_run_lifecycle_against_fake_cli(web, tmp_path, monkeypatch):
 
     assert web.post("/api/runs/stop").status_code == 200
     assert spawned[0].poll() is not None
+
+
+# ---------------------------------------------------------------------------
+# resuming from the UI
+# ---------------------------------------------------------------------------
+
+def test_summarise_flags_a_resumable_run(tmp_path):
+    assert runparse.summarise(make_run_dir(tmp_path))["resumable"] is False
+    d = make_run_dir(tmp_path, run_id="failed1", with_checkpoint=True)
+    assert runparse.summarise(d)["resumable"] is True
+
+
+def test_resume_requires_a_checkpoint(web, tmp_path):
+    make_run_dir(tmp_path / "runs", run_id=RUN_ID)        # no checkpoint
+    res = web.post("/api/runs", json={"resume": RUN_ID})
+    assert res.status_code == 409
+    assert "no checkpoint" in res.json()["detail"]
+    assert web.post("/api/runs", json={"resume": "nope"}).status_code == 404
+
+
+def test_resume_spawns_the_cli_with_resume_and_its_own_dir(web, tmp_path,
+                                                           monkeypatch):
+    make_run_dir(tmp_path / "runs", run_id=RUN_ID, with_checkpoint=True)
+    spawned = []
+
+    def fake_popen(argv, **kwargs):
+        proc = FakeProc(argv, stay_running=True, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", fake_popen)
+    res = web.post("/api/runs", json={"resume": RUN_ID, "max_steps": 10})
+    assert res.status_code == 200
+
+    argv = spawned[0].argv
+    assert "--resume" in argv
+    assert argv[argv.index("--resume") + 1] == RUN_ID
+    assert "turn on wifi" not in argv     # the checkpoint supplies the goal
+    assert "--unattended" in argv
+    assert "--max-steps" in argv
+
+    # Status shows the checkpoint's goal, not an empty string.
+    st = web.get("/api/status").json()
+    assert st["run"]["goal"] == "turn on wifi"
+    assert st["run"]["run_id"] == RUN_ID
+
+    web.post("/api/runs/stop")
+
+    # The directory already exists, so the manager knew it without discovery:
+    # the stream attaches to the old events and replays them.
+    body = web.get("/api/runs/stream").text
+    assert f'"run_id": "{RUN_ID}"' in body
+    assert "turn on wifi" in body         # the first sitting's events replay
 
 
 def test_stream_with_no_run_ends_immediately(web):

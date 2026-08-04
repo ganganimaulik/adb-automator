@@ -301,9 +301,9 @@ def cmd_doctor(args) -> int:
     cfg = build_config(args)
     key = cfg.api_key()
     if key:
-        out.ok(f"${cfg.llm.api_key_env} is set ({len(key)} chars)")
+        out.ok(f"API key is set ({len(key)} chars)")
     else:
-        out.bad(f"${cfg.llm.api_key_env} is not set")
+        out.bad(f"no API key: set llm.api_key in config.json or ${cfg.llm.api_key_env}")
         problems += 1
     if cfg.llm.model:
         out.ok(f"model {cfg.llm.model}")
@@ -436,7 +436,7 @@ def cmd_models(args) -> int:
         return 1
     key = cfg.api_key()
     if not key:
-        out.bad(f"${cfg.llm.api_key_env} is not set")
+        out.bad(f"no API key: set llm.api_key in config.json or ${cfg.llm.api_key_env}")
         return 1
 
     models = list_models(provider, key)
@@ -917,7 +917,21 @@ def _learn(out: Out, traces, llm, cfg, goal: str) -> None:
                          f"-> {registry.path_for(skill)}"))
 
 
+def _resolve_resume(target: str, artifacts_dir: str) -> Optional[Path]:
+    """The run directory a `--resume` value points at, or None."""
+    from . import checkpoint as ckpt
+
+    if target == "latest":
+        return ckpt.latest_resumable(Path(artifacts_dir).expanduser())
+    path = Path(target).expanduser()
+    if path.is_dir():
+        return path
+    candidate = Path(artifacts_dir).expanduser() / target
+    return candidate if candidate.is_dir() else None
+
+
 def cmd_run(args) -> int:
+    from . import checkpoint as ckpt
     from . import skills as skillmod
     from .agent import Agent, Oracle
     from .device import Device
@@ -926,6 +940,43 @@ def cmd_run(args) -> int:
 
     out = Out()
     cfg = build_config(args)
+
+    # -- where does the goal come from? ------------------------------------
+    # Normally the command line. With --resume it comes from the checkpoint,
+    # because everything the run remembers -- its history, its dead ends, its
+    # collected data -- is keyed to the goal it started with.
+    resume_data: Optional[Dict[str, Any]] = None
+    run_id = ""
+    goal = args.goal or ""
+    if args.resume is not None:
+        run_dir = _resolve_resume(args.resume, cfg.run.artifacts_dir)
+        if run_dir is None:
+            if args.resume == "latest":
+                out.bad("no resumable run found -- a run leaves a checkpoint "
+                        "when it fails or is interrupted")
+            else:
+                out.bad(f"no such run: {args.resume}")
+            return 1
+        resume_data = ckpt.load(run_dir)
+        if resume_data is None:
+            out.bad(f"run {run_dir.name} has no checkpoint to resume from "
+                    f"-- it either finished or predates checkpoints")
+            return 1
+        run_id = resume_data.get("run_id") or run_dir.name
+        ckpt_goal = resume_data.get("goal") or ""
+        if goal and goal != ckpt_goal:
+            out.warn(f"resuming run {run_id} -- keeping its original goal, "
+                     f"not the one just given")
+        goal = ckpt_goal
+        # The budget is for *additional* steps: the steps already taken are
+        # spent, so the ceiling moves up by that many. --max-steps still says
+        # how much more work this sitting may do.
+        cfg.run.max_steps += int(resume_data.get("step") or 0)
+    if not goal:
+        out.bad("no goal given -- pass one, or continue a failed run with "
+                "--resume")
+        return 1
+
     if not cfg.llm.model:
         out.bad("no model chosen. Run `adbagent models` and pass --model.")
         return 1
@@ -938,6 +989,11 @@ def cmd_run(args) -> int:
     repeats = args.repeat
     infinite = isinstance(repeats, str) and repeats == "inf"
     total = 0 if infinite else int(repeats or 1)
+
+    if resume_data:
+        out.say(out.bold(f"  resuming run {run_id} from step "
+                         f"{resume_data.get('step') or 0}"))
+        out.say(out.dim(f"  goal: {goal}"))
 
     exit_code = 0
     iteration = 0
@@ -954,13 +1010,16 @@ def cmd_run(args) -> int:
             # a screenshot of each new screen -- and a new Agent per iteration
             # reads back whatever the last one learned.
             trace = skillmod.TraceCollector(
-                dev, skillmod.AppTrace(tasks=args.goal),
+                dev, skillmod.AppTrace(tasks=goal),
                 on_event=_live_reporter(out, max_steps=cfg.run.max_steps))
             agent = Agent(dev, mem, llm, cfg, oracle=oracle, on_event=trace)
             if infinite or total > 1:
                 out.say(out.bold(f"\n  iteration {iteration}"))
             started = time.monotonic()
-            outcome, state = agent.run(args.goal)
+            outcome, state = agent.run(goal, run_id=run_id, resume=resume_data)
+            # A repeat after a resume is a fresh run of the same goal: the
+            # checkpoint was spent on the first iteration.
+            resume_data, run_id = None, ""
             elapsed = time.monotonic() - started
 
             colour = out.green if outcome == "success" else (
@@ -989,7 +1048,7 @@ def cmd_run(args) -> int:
                 # after the loop has closed its log.
                 with runlog.capture(run_path):
                     trace.finish(outcome, state)
-                    _learn(out, trace.app_traces(), llm, cfg, args.goal)
+                    _learn(out, trace.app_traces(), llm, cfg, goal)
             if outcome != "success":
                 exit_code = 1
             if outcome in ("aborted", "needs_user"):
@@ -1172,7 +1231,9 @@ def cmd_report(args) -> int:
     events = [json.loads(line) for line in
               events_file.read_text().splitlines() if line.strip()]
     start = next((e for e in events if e["kind"] == "run_start"), {})
-    end = next((e for e in events if e["kind"] == "run_end"), {})
+    # The LAST run_end: a run continued with --resume has one per sitting, and
+    # only the final one carries the outcome the run actually reached.
+    end = next((e for e in reversed(events) if e["kind"] == "run_end"), {})
 
     out.say(out.bold(f"  goal: {start.get('goal', '?')}"))
     out.say(f"  model: {start.get('model', '?')}")
@@ -1469,7 +1530,7 @@ def cmd_skills(args) -> int:
             out.bad("no model chosen. Run `adbagent models` and pass --model.")
             return 1
         if not cfg.api_key():
-            out.bad(f"no API key: exploring the app needs one. Set ${cfg.llm.api_key_env}.")
+            out.bad(f"no API key: exploring the app needs one. Set llm.api_key in config.json or ${cfg.llm.api_key_env}.")
             return 1
 
         # An open-ended "look around" must not inherit a step budget sized for a
@@ -1643,7 +1704,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_dump)
 
     p = sub.add_parser("run", help="pursue a goal on the device")
-    p.add_argument("goal", help="what to accomplish, in plain language")
+    p.add_argument("goal", nargs="?",
+                   help="what to accomplish, in plain language "
+                        "(optional with --resume: the checkpoint's goal is kept)")
+    p.add_argument("--resume", nargs="?", const="latest", metavar="RUN",
+                   help="continue a failed or interrupted run where it stopped: "
+                        "a run id or directory, or the most recent resumable "
+                        "run when no value is given")
     p.add_argument("--repeat", default="1",
                    help="how many times to repeat the goal ('inf' for forever)")
     p.add_argument("--max-steps", dest="max_steps", type=int)

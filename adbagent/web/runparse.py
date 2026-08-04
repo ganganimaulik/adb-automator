@@ -11,6 +11,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from ..checkpoint import NAME as CHECKPOINT_NAME
+
 EVENTS_NAME = "events.jsonl"
 
 
@@ -85,6 +87,7 @@ def summarise(path: Path) -> Dict[str, Any]:
     """
     events = read_events(path)
     run_id = path.name if path.is_dir() else path.parent.name
+    directory = path if path.is_dir() else path.parent
     summary: Dict[str, Any] = {
         "id": run_id,
         "goal": "",
@@ -96,6 +99,9 @@ def summarise(path: Path) -> Dict[str, Any]:
         "started": 0.0,
         "duration_s": 0.0,
         "packages": [],
+        # A checkpoint on disk means the run never finished and can be
+        # continued -- the history view keys its resume button off this.
+        "resumable": (directory / CHECKPOINT_NAME).is_file(),
         "n_events": len(events),
     }
     if not events:

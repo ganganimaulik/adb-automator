@@ -23,7 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import __version__, prompts, runlog, safety
+from . import __version__, checkpoint, prompts, runlog, safety
 from .actions import (ActionError, AgentAction, append_history, execute,
                       format_history_entry, synthesise_postcondition, verify)
 from .config import Config
@@ -352,14 +352,25 @@ class Agent:
 
     # -- public ------------------------------------------------------------
 
-    def run(self, goal: str, run_id: str = "") -> Tuple[Outcome, RunState]:
+    def run(self, goal: str, run_id: str = "",
+            resume: Optional[Dict[str, Any]] = None) -> Tuple[Outcome, RunState]:
         run_id = run_id or uuid.uuid4().hex[:12]
         state = RunState(goal=goal, run_id=run_id, intent_id=intent_key(goal))
+        if resume:
+            checkpoint.restore(state, resume)
         self._goal_apps: Optional[List[str]] = None
         recorder = Recorder(self.cfg, run_id)
-        self._log_header(goal, recorder)
+        self._log_header(goal, recorder, resumed_from=state.step if resume else 0)
         self.mem.begin_run(run_id, goal, state.intent_id)
-        recorder.event("run_start", goal=goal, model=getattr(self.llm, "model", ""))
+        if resume:
+            # One directory per run still holds: the events of this sitting are
+            # appended to the failed one's, with this event where they join.
+            recorder.event("run_resume", goal=goal,
+                           model=getattr(self.llm, "model", ""),
+                           resumed_at_step=state.step)
+        else:
+            recorder.event("run_start", goal=goal,
+                           model=getattr(self.llm, "model", ""))
 
         try:
             self._loop(state, recorder)
@@ -393,6 +404,13 @@ class Agent:
             raise
         finally:
             outcome = state.finished or "failed"
+            # A checkpoint is unfinished business: keep it current on every way
+            # out but success, so `--resume` can put the run back where it
+            # stopped. Success deletes it -- there is nothing left to continue.
+            if outcome == "success":
+                checkpoint.clear(self.cfg, run_id)
+            else:
+                checkpoint.save(self.cfg, state)
             usd = self.llm.ledger.total_usd if self.llm else 0.0
             self.mem.end_run(run_id, outcome, state.step, state.llm_calls, usd)
             recorder.event("run_end", outcome=outcome, steps=state.step,
@@ -413,7 +431,8 @@ class Agent:
 
     # -- internals ---------------------------------------------------------
 
-    def _log_header(self, goal: str, rec: Recorder) -> None:
+    def _log_header(self, goal: str, rec: Recorder, *,
+                    resumed_from: int = 0) -> None:
         """Write who, what and with which settings at the top of the run log.
 
         All of it is knowable the moment a run starts and none of it is
@@ -425,6 +444,9 @@ class Agent:
         runlog.preamble(
             run=rec.dir.name,
             goal=goal,
+            # A resumed run's log continues the failed sitting's; this is the
+            # only line that says why the first step is not step 1.
+            resumed=(f"from step {resumed_from}" if resumed_from else ""),
             artifacts=str(rec.dir),
             # `events.jsonl` timestamps are epoch seconds and these lines are
             # wall clock, so one run needs one number that converts between them.
@@ -468,6 +490,11 @@ class Agent:
                 log.error("wall-clock budget exhausted")
                 state.finished = "failed"
                 return
+            # The resume point: everything the run knows, through the last
+            # *completed* step. Written here rather than only on the way out so
+            # a run that dies mid-step -- a hang, a kill, a crash -- still
+            # leaves something `--resume` can pick up.
+            checkpoint.save(cfg, state)
             state.step += 1
 
             # ---- 1. perceive (no LLM) -----------------------------------

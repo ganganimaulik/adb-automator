@@ -66,8 +66,9 @@ adbagent models --vision --search kimi
 ```
 
 Any model in the provider's catalogue works. Pass it with `--model`, or set it in
-`config.json` (copy `config.example.json`). The API key is only ever read from the
-environment, never from the config file.
+`config.json` (copy `config.example.json`). The API key may be set in `config.json`
+(`llm.api_key`, which is gitignored) or via the `FIREWORKS_API_KEY` environment
+variable.
 
 Four models are configurable and each is used for one job:
 
@@ -94,7 +95,17 @@ adbagent run "turn on dark mode"
 
 # Repeat, with a spend ceiling for the whole session
 adbagent run "check the loyalty app" --repeat inf --budget-usd 5
+
+# Continue a failed or interrupted run where it stopped
+adbagent run --resume                # the most recent unfinished run
+adbagent run --resume 8f21c0a4e1b9   # or a specific one
 ```
+
+A run that fails or is interrupted leaves a checkpoint in its `runs/<id>`
+directory — its history, collected data and where it had got to. `--resume`
+continues it in the same directory with a fresh step and wall-clock budget
+(`--max-steps` then means *additional* steps), instead of starting over from
+the launcher knowing nothing. A run that succeeds clears its checkpoint.
 
 `run` takes `--max-steps`, `--budget-usd`, `--artifacts-dir`,
 `--always-screenshot` / `--never-screenshot`, `--allow-destructive` and
@@ -291,7 +302,9 @@ Five tabs. **Run** takes a goal and streams the run live — every decision,
 verification, vision read and the running cost — over the same `events.jsonl`
 the CLI writes, so what you see is exactly what `report` would replay. **History**
 lists recorded runs with their outcome, cost and duration, and opens the full
-trace, stats and scratchpad for any of them. **Devices** shows what is attached
+trace, stats and scratchpad for any of them — and a failed or interrupted one
+has a **resume** button, continuing it from its checkpoint exactly like
+`run --resume`. **Devices** shows what is attached
 and grabs a screenshot on demand. **Config** edits `config.json`. **Skills**
 lists, edits and generates app skills.
 

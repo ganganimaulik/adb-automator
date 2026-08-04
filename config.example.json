@@ -11,6 +11,7 @@
     "rpm": 120,
     "max_retries": 10,
     "service_tier": "",
+    "api_key": "",
     "api_key_env": "FIREWORKS_API_KEY",
     "vision_in_decider": false,
     "reasoning_effort": "",

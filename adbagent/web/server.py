@@ -31,7 +31,7 @@ _MEDIA_TYPES = {".html": "text/html", ".js": "text/javascript",
 
 
 class RunRequest(BaseModel):
-    goal: str
+    goal: str = ""
     max_steps: Optional[int] = None
     budget_usd: Optional[float] = None
     repeat: str = "1"
@@ -39,6 +39,9 @@ class RunRequest(BaseModel):
     allow_destructive: bool = False
     no_learn: bool = False
     serial: str = ""
+    #: A run id to continue from its checkpoint. When set, `goal` is ignored
+    #: -- the checkpoint's own goal is the one being pursued.
+    resume: str = ""
 
 
 class ConfigUpdate(BaseModel):
@@ -166,6 +169,9 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             except (OSError, json.JSONDecodeError):
                 pass
         for section, values in update.sections.items():
+            # Never persist the redaction marker as a real key.
+            if section == "llm" and values.get("api_key") == "***":
+                values = {k: v for k, v in values.items() if k != "api_key"}
             raw.setdefault(section, {}).update(values)
         path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
         return {"saved": True, "path": str(path)}
@@ -185,14 +191,28 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
 
     @app.post("/api/runs")
     def start_run(req: RunRequest) -> Dict[str, Any]:
-        if not req.goal.strip():
+        from .. import checkpoint as ckpt
+
+        goal = req.goal.strip()
+        if req.resume:
+            path = runparse.find_run(runs_dir, req.resume)
+            if path is None:
+                raise HTTPException(status_code=404, detail="run not found")
+            data = ckpt.load(path)
+            if data is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"run {req.resume} has no checkpoint to resume from")
+            goal = data.get("goal", "")
+        if not goal:
             raise HTTPException(status_code=400, detail="goal is required")
         try:
-            return manager.start(req.goal.strip(), max_steps=req.max_steps,
+            return manager.start(goal, max_steps=req.max_steps,
                                  budget_usd=req.budget_usd, repeat=req.repeat,
                                  dry_run=req.dry_run,
                                  allow_destructive=req.allow_destructive,
-                                 no_learn=req.no_learn, serial=req.serial)
+                                 no_learn=req.no_learn, serial=req.serial,
+                                 resume=req.resume)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
 

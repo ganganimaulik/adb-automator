@@ -93,22 +93,28 @@ def packages_in(events: Sequence[Dict[str, Any]]) -> Set[str]:
     steps: Dict[str, int] = {}
     packages: Set[str] = set()
     opened: Set[str] = set()
+    #: A run continued with --resume leaves one `run_end` per sitting, and the
+    #: counts accumulate across them -- so only the last one is read, or every
+    #: step the first sitting took would be counted twice.
+    last_end: Dict[str, Any] = {}
 
     for event in events:
         kind = event.get("kind")
         if kind == "run_end":
-            counts = event.get("package_steps") or {}
-            if isinstance(counts, dict):
-                for pkg, n in counts.items():
-                    if pkg:
-                        steps[str(pkg)] = steps.get(str(pkg), 0) + int(n or 0)
-            packages.update(str(p) for p in (event.get("packages") or []) if p)
+            last_end = event
         elif kind == "decide":
             action = event.get("action") or {}
             if isinstance(action, dict) and action.get("action") == "open_app":
                 text = str(action.get("text") or "")
                 if "." in text:
                     opened.add(text)
+
+    counts = last_end.get("package_steps") or {}
+    if isinstance(counts, dict):
+        for pkg, n in counts.items():
+            if pkg:
+                steps[str(pkg)] = int(n or 0)
+    packages.update(str(p) for p in (last_end.get("packages") or []) if p)
 
     if steps:
         total = sum(steps.values()) or 1

@@ -96,6 +96,12 @@ function renderEvent(ev) {
   if (kind === "run_start") {
     div.className = "banner";
     div.innerHTML = `<b>goal</b> ${esc(ev.goal)}<br><span class="small">${esc(ev.model || "")}</span>`;
+  } else if (kind === "run_resume") {
+    // Where two sittings of one run join: the events above it are the failed
+    // attempt, the ones below are the continuation.
+    div.className = "banner";
+    div.innerHTML = `<b>resumed from step ${esc(ev.resumed_at_step || 0)}</b>` +
+      `<br><span class="small">${esc(ev.model || "")}</span>`;
   } else if (kind === "decide") {
     const a = ev.action || {};
     const llm = ev.llm || {};
@@ -219,10 +225,10 @@ function openStream() {
   };
 }
 
-$("run-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
+/* What the form's options are currently set to -- shared by a fresh run and a
+   resume, since a resume starts a new sitting under the same options. */
+function runOptions() {
   const body = {
-    goal: $("goal").value.trim(),
     repeat: $("opt-repeat").value.trim() || "1",
     dry_run: $("opt-dry-run").checked,
     allow_destructive: $("opt-destructive").checked,
@@ -233,6 +239,22 @@ $("run-form").addEventListener("submit", async (e) => {
   if (ms) body.max_steps = ms;
   const budget = parseFloat($("opt-budget").value);
   if (!isNaN(budget)) body.budget_usd = budget;
+  return body;
+}
+
+function beginLive() {
+  live.step = 0; live.calls = 0; live.cost = 0; live.startedAt = Date.now() / 1000;
+  $("feed").innerHTML = "";
+  $("c-runid").textContent = "starting…";
+  paintCounters();
+  setRunningUI(true);
+  $("run-hint").textContent = "";
+  openStream();
+}
+
+$("run-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = { goal: $("goal").value.trim(), ...runOptions() };
   if (!body.goal) { notice("a goal is required"); return; }
 
   try {
@@ -241,14 +263,24 @@ $("run-form").addEventListener("submit", async (e) => {
     notice(err.message);
     return;
   }
-  live.step = 0; live.calls = 0; live.cost = 0; live.startedAt = Date.now() / 1000;
-  $("feed").innerHTML = "";
-  $("c-runid").textContent = "starting…";
-  paintCounters();
-  setRunningUI(true);
-  $("run-hint").textContent = "";
-  openStream();
+  beginLive();
 });
+
+/* Continue a failed run from its checkpoint, watched in the run tab. */
+async function resumeRun(id) {
+  try {
+    await api("/api/runs", {
+      method: "POST",
+      body: JSON.stringify({ resume: id, ...runOptions() }),
+    });
+  } catch (err) {
+    notice(err.message);
+    return;
+  }
+  document.querySelector('button[data-tab="run"]').click();
+  beginLive();
+  $("run-hint").textContent = `resuming ${id} from its checkpoint`;
+}
 
 $("btn-stop").addEventListener("click", async () => {
   try {
@@ -297,7 +329,19 @@ async function loadRuns() {
       `<td><span class="chip ${esc(r.outcome)}">${esc(r.outcome)}</span></td>` +
       `<td>${esc(r.steps)}</td><td>$${(r.usd || 0).toFixed(3)}</td>` +
       `<td>${fmtDur(r.duration_s)}</td>` +
-      `<td class="small">${fmtTime(r.started)}</td>`;
+      `<td class="small">${fmtTime(r.started)}</td>` +
+      `<td></td>`;
+    if (r.resumable && !(data.active && data.active.running)) {
+      const btn = document.createElement("button");
+      btn.className = "ghost";
+      btn.textContent = "resume";
+      btn.title = `continue from step ${r.steps}`;
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();          // the row itself opens the detail view
+        resumeRun(r.id);
+      });
+      tr.lastElementChild.appendChild(btn);
+    }
     tr.addEventListener("click", () => openRunDetail(r.id));
     tbody.appendChild(tr);
   }
@@ -314,6 +358,9 @@ async function openRunDetail(id) {
   try {
     const d = await api("/api/runs/" + encodeURIComponent(id));
     const s = d.summary, st = d.stats;
+    const resumeBtn = $("btn-resume-run");
+    resumeBtn.style.display = s.resumable ? "" : "none";
+    resumeBtn.onclick = () => resumeRun(id);
     $("detail-stats").innerHTML =
       `<h3>${esc(s.goal)}</h3><div class="counters">` +
       `<span>outcome <b>${esc(s.outcome)}</b></span>` +
@@ -381,6 +428,7 @@ const CFG_SPEC = [
     ["model_image", "text"], ["model_skill", "text"],
     ["temperature", "number"], ["max_tokens", "number"], ["max_tokens_image", "number"],
     ["rpm", "number"], ["base_url", "text"], ["service_tier", "text"],
+    ["api_key", "password"], ["api_key_env", "text"],
     ["reasoning_effort", ["", "none", "low", "medium", "high"]],
     ["reasoning_effort_hard", ["", "none", "low", "medium", "high"]],
     ["reasoning_style", ["auto", "effort", "thinking", "off"]],
@@ -429,6 +477,10 @@ async function loadConfig() {
         label.innerHTML = `${esc(key)}<select id="${inputId}">` +
           type.map((v) => `<option value="${esc(v)}" ${v === value ? "selected" : ""}>` +
             `${v === "" ? "(unset)" : esc(v)}</option>`).join("") + `</select>`;
+      } else if (type === "password") {
+        const set = value && value !== "";
+        label.innerHTML = `${esc(key)}<input type="password" id="${inputId}" ` +
+          `placeholder="${set ? "(set, hidden)" : "(unset)"}" autocomplete="off">`;
       } else {
         const step = Number.isInteger(value) ? "1" : "any";
         label.innerHTML = `${esc(key)}<input type="${type}" id="${inputId}" ` +
@@ -457,6 +509,9 @@ $("btn-cfg-save").addEventListener("click", async () => {
         if (el.value.trim() === "") continue;
         value = Number.isInteger(original) ? parseInt(el.value, 10) : parseFloat(el.value);
         if (Number.isNaN(value)) continue;
+      } else if (type === "password") {
+        value = el.value;
+        if (value === "") continue;  // blank = leave the stored key untouched
       } else {
         value = el.value;
         if (value === "" && original !== "") continue;

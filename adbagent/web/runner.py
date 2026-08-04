@@ -61,13 +61,20 @@ class RunManager:
     def start(self, goal: str, *, max_steps: Optional[int] = None,
               budget_usd: Optional[float] = None, repeat: str = "1",
               dry_run: bool = False, allow_destructive: bool = False,
-              no_learn: bool = False, serial: str = "") -> Dict[str, Any]:
+              no_learn: bool = False, serial: str = "",
+              resume: str = "") -> Dict[str, Any]:
         with self._lock:
             if self._proc is not None and self._proc.poll() is None:
                 raise RuntimeError("a run is already in progress")
 
-            argv = [sys.executable, "-m", "adbagent", "run", goal,
-                    "--repeat", str(repeat or "1")]
+            if resume:
+                # No goal argument: the checkpoint supplies it, along with the
+                # run's history and where it stopped.
+                argv = [sys.executable, "-m", "adbagent", "run",
+                        "--resume", resume, "--repeat", "1"]
+            else:
+                argv = [sys.executable, "-m", "adbagent", "run", goal,
+                        "--repeat", str(repeat or "1")]
             if max_steps:
                 argv += ["--max-steps", str(max_steps)]
             if budget_usd is not None:
@@ -86,7 +93,10 @@ class RunManager:
             self.artifacts_dir.mkdir(parents=True, exist_ok=True)
             self._dirs_before = {d.name for d in self.artifacts_dir.iterdir()
                                  if d.is_dir()}
-            self._run_dir = None
+            # A resumed run reuses its existing directory, which the new-dir
+            # discovery below would never report as fresh -- so it is set
+            # directly, and discovery has nothing left to do.
+            self._run_dir = self.artifacts_dir / resume if resume else None
             self._returncode = None
             self._output = []
             self._goal = goal

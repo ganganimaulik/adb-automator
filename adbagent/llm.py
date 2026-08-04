@@ -612,10 +612,11 @@ class LLMClient:
         if self.provider is None:
             raise LLMError(f"unknown provider {cfg.llm.provider!r}; "
                            f"known: {sorted(PROVIDERS)}")
-        key_env = cfg.llm.api_key_env or self.provider.api_key_env
-        self.api_key = __import__("os").environ.get(key_env, "")
+        self.api_key = cfg.api_key()
         if not self.api_key:
-            raise LLMError(f"${key_env} is not set")
+            key_env = cfg.llm.api_key_env or self.provider.api_key_env
+            raise LLMError(f"no API key: set llm.api_key in config.json "
+                           f"or ${key_env} in the environment")
 
         self.model = qualify(self.provider, cfg.llm.model)
         self.model_small = qualify(self.provider, cfg.llm.small())
