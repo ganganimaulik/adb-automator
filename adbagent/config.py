@@ -31,7 +31,12 @@ class LLMConfig:
     #: Falls back to `model` when empty.
     model_skill: str = ""
     temperature: float = 0.0
-    max_tokens: int = 1500
+    #: Output ceiling for every call the agent makes -- deciding, judging,
+    #: describing a screenshot, reading one item. The single source: no call site
+    #: clamps it further, so a truncated reply means raise this, not hunt for a
+    #: literal. Reasoning models spend most of their output thinking, so a
+    #: ceiling that fits a bare answer truncates a thought.
+    max_tokens: int = 10000
     #: Client-side request throttle. Fireworks free accounts are capped at 10 RPM;
     #: paid accounts go to 6000. 120 is a safe default for a paid account.
     rpm: int = 120
