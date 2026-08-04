@@ -1542,6 +1542,32 @@ def cmd_skills(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# ui
+# ---------------------------------------------------------------------------
+
+def cmd_ui(args) -> int:
+    try:
+        import uvicorn
+    except ImportError:
+        print("error: the web UI needs uvicorn -- pip install uvicorn fastapi",
+              file=sys.stderr)
+        return 1
+
+    from .web.server import create_app
+
+    out = Out()
+    kwargs: Dict[str, Any] = {}
+    if getattr(args, "artifacts_dir", None):
+        kwargs["artifacts_dir"] = args.artifacts_dir
+    if getattr(args, "config", None):
+        kwargs["config_path"] = args.config
+    app = create_app(**kwargs)
+    out.say(f"  adbagent ui on http://{args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -1691,6 +1717,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_apps)
 
     from .skills import DEFAULT_EXPLORE_STEPS
+
+    p = sub.add_parser("ui", help="serve the web UI")
+    p.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
+    p.add_argument("--port", type=int, default=8765, help="port (default 8765)")
+    p.add_argument("--artifacts-dir", dest="artifacts_dir",
+                   help="directory of recorded runs (default: config's run.artifacts_dir)")
+    _add_common(p)
+    p.set_defaults(func=cmd_ui)
 
     p = sub.add_parser("skills", help="manage app skills (list, view, create, generate)")
     p.add_argument("skills_action", nargs="?", choices=["list", "view", "create", "generate"],
