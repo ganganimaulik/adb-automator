@@ -9,7 +9,8 @@ from adbagent.skills import (DEFAULT_EXPLORE_STEPS, MIN_LEARNABLE_STEPS,
                              AppTrace, ExplorationBlocked, Skill,
                              SkillGenerator, SkillRegistry, TraceCollector,
                              Workflow, exploration_goal, explore_app,
-                             learn_from_run, package_from_text, resolve_package)
+                             goal_app_candidates, learn_from_run,
+                             package_from_text, resolve_package)
 from adbagent.cli import main
 
 from . import fake
@@ -104,6 +105,70 @@ def test_skill_registry(tmp_path):
     goal_matched = registry.find_for_run("", "Open AppOne and search")
     assert goal_matched is not None
     assert goal_matched.name == "AppOne"
+
+
+def _registry_with(*skills: Skill) -> SkillRegistry:
+    registry = SkillRegistry.__new__(SkillRegistry)
+    registry.skills = {s.name.lower(): s for s in skills}
+    return registry
+
+
+def test_find_for_run_prefers_the_app_the_goal_names():
+    """What the last session left on screen is not what the run is for: a price
+    comparison starting on top of Bumble must not load Bumble's skill."""
+    bumble = Skill(name="Bumble", packages=["com.bumble.app"], aliases=["bumble"])
+    zepto = Skill(name="Zepto", packages=["com.zeptoconsumerapp"], aliases=["zepto"])
+    blinkit = Skill(name="Blinkit", packages=["com.grofers.customerapp"],
+                    aliases=["blinkit"])
+    registry = _registry_with(bumble, zepto, blinkit)
+    goal = "compare price of coconut water on zepto and blinkit"
+
+    # Bumble in front, both goal apps elsewhere: a goal-named skill wins.
+    picked = registry.find_for_run("com.bumble.app", goal, goal_names_app=True)
+    assert picked is not None and picked.name in ("Zepto", "Blinkit")
+
+    # And a goal spanning two apps follows the one on screen.
+    assert registry.find_for_run(
+        "com.zeptoconsumerapp", goal, goal_names_app=True).name == "Zepto"
+    assert registry.find_for_run(
+        "com.grofers.customerapp", goal, goal_names_app=True).name == "Blinkit"
+
+
+def test_find_for_run_falls_back_to_the_foreground_app():
+    """A vague goal makes the open app the likely subject, so its skill loads."""
+    bumble = Skill(name="Bumble", packages=["com.bumble.app"], aliases=["bumble"])
+    registry = _registry_with(bumble)
+    assert registry.find_for_run("com.bumble.app", "read my matches").name == "Bumble"
+
+
+def test_find_for_run_no_fallback_when_the_goal_named_other_apps():
+    """The goal pointed at apps that have no skill yet: the leftover app's
+    skill is noise, and nothing loading is the right answer."""
+    bumble = Skill(name="Bumble", packages=["com.bumble.app"], aliases=["bumble"])
+    registry = _registry_with(bumble)
+    picked = registry.find_for_run(
+        "com.bumble.app", "compare price of coconut water on zepto and blinkit",
+        goal_names_app=True)
+    assert picked is None
+
+
+def test_goal_app_candidates():
+    class Dev:
+        def list_apps(self):
+            return ["com.bumble.app", "com.grofers.customerapp",
+                    "com.whatsapp", "com.zeptoconsumerapp"]
+
+    found = goal_app_candidates(
+        Dev(), "compare price of yu coconut water 1 liter on zepto and blinkit")
+    # "zepto" is a substring of its package; "blinkit" appears nowhere in
+    # `com.grofers.customerapp`, which is the documented limit of a
+    # package-name-only lookup.
+    assert found == ["com.zeptoconsumerapp"]
+    # A goal naming no app names none -- including the instruction words.
+    assert goal_app_candidates(Dev(), "read my unread messages") == []
+    # CamelCase and punctuation still reach the package.
+    assert goal_app_candidates(Dev(), "open BumbleApp, then tour it") == \
+        ["com.bumble.app"]
 
 
 def test_skill_prompt_text():
@@ -802,6 +867,73 @@ def test_the_trace_ignores_the_launcher_when_picking_the_app(cfg):
         collector.record(screen, step)
 
     assert collector.main_package == "com.whatsapp"
+
+
+def a_two_app_tour(cfg, blinkit_steps=3):
+    """Drive a collector through a zepto-then-blinkit price check."""
+    from types import SimpleNamespace
+    dev = fake.FakeDevice(cfg)
+    collector = TraceCollector(dev)
+    stops = ["com.zepto"] * 4 + ["com.blinkit"] * blinkit_steps
+    for step, pkg in enumerate(stops, start=1):
+        screen = dev.observe()
+        screen.package = pkg
+        screen.skeleton_id = f"{pkg}-{step}"
+        collector("step", step=step, screen=screen, action=f"tap #{step}")
+    collector.finish("success", SimpleNamespace(step=len(stops), llm_calls=len(stops),
+                                                run_id="r1", scratchpad=None))
+    return collector
+
+
+def test_a_run_across_two_apps_leaves_a_trace_for_each(cfg):
+    """The zepto-and-blinkit case: a price check across two apps is a tour of
+    both, and learning from only the busier one leaves the other with no skill
+    from a run that walked its screens just the same."""
+    zepto, blinkit = a_two_app_tour(cfg).app_traces()
+
+    assert (zepto.package, blinkit.package) == ("com.zepto", "com.blinkit")
+    assert zepto.steps == 4 and blinkit.steps == 3
+    assert all("com.zepto" in s for s in zepto.screens)
+    assert all("com.blinkit" in s for s in blinkit.screens)
+    assert len(zepto.actions) == 4 and len(blinkit.actions) == 3
+
+
+class PerAppLLM(MockLLM):
+    """Answers each synthesis with a skill named for the app being asked about."""
+
+    def _post_chat(self, messages, model=None):
+        content = messages[1]["content"]
+        if isinstance(content, list):  # the with-screenshots attempt: parts, not text
+            content = " ".join(part.get("text", "") for part in content
+                               if isinstance(part, dict))
+        pkg = "com.zepto" if "com.zepto" in content else "com.blinkit"
+        name = "Zepto" if pkg == "com.zepto" else "Blinkit"
+        skill = dict(GENERATED, name=name, packages=[pkg])
+        return {"choices": [{"message": {"content": json.dumps(skill)}}]}
+
+
+def test_a_run_across_two_apps_updates_both_skills(tmp_path, cfg):
+    registry = SkillRegistry(tmp_path / "skills")
+    for trace in a_two_app_tour(cfg).app_traces():
+        learn_from_run(trace, PerAppLLM(""), registry)
+
+    saved = SkillRegistry(tmp_path / "skills")
+    assert len(saved.list_skills()) == 2
+    assert saved.find_by_package("com.zepto") is not None
+    assert saved.find_by_package("com.blinkit") is not None
+
+
+def test_a_run_that_only_peeked_at_the_second_app_leaves_it_unlearned(tmp_path, cfg):
+    """Opening an app for one step on the way past is not a tour of it, and a
+    skill written from that is invention."""
+    registry = SkillRegistry(tmp_path / "skills")
+    learned = [learn_from_run(trace, PerAppLLM(""), registry)
+               for trace in a_two_app_tour(cfg, blinkit_steps=1).app_traces()]
+
+    assert learned[0] is not None and learned[1] is None
+    saved = SkillRegistry(tmp_path / "skills")
+    assert saved.find_by_package("com.zepto") is not None
+    assert saved.find_by_package("com.blinkit") is None
 
 
 def test_the_collector_passes_events_through_to_the_reporter(cfg, mem):

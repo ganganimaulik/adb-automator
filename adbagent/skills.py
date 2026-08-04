@@ -447,17 +447,36 @@ class SkillRegistry:
                 return skill
         return None
 
-    def find_for_run(self, package: str, goal: str) -> Optional[Skill]:
-        # 1. Package match (highest priority when inside app)
-        if package:
-            sk = self.find_by_package(package)
-            if sk:
+    def find_for_run(self, package: str, goal: str, *,
+                     goal_names_app: bool = False) -> Optional[Skill]:
+        """The skill to put in the prompt for this step.
+
+        Ordered by what the run is *for*, not by what happens to be on screen.
+        What is on screen at step one is whatever the last session left there,
+        so a foreground-first lookup loads that app's guidance into a task that
+        never touches it -- a run comparing prices on Zepto and Blinkit used to
+        start with the Bumble skill purely because Bumble was open.
+
+        1. The goal-named app the run is in right now, so a goal spanning two
+           apps follows the one on screen.
+        2. A goal-named app's skill before the run reaches the app: its
+           workflow is more use in the prompt while deciding how to get there
+           than the leftover app's is.
+        3. The foreground app, but only when the goal named no app at all. A
+           vague goal ("read my messages") makes the open app the likely
+           subject; a goal about other apps makes its skill noise.
+           `goal_names_app` is that distinction, resolved by the caller against
+           the installed apps -- the registry cannot tell "named no app" from
+           "named an app that has no skill yet" on its own.
+        """
+        named = [s for s in self.list_skills() if s.matches_goal(goal)] if goal else []
+        for sk in named:
+            if sk.matches_package(package):
                 return sk
-        # 2. Goal text match (e.g. goal says "Open Spotify and search...")
-        if goal:
-            for skill in self.skills.values():
-                if skill.matches_goal(goal):
-                    return skill
+        if named:
+            return named[0]
+        if package and not goal_names_app:
+            return self.find_by_package(package)
         return None
 
     def path_for(self, skill: Skill) -> Path:
@@ -629,6 +648,41 @@ def package_from_text(dev: Any, text: str) -> Tuple[str, List[str]]:
     return "", sorted(hits)
 
 
+def goal_app_candidates(dev: Any, goal: str) -> List[str]:
+    """Installed packages a goal text names, best-effort.
+
+    `find_for_run`'s foreground fallback needs to know one thing: did the goal
+    point at any app at all? "compare prices on Zepto and Blinkit" did; "read
+    my messages" did not, and for that one the app already open is the likely
+    subject, so its skill should still load.
+
+    `package_from_text` answers a stricter question -- which ONE app do the
+    tasks mean -- and matches on whole package segments, which misses an app
+    whose display name is no segment of its package ("zepto" is not a segment
+    of `com.zeptoconsumerapp`). For a yes/no question a substring hit is
+    enough; a false positive merely skips the fallback, which is the right
+    call for a goal about an app the phone does have anyway, and a goal word
+    that matches nothing installed falls through to the fallback as before.
+
+    Never fatal: a device that cannot answer degrades to the old
+    foreground-first behaviour rather than costing the run its skill lookup.
+    """
+    raw = {_squash(token) for token in re.split(r"\s+", goal or "")}
+    raw |= {w.lower() for w in _NAME_WORD.findall(goal or "")}
+    words = {w for w in raw
+             if len(w) > 2 and w not in _TOO_COMMON and w not in _INSTRUCTION_WORDS}
+    if not words:
+        return []
+    try:
+        installed = dev.list_apps()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not list apps named in the goal: %s", exc)
+        return []
+    # Squashed on both sides, as `resolve_package` does: the dot in
+    # `com.bumble.app` is what defeats a plain "BumbleApp" substring search.
+    return sorted(p for p in installed if any(w in _squash(p) for w in words))
+
+
 def ready_for_exploration(dev: Any) -> str:
     """"" when the phone can be driven, otherwise why it cannot."""
     try:
@@ -788,6 +842,15 @@ class TraceCollector:
         #: Steps spent in each package, so a run that crosses apps can say which
         #: one it was mostly working in.
         self.steps_in: Dict[str, int] = {}
+        #: The same breakdown for screens, actions and frames: a run that works
+        #: two apps has something to teach both, and attributing everything to
+        #: the busier one is how the other never gets a skill.
+        self.screens_in: Dict[str, List[str]] = {}
+        self.actions_in: Dict[str, List[str]] = {}
+        self.shots_in: Dict[str, List[bytes]] = {}
+        #: Where the run was at the last recorded screen, for attributing the
+        #: action that followed it.
+        self._last_package = ""
 
     def __call__(self, kind: str, **kw: Any) -> None:
         self.on_event(kind, **kw)
@@ -800,17 +863,29 @@ class TraceCollector:
         if screen is not None:
             self.record(screen, step)
         if action is not None:
-            self.trace.actions.append(_describe(action, step))
+            described = _describe(action, step)
+            self.trace.actions.append(described)
+            if self._last_package:
+                self.actions_in.setdefault(self._last_package, []).append(described)
 
     def record(self, screen: "Screen", step: int) -> None:
         if screen.package:
             self.steps_in[screen.package] = self.steps_in.get(screen.package, 0) + 1
+            self._last_package = screen.package
         key = screen.skeleton_id or f"{screen.package}{screen.activity}"
         if key in self.seen:
             return
         self.seen.add(key)
-        self.trace.screens.append(_summarise(screen, step))
-        if len(self.trace.screenshots) >= MAX_EXPLORE_SHOTS:
+        summary = _summarise(screen, step)
+        self.trace.screens.append(summary)
+        if screen.package:
+            self.screens_in.setdefault(screen.package, []).append(summary)
+        # The frame budget is per app, not per run: with one global cap, the
+        # first app a price-check run tours would spend every frame and the
+        # second app's synthesis would see none of its screens.
+        pkg_shots = self.shots_in.setdefault(screen.package, []) if screen.package else None
+        spent = pkg_shots if pkg_shots is not None else self.trace.screenshots
+        if len(spent) >= MAX_EXPLORE_SHOTS:
             return
         # Verification already grabbed a frame of this screen most turns; reuse
         # it rather than paying a second round trip for the same pixels.
@@ -822,7 +897,10 @@ class TraceCollector:
                 log.warning("no screenshot for step %d: %s", step, exc)
                 return
         if shot:
-            self.trace.screenshots.append(shot)
+            if len(self.trace.screenshots) < MAX_EXPLORE_SHOTS:
+                self.trace.screenshots.append(shot)
+            if pkg_shots is not None:
+                pkg_shots.append(shot)
 
     @property
     def main_package(self) -> str:
@@ -849,6 +927,37 @@ class TraceCollector:
         if not self.trace.package:
             self.trace.package = self.main_package
         return self.trace
+
+    def app_traces(self) -> List[AppTrace]:
+        """One trace per app the run worked in, busiest first.
+
+        A goal like "compare prices on Zepto and Blinkit" is a tour of *both*
+        apps; learning only from `main_package`'s share leaves the second app
+        with no skill from a run that walked its search, list and item screens.
+        Each trace here carries just that app's screens, actions and frames and
+        its own step count, so `learn_from_run`'s "went nowhere teaches
+        nothing" guards judge each app on what the run actually did there.
+
+        The notes stay whole for every app: the scratchpad is the run's ledger
+        and is not keyed by app, so there is no honest way to split it -- and
+        the synthesis is told to write about the app the screens show, not the
+        data the run collected.
+        """
+        packages = sorted((p for p in self.steps_in if is_app_package(p)),
+                          key=lambda p: -self.steps_in[p])
+        if not packages:
+            return [self.trace]
+        return [AppTrace(query=self.trace.query, package=pkg,
+                         tasks=self.trace.tasks,
+                         screens=list(self.screens_in.get(pkg, [])),
+                         actions=list(self.actions_in.get(pkg, [])),
+                         screenshots=list(self.shots_in.get(pkg, [])),
+                         notes=self.trace.notes, chosen_by=self.trace.chosen_by,
+                         outcome=self.trace.outcome,
+                         steps=self.steps_in.get(pkg, 0),
+                         llm_calls=self.trace.llm_calls,
+                         run_id=self.trace.run_id)
+                for pkg in packages]
 
 
 def explore_app(dev: Any, mem: Any, llm: Any, cfg: Any, *, query: str = "",
