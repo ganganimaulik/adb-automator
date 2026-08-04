@@ -306,7 +306,10 @@ def test_a_sweep_only_ever_swipes(cfg, mem):
     dev, _, _, _ = walk(cfg, mem, chrome_fades_after=999)
     swipes = [a for a in dev.actions if a.startswith("scroll(")]
     assert swipes, "the album was never paged"
+    # `list_apps('')` is the once-per-run "which apps did the goal name" lookup
+    # for skill selection -- a read-only query, not a gesture on this screen.
     assert all(a in ("scroll(left)", "scroll(right)") or a.startswith("tap(")
+               or a == "list_apps('')"
                for a in dev.actions), dev.actions
     assert "press(back)" not in dev.actions
     assert not any(a.startswith("input_text") for a in dev.actions)

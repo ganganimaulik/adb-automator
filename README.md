@@ -281,7 +281,12 @@ truncating, because the interesting steps of a long run are at the end.
 ## App skills
 
 A skill is per-app guidance — workflows, UI quirks, what to avoid — injected into
-the prompt when the agent is in that app.
+the prompt for the apps the task is about. The goal decides, not whatever happens
+to be on screen: a run comparing prices on Zepto and Blinkit gets those skills,
+even if the phone was left on Bumble — and Bumble's skill does not load just
+because Bumble was open. A goal that names two apps follows the one on screen as
+the run moves between them, and a goal naming no app at all ("read my messages")
+falls back to the app in front, which is then the likely subject.
 
 ```bash
 adbagent skills list
@@ -384,15 +389,19 @@ as flaky, and only one of those belongs in a skill.
 Attribution is the part that has to be right — a run filed under the wrong app
 hands its failures to that app's skill as fact. It comes from where a run's steps
 actually went, recorded in `run_end`. (`active_skill` looks like it would do and
-does not: it records the package on screen when the skill loaded, which filed a
-WhatsApp run under Bumble because Bumble happened to be open.)
+does not: a skill loads because the goal named the app, which says nothing about
+where the steps went — a run can carry the WhatsApp skill from start to finish
+without one step landing in WhatsApp.)
 
 A run that went nowhere teaches nothing and is skipped — fewer than three steps,
 or only one screen reached, or the steps were spent in the launcher rather than an
 app. A run that *failed* is not skipped: "tapping this row does nothing" and "back
 leaves the app from here" are only ever learned the hard way, and they are what a
-skill is for. A goal that crosses apps updates the skill for the app the steps
-were spent in, not whichever happened to be in front at the end.
+skill is for. A goal that crosses apps — "compare prices on Zepto and Blinkit" —
+updates *each* app's skill from the steps spent in it: every app gets its own
+screens, actions and step count judged against the same "went nowhere teaches
+nothing" rule, so an app the run only opened in passing learns nothing, and
+neither is credited with what the other did.
 
 Turn it off per run with `--no-learn`, or for good with `skills.learn_after_run:
 false`.
