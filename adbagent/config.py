@@ -37,6 +37,11 @@ class LLMConfig:
     #: literal. Reasoning models spend most of their output thinking, so a
     #: ceiling that fits a bare answer truncates a thought.
     max_tokens: int = 10000
+    #: Output ceiling for image model calls (analyze_image, read_item). The
+    #: image model is often a different family with a different output limit,
+    #: and a single ceiling that fits a reasoning model's chain of thought can
+    #: truncate a vision transcription. Set to 0 to fall back to `max_tokens`.
+    max_tokens_image: int = 4096
     #: Client-side request throttle. Fireworks free accounts are capped at 10 RPM;
     #: paid accounts go to 6000. 120 is a safe default for a paid account.
     rpm: int = 120
@@ -90,6 +95,9 @@ class LLMConfig:
 
     def image(self) -> str:
         return self.model_image or self.model
+
+    def image_max_tokens(self) -> int:
+        return self.max_tokens_image or self.max_tokens
 
     def skill(self) -> str:
         return self.model_skill or self.model
@@ -208,6 +216,7 @@ _ENV_MAP = {
     "ADBAGENT_BASE_URL": "llm.base_url",
     "ADBAGENT_RPM": "llm.rpm",
     "ADBAGENT_MAX_TOKENS": "llm.max_tokens",
+    "ADBAGENT_MAX_TOKENS_IMAGE": "llm.max_tokens_image",
     "ADBAGENT_DB": "memory.db",
     "ADBAGENT_BUDGET_USD": "safety.budget_usd",
     "ADBAGENT_MAX_STEPS": "run.max_steps",

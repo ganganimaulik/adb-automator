@@ -123,6 +123,7 @@ OVERRIDES = {
     "service_tier": "llm.service_tier",
     "rpm": "llm.rpm",
     "max_tokens": "llm.max_tokens",
+    "max_tokens_image": "llm.max_tokens_image",
     "device": "device.serial",
     "db": "memory.db",
     "budget_usd": "safety.budget_usd",
@@ -1547,6 +1548,9 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rpm", type=int, help="client-side request throttle")
     parser.add_argument("--max-tokens", dest="max_tokens", type=int,
                         help="max completion tokens for LLM calls")
+    parser.add_argument("--max-tokens-image", dest="max_tokens_image", type=int,
+                        help="max completion tokens for image model calls "
+                             "(falls back to --max-tokens)")
     parser.add_argument("--db", help="path to the memory database")
 
 
