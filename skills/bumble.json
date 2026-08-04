@@ -1,0 +1,70 @@
+{
+  "name": "Bumble",
+  "packages": [
+    "com.bumble.app"
+  ],
+  "aliases": [
+    "Bumble",
+    "BumbleApp",
+    "Bumble Date"
+  ],
+  "description": "Bumble is a dating/social app organized around five bottom-navigation tabs: Profile, Discover, People, Liked You, and Chats. The People tab is the default landing screen and shows a swipeable card deck of profiles. Liked You lists people who liked the user, Chats lists match conversations with search and per-conversation detail screens, Profile shows the user's own profile with completeness status, horizontal sub-tabs (Pay plan, Photo insights, Safety and wellbeing) and plan/consumable promos, and Settings (reached from the Profile tab gear) exposes account, mode, location, notification, payment, legal and privacy options.",
+  "workflows": [
+    {
+      "name": "navigate_main_tabs",
+      "steps": "Use the bottom navigation bar with tabs labeled 'Profile', 'Discover', 'People', 'Liked You', 'Chats'. Tap a tab label to switch sections. The app opens by default on the 'People' tab showing the card deck."
+    },
+    {
+      "name": "view_liked_you_list",
+      "steps": "Tap the 'Liked You' tab in the bottom navigation bar. The screen header reads 'Liked You' with the subtext 'They're into you! If you're into them too, like them back to match instantly.' It shows profile photos of people who liked you plus a promotional Spotlight card ('Be seen by up to 10x more people', 'Try a Spotlight' button). Do not tap a profile photo unless the task requires it - it opens the card deck/profile card."
+    },
+    {
+      "name": "browse_chats_list",
+      "steps": "Tap the 'Chats' tab in the bottom navigation bar. The screen shows a 'Your matches' section, a Spotlight promo banner ('Be seen up to 10x more', 'Shine a Spotlight and be seen first.'), a filter control reading 'Conversations are filtered by Recent', match conversation rows (e.g. I, R) with last-message previews and status chips like 'Your move', and an 'Older chats (N)' expander at the bottom that reveals archived conversations when tapped. A Search (magnifier) icon sits at the top of the screen."
+    },
+    {
+      "name": "search_connections",
+      "steps": "From the Chats tab, tap the Search (magnifier) icon at the top of the screen to open ConnectionsSearchActivity. The soft keyboard opens automatically with the cursor in the search field. Type into the search field; results filter as you type and 'No results' is shown when nothing matches (and also while the field is empty). A 'Clear text' (X) button appears at the right of the field once text is entered. Tap the Back arrow at top-left to return to the Chats tab."
+    },
+    {
+      "name": "open_conversation_detail",
+      "steps": "From the Chats tab, tap a match row (e.g. 'I') to open ConversationActivity showing the message thread with the match's name/photo at top, call and video icons, and a message input row. To leave, tap the Back arrow at top-left - this returns to the Chats list."
+    },
+    {
+      "name": "view_own_profile",
+      "steps": "Tap the 'Profile' tab in the bottom navigation bar. The screen shows the user's own profile (name and age, e.g. Maulik, 29), a profile-completeness percentage (e.g. '74%') with a 'Complete profile' CTA, and horizontal sub-tab buttons below the photo: 'Pay plan' (selected by default), 'Photo insights', 'Safety and wellbeing'. The Pay plan sub-tab shows Spotlight/SuperSwipe consumable status ('Spotlight Stand out', 'SuperSwipe 1 left') and Premium/Premium+ promo cards ('Explore Premium+' button, 'What you get:' comparison). A 'Visit Help Hub' button sits top-left and a Settings gear icon top-right."
+    },
+    {
+      "name": "open_and_read_settings",
+      "steps": "From the Profile tab, tap the Settings gear icon at top-right to open SettingsActivity. The initial element list may show only system UI, Back, and the 'Settings' title - scroll down once to load the list content. Rows include: Type of connection (Date), Date mode toggle, Snooze mode, Incognito Mode for Date (toggle), Auto-Spotlight (toggle), Current location (e.g. Ahmedabad, IN), Travel, Video autoplay settings, Notification settings, Payment settings, Legal information, Get help, Security and Privacy, and at the very bottom 'Log out' and 'Delete account'. Tap the Back arrow at top-left to return to the Profile tab."
+    },
+    {
+      "name": "view_photo_insights",
+      "steps": "From the Profile tab, tap the horizontal sub-tab 'Photo insights' below the profile photo. The screen shows 'How are your photos doing?' with a blurred graph locked behind Premium+ (labeled 'Double tap to upgrade to Premium+ to unlock') plus a note that insights can take a while and that Best Photo must be on. Do not double-tap the locked graph unless the task requires starting the Premium+ upgrade flow."
+    },
+    {
+      "name": "view_safety_wellbeing",
+      "steps": "From the Profile tab, tap the horizontal sub-tab 'Safety and wellbeing' below the profile photo. The screen shows cards 'Mental exhaustion' (Help with dating anxiety, uncertainty or burnout), 'Feelings of rejection' (Overcome low moments like ghosting), a 'Get Help' button, 'Your safety' (Trusted organisations to help keep you safe and well), and 'Your emotional wellbeing' (Resources for a healthy state of mind)."
+    }
+  ],
+  "nuances": [
+    "Conversation detail (ConversationActivity) content - messages, input field, call/video icons - never appears in the element list; only system UI (Back, status bar) is exposed. Do not try to read or type messages via the element tree; use the Back button to leave.",
+    "Settings screen content does not appear in the element list on first open - only system UI, Back, and the 'Settings' title are listed. The content lives in a scrollable list (settingsV2_recycler); scroll down to populate and reveal all rows.",
+    "The bottom of the Settings list contains destructive 'Log out' and 'Delete account' buttons - never tap them during recon or unless the task explicitly demands it.",
+    "Tapping a profile photo in the 'Liked You' tab opens the card deck/profile card, leaving the list context.",
+    "The Chats search screen shows 'No results' both when the field is empty and when a query matches nothing; a system clipboard popup may briefly overlay the bottom of the screen after typing.",
+    "The People tab is the default landing screen and shows a swipeable card deck (profile photo, name, age, tagline, 'New here' badges, 'Send a compliment' and 'Send SuperSwipe' buttons, Filters button top-right). Swiping or tapping a card acts on real profiles - avoid unless the task requires it.",
+    "The Chats search screen shows 'No results' both when the field is empty and when a query matches nothing, so an empty field can be mistaken for a failed search; the soft keyboard also opens automatically when the screen appears.",
+    "The Chats list hides older conversations behind an 'Older chats (N)' expander that must be tapped to reveal them; the count N can change between visits (observed 28 and 29), so do not assert an exact number.",
+    "The Photo insights graph on the Profile tab is blurred and locked behind Premium+ with the prompt 'Double tap to upgrade to Premium+ to unlock' - double-tapping it starts an upgrade flow."
+  ],
+  "recommendations": [
+    "Navigate between main sections only via the bottom nav labels 'Profile', 'Discover', 'People', 'Liked You', 'Chats' - they are consistently present on all main-tab screens.",
+    "On the Settings screen, always scroll at least once before concluding a row is missing; the full row set (including Security and Privacy, Log out, Delete account) only appears after scrolling.",
+    "Treat the conversation detail screen as a dead end for element-tree interaction: verify entry by the activity name (ConversationActivity), then exit with the Back button rather than hunting for message elements.",
+    "When a task only requires touring lists (Liked You, Chats), avoid tapping profile photos or cards, since they navigate into the card deck or a conversation and change context.",
+    "Use the 'Clear text' (X) button in the search field to reset a query, and the top-left Back arrow to exit Search, Conversation, and Settings screens.",
+    "On the Profile tab, switch content with the horizontal sub-tab buttons 'Pay plan', 'Photo insights', 'Safety and wellbeing' below the photo; avoid double-tapping locked Premium+ content such as the Photo insights graph."
+  ],
+  "custom_prompt": ""
+}

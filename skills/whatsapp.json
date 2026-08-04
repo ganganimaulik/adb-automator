@@ -9,11 +9,11 @@
     "wa",
     "com.whatsapp"
   ],
-  "description": "App skill for WhatsApp (com.whatsapp & com.whatsapp.w4b) covering chat navigation, media inspection, group chat workflows, and avoiding contact sheet loops.",
+  "description": "App skill for WhatsApp (com.whatsapp & com.whatsapp.w4b) covering chat list inspection (unread badges, read-only counts), chat navigation, media inspection, group chat workflows, and avoiding contact sheet loops.",
   "workflows": [
     {
       "name": "search_and_open_chat",
-      "steps": "1. Tap the search icon (magnifying glass) at top bar. 2. Type the contact or group name in search input. 3. Tap the matching contact/chat from the search results list."
+      "steps": "1. Tap the search field reading 'Ask Meta AI or Search' at the top of the Chats home (older versions show a magnifying-glass search icon in the top bar). 2. Type the contact or group name in the search input. 3. Tap the matching contact/chat from the search results list."
     },
     {
       "name": "send_message",
@@ -34,6 +34,10 @@
     {
       "name": "view_multiple_images_in_chat",
       "steps": "1. Open target chat or group. 2. Scan chat history for undownloaded images (marked with a download arrow icon) and tap each download icon to download images first. 3. Tap an image thumbnail directly to open full-screen media viewer (avoid tapping sender avatar or name). 4. In full-screen viewer, swipe left (action='swipe', direction='left') for next photo or right for previous photo. If an image displays a central download button, tap it to load the photo before swiping further. 5. Do NOT press back to the album grid to 'pick the next photo' — the grid cannot reach past the second tile and you will restart the album from the beginning."
+    },
+    {
+      "name": "count_unread_chats_readonly",
+      "steps": "1. Launch with open_app using the full package name 'com.whatsapp' and confirm the foreground screen is com.whatsapp.home.ui.HomeActivity; if only the Android home screen shows, run open_app again. 2. On the Chats tab, read the green numeric badge on the 'Chats' bottom-navigation tab — it is the aggregate unread total. 3. Scan each visible chat row: rows with unread messages include 'N unread message' in their accessibility text and show a green circular badge at the row's right edge with a green timestamp. 4. Scroll the chat list down to reveal more rows and keep counting rows carrying 'unread message' text. 5. Do NOT tap any chat row — opening a chat clears its badge and spoils a read-only count."
     }
   ],
   "nuances": [
@@ -50,7 +54,11 @@
     "Tapping Group/Chat Header -> 'Media, links, and docs' opens grid view of all shared photos, avoiding chat history scrolling delays.",
     "Do NOT tap 'Jump to latest message' or 'Scroll to bottom' floating arrow while searching past messages as it resets your search position.",
     "Sending a message requires explicit tap on the green Send button after typing in input field.",
-    "WhatsApp Web / Linked Device notifications may appear as popups; press back or tap outside to dismiss."
+    "WhatsApp Web / Linked Device notifications may appear as popups; press back or tap outside to dismiss.",
+    "HOME SEARCH BAR: the Chats home top bar is a search field reading 'Ask Meta AI or Search' (with a 'Swipe down to reveal additional actions' hint element beneath it). Tap that field to search; there may be no separate magnifying-glass icon.",
+    "UNREAD BADGES IN CHAT LIST: a chat with unread messages shows a green circle with the count at the row's right edge and a green timestamp, and the row's accessibility text includes 'N unread message' (e.g. '01/08/26 1 unread message Reserve Bank of India ..'). The 'Chats' tab in the bottom navigation (Chats / Updates / Communities / Calls) carries a green badge with the aggregate total.",
+    "READ-ONLY RULE: opening a chat marks it read and clears its unread badge. For badge-counting tasks, never tap a chat row — count from the list and the Chats tab badge only.",
+    "ASK META AI FLOATER: a transient 'Ask Meta AI' bubble can float over the chat list and move or vanish between turns; it is not a chat row — ignore it. A green '+' FAB (new chat) also sits at the bottom right."
   ],
   "recommendations": [
     "To check every photo of an album, open the first one and swipe left through the whole album in one pass, recording each photo's content in `observation` as you go. Leaving the viewer and coming back restarts you at photo 1 or 2.",
@@ -62,7 +70,9 @@
     "When inspecting long or truncated text messages, tap 'Read more' to expand and view the full text content.",
     "Clear search input before searching for a new contact.",
     "Verify target chat header text matches intended contact before sending messages.",
-    "Use input_text with clear=true when editing fields."
+    "Use input_text with clear=true when editing fields.",
+    "For read-only unread counts, combine the green badge on the 'Chats' bottom-nav tab with per-row 'N unread message' text; scroll the list to cover all rows and never open a chat, since that clears its badge.",
+    "Launch WhatsApp with the full package name com.whatsapp (not the bare alias 'whatsapp') and verify com.whatsapp.home.ui.HomeActivity is in the foreground before acting; retry open_app if the Android home screen shows instead."
   ],
   "custom_prompt": ""
 }
