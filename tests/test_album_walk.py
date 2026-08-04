@@ -114,10 +114,6 @@ def album_walker():
             return AgentAction(observation="album finished",
                                reasoning="every photo is read",
                                action="done", text="read all photos")
-        if "did NOT change" in note:
-            return AgentAction(observation="the swipe was dropped",
-                               reasoning="flick harder", action="swipe",
-                               direction="left", scroll_amount=2, duration=0.12)
         pager = pager_element(screen)
         if pager is None:
             return AgentAction(observation="no pager", reasoning="give up",
@@ -219,7 +215,6 @@ def test_a_dropped_fling_between_the_twins_still_advances(cfg, mem):
 def test_the_agent_is_told_where_it_is_and_what_it_has_read(cfg, mem):
     _, llm, _, _ = walk(cfg, mem)
     notes = "\n".join(llm.notes)
-    assert "CAROUSEL: this screen shows ONE item of a set" in notes
     assert "ITEMS INSPECTED IN THIS SET" in notes
     assert "you are here" in notes
 

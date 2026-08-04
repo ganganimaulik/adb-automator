@@ -119,6 +119,7 @@ OVERRIDES = {
     "model_small": "llm.model_small",
     "model_image": "llm.model_image",
     "model_skill": "llm.model_skill",
+    "model_skill_image": "llm.model_skill_image",
     "provider": "llm.provider",
     "service_tier": "llm.service_tier",
     "rpm": "llm.rpm",
@@ -1550,7 +1551,8 @@ def cmd_skills(args) -> int:
         out.say(out.bold(f"  Exploring {app_target or 'the app your tasks name'} live on the phone"))
         out.say(out.dim(f"  tasks:     {user_tasks or skillmod.DEFAULT_EXPLORE_TASKS}"))
         out.say(out.dim(f"  budget:    up to {cfg.run.max_steps} steps, ${cfg.safety.budget_usd:.2f}"))
-        out.say(out.dim(f"  synthesis: {cfg.llm.skill()}"))
+        out.say(out.dim(f"  synthesis: {cfg.llm.skill()} "
+                        f"(screenshots: {cfg.llm.skill_image()})"))
         out.say()
 
         llm = LLMClient(cfg, run_id=f"skill-{int(time.time())}")
@@ -1645,6 +1647,9 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
                         help="model for vision calls with screenshots")
     parser.add_argument("--model-skill", dest="model_skill",
                         help="dedicated model for app skill generation and exploration")
+    parser.add_argument("--model-skill-image", dest="model_skill_image",
+                        help="multimodal model for the screenshot pass of skill "
+                             "synthesis (falls back to --model-image)")
     parser.add_argument("--skills-dir", dest="skills_dir",
                         help="directory for app skills (default ./skills)")
     parser.add_argument("--rpm", type=int, help="client-side request throttle")

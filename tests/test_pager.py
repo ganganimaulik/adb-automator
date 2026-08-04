@@ -274,28 +274,6 @@ def test_ledger_render_is_bounded():
 
 
 # ---------------------------------------------------------------------------
-# Guidance
-# ---------------------------------------------------------------------------
-
-def test_browsing_note_names_the_pager_and_the_current_caption():
-    screen = viewer("9:40 am")
-    note = pager.browsing_note(screen, pager.ItemLedger())
-    element = pager.pager_element(screen)
-    assert f"swipe left on #{element.index}" in note
-    assert "Today, 9:40 am" in note
-
-
-def test_browsing_note_offers_a_way_out_when_the_caption_is_hidden():
-    note = pager.browsing_note(viewer(chrome=False), pager.ItemLedger())
-    assert "Tap the item once" in note
-
-
-def test_browsing_note_reports_a_dropped_swipe():
-    note = pager.browsing_note(viewer(), pager.ItemLedger(), swipe_failed=True)
-    assert "did NOT change" in note
-
-
-# ---------------------------------------------------------------------------
 # Sweep policy
 # ---------------------------------------------------------------------------
 #

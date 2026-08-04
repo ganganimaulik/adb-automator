@@ -30,9 +30,8 @@ from .config import Config
 from .device import Device, DeviceTimeout, DeviceLost
 from .llm import (BudgetExceeded, LLMClient, LLMError, Prefetch, ScreenAnalysis)
 from .memory import Memory, intent_key
-from .pager import (ItemLedger, attach_item, browsing_note, can_sweep, loop_id,
-                    pager_element, set_id as pager_set_id, stop_sweeping,
-                    sweep_summary)
+from .pager import (ItemLedger, attach_item, can_sweep, loop_id, pager_element,
+                    set_id as pager_set_id, stop_sweeping, sweep_summary)
 from .safety import Aborted, LoopDetector
 from .scratchpad import NoteLedger
 from .screen import Screen, render
@@ -544,6 +543,7 @@ class Agent:
             model_image=cfg.llm.image(),
             model_small=cfg.llm.small(),
             model_skill=cfg.llm.skill(),
+            model_skill_image=cfg.llm.skill_image(),
             reasoning=f"effort={cfg.llm.reasoning_effort or '(model default)'} "
                       f"hard={cfg.llm.reasoning_effort_hard} "
                       f"style={cfg.llm.reasoning_style} "
@@ -762,10 +762,8 @@ class Agent:
                     # tap that reveals the caption again is not itself a move.
                     # Here a caption was available, so the latch has been spent.
                     state.item_moved = None
-                pager_note = "\n".join(filter(None, (
-                    browsing_note(screen, state.items,
-                                  swipe_failed=state.item_moved is False),
-                    state.items.render(state.item_key, screen.item_label))))
+                pager_note = state.items.render(state.item_key,
+                                                screen.item_label)
                 rec.event("pager_item", step=state.step, key=state.item_key,
                           label=screen.item_label, read=bool(screenshot),
                           read_count=state.items.read_count,

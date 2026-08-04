@@ -774,6 +774,38 @@ def test_synthesis_retries_without_the_screenshots_when_they_break_the_call(tmp_
     assert skill.name == "GeneratedApp"      # the trace survived, not a template
 
 
+def test_the_screenshot_pass_goes_to_the_skill_image_model(tmp_path):
+    """The model that writes a skill well is not always one that can see, so the
+    pictures and the words are allowed to go to different models."""
+    from adbagent.config import Config
+    registry = SkillRegistry(tmp_path / "skills")
+
+    class RoutedLLM:
+        def __init__(self):
+            self.cfg = Config()
+            self.cfg.llm.model = "main-model"
+            self.cfg.llm.model_skill = "skill-writer"
+            self.cfg.llm.model_skill_image = "skill-vision"
+            self.seen = []
+
+        def _post(self, messages, model=None, schema=None, max_tokens=None, purpose=None):
+            content = messages[1]["content"]
+            if isinstance(content, list):
+                self.seen.append(("images", model))
+                raise RuntimeError("vision pass declined")
+            self.seen.append(("text", model))
+            return json.dumps(GENERATED), None
+
+    llm = RoutedLLM()
+    skill = SkillGenerator(registry).generate_from_exploration(
+        "com.generated.app", tasks="t", screen_summaries=["home"],
+        actions_taken=["tap #1"], llm_client=llm,
+        screenshots=[b"\x89PNG\r\n\x1a\n"], package="com.generated.app")
+
+    assert llm.seen == [("images", "skill-vision"), ("text", "skill-writer")]
+    assert skill.name == "GeneratedApp"
+
+
 # ---------------------------------------------------------------------------
 # Learning from an ordinary run
 # ---------------------------------------------------------------------------
