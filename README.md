@@ -353,21 +353,41 @@ are already known to lead nowhere. A reply that misses the schema also escalates
 its own repair, because a malformed answer is the clearest evidence there is that
 the turn was harder than assumed.
 
-Left unset, nothing is sent and the model thinks as it pleases. **Check
-`adbagent doctor` after setting it**, because two conventions exist for this on
-the OpenAI wire protocol and no model advertises which it takes:
+Left unset — the default — nothing is sent and every model thinks as it pleases.
+
+**Most models do not reason at all**, and none of this applies to them. Nothing in
+the OpenAI protocol reports whether a model reasons or how to ask it to stop, two
+incompatible conventions are in use among those that do, and new models ship
+weekly. So the setting is designed to be cheap to be wrong about rather than
+clever:
+
+- A model recognised as non-reasoning is sent nothing, and `doctor` says so
+  without calling it a problem — because it is not one.
+- An unrecognised model is sent nothing either. `doctor` warns, and offers both
+  readings: set `llm.reasoning_style` if it does reason, ignore the warning if it
+  does not. (Forcing a style on a model that does not think would break every call
+  it makes.)
+- **If the provider rejects the field anyway, the run does not die.** The field is
+  dropped, the model is remembered so it costs one call and not every call, the
+  rest of the body — including `prompt_cache_key` — is kept, and the run carries
+  on with a warning. A 400 ninety steps in, over an optimisation, is not an
+  acceptable outcome. A rejection that was *not* about reasoning still raises.
+
+**Check `adbagent doctor` after setting it.** It reports per model, because a run
+uses up to four and they need not agree:
 
 ```
-  OK    reasoning depth 'none' routine, 'high' when stuck (thinking convention, from the model name)
-        routine turn sends {"chat_template_kwargs": {"thinking": false}}
-        hard turn sends    {"chat_template_kwargs": {"thinking": true}}
+  OK    deepseek-v4-flash-0731 (deciding/judging): thinking convention, from the model name
+        none   sends {"chat_template_kwargs": {"thinking": false}}
+        high   sends {"chat_template_kwargs": {"thinking": true}}
+  OK    llama-v3p3-70b-instruct (vision) does not reason -- nothing to cap
+        confirm the bodies above against your provider's docs -- an ignored field looks like a working one
 ```
 
-`llm.reasoning_style` overrides the guess — `"effort"` sends
-`reasoning_effort`, `"thinking"` sends `chat_template_kwargs`, `"off"` sends
-nothing. An unrecognised model sends nothing rather than guessing, and `doctor`
-says so, because a field the model ignores looks exactly like a field that worked
-while the bill and the clock say otherwise.
+That last line is the one that matters. A rejected field is survivable; a field
+the model quietly *ignores* is not detectable from the outside — the clock and the
+bill say nothing changed while the config says it was capped. Only the provider's
+own documentation settles it.
 
 Then measure it, rather than believing it:
 
