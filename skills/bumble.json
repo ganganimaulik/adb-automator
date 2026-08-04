@@ -20,7 +20,7 @@
     },
     {
       "name": "browse_chats_list",
-      "steps": "Tap the 'Chats' tab in the bottom navigation bar. The screen shows a 'Your matches' section, a Spotlight promo banner ('Be seen up to 10x more', 'Shine a Spotlight and be seen first.'), a filter control reading 'Conversations are filtered by Recent', match conversation rows (e.g. I, R) with last-message previews and status chips like 'Your move', and an 'Older chats (N)' expander at the bottom that reveals archived conversations when tapped. A Search (magnifier) icon sits at the top of the screen."
+      "steps": "Tap the 'Chats' tab in the bottom navigation bar. The screen shows a 'Your matches' section, a Spotlight promo banner ('Be seen up to 10x more', 'Shine a Spotlight and be seen first.'), a filter control reading 'Conversations are filtered by Recent', one row per match with last-message previews and status chips like 'Your move', and an 'Older chats (N)' expander at the bottom that reveals archived conversations when tapped. A Search (magnifier) icon sits at the top of the screen."
     },
     {
       "name": "search_connections",
@@ -28,15 +28,15 @@
     },
     {
       "name": "open_conversation_detail",
-      "steps": "From the Chats tab, tap a match row (e.g. 'I') to open ConversationActivity showing the message thread with the match's name/photo at top, call and video icons, and a message input row. To leave, tap the Back arrow at top-left - this returns to the Chats list."
+      "steps": "From the Chats tab, tap a match row to open ConversationActivity showing the message thread with the match's name/photo at top, call and video icons, and a message input row. To leave, tap the Back arrow at top-left - this returns to the Chats list."
     },
     {
       "name": "view_own_profile",
-      "steps": "Tap the 'Profile' tab in the bottom navigation bar. The screen shows the user's own profile (name and age, e.g. Maulik, 29), a profile-completeness percentage (e.g. '74%') with a 'Complete profile' CTA, and horizontal sub-tab buttons below the photo: 'Pay plan' (selected by default), 'Photo insights', 'Safety and wellbeing'. The Pay plan sub-tab shows Spotlight/SuperSwipe consumable status ('Spotlight Stand out', 'SuperSwipe 1 left') and Premium/Premium+ promo cards ('Explore Premium+' button, 'What you get:' comparison). A 'Visit Help Hub' button sits top-left and a Settings gear icon top-right."
+      "steps": "Tap the 'Profile' tab in the bottom navigation bar. The screen shows the user's own profile (the account holder's name and age), a profile-completeness percentage with a 'Complete profile' CTA, and horizontal sub-tab buttons below the photo: 'Pay plan' (selected by default), 'Photo insights', 'Safety and wellbeing'. The Pay plan sub-tab shows Spotlight/SuperSwipe consumable status ('Spotlight Stand out', a SuperSwipe remaining count) and Premium/Premium+ promo cards ('Explore Premium+' button, 'What you get:' comparison). A 'Visit Help Hub' button sits top-left and a Settings gear icon top-right."
     },
     {
       "name": "open_and_read_settings",
-      "steps": "From the Profile tab, tap the Settings gear icon at top-right to open SettingsActivity. The initial element list may show only system UI, Back, and the 'Settings' title - scroll down once to load the list content. Rows include: Type of connection (Date), Date mode toggle, Snooze mode, Incognito Mode for Date (toggle), Auto-Spotlight (toggle), Current location (e.g. Ahmedabad, IN), Travel, Video autoplay settings, Notification settings, Payment settings, Legal information, Get help, Security and Privacy, and at the very bottom 'Log out' and 'Delete account'. Tap the Back arrow at top-left to return to the Profile tab."
+      "steps": "From the Profile tab, tap the Settings gear icon at top-right to open SettingsActivity. The initial element list may show only system UI, Back, and the 'Settings' title - scroll down once to load the list content. Rows include: Type of connection (Date), Date mode toggle, Snooze mode, Incognito Mode for Date (toggle), Auto-Spotlight (toggle), Current location (the account's city), Travel, Video autoplay settings, Notification settings, Payment settings, Legal information, Get help, Security and Privacy, and at the very bottom 'Log out' and 'Delete account'. Tap the Back arrow at top-left to return to the Profile tab."
     },
     {
       "name": "view_photo_insights",

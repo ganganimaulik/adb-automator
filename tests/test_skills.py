@@ -260,6 +260,61 @@ def test_a_short_nuance_is_not_swallowed_by_a_long_unrelated_one():
     assert collapse_restatements(entries) == entries
 
 
+def test_merging_keeps_the_workflow_that_says_more_not_the_newest():
+    """This used to be "the newest wins", so one thin run could replace a
+    detailed procedure with "Tap send." in the file the next run obeys."""
+    detailed = "1. Open chat. 2. Tap the input box. 3. Type. 4. Tap the green Send button."
+    existing = Skill(name="AppX", workflows=[Workflow("send_message", detailed)])
+    thin = Skill(name="AppX", workflows=[Workflow("send_message", "Tap send.")])
+
+    assert existing.merge(thin).workflows[0].steps == detailed
+    # And a genuinely fuller version does replace the shorter one.
+    fuller = Skill(name="AppX", workflows=[
+        Workflow("send_message", detailed + " 5. Check the tick appears.")])
+    assert "tick" in existing.merge(fuller).workflows[0].steps
+
+
+def test_a_renamed_workflow_does_not_become_a_second_copy():
+    steps = "Open the chat, tap the input box, type, tap the green Send button."
+    existing = Skill(name="AppX", workflows=[Workflow("send_message", steps)])
+    renamed = Skill(name="AppX", workflows=[Workflow("send_a_message", steps + " ")])
+
+    merged = existing.merge(renamed)
+    assert len(merged.workflows) == 1
+    assert merged.workflows[0].name == "send_message"   # no name churn
+
+
+def test_a_genuinely_new_workflow_is_still_added():
+    existing = Skill(name="AppX", workflows=[Workflow("send_message", "Tap send.")])
+    other = Skill(name="AppX", workflows=[
+        Workflow("attach_media", "Tap the paperclip, pick Gallery, choose a photo.")])
+    assert {w.name for w in existing.merge(other).workflows} == {"send_message",
+                                                                "attach_media"}
+
+
+def test_a_hand_written_markdown_skill_is_not_shadowed_by_a_generated_one(tmp_path):
+    """`generate` always writes JSON. Before this, the first run that learned
+    anything silently replaced guidance somebody had typed on purpose -- and
+    which file won depended on the order the filesystem listed them."""
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    (skills_dir / "whatsapp.md").write_text(
+        "# WhatsApp\n\n**Packages**: com.whatsapp\n\n"
+        "## App Nuances & UI Quirks\n- Something I worked out by hand.\n",
+        encoding="utf-8")
+
+    SkillRegistry(skills_dir).save_skill(
+        Skill(name="WhatsApp", packages=["com.whatsapp"],
+              nuances=["Something a run worked out."]))
+
+    reloaded = SkillRegistry(skills_dir).find_by_name_or_alias("whatsapp")
+    assert set(reloaded.nuances) == {"Something I worked out by hand.",
+                                     "Something a run worked out."}
+    # Both files are still there; neither was overwritten on disk.
+    assert (skills_dir / "whatsapp.md").is_file()
+    assert (skills_dir / "whatsapp.json").is_file()
+
+
 def test_skill_merge():
     sk1 = Skill(
         name="AppX",
@@ -579,6 +634,15 @@ def test_the_exploration_brief_says_what_to_record_and_what_not_to_touch():
     # On a dating or feed app the swipe *is* the irreversible action, and it
     # reaches a real person.
     assert "Do NOT swipe, like, pass, match" in goal
+    # A skill is re-read every run; the account holder's data does not belong in it.
+    assert "never what it currently holds" in goal
+
+
+def test_the_synthesis_is_told_to_describe_controls_not_their_contents():
+    from adbagent.skills import SKILL_SYNTHESIS_SYSTEM
+
+    assert "never about the account using it" in SKILL_SYNTHESIS_SYSTEM
+    assert "failed once and then worked" in SKILL_SYNTHESIS_SYSTEM
 
 
 def test_a_skill_generated_by_name_is_filed_under_the_resolved_package(tmp_path):

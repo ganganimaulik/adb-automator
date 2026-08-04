@@ -70,9 +70,8 @@
     "When inspecting long or truncated text messages, tap 'Read more' to expand and view the full text content.",
     "Clear search input before searching for a new contact.",
     "Verify target chat header text matches intended contact before sending messages.",
-    "Use input_text with clear=true when editing fields.",
     "For read-only unread counts, combine the green badge on the 'Chats' bottom-nav tab with per-row 'N unread message' text; scroll the list to cover all rows and never open a chat, since that clears its badge.",
-    "Launch WhatsApp with the full package name com.whatsapp (not the bare alias 'whatsapp') and verify com.whatsapp.home.ui.HomeActivity is in the foreground before acting; retry open_app if the Android home screen shows instead."
+    "After open_app, confirm com.whatsapp is actually in the foreground before acting: the frame captured mid-launch is com.android.systemui, not the app, and a check made on it fails. Retry or wait rather than concluding the launch went to the wrong app."
   ],
   "custom_prompt": ""
 }

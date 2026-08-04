@@ -28,6 +28,13 @@ DEFAULT_SKILLS_DIR = "skills"
 #: a long unrelated one that happens to share two words.
 _RESTATEMENT_FLOOR = 0.34
 
+#: Distinctive words an entry needs before containment means anything. "Something
+#: a run worked out" reduces to {something, worked}, which sits inside "Something I
+#: worked out by hand" -- two unrelated lines, and the ratio floor cannot tell,
+#: because 2-of-3 is a high ratio. Below this an entry is only ever dropped for
+#: being an exact duplicate.
+_MIN_TOKENS_TO_JUDGE = 4
+
 #: Overlap at which two entries are the same finding worded twice, even though
 #: neither contains the other. "Search top bar icon must be tapped before typing"
 #: and "Search top bar must be opened before typing" measured 0.75: each holds a
@@ -62,7 +69,7 @@ def collapse_restatements(entries: List[str]) -> List[str]:
     def swallows(rich: int, weak: int) -> bool:
         """Does `rich` already say everything `weak` does?"""
         a, b = tokens[weak], tokens[rich]
-        if not a or not b:
+        if len(a) < _MIN_TOKENS_TO_JUDGE or len(b) < _MIN_TOKENS_TO_JUDGE:
             return False
         overlap = len(a & b) / len(a | b)
         contained = a <= b and len(a) >= _RESTATEMENT_FLOOR * len(b)
@@ -80,6 +87,45 @@ def collapse_restatements(entries: List[str]) -> List[str]:
         if entry not in kept:
             kept.append(entry)
     return kept
+
+
+def _richer(kept: str, fresh: str) -> str:
+    """Of two versions of the same thing, the one that says more.
+
+    A superset of the other's distinctive words wins outright; failing that the
+    longer text does, which is the rule `description` has always used.
+    """
+    from .scratchpad import distinctive
+
+    a, b = distinctive(kept), distinctive(fresh)
+    if a and b and a != b:
+        if a < b:
+            return fresh
+        if b < a:
+            return kept
+    return fresh if len(fresh) > len(kept) else kept
+
+
+def _dedupe_workflows(workflows: List["Workflow"]) -> List["Workflow"]:
+    """Drop workflows whose steps merely restate another's.
+
+    A run that renames ``send_message`` to ``send_a_message`` produces a second
+    entry saying the same thing, and a map keyed by name cannot see it. Keyed on
+    the steps here, keeping the first (older) name so a skill does not churn its
+    workflow names every time it is regenerated.
+    """
+    keep = set(collapse_restatements([wf.steps for wf in workflows]))
+    out: List["Workflow"] = []
+    seen: set = set()
+    for wf in workflows:
+        if wf.steps and wf.steps not in keep:
+            log.info("skill: dropped workflow %r, a restatement of another", wf.name)
+            continue
+        if wf.steps and wf.steps in seen:
+            continue
+        seen.add(wf.steps)
+        out.append(wf)
+    return out
 
 
 @dataclass
@@ -268,13 +314,21 @@ class Skill:
 
         wf_map = {wf.name: wf for wf in self.workflows}
         for wf in other.workflows:
-            if wf.name in wf_map:
-                if wf.steps and wf.steps != wf_map[wf.name].steps:
-                    wf_map[wf.name] = Workflow(name=wf.name, steps=wf.steps)
-            else:
+            kept = wf_map.get(wf.name)
+            if kept is None:
                 wf_map[wf.name] = wf
+            elif wf.steps and wf.steps != kept.steps:
+                # Whichever says more wins. This used to be "the newest wins",
+                # which let one thin run replace a detailed procedure with "Tap
+                # send." -- a silent regression in the file the next run obeys.
+                # Additive like the nuances, for the same reason: a correction
+                # that shortens a workflow has to be made by hand.
+                wf_map[wf.name] = Workflow(
+                    name=wf.name, steps=_richer(kept.steps, wf.steps))
 
-        merged_workflows = list(wf_map.values())
+        # Renames arrive as a second workflow saying the same thing under a new
+        # name, which no name-keyed map can catch.
+        merged_workflows = _dedupe_workflows(list(wf_map.values()))
         merged_nuances = collapse_restatements(
             [n.strip() for n in (self.nuances + other.nuances) if n.strip()])
         merged_recommendations = collapse_restatements(
@@ -343,21 +397,36 @@ class SkillRegistry:
                 log.warning("Could not create skills directory %s: %s", self.skills_dir, exc)
                 return
 
-        for path in self.skills_dir.glob("*"):
+        # Sorted, because two files can name the same skill and whose content
+        # survived used to depend on the order the filesystem happened to hand
+        # them back.
+        for path in sorted(self.skills_dir.glob("*")):
+            skill: Optional[Skill] = None
             if path.suffix == ".json":
                 try:
-                    data = json.loads(path.read_text(encoding="utf-8"))
-                    skill = Skill.from_dict(data)
-                    self.skills[skill.name.lower()] = skill
+                    skill = Skill.from_dict(json.loads(path.read_text(encoding="utf-8")))
                 except Exception as exc:  # noqa: BLE001
                     log.warning("Failed to parse skill JSON %s: %s", path, exc)
             elif path.suffix in (".md", ".markdown"):
                 try:
-                    text = path.read_text(encoding="utf-8")
-                    skill = Skill.from_markdown(text, name_hint=path.stem.capitalize())
-                    self.skills[skill.name.lower()] = skill
+                    skill = Skill.from_markdown(path.read_text(encoding="utf-8"),
+                                                name_hint=path.stem.capitalize())
                 except Exception as exc:  # noqa: BLE001
                     log.warning("Failed to parse skill MD %s: %s", path, exc)
+            if skill is None:
+                continue
+
+            key = skill.name.lower()
+            if key in self.skills:
+                # `generate` always writes JSON, so a hand-written `whatsapp.md`
+                # would otherwise be silently shadowed the first time a run
+                # learned anything -- losing guidance somebody typed on purpose.
+                # Merging keeps both; the warning is so the two files can be
+                # consolidated rather than quietly diverging forever.
+                log.warning("two files define the skill %r; merging %s into what "
+                            "was already loaded", skill.name, path.name)
+                skill = self.skills[key].merge(skill)
+            self.skills[key] = skill
 
     def list_skills(self) -> List[Skill]:
         return sorted(self.skills.values(), key=lambda s: s.name)
@@ -629,6 +698,10 @@ How to cover the app:
     real person, and it cannot be taken back. Read such a screen, record how it
     works, and leave with `press_key back`.
   - Decline permission prompts and dismiss rate-this-app popups.
+  - Record what a control is and where, never what it currently holds. "The row shows
+    the account's city" is a note; the city is somebody's address. The same goes for
+    names, ages, photos, message text, balances and counts -- all of them are wrong by
+    tomorrow, and the first few are not yours to write down.
 
 Answer `done` once you have covered the main screens, or finished the tasks
 above, and summarise what you covered in `text`. Stop when the screens start
@@ -662,6 +735,9 @@ class AppTrace:
     outcome: str = ""
     steps: int = 0
     llm_calls: int = 0
+    #: The run whose artifacts this trace came from, so a caller can find its
+    #: `runs/<id>/` -- and write the synthesis that follows into the same log.
+    run_id: str = ""
 
     @property
     def looked_around(self) -> bool:
@@ -766,6 +842,7 @@ class TraceCollector:
         self.trace.outcome = outcome
         self.trace.steps = getattr(state, "step", 0)
         self.trace.llm_calls = getattr(state, "llm_calls", 0)
+        self.trace.run_id = getattr(state, "run_id", "")
         scratchpad = getattr(state, "scratchpad", None)
         if scratchpad is not None:
             self.trace.notes = scratchpad.plain()
@@ -903,6 +980,19 @@ Two traps in particular, both of which have produced confident and false nuances
   action took it.
 
 Say only what the trace supports. "This failed once here" is not "this does not work".
+
+Write about the app, never about the account using it. A skill is re-read on every run
+and is not the place for either of these:
+
+* The account holder's own data -- their name, age, city, photos, who they talk to,
+  what a message said. Describe the control, not its contents: "the row shows the
+  current city", not the city.
+* State that will have changed by tomorrow -- a completeness percentage, a credit
+  balance, an unread count, how many items a list held. Say that the figure is shown
+  and where; do not record its value.
+
+Both make a skill wrong within a day, and the first sends personal data to a model on
+every later run for no benefit.
 Reply with ONLY the JSON object.
 """
 
