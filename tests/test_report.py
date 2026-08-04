@@ -219,9 +219,9 @@ def test_an_unfamiliar_model_says_which_of_the_two_it_might_be():
 def test_a_mixed_setup_is_reported_per_model():
     """A reasoning decider next to a vision model that does not think is a
     perfectly ordinary setup, so one verdict for the whole config would be wrong."""
-    text = reasoning_report(model="deepseek-v4-flash",
+    text = reasoning_report(model="deepseek-v3p1",
                             model_image="llama-v3p3-70b-instruct")
-    assert "deepseek-v4-flash (deciding/judging/skills)" in text
+    assert "deepseek-v3p1 (deciding/judging/skills)" in text
     assert '"thinking": true' in text
     assert "llama-v3p3-70b-instruct (vision) does not reason" in text
 
@@ -233,10 +233,19 @@ def test_nothing_is_said_about_bodies_when_none_were_printed():
 
 def test_the_depths_a_model_will_actually_be_asked_for_are_the_ones_shown():
     """The decider varies turn to turn; a vision model never reasons at all."""
-    text = reasoning_report(model="deepseek-v4-flash")
+    text = reasoning_report(model="deepseek-v3p1")
     decider = text.split("deciding")[1]
     assert '"thinking": false' in decider      # routine
     assert '"thinking": true' in decider       # when stuck
+
+
+def test_an_effort_model_shows_the_depths_it_will_be_asked_for_too():
+    """Same check on the other convention -- the report is what says whether "none"
+    goes out as itself or as the floor, and those are different bills."""
+    text = reasoning_report(model="deepseek-v4-flash")
+    decider = text.split("deciding")[1]
+    assert '"reasoning_effort": "none"' in decider     # routine
+    assert '"reasoning_effort": "high"' in decider     # when stuck
 
 
 def test_the_feature_being_off_is_stated_plainly():
