@@ -10,7 +10,7 @@ from adbagent.skills import (DEFAULT_EXPLORE_STEPS, MIN_LEARNABLE_STEPS,
                              SkillGenerator, SkillRegistry, TraceCollector,
                              Workflow, exploration_goal, explore_app,
                              goal_app_candidates, learn_from_run,
-                             package_from_text, resolve_package)
+                             package_from_text, resolve_package, use_skill_model)
 from adbagent.cli import main
 
 from . import fake
@@ -483,6 +483,60 @@ def test_cli_skills_create(tmp_path):
     assert (skills_dir / "newapp.json").exists()
 
 
+def test_cli_skills_generate_explores_with_the_skill_model(tmp_path, monkeypatch,
+                                                           capsys):
+    """`skills generate` -- the command the web UI spawns -- gives the whole run
+    to `llm.model_skill`, exploration included. Every step of it used to go to
+    `llm.model`, so a configured skill model only ever saw the write-up."""
+    import adbagent.device
+    import adbagent.llm
+    import adbagent.memory
+    import adbagent.skills as skillmod
+    from adbagent import cli
+
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"llm": {
+        "model": "main-model", "model_skill": "skill-writer",
+        "model_image": "sees-things", "api_key": "k",
+    }}), encoding="utf-8")
+
+    class Nothing:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    built = {}
+
+    class SpyClient(Nothing):
+        def __init__(self, cfg, run_id=""):
+            built["model"] = cfg.llm.model
+            self.cfg = cfg
+            self.ledger = type("L", (), {"total_usd": 0.0, "calls": []})()
+
+    monkeypatch.setattr(cli, "_ensure_device", lambda *a, **kw: None)
+    monkeypatch.setattr(adbagent.llm, "LLMClient", SpyClient)
+    monkeypatch.setattr(adbagent.device, "Device", Nothing)
+    monkeypatch.setattr(adbagent.memory, "Memory", Nothing)
+    monkeypatch.setattr(skillmod, "explore_app",
+                        lambda *a, **kw: AppTrace(package="com.explored.app",
+                                                  screens=["home", "detail"],
+                                                  outcome="success"))
+    monkeypatch.setattr(skillmod.SkillGenerator, "generate_from_exploration",
+                        lambda self, *a, **kw: Skill(name="Explored"))
+
+    code = main(["skills", "generate", "explored", "-c", str(config),
+                 "--skills-dir", str(tmp_path / "skills")])
+
+    assert code == 0
+    assert built["model"] == "skill-writer"
+    assert "skill-writer explores and writes the skill" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # Live exploration
 # ---------------------------------------------------------------------------
@@ -804,6 +858,79 @@ def test_the_screenshot_pass_goes_to_the_skill_image_model(tmp_path):
 
     assert llm.seen == [("images", "skill-vision"), ("text", "skill-writer")]
     assert skill.name == "GeneratedApp"
+
+
+def test_the_short_form_of_a_skill_model_is_qualified_like_every_other(tmp_path):
+    """`model_skill: "kimi-k3"` is the form every other model setting takes. Read
+    off the config rather than off the client, it used to go out unqualified: both
+    attempts 404 and the run's whole trace is replaced by the template skill."""
+    from adbagent.llm import PROVIDERS
+    registry = SkillRegistry(tmp_path / "skills")
+
+    class ShortFormLLM:
+        def __init__(self):
+            self.cfg = Config()
+            self.cfg.llm.model_skill = "kimi-k3"
+            self.provider = PROVIDERS["fireworks"]
+            self.seen = []
+
+        def _post(self, messages, model=None, schema=None, max_tokens=None, purpose=None):
+            self.seen.append(model)
+            return json.dumps(GENERATED), None
+
+    llm = ShortFormLLM()
+    SkillGenerator(registry).generate_from_exploration(
+        "com.generated.app", tasks="t", screen_summaries=["home"],
+        actions_taken=["tap #1"], llm_client=llm, package="com.generated.app")
+
+    assert llm.seen == ["accounts/fireworks/models/kimi-k3"]
+
+
+# ---------------------------------------------------------------------------
+# Which model explores
+# ---------------------------------------------------------------------------
+
+def test_the_skill_model_decides_the_exploration_too():
+    """A skill run is skill work from its first step: the tour is where the
+    quirks are found, and synthesis can only write down what the tour saw."""
+    cfg = Config()
+    cfg.llm.model = "main-model"
+    cfg.llm.model_skill = "skill-writer"
+
+    assert use_skill_model(cfg) is False
+    assert cfg.llm.model == "skill-writer"
+    assert cfg.llm.skill() == "skill-writer"
+
+
+def test_exploring_falls_back_to_the_main_model_when_no_skill_model_is_set():
+    cfg = Config()
+    cfg.llm.model = "main-model"
+
+    assert use_skill_model(cfg) is False
+    assert cfg.llm.model == "main-model"
+
+
+def test_a_skill_model_that_may_not_see_is_not_handed_the_screenshot():
+    """A text-only model given an image part fails the whole call, not just the
+    picture -- so the screenshot goes back through `llm.model_image`."""
+    cfg = Config()
+    cfg.llm.model = "main-model"
+    cfg.llm.model_skill = "skill-writer"
+    cfg.llm.vision_in_decider = True
+
+    assert use_skill_model(cfg) is True
+    assert cfg.llm.vision_in_decider is False
+
+
+def test_one_model_for_both_jobs_keeps_the_vision_setting_it_was_given():
+    """`vision_in_decider` was set for this model deciding; a skill run decides
+    with the same model, so there is nothing to protect it from."""
+    cfg = Config()
+    cfg.llm.model = "sees-everything"
+    cfg.llm.vision_in_decider = True
+
+    assert use_skill_model(cfg) is False
+    assert cfg.llm.vision_in_decider is True
 
 
 # ---------------------------------------------------------------------------

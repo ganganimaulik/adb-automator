@@ -221,9 +221,8 @@ def state_block(scratchpad: str = "", progress: str = "") -> str:
 # Situational advice
 # ---------------------------------------------------------------------------
 #
-# These three blocks used to sit in SYSTEM, where they were 36% of it (3,542 of
-# 9,722 characters) and irrelevant on most turns: a run that never opens a photo
-# viewer paid for the gallery rules on all 127 of its steps.
+# These blocks used to sit in SYSTEM, where they were a large fraction of it
+# and irrelevant on most turns.
 #
 # They cannot simply be interpolated into the system message when they apply --
 # that changes the prompt's stable prefix and evicts everything after it from the
@@ -233,18 +232,18 @@ def state_block(scratchpad: str = "", progress: str = "") -> str:
 # varies belongs where variation is free.
 
 SCROLLING_ADVICE = """\
-SCROLLING STRATEGY (you are searching a long list or history):
+SCROLLING STRATEGY (you are searching a long list or feed):
 - Fast when far away: use `scroll_amount=2` to `4` (or `base_scale=0.8`) to cover \
 more content in fewer turns.
-- Slow down near the target: at the right time range or section, drop to \
+- Slow down near the target: once you reach the right area, drop to \
 `scroll_amount=1.0` or `0.5` so you do not overshoot.
-- Backtrack if overshot: if timestamps jumped past your target, take one small \
-step the other way (`scroll_amount=0.5`).
-- Pick a direction from what you need — older content is up, newer is down — and \
-COMMIT to it. Do NOT reverse, and do NOT tap "Go to most recent message", "Jump \
-to bottom" or similar: that undoes all your scrolling progress.
+- Backtrack if overshot: if you passed your target, take one small step the other \
+way (`scroll_amount=0.5`).
+- Pick a direction and COMMIT to it. Do not reverse, and do not tap any button \
+that jumps to the end or a labelled anchor: that undoes all your scrolling \
+progress.
 - Record the range you have covered as a note record (key "covered", value \
-"scrolled up past 10:30am, now at 9:15am"). That is your spatial memory.
+"scrolled up through section 3, now in section 1"). That is your spatial memory.
 - If no new content appears, you have seen everything in that direction. Stop."""
 
 MULTI_APP_ADVICE = """\
@@ -253,8 +252,7 @@ SWITCHING APPS:
 switch.
 - Record anything you still need (messages, contact names) as note records BEFORE \
 switching — the previous screen will be gone.
-- Track which app you are in, and what remains, in `progress`.
-- Sending messages (tapping "Send", "Post", etc.) is expected and allowed."""
+- Track which app you are in, and what remains, in `progress`."""
 
 #: Goal wording that means the answer will not fit on one screen, so the
 #: scrolling advice is worth its tokens before the first scroll rather than after.

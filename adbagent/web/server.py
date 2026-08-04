@@ -324,6 +324,11 @@ def _event_stream(manager: RunManager) -> Generator[str, None, None]:
     `event`, and `stream.jsonl` (the model's raw thinking and response as they
     happen) arrives as `llm`. A run recorded before the stream file existed
     just yields the first.
+
+    Under `--repeat` one subprocess writes several runs, each in its own
+    directory, so the tail follows the move and announces it with a fresh
+    `run` frame. The client rules off there; the session's own totals -- the
+    spend the budget bounds -- carry across.
     """
     yield sse(manager.state(), "state")
     state = manager.state()
@@ -337,10 +342,14 @@ def _event_stream(manager: RunManager) -> Generator[str, None, None]:
                    "output_tail": manager.state()["output_tail"]}, "end")
         return
 
-    yield sse({"run_id": run_dir.name}, "run")
+    def tails_for(path: Path):
+        return [(path / runparse.EVENTS_NAME, "event"),
+                (path / STREAM_NAME, "llm")]
 
-    tails = [(run_dir / runparse.EVENTS_NAME, "event"),
-             (run_dir / STREAM_NAME, "llm")]
+    yield sse({"run_id": run_dir.name,
+               "iteration": manager.state()["iteration"] or 1}, "run")
+
+    tails = tails_for(run_dir)
     offsets = [0] * len(tails)
     carries = [b""] * len(tails)  # an appended-to file's last line may be torn
     drain_passes = 0  # once the child exits, read twice more to catch the tail
@@ -372,6 +381,28 @@ def _event_stream(manager: RunManager) -> Generator[str, None, None]:
                     continue
                 flowed = True
                 yield sse(event, frame)
+
+        # A repeat iteration starts in a directory of its own. Follow it, but
+        # only once this one has gone quiet, so the move never abandons events
+        # still being written -- and never before the last one has been read,
+        # which is why a switch resets the drain count.
+        if not flowed:
+            newest = manager.run_dir()
+            if newest is not None and newest != run_dir:
+                for i, (_, frame) in enumerate(tails):
+                    if carries[i].strip():
+                        try:
+                            yield sse(json.loads(carries[i]), frame)
+                        except json.JSONDecodeError:
+                            pass
+                run_dir = newest
+                tails = tails_for(run_dir)
+                offsets = [0] * len(tails)
+                carries = [b""] * len(tails)
+                drain_passes = 0
+                yield sse({"run_id": run_dir.name,
+                           "iteration": manager.state()["iteration"]}, "run")
+                continue
 
         if manager.state()["running"]:
             drain_passes = 0

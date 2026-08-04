@@ -77,7 +77,7 @@ Five models are configurable and each is used for one job:
 | `llm.model` | every action decision |
 | `llm.model_image` | reading screenshots |
 | `llm.model_small` | judging whether a `done` claim is true |
-| `llm.model_skill` | writing app skills |
+| `llm.model_skill` | `skills generate`: exploring the app and writing the skill (falls back to `llm.model`) |
 | `llm.model_skill_image` | reading the screenshots taken while writing app skills (falls back to `llm.model_image`) |
 
 ## Run
@@ -334,6 +334,14 @@ phone's keyboard, animations and rotation are restored exactly as with Ctrl-C.
 A run started from the UI can never block on a confirmation prompt: it is
 launched with `--unattended` unless you tick "allow destructive". One run at a
 time — there is one phone.
+
+**repeat** takes a count or `inf`, the same as the CLI flag. Each iteration is
+a separate run in its own directory, so the live view follows the move and
+rules off between them: the step counter restarts, while the calls and the
+spend keep climbing, because the budget bounds the whole session and not the
+iteration. An unbounded repeat with a budget set is the way to leave it
+working — it stops on the ceiling, on Stop, or on the first iteration that
+needs you.
 
 ## App skills
 
