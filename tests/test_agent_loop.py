@@ -281,6 +281,65 @@ def test_run_writes_artifacts(cfg, mem, tmp_path):
     assert {"run_start", "decide", "verify", "run_end"} <= kinds
 
 
+def test_run_mirrors_the_llm_stream(cfg, mem, tmp_path):
+    # The web UI tails stream.jsonl to show the model thinking live. A fake
+    # LLM never chunks, but the loop's own llm_start/llm_end still land there.
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    stream = tmp_path / "runs" / state.run_id / "stream.jsonl"
+    assert stream.exists()
+    records = [json.loads(l) for l in stream.read_text().splitlines() if l.strip()]
+    kinds = [r["kind"] for r in records]
+    assert "llm_start" in kinds and "llm_end" in kinds
+    starts = [r for r in records if r["kind"] == "llm_start"]
+    assert any(r["purpose"] == "decide" and r["step"] >= 1 for r in starts)
+    ends = [r for r in records if r["kind"] == "llm_end"]
+    assert all("elapsed" in r and "completion_tokens" in r for r in ends)
+    # And the decision file is not polluted with stream records.
+    events = (tmp_path / "runs" / state.run_id / "events.jsonl").read_text()
+    assert '"llm_stream"' not in events
+
+
+def test_stream_tap_whitelists_fields(cfg, tmp_path):
+    from adbagent.agent import Recorder, _stream_tap
+
+    class Verdict:  # a pydantic look-alike the tap must not try to serialise
+        satisfied = True
+
+    class Call:
+        prompt_tokens = 100
+        completion_tokens = 40
+        reasoning_tokens = 30
+
+    seen = []
+    rec = Recorder(cfg, "run_stream_tap")
+    tap = _stream_tap(rec, lambda kind, **kw: seen.append((kind, kw)))
+    tap("llm_start", step=2, purpose="decide", model="m", screenshot=True,
+        effort="high", hard_because="new screen")
+    tap("llm_stream", stream_type="thinking", text="hmm ")
+    tap("llm_stream", stream_type="content", text='{"action":')
+    tap("llm_end", step=2, purpose="decide", elapsed=1.5, call=Call(),
+        verdict=Verdict())
+    tap("perceive", step=2, elapsed=0.1)  # not an llm event: no record
+    rec.close()
+
+    # Everything still flows through to the wrapped reporter.
+    assert [k for k, _ in seen] == ["llm_start", "llm_stream", "llm_stream",
+                                    "llm_end", "perceive"]
+    records = [json.loads(l)
+               for l in (tmp_path / "runs" / "run_stream_tap" / "stream.jsonl")
+               .read_text().splitlines() if l.strip()]
+    assert [r["kind"] for r in records] == ["llm_start", "llm_stream",
+                                            "llm_stream", "llm_end"]
+    assert records[0]["screenshot"] is True and records[0]["effort"] == "high"
+    assert "hard_because" not in records[0]
+    assert records[1]["stream_type"] == "thinking" and records[1]["text"] == "hmm "
+    end = records[3]
+    assert end["completion_tokens"] == 40 and end["reasoning_tokens"] == 30
+    assert "verdict" not in end and "call" not in end
+
+
 def test_recorder_dump_messages(cfg, tmp_path):
     from adbagent.agent import Recorder
     rec = Recorder(cfg, "run_test_123")
