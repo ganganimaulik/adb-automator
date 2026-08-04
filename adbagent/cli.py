@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__, scratchpad
 
@@ -152,16 +152,33 @@ def build_config(args: argparse.Namespace):
 # doctor
 # ---------------------------------------------------------------------------
 
+#: Every job a run gives a model, the config field it comes from, and the depths
+#: that job asks for. The decider is the only one with two, because it is the only
+#: one whose difficulty varies from turn to turn.
+_REASONING_JOBS = (
+    ("deciding", "model", (("decide", False), ("decide", True))),
+    ("judging", "small", (("judge", True),)),
+    ("vision", "image", (("analyze_image", False),)),
+    ("skills", "skill", (("decide", False),)),
+)
+
+
 def _report_reasoning(out: Out, cfg) -> None:
     """Print the exact request fields the reasoning setting will send.
 
-    Two conventions exist for this on the OpenAI wire protocol and no model
-    advertises which it takes, so a wrong guess either 400s or -- far worse --
-    is ignored, leaving the latency and the bill unchanged while looking fixed.
-    Printing the body means it can be checked against the provider's docs before
-    a long run depends on it.
+    Two conventions exist for this on the OpenAI wire protocol, most models take
+    neither, and nothing in the catalogue says which a given model wants. A wrong
+    guess either 400s -- survivable, since `_post` drops the field and carries on
+    -- or is silently ignored, which is worse: the bill and the clock say nothing
+    changed while the config says it was capped. Printing the body is what makes
+    that checkable before a long run depends on it.
+
+    Reported per model, because a run uses up to four and they need not agree. A
+    reasoning decider alongside a vision model that does not think is normal, not
+    a mistake.
     """
-    from .llm import qualify, reasoning_body, reasoning_style_for, PROVIDERS
+    from .llm import (PROVIDERS, known_non_reasoning, qualify, reasoning_body,
+                      reasoning_style_for)
 
     if not cfg.llm.reasoning_effort:
         out.say(out.dim("        reasoning depth left to the model "
@@ -169,28 +186,54 @@ def _report_reasoning(out: Out, cfg) -> None:
         return
 
     provider = PROVIDERS.get(cfg.llm.provider)
-    model = qualify(provider, cfg.llm.model) if provider else cfg.llm.model
     style = cfg.llm.reasoning_style
-    resolved = style if style in ("effort", "thinking", "off") else \
-        reasoning_style_for(model)
 
-    routine = reasoning_body(model, cfg.llm.effort_for("decide"), style)
-    hard = reasoning_body(model, cfg.llm.effort_for("decide", hard=True), style)
-    if not routine and not hard:
-        out.warn(f"llm.reasoning_effort is set but nothing will be sent: "
-                 f"{cfg.llm.model} matches no known reasoning convention")
-        out.say(out.dim("        set llm.reasoning_style to 'effort' or "
-                        "'thinking' to say which it takes"))
-        return
+    # One model commonly serves several jobs, so group by model and collect every
+    # depth it will actually be asked for.
+    per_model: Dict[str, Tuple[List[str], List[str]]] = {}
+    for label, field, calls in _REASONING_JOBS:
+        name = getattr(cfg.llm, field)() if field != "model" else cfg.llm.model
+        if not name:
+            continue
+        model = qualify(provider, name) if provider else name
+        labels, depths = per_model.setdefault(model, ([], []))
+        labels.append(label)
+        for purpose, hard in calls:
+            depth = cfg.llm.effort_for(purpose, hard=hard)
+            if depth not in depths:
+                depths.append(depth)
 
-    out.ok(f"reasoning depth {cfg.llm.reasoning_effort!r} routine, "
-           f"{cfg.llm.effort_for('decide', hard=True)!r} when stuck "
-           f"({resolved} convention"
-           f"{', from the model name' if style == 'auto' else ', configured'})")
-    out.say(out.dim(f"        routine turn sends {json.dumps(routine)}"))
-    out.say(out.dim(f"        hard turn sends    {json.dumps(hard)}"))
-    out.say(out.dim("        confirm those against your provider's docs -- an "
-                    "ignored field looks exactly like a working one"))
+    unknown: List[Tuple[str, str]] = []
+    printed_a_body = False
+    for model, (labels, depths) in per_model.items():
+        short = model.rsplit("/", 1)[-1]
+        used = "/".join(labels)
+        bodies = [(depth, reasoning_body(model, depth, style)) for depth in depths]
+        if not any(body for _, body in bodies):
+            # Two different silences, and only one wants doing something about.
+            if known_non_reasoning(model):
+                out.ok(f"{short} ({used}) does not reason -- nothing to cap")
+            else:
+                unknown.append((short, used))
+            continue
+        resolved = style if style in ("effort", "thinking", "off") else \
+            reasoning_style_for(model)
+        out.ok(f"{short} ({used}): {resolved} convention"
+               f"{', from the model name' if style == 'auto' else ', configured'}")
+        for depth, body in bodies:
+            out.say(out.dim(f"        {depth:<6} sends {json.dumps(body)}"))
+            printed_a_body = True
+
+    for short, used in unknown:
+        # Telling someone to force a style on a model that does not think would
+        # break every call it makes, so both readings are offered.
+        out.warn(f"{short} ({used}) is not a model this knows a reasoning "
+                 f"convention for, so nothing will be sent")
+        out.say(out.dim("        if it does reason, set llm.reasoning_style to "
+                        "'effort' or 'thinking'; if it does not, nothing to fix"))
+    if printed_a_body:
+        out.say(out.dim("        confirm the bodies above against your provider's "
+                        "docs -- an ignored field looks like a working one"))
 
 
 def cmd_doctor(args) -> int:
@@ -781,6 +824,14 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             out.say(f"{step_hdr} {out.cyan('sweep')} {kw.get('direction', '')} "
                     f"-> {label}  [read {kw.get('read_count', 0)}{of}]{moved}")
 
+        elif kind == "reasoning_unsupported":
+            # Said once, and said out loud: continuing quietly would leave the
+            # run looking capped when it is not.
+            out.say(out.yellow(
+                f"        [Reasoning] {kw.get('model', '')} rejected "
+                f"{', '.join(kw.get('fields') or [])} -- it does not take a "
+                f"reasoning setting. Continuing without one."))
+
         elif kind == "item_reading":
             out.say(out.dim(f"        Read:      {kw.get('reading', '')}"))
 
@@ -830,7 +881,7 @@ def _learn(out: Out, trace, llm, cfg, goal: str) -> None:
 
     try:
         registry = SkillRegistry(cfg.skills.skills_dir)
-        skill = learn_from_run(trace, llm, registry, goal=goal)
+        skill = learn_from_run(trace, llm, registry, goal=goal, cfg=cfg)
     except Exception as exc:  # noqa: BLE001
         out.warn(f"could not update the app skill: {exc}")
         return
@@ -1412,7 +1463,8 @@ def cmd_skills(args) -> int:
         skill = SkillGenerator(registry).generate_from_exploration(
             app_target or exp.package, exp.tasks, exp.screens, exp.actions, llm,
             screenshots=exp.screenshots, package=exp.package,
-            notes=exp.notes, outcome=exp.outcome)
+            notes=exp.notes, outcome=exp.outcome,
+            history=skillmod.run_history(cfg, exp.package))
         out.ok(f"saved skill '{skill.name}' to {registry.path_for(skill)}")
         out.say()
         out.say(skill.to_markdown())
