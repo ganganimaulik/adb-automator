@@ -311,6 +311,65 @@ def test_image_model_used_for_image_analysis_and_main_model_decides_action(monke
     assert action.action == "tap"
 
 
+class KeepingRecorder:
+    """A recorder that keeps the frames it is handed, like the real one."""
+
+    def __init__(self):
+        self.kept = []
+
+    def dump_messages(self, step, messages, purpose="decide"):
+        return ""
+
+    def screenshot(self, step, jpeg, purpose):
+        self.kept.append((step, jpeg, purpose))
+        return f"step_{step:03d}_{purpose}_00c0ffee.jpg"
+
+
+def _analyze(client, monkeypatch, recorder):
+    monkeypatch.setattr(client, "structured",
+                        lambda *a, **kw: ScreenAnalysis(reading="428 g"))
+    events = []
+    client.analyze_image(b"\xff\xd8jpeg", goal="weigh it", step=7,
+                         recorder=recorder,
+                         on_event=lambda kind, **kw: events.append((kind, kw)))
+    return next(kw for kind, kw in events if kind == "llm_start")
+
+
+def test_a_submitted_frame_is_kept_and_named_on_the_stream(monkeypatch):
+    """The web UI shows the screenshot beside the call that was shown it, so the
+    frame is kept and the file it landed in travels on `llm_start`."""
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    rec = KeepingRecorder()
+    start = _analyze(LLMClient(Config()), monkeypatch, rec)
+
+    assert rec.kept == [(7, b"\xff\xd8jpeg", "analyze_image")]
+    assert start["screenshot"] is True
+    assert start["shot"] == "step_007_analyze_image_00c0ffee.jpg"
+
+
+class BareRecorder:
+    """A recorder that dumps prompts and keeps no frames."""
+
+    def dump_messages(self, step, messages, purpose="decide"):
+        return ""
+
+
+@pytest.mark.parametrize("recorder", [None, BareRecorder()])
+def test_a_recorder_that_keeps_no_frames_still_reads_the_screen(monkeypatch,
+                                                                recorder):
+    """No recorder at all, or one without a frame store: the analysis is
+    unaffected and the panel simply has no image to show."""
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    start = _analyze(LLMClient(Config()), monkeypatch, recorder)
+    assert start["shot"] == ""
+
+
 def test_llm_streaming_reasoning_and_content_events(monkeypatch):
     from adbagent.config import Config
     from adbagent.llm import LLMClient
@@ -1029,12 +1088,26 @@ def test_an_effort_family_gets_reasoning_effort():
     assert reasoning_body("gpt-5", "high") == {"reasoning_effort": "high"}
 
 
-def test_an_effort_family_floors_none_rather_than_inventing_a_level():
-    """No family exposes an "off", so "none" becomes the lowest real setting.
-    Sending `reasoning_effort: "none"` would be a 400."""
+def test_an_effort_family_without_an_off_switch_floors_none():
+    """gpt-oss and the o-series expose no "off", so "none" becomes the lowest real
+    setting. Sending `reasoning_effort: "none"` would be a 400."""
     from adbagent.llm import reasoning_body
 
     assert reasoning_body("gpt-oss-120b", "none") == {"reasoning_effort": "low"}
+    assert reasoning_body("gpt-5", "none") == {"reasoning_effort": "low"}
+
+
+def test_an_effort_family_with_an_off_switch_is_actually_switched_off():
+    """The floor is a cap for a model that cannot stop and a silent no-op for one
+    that can. On deepseek-v4-flash "low" is indistinguishable from sending nothing,
+    so flooring "none" would buy back the whole chain of thought the config just
+    asked not to have."""
+    from adbagent.llm import reasoning_body
+
+    for model in ("accounts/fireworks/models/deepseek-v4-flash-0731",
+                  "kimi-k3", "qwen3p7-plus"):
+        assert reasoning_body(model, "none") == {"reasoning_effort": "none"}, model
+        assert reasoning_body(model, "high") == {"reasoning_effort": "high"}, model
 
 
 def test_a_hybrid_family_gets_a_thinking_switch():
@@ -1043,9 +1116,10 @@ def test_a_hybrid_family_gets_a_thinking_switch():
 
     off = {"chat_template_kwargs": {"thinking": False}}
     on = {"chat_template_kwargs": {"thinking": True}}
-    assert reasoning_body("accounts/fireworks/models/deepseek-v4-flash", "none") == off
-    assert reasoning_body("accounts/fireworks/models/deepseek-v4-flash", "high") == on
-    assert reasoning_body("qwen3p7-plus", "low") == on
+    assert reasoning_body("accounts/fireworks/models/deepseek-v3p1", "none") == off
+    assert reasoning_body("accounts/fireworks/models/deepseek-v3p1", "high") == on
+    assert reasoning_body("qwen3-235b-a22b", "low") == on
+    assert reasoning_body("glm-4p6", "low") == on
 
 
 def test_an_unrecognised_model_sends_nothing_rather_than_guessing():
@@ -1087,7 +1161,7 @@ def test_the_depth_reaches_the_request_body(monkeypatch):
     client = LLMClient(cfg)
 
     body = client._extra_body(client.model, "none")
-    assert body["chat_template_kwargs"] == {"thinking": False}
+    assert body["reasoning_effort"] == "none"
     # And the settings that were already there survive alongside it.
     assert "prompt_cache_key" in body
 
@@ -1156,7 +1230,7 @@ def test_a_vision_call_is_capped_without_the_caller_threading_it(monkeypatch):
         client._post([{"role": "user", "content": "hi"}],
                      model=client.model_image, schema=None, max_tokens=100,
                      purpose="read_item")
-    assert seen["extra_body"]["chat_template_kwargs"] == {"thinking": False}
+    assert seen["extra_body"]["reasoning_effort"] == "none"
 
 
 def test_the_judge_always_thinks_properly(monkeypatch):
@@ -1245,7 +1319,20 @@ def test_the_version_that_gained_reasoning_is_respected():
     assert reasoning_style_for("glm-4-9b") == "off"
     assert reasoning_style_for("glm-4p6") == "thinking"
     assert reasoning_style_for("kimi-k2p6") == "off"
-    assert reasoning_style_for("kimi-k3") == "thinking"
+
+
+def test_the_version_that_changed_convention_is_respected_too():
+    """The 2026 generation moved off the chat template and onto `reasoning_effort`,
+    and the split is again by version inside the family -- so the newer name has to
+    win over the older prefix it contains."""
+    from adbagent.llm import reasoning_style_for
+
+    assert reasoning_style_for("deepseek-v3p1") == "thinking"
+    assert reasoning_style_for("deepseek-v4-flash-0731") == "effort"
+    assert reasoning_style_for("qwen3-235b-a22b") == "thinking"
+    assert reasoning_style_for("qwen3p7-plus") == "effort"   # not shadowed by qwen3
+    assert reasoning_style_for("kimi-k2-thinking") == "thinking"
+    assert reasoning_style_for("kimi-k3") == "effort"
 
 
 def test_the_reasoning_fields_are_named_so_dropping_them_takes_nothing_else():
@@ -1259,15 +1346,21 @@ def test_the_reasoning_fields_are_named_so_dropping_them_takes_nothing_else():
     assert reasoning_fields(None) == []
 
 
-def _rejecting_client(monkeypatch, status=400, reject_times=1):
-    """A client whose provider rejects any request carrying a reasoning field."""
+def _rejecting_client(monkeypatch, status=400, reject_times=1,
+                      model="deepseek-v3p1", field="chat_template_kwargs"):
+    """A client whose provider rejects any request carrying a reasoning field.
+
+    Parametrised by convention, because either one can be the wrong guess: a
+    thinking family that has moved to `reasoning_effort` is how this was found,
+    and the drop has to work the same way whichever field went out.
+    """
     from adbagent.llm import LLMClient
     from openai import APIStatusError
     import httpx
 
     monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
     cfg = cfg_with(effort="none", hard="high")
-    cfg.llm.model = "deepseek-v4-flash"
+    cfg.llm.model = model
     client = LLMClient(cfg)
 
     sent = []
@@ -1284,11 +1377,11 @@ def _rejecting_client(monkeypatch, status=400, reject_times=1):
 
     def create(**kwargs):
         sent.append(kwargs.get("extra_body") or {})
-        if ("chat_template_kwargs" in (kwargs.get("extra_body") or {})
+        if (field in (kwargs.get("extra_body") or {})
                 and state["rejections"] < reject_times):
             state["rejections"] += 1
             raise APIStatusError(
-                "chat_template_kwargs is not supported for this model",
+                f"Extra inputs are not permitted, field: '{field}'",
                 response=httpx.Response(status, request=httpx.Request("POST", "http://x")),
                 body=None)
         return iter([Chunk()])
@@ -1297,17 +1390,22 @@ def _rejecting_client(monkeypatch, status=400, reject_times=1):
     return client, sent
 
 
-def test_a_rejected_reasoning_field_is_dropped_rather_than_ending_the_run(monkeypatch):
+@pytest.mark.parametrize("model,field", [
+    ("deepseek-v3p1", "chat_template_kwargs"),
+    ("deepseek-v4-flash", "reasoning_effort"),
+])
+def test_a_rejected_reasoning_field_is_dropped_rather_than_ending_the_run(
+        monkeypatch, model, field):
     """A 400 ninety steps into a run, over an optimisation, is not acceptable."""
-    client, sent = _rejecting_client(monkeypatch)
+    client, sent = _rejecting_client(monkeypatch, model=model, field=field)
 
     raw, call = client._post([{"role": "user", "content": "hi"}],
                              model=client.model, schema=None, max_tokens=100,
                              purpose="decide")
     assert raw == "ok"
     assert len(sent) == 2                              # rejected, then retried
-    assert "chat_template_kwargs" in sent[0]
-    assert "chat_template_kwargs" not in sent[1]
+    assert field in sent[0]
+    assert field not in sent[1]
 
 
 def test_dropping_the_field_keeps_the_rest_of_the_body(monkeypatch):

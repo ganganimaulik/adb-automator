@@ -408,18 +408,37 @@ RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504, 520})
 REASONING_LEVELS = ("none", "low", "medium", "high")
 
 #: Families taking `reasoning_effort: "low" | "medium" | "high"`.
-EFFORT_FAMILIES = ("gpt-oss", "gpt-5", "o1", "o3", "o4")
+#:
+#: The second row is the 2026 open-weight generation, which moved off the chat
+#: template and onto this field: Fireworks answers `chat_template_kwargs` with a
+#: 400 ("Extra inputs are not permitted") for all three, and takes
+#: `reasoning_effort` for all three. Checked against the API, not inferred from
+#: the names -- and being wrong about a newer sibling still only costs the one
+#: call `_post` spends discovering it.
+EFFORT_FAMILIES = ("gpt-oss", "gpt-5", "o1", "o3", "o4",
+                   "deepseek-v4", "kimi-k3", "qwen3p7")
+
+#: Effort families whose "none" is a real setting rather than a 400. gpt-oss and
+#: the o-series expose no off switch, so for them "none" has to be floored to the
+#: lowest real level -- but these take it and honour it (`reasoning_content` comes
+#: back empty and the completion roughly halves), and flooring it would quietly
+#: buy the chain of thought the config asked not to have. On deepseek-v4-flash
+#: that is the whole of the setting: low, medium and high are indistinguishable
+#: from sending nothing, and only "none" changes anything.
+EFFORT_NONE_FAMILIES = ("deepseek-v4", "kimi-k3", "qwen3p7")
+
 #: Families taking `chat_template_kwargs: {"thinking": bool}` -- a hybrid model
 #: with one switch rather than a dial, so any non-"none" depth just turns it on.
 #:
 #: Version markers are deliberate. Most models do not reason at all, and within a
 #: family the split is by version rather than by name: DeepSeek is hybrid from 3.1,
 #: GLM from 4.5, Kimi from k2-thinking. An earlier table matched bare "deepseek-v3"
-#: and "glm-4", which aimed the flag at three models that do not think.
-THINKING_FAMILIES = ("deepseek-v3p1", "deepseek-v3.1", "deepseek-v4",
+#: and "glm-4", which aimed the flag at three models that do not think. The same
+#: split now runs the other way too -- "qwen3" is here while "qwen3p7" is an effort
+#: family above, and EFFORT_FAMILIES is matched first so the newer name wins.
+THINKING_FAMILIES = ("deepseek-v3p1", "deepseek-v3.1",
                      "qwen3", "glm-4p5", "glm-4.5", "glm-4p6", "glm-4.6",
-                     "glm-5", "minimax-m", "kimi-k2-thinking", "kimi-k2p7",
-                     "kimi-k3")
+                     "glm-5", "minimax-m", "kimi-k2-thinking", "kimi-k2p7")
 
 #: Families that do not reason at all, so there is nothing to cap and nothing
 #: wrong. Listed only so `doctor` can say which of the two silences it is in --
@@ -472,6 +491,17 @@ def known_non_reasoning(model: str) -> bool:
     return False
 
 
+def accepts_effort_none(model: str) -> bool:
+    """True when `model` takes `reasoning_effort: "none"` verbatim.
+
+    The alternative is the floor, which is a real cap for a model that has no off
+    switch and a silent no-op for one that does -- so it has to be asked per
+    family rather than applied to the whole convention.
+    """
+    name = (model or "").lower()
+    return any(family in name for family in EFFORT_NONE_FAMILIES)
+
+
 def reasoning_body(model: str, effort: str, style: str = "auto") -> Dict[str, Any]:
     """The request fields that ask `model` for `effort` worth of thinking.
 
@@ -484,8 +514,12 @@ def reasoning_body(model: str, effort: str, style: str = "auto") -> Dict[str, An
     resolved = style if style in ("effort", "thinking", "off") else \
         reasoning_style_for(model)
     if resolved == "effort":
-        # No family exposes an "off"; the floor is the closest thing to it.
-        return {"reasoning_effort": "low" if effort == "none" else effort}
+        if effort == "none" and not accepts_effort_none(model):
+            # No off switch on this family; the floor is the closest thing to it.
+            # Also where a forced style lands, so a model nobody has checked gets
+            # the setting least likely to be a 400.
+            return {"reasoning_effort": "low"}
+        return {"reasoning_effort": effort}
     if resolved == "thinking":
         return {"chat_template_kwargs": {"thinking": effort != "none"}}
     return {}
@@ -981,12 +1015,19 @@ class LLMClient:
             {"role": "system", "content": prompts.IMAGE_ANALYSIS_SYSTEM},
             {"role": "user", "content": content},
         ]
+        shot = ""
         if recorder is not None:
             recorder.dump_messages(step, messages, purpose="analyze_image")
-        log.info("submitting screenshot (%d bytes) to image model (%s) for visual analysis",
-                 len(screenshot), self.model_image)
+            if hasattr(recorder, "screenshot"):
+                # Kept on disk so the UI can show what was submitted beside what
+                # came back. A recorder without it (replay's, a test's) simply
+                # leaves the panel without an image.
+                shot = recorder.screenshot(step, screenshot, "analyze_image")
+        log.info("submitting screenshot (%d bytes%s) to image model (%s) for visual analysis",
+                 len(screenshot), f", kept as {shot}" if shot else "", self.model_image)
         if on_event:
-            on_event("llm_start", step=step, purpose="analyze_image", model=self.model_image, screenshot=True)
+            on_event("llm_start", step=step, purpose="analyze_image",
+                     model=self.model_image, screenshot=True, shot=shot)
         t0 = time.monotonic()
         kw = {}
         if on_event is not None:

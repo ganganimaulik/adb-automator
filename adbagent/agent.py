@@ -186,6 +186,25 @@ class Recorder:
         path.write_bytes(data)
         return str(path)
 
+    def screenshot(self, step: int, jpeg: bytes, purpose: str) -> str:
+        """Keep the frame a model was shown, and return its file name.
+
+        Best-effort, for the same reason as `stream_event`: this exists so the
+        live view and the history can show the screenshot next to the call that
+        saw it, and a disk that will not take a 40 KB JPEG is not a reason to end
+        the run. The empty string means "there is nothing to show", which is what
+        every caller passes on to the UI.
+        """
+        if not jpeg:
+            return ""
+        name = runlog.shot_name(step, purpose, jpeg)
+        try:
+            self.blob(name, jpeg)
+        except OSError as exc:
+            log.warning("could not keep the %s screenshot (%s)", purpose, exc)
+            return ""
+        return name
+
     def dump_messages(self, step: int, messages: List[Dict[str, Any]], purpose: str = "decide") -> str:
         """Dump step prompt messages to a formatted JSON file in the run directory."""
         filename = f"step_{step:03d}_{purpose}_messages.json"
@@ -238,6 +257,10 @@ def _stream_tap(rec: Recorder, inner: Any) -> Any:
                              purpose=kw.get("purpose") or "decide",
                              model=kw.get("model") or "",
                              screenshot=bool(kw.get("screenshot")),
+                             # The kept frame, when this call is the one that was
+                             # shown it. `screenshot` says a screenshot was taken
+                             # this turn; this says which model looked at it.
+                             shot=kw.get("shot") or "",
                              effort=kw.get("effort") or "")
         elif kind == "llm_stream":
             rec.stream_event(kind, stream_type=kw.get("stream_type") or "content",
@@ -816,8 +839,13 @@ class Agent:
                 log.info("step %d: thinking harder (%s) because %s",
                          state.step, effort, hard_because)
             model_name = self.llm.model if self.llm else ""
+            # The frame reaches the decider itself only when the decider is the
+            # model doing the looking. Otherwise the vision pass above is the call
+            # that was shown it, and its own panel already carries the image.
+            shot = rec.screenshot(state.step, screenshot, "decide") \
+                if (screenshot and cfg.llm.vision_in_decider) else ""
             self.on_event("llm_start", step=state.step, purpose="decide", model=model_name,
-                          screenshot=bool(screenshot), effort=effort,
+                          screenshot=bool(screenshot), shot=shot, effort=effort,
                           hard_because=hard_because)
             t0_llm = time.monotonic()
             action = self.llm.decide(                      ### LLM ###
@@ -1204,10 +1232,17 @@ class Agent:
 
             # -- read the item we are on, in the background ----------------
             reading: Optional[Prefetch] = None
+            shot_name = ""
             ledger_mark = self.llm.ledger.mark() if self.llm else 0
             if (self.llm is not None and not cfg.run.never_screenshot
                     and not state.items.was_read(here)):
                 shot = self._ensure_screenshot(screen)
+                # Kept here rather than inside `read_item`: the read runs on
+                # another thread, and the name has to be in hand on this one to
+                # travel with the reading when it is filed below. A sweep is most
+                # of a run's vision calls, and "what did it read off item 7" is
+                # not answerable from the reading alone.
+                shot_name = rec.screenshot(state.step, shot, "read_item")
                 reading = Prefetch(lambda s=shot, l=label: self.llm.read_item(
                     s, goal=state.goal, label=l, step=state.step))
 
@@ -1223,7 +1258,8 @@ class Agent:
             except (ActionError, ValueError) as exc:
                 reason = f"the swipe could not be carried out ({exc})"
                 if reading is not None and self._file_reading(state, screen, here,
-                                                              reading, rec):
+                                                              reading, rec,
+                                                              shot=shot_name):
                     read += 1
                 break
             except (DeviceTimeout, DeviceLost) as exc:
@@ -1262,7 +1298,8 @@ class Agent:
             # Filed before `screen` moves on, because `note` reads the label and
             # the total off the screen the reading was taken of.
             if reading is not None and self._file_reading(state, screen, here,
-                                                          reading, rec):
+                                                          reading, rec,
+                                                          shot=shot_name):
                 read += 1
             swept += 1
 
@@ -1310,15 +1347,22 @@ class Agent:
         return screen
 
     def _file_reading(self, state: RunState, screen: Screen, key: str,
-                      reading: "Prefetch", rec: Recorder) -> bool:
-        """Attach a prefetched item reading to the item it was taken of."""
+                      reading: "Prefetch", rec: Recorder, shot: str = "") -> bool:
+        """Attach a prefetched item reading to the item it was taken of.
+
+        `shot` is the frame the reading was taken from, so the record carries
+        both halves of the call: a sweep read has no live panel -- it runs on
+        another thread, and streaming two of those into one terminal interleaves
+        them into nonsense -- so this event is the whole of it.
+        """
         text = reading.result(default="")
         if not text:
             return False
         state.items.note(key, screen, state.step, detail=text, read=True)
-        rec.event("item_reading", step=state.step, item=key, reading=text)
+        rec.event("item_reading", step=state.step, item=key, reading=text,
+                  shot=shot)
         self.on_event("item_reading", step=state.step, label=screen.item_label,
-                      reading=text)
+                      reading=text, shot=shot)
         return True
 
     # -- terminal actions --------------------------------------------------

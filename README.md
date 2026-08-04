@@ -205,8 +205,14 @@ adbagent report runs/<id>
 Every run writes a directory of its own: `events.jsonl` (what it decided, one
 structured line per step), `run.log` (what it did, in full detail),
 `stream.jsonl` (the raw LLM stream — every `llm_start`/chunk/`llm_end`, which
-the web UI tails to show the model thinking live) and the exact messages sent
-at each step. `report` replays the events as a readable trace and
+the web UI tails to show the model thinking live), the exact messages sent
+at each step, and the screenshots that were *submitted* to a model —
+`step_004_analyze_image_9f3c1a20.jpg`, named by the step, the call that was shown
+it, and a digest of the bytes, so one frame shown twice is one file. Only
+submitted frames are kept: the screen read on the ~fifth of turns that take a
+screenshot, one per item a sweep reads, and the decision itself when
+`llm.vision_in_decider` is on. The web UI shows each beside the call that saw it.
+`report` replays the events as a readable trace and
 ends with where the time went:
 
 ```
@@ -306,7 +312,15 @@ the CLI writes, so what you see is exactly what `report` would replay. While a
 call is in flight its raw stream is shown too: the model's thinking and
 response arrive live in a panel per call (from `stream.jsonl`, below), which
 folds itself away the moment the call ends and leaves the decision card as the
-record. **History**
+record. A call that was handed a screenshot shows it, thumbnailed under the
+panel and full size on click — and the thumbnail stays after the panel folds,
+because a vision read you cannot check against the frame it read is only half
+the record. It appears on the call that was actually shown the pixels: the
+vision read, or the decision itself when `llm.vision_in_decider` is on. A
+sweep's per-item reads have no panel — each is prefetched on another thread, and
+streaming several of those into one view interleaves them — so each arrives as a
+card carrying the line the model read and the frame it read it from, which on a
+carousel is most of the run's vision calls. **History**
 lists recorded runs with their outcome, cost and duration, and opens the full
 trace, stats and scratchpad for any of them — and a failed or interrupted one
 has a **resume** button, continuing it from its checkpoint exactly like
@@ -499,17 +513,27 @@ clever:
   rest of the body — including `prompt_cache_key` — is kept, and the run carries
   on with a warning. A 400 ninety steps in, over an optimisation, is not an
   acceptable outcome. A rejection that was *not* about reasoning still raises.
+- **A family can change convention between versions**, so the table splits by
+  version and not by name. DeepSeek 3.1 takes `chat_template_kwargs`; v4 answers
+  it with a 400 and takes `reasoning_effort`. Same for Qwen3 → Qwen3.7 and Kimi
+  k2-thinking → k3. Being wrong about a model still costs one call, but it also
+  costs the cap — a dropped field means the model thinks as it pleases, which is
+  the thing the setting was for.
 
 **Check `adbagent doctor` after setting it.** It reports per model, because a run
 uses up to four and they need not agree:
 
 ```
-  OK    deepseek-v4-flash-0731 (deciding/judging): thinking convention, from the model name
-        none   sends {"chat_template_kwargs": {"thinking": false}}
-        high   sends {"chat_template_kwargs": {"thinking": true}}
+  OK    deepseek-v4-flash-0731 (deciding/judging): effort convention, from the model name
+        none   sends {"reasoning_effort": "none"}
+        high   sends {"reasoning_effort": "high"}
   OK    llama-v3p3-70b-instruct (vision) does not reason -- nothing to cap
         confirm the bodies above against your provider's docs -- an ignored field looks like a working one
 ```
+
+`none` goes out as itself where the model has a real off switch, and as the lowest
+real level where it does not (gpt-oss and the o-series have no "off", so asking for
+one is a 400).
 
 That last line is the one that matters. A rejected field is survivable; a field
 the model quietly *ignores* is not detectable from the outside — the clock and the

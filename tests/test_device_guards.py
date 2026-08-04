@@ -5,6 +5,8 @@ These are the parts of the device layer that can be tested without a phone.
 
 from __future__ import annotations
 
+import atexit
+import threading
 import time
 
 import pytest
@@ -160,3 +162,179 @@ def test_device_scroll_gesture_directions_and_duration(capsys):
     captured = capsys.readouterr()
     assert "Scrolling left (scale=0.8, duration=0.15s)" in captured.out
     assert "Scrolling down (scale=0.6)" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Teardown
+#
+# `close` runs after the run has already printed its result, so a step that
+# blocks there costs the user their prompt and nothing else -- which is exactly
+# how it went unnoticed that all four restores were failing, and how a wedged
+# adb socket turned into "it never exits unless I press ctrl+c".
+# ---------------------------------------------------------------------------
+
+class _StubAdb:
+    def __init__(self):
+        self.commands = []
+
+    def shell(self, command, timeout=None):
+        self.commands.append(command)
+        return ""
+
+
+class _StubU2:
+    """Just enough u2.Device for `Device.close` to run against."""
+
+    def __init__(self, ime="com.sample/.Ime", stop_blocks_forever=False):
+        self.adb_device = _StubAdb()
+        self.stopped = False
+        self._ime = ime
+        self._stop_blocks_forever = stop_blocks_forever
+
+    def current_ime(self):
+        return "com.github.uiautomator/.FastInputIME"
+
+    def stop_uiautomator(self):
+        self.stopped = True
+        if self._stop_blocks_forever:
+            threading.Event().wait()  # a socket with no timeout, in effect
+
+
+def _closable_device(**stub_kw):
+    """A `Device` wired to a stub, with state worth putting back."""
+    from adbagent.config import Config
+    from adbagent.device import Device, _Restore
+
+    dev = Device.__new__(Device)
+    dev.cfg = Config()
+    dev.cfg.device.disable_animations = True
+    dev.cfg.device.disable_auto_rotate = True
+    dev._restore = _Restore(
+        ime="com.sample/.Ime",
+        window_scale="1.0", transition_scale="1.0", animator_scale="1.0",
+        screen_off_timeout="60000",
+        accelerometer_rotation="1", user_rotation="0",
+    )
+    dev._d = _StubU2(**stub_kw)
+    return dev
+
+
+def test_close_actually_restores_what_open_changed():
+    """The restores must run *before* `_d` is cleared.
+
+    Clearing it first made every one of them raise `device is not open`, so a
+    run left the phone with animations off, rotation locked, the agent's IME
+    selected and a 30-minute screen timeout -- reported only as four warnings
+    nobody reads.
+    """
+    dev = _closable_device()
+    stub = dev._d
+    dev.close()
+
+    sent = " | ".join(stub.adb_device.commands)
+    assert "settings put global window_animation_scale 1.0" in sent
+    assert "settings put global transition_animation_scale 1.0" in sent
+    assert "settings put global animator_duration_scale 1.0" in sent
+    assert "settings put system accelerometer_rotation 1" in sent
+    assert "settings put system screen_off_timeout 60000" in sent
+    assert "ime set com.sample/.Ime" in sent
+    assert "svc power stayon false" in sent
+    assert stub.stopped
+    assert dev._d is None
+
+
+def test_close_is_idempotent():
+    dev = _closable_device()
+    stub = dev._d
+    dev.close()
+    before = len(stub.adb_device.commands)
+    dev.close()
+    assert len(stub.adb_device.commands) == before
+
+
+def test_close_is_bounded_when_a_step_never_returns(monkeypatch, caplog):
+    """A teardown step on a dead socket must cost a pause, not the process.
+
+    adbutils floors its socket timeout at 600s and `stop_uiautomator` reaches it
+    directly, so before this the exit could block for ten minutes with the run
+    finished and printed.
+    """
+    from adbagent import device as devmod
+
+    monkeypatch.setattr(devmod, "TEARDOWN_BUDGET_S", 1.0)
+    dev = _closable_device(stop_blocks_forever=True)
+    stub = dev._d
+
+    started = time.monotonic()
+    dev.close()
+    elapsed = time.monotonic() - started
+
+    assert stub.stopped, "the stalling step should have been entered"
+    assert elapsed < 5.0, f"close() took {elapsed:.1f}s -- the budget did not hold"
+    assert "could not restore uiautomator server" in caplog.text
+    assert "exceeded" in caplog.text  # the watchdog, not some other failure
+    assert dev._d is None
+
+
+def test_close_drops_u2s_duplicate_atexit_hook(monkeypatch):
+    """u2 registers `stop_uiautomator` with atexit, under the same server lock.
+
+    Leaving it registered means that if the step above was abandoned on a
+    stalled socket -- its daemon thread still holding that lock -- interpreter
+    shutdown blocks on it forever, after the last line of output.
+    """
+    from adbagent import device as devmod
+
+    dropped = []
+    monkeypatch.setattr(devmod.atexit, "unregister", dropped.append)
+
+    dev = _closable_device()
+    stub = dev._d
+    dev.close()
+
+    assert dropped == [stub.stop_uiautomator]
+
+
+def test_close_drops_the_atexit_hook_even_when_a_step_stalls(monkeypatch):
+    """The stalling case is the one that needs it, so it must not be skipped."""
+    from adbagent import device as devmod
+
+    dropped = []
+    monkeypatch.setattr(devmod.atexit, "unregister", dropped.append)
+    monkeypatch.setattr(devmod, "TEARDOWN_BUDGET_S", 1.0)
+
+    dev = _closable_device(stop_blocks_forever=True)
+    stub = dev._d
+    dev.close()
+
+    assert dropped == [stub.stop_uiautomator]
+
+
+def test_reconnect_drops_the_replaced_devices_atexit_hook(monkeypatch):
+    """A recovery swaps in a fresh u2.Device, and each one registers its own hook.
+
+    Without this, a run that recovered twice reaches interpreter shutdown with
+    three `stop_uiautomator` handlers queued on the same server lock -- over a
+    link the recovery already proved was wedged.
+    """
+    from adbagent import device as devmod
+
+    dropped = []
+    monkeypatch.setattr(devmod.atexit, "unregister", dropped.append)
+
+    replacement = _StubU2()
+    monkeypatch.setattr(devmod.u2, "connect", lambda *a, **kw: replacement)
+    monkeypatch.setattr(_StubU2, "settings", {}, raising=False)
+    monkeypatch.setattr(_StubU2, "window_size", lambda self: (1080, 2400),
+                        raising=False)
+
+    dev = _closable_device()
+    original = dev._d
+    dev.serial = "192.168.1.23:33463"
+
+    dev._reconnect()
+    assert dropped == [original.stop_uiautomator]
+    assert dev._d is replacement
+
+    dev.close()
+    assert dropped == [original.stop_uiautomator, replacement.stop_uiautomator]

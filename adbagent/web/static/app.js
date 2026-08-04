@@ -45,6 +45,55 @@ function fmtDur(s) {
   return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
 }
 
+/* ------------------------------------------------------- follow the tail
+
+   Live surfaces -- the event feed, a streaming llm panel, the generator log --
+   chase their newest line only while the reader is at the bottom. Scrolling up
+   parks the view where it was left; scrolling back down resumes the chase.
+
+   Decided here and now on each new line, never from a scroll listener: scroll
+   events land a frame late, and a stream can outrun them. */
+
+const TAIL_SLACK = 32;  // px short of the bottom that still counts as "at it"
+
+function nearBottom(box) {
+  return box.scrollHeight - box.scrollTop - box.clientHeight <= TAIL_SLACK;
+}
+
+/* Add live content to `box` via `grow`, keeping the newest of it in view --
+   unless the reader has scrolled away from the tail, in which case the view
+   stays where they put it.
+
+   Whether to chase is decided before `grow` runs: one card can be taller than
+   the slack, and once it is in the DOM there is no telling that from a reader
+   having scrolled up. Sitting exactly where the last chase landed also counts
+   as the tail however far the bottom has moved since -- that was content
+   arriving or a screenshot finishing, not the reader. */
+function followTail(box, grow) {
+  const chase = Math.abs(box.scrollTop - box._autoTop) < 1  // NaN when unset: fine
+                || nearBottom(box);
+  grow();
+  if (!chase) {
+    box._autoTop = -1;  // parked; only being at the bottom resumes the chase
+    return;
+  }
+  box.scrollTop = box.scrollHeight;
+  box._autoTop = box.scrollTop;  // read back: the write above was clamped
+}
+
+/* The event feed rides the page's own scrollbar, which lives on the document. */
+function followPageTail(feed, grow) {
+  if (!feed.offsetParent) { grow(); return; }  // hidden tab: no tail to chase
+  followTail(document.scrollingElement, grow);
+}
+
+/* Treat wherever the page sits now as the tail, so the next live line resumes
+   the chase: a reader opening the run tab mid-run wants the newest of it. */
+function armPageTail() {
+  const page = document.scrollingElement;
+  page._autoTop = page.scrollTop;
+}
+
 /* ---------------------------------------------------------------- tabs */
 
 const loadedTabs = new Set();
@@ -63,6 +112,8 @@ $("tabs").addEventListener("click", (e) => {
   document.querySelectorAll("section.tab").forEach((s) =>
     s.classList.toggle("active", s.id === "tab-" + btn.dataset.tab));
   const name = btn.dataset.tab;
+  if (name === "run") armPageTail();  // the other tab's scroll position isn't a
+                                      // reader's decision about this feed
   if (!loadedTabs.has(name)) {
     loadedTabs.add(name);
     tabLoaders[name]().catch((err) => notice(err.message));
@@ -89,7 +140,48 @@ function actionSummary(a) {
 
 const GRADE_CLASSES = { worked: "worked", no_change: "no_change" };
 
-function renderEvent(ev) {
+/* A ledger key as a person reads it: `label:today, 9:17 am#2` is the app's own
+   caption plus the ledger's bookkeeping, and the prefix is the bookkeeping. */
+function itemName(key) {
+  return String(key || "").replace(/^[a-z]+:/, "");
+}
+
+/* Kinds that are a line of context rather than a card, each mapped to its text.
+   A kind in neither this table nor a branch below renders as its bare name --
+   which is how a sweep used to read as twenty lines saying "sweep_step" with
+   everything the events carried thrown away. */
+const NOTE_LINES = {
+  sweep_step: (e) => `swept ${e.direction || ""} · ` +
+    `${e.label || itemName(e.item) || "item"} · ${e.read_count || 0} read` +
+    (e.moved === false ? " · did not move" : ""),
+  pager_item: (e) => `gallery item ${e.read_count || 0}/${e.total || "?"}` +
+    (e.label ? ` · ${e.label}` : "") + (e.read ? " · looked at" : ""),
+  pager_retry: (e) => `pager retry: ${e.action || "the same gesture, harder"}`,
+  dismiss: (e) => `harness dismissed ${e.label} (attempt ${e.attempt})`,
+  dismiss_failed: (e) =>
+    `${e.label} dismisses nothing after ${e.tries} tries — handed to the model`,
+  loop_break: (e) => `stuck on ${e.exact_id} — going back`,
+  back_loop_escape: (e) =>
+    `${e.consecutive_backs} backs in a row — asking for another approach`,
+  scroll_rejected: (e) => `scroll rejected: ${e.action}`,
+  refused: (e) => `refused ${e.label} — needs "allow destructive"`,
+  scratchpad: (e) => `collected: ${(e.keys || []).join(", ")} (${e.total} total)`,
+  dead_ends: (e) => `dead ends avoided: ${(e.remembered || []).join(", ")}`,
+};
+
+/* How a run stops badly. Rendered rather than dropped: an `error` event used to
+   reach the feed as the bare word "error", message and all discarded. */
+const HALT_BANNERS = {
+  error: (e) => [`failed`, `<b>error</b> ${esc(e.error || "")}`],
+  gave_up: (e) => [`failed`, `<b>gave up</b> ${esc(e.reason || "")}`],
+  sensitive: (e) => [`needs_user`,
+                     `<b>stopped on a sensitive screen</b> ${esc(e.reason || "")}`],
+};
+
+/* One feed entry, or null when the event says nothing new.
+   `feed` is the element it is going into, which is where the per-feed state a
+   few kinds need lives -- see `active_skill`. */
+function renderEvent(ev, feed) {
   const kind = ev.kind || "";
   const div = document.createElement("div");
 
@@ -136,14 +228,43 @@ function renderEvent(ev) {
     div.innerHTML = `<b>${esc((ev.outcome || "").toUpperCase())}</b> — ${esc(ev.steps)} steps, ` +
       `${esc(ev.llm_calls)} LLM calls, $${(ev.usd || 0).toFixed(4)}`;
   } else if (kind === "active_skill") {
+    // Recorded on every step -- it is the per-step record of what the prompt
+    // actually carried -- so rendering each one buried the fact under eight
+    // identical grey lines. A line per *change* is the information: it is where
+    // the run crossed into another app's guidance, or failed to.
+    const label = `${ev.name || "?"}|${ev.package || ""}`;
+    if (feed) {
+      if (feed._skill === label) return null;
+      feed._skill = label;
+    }
+    div.className = "banner skill";
+    div.innerHTML = `<span class="chip skill">skill loaded</span> <b>${esc(ev.name || "?")}</b>` +
+      (ev.package ? ` <span class="small">${esc(ev.package)}</span>` : "");
+  } else if (kind === "item_reading") {
+    // The sweep's own vision call. It gets no live panel -- a prefetched read
+    // runs on another thread, and streaming two of those into one view
+    // interleaves them -- so this card is the whole of it: the line the model
+    // read, and the frame it read it from.
+    div.className = "card";
+    div.innerHTML =
+      `<div class="head"><span class="stepno">step ${esc(ev.step)}</span>` +
+      `<span class="chip neutral">item read</span>` +
+      (ev.item ? `<span class="mono">${esc(itemName(ev.item))}</span>` : "") + `</div>` +
+      `<div class="obs">${esc(ev.reading || "")}</div>`;
+    const thumb = llmShot(ev, feed && feed._runId);
+    if (thumb) div.appendChild(thumb);
+  } else if (kind === "sweep") {
+    div.className = "banner";
+    div.innerHTML = `<b>swept ${esc(ev.swept)} item(s) ${esc(ev.direction)}</b>, ` +
+      `${esc(ev.read)} read <span class="small">· steps ${esc(ev.first_step)}–` +
+      `${esc(ev.last_step)}${ev.reason ? " · " + esc(ev.reason) : ""}</span>`;
+  } else if (HALT_BANNERS[kind]) {
+    const [cls, html] = HALT_BANNERS[kind](ev);
+    div.className = "banner " + cls;
+    div.innerHTML = html;
+  } else if (NOTE_LINES[kind]) {
     div.className = "small mono";
-    div.textContent = `skill loaded: ${ev.name} (${ev.package})`;
-  } else if (kind === "scratchpad") {
-    div.className = "small mono";
-    div.textContent = `collected: ${(ev.keys || []).join(", ")} (${ev.total} total)`;
-  } else if (kind === "dead_ends") {
-    div.className = "small mono";
-    div.textContent = `dead ends avoided: ${(ev.remembered || []).join(", ")}`;
+    div.textContent = NOTE_LINES[kind](ev);
   } else {
     div.className = "small mono";
     div.textContent = kind;
@@ -154,6 +275,12 @@ function renderEvent(ev) {
 function updateCountersFromEvent(ev) {
   if (typeof ev.step === "number") {
     live.step = Math.max(live.step, ev.step);
+  }
+  // Which skill is in the prompt *now*, not just where it last changed: the
+  // feed scrolls away and the answer to "is this run being helped by the right
+  // app's skill" should not need scrolling back for.
+  if (ev.kind === "active_skill" && ev.name) {
+    live.skill = ev.name;
   }
   const llm = ev.llm;
   if (llm && typeof llm === "object") {
@@ -170,7 +297,13 @@ function updateCountersFromEvent(ev) {
    away the moment the call ends -- the decide/verify cards carry the result.
    Panels are keyed off order, not step: calls within a step are sequential
    (a vision read, then the decision), so at most one is ever open per feed,
-   tracked as feed._llm. */
+   tracked as feed._llm.
+
+   A call that was shown a screenshot carries its file name, and the thumbnail
+   stays visible after the panel folds: a vision read you cannot check against
+   the frame it read is only half the record. Which run's files to ask for is
+   feed._runId -- the live feed learns it from the stream, the history feed from
+   the run it opened. */
 
 const LLM_PURPOSES = { decide: "decide", judge: "judge",
   analyze_image: "vision read", read_item: "item read" };
@@ -197,6 +330,38 @@ function llmSummary(start, end) {
   return s;
 }
 
+function openLightbox(src, alt) {
+  $("lightbox-img").src = src;
+  $("lightbox-img").alt = alt || "";
+  $("lightbox").style.display = "flex";
+}
+
+function closeLightbox() {
+  $("lightbox").style.display = "none";
+  $("lightbox-img").removeAttribute("src");  // stop holding the decoded frame
+}
+
+$("lightbox").addEventListener("click", closeLightbox);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeLightbox();
+});
+
+/* The thumbnail of the frame this call was shown, or nothing when it was shown
+   none. Lives outside the <details> so folding the panel keeps it. */
+function llmShot(ev, runId) {
+  if (!ev.shot || !runId) return null;
+  const wrap = document.createElement("div");
+  wrap.className = "llm-shot";
+  const img = document.createElement("img");
+  img.src = `/api/runs/${encodeURIComponent(runId)}/shot/${encodeURIComponent(ev.shot)}`;
+  img.alt = `the screen sent to the model at step ${ev.step || 0}`;
+  img.title = "the frame this call was shown — click to enlarge";
+  img.loading = "lazy";
+  img.addEventListener("click", () => openLightbox(img.src, img.alt));
+  wrap.appendChild(img);
+  return wrap;
+}
+
 function finalizeLlm(feed, end) {
   const p = feed._llm;
   if (!p) return;
@@ -216,6 +381,8 @@ function handleLlmEvent(ev, feed) {
       `<div class="llm-text"></div></div>` +
       `<div class="llm-sec response"><div class="llm-sec-label">response</div>` +
       `<div class="llm-text"></div></div></details>`;
+    const shot = llmShot(ev, feed._runId);
+    if (shot) card.appendChild(shot);
     feed.appendChild(card);
     feed._llm = {
       start: ev,
@@ -235,8 +402,7 @@ function handleLlmEvent(ev, feed) {
     const sec = thinking ? p.thinkingSec : p.responseSec;
     const text = thinking ? p.thinkingText : p.responseText;
     if (sec.style.display !== "block") sec.style.display = "block";
-    text.textContent = p[key];
-    text.scrollTop = text.scrollHeight;
+    followTail(text, () => { text.textContent = p[key]; });
   } else if (ev.kind === "llm_end") {
     finalizeLlm(feed, ev);
   }
@@ -246,11 +412,13 @@ function paintCounters() {
   $("c-step").textContent = live.step;
   $("c-calls").textContent = live.calls;
   $("c-cost").textContent = "$" + live.cost.toFixed(4);
+  $("c-skill").textContent = live.skill || "—";
 }
 
 /* ------------------------------------------------------------ run tab */
 
-const live = { step: 0, calls: 0, cost: 0, source: null, startedAt: 0, timer: null };
+const live = { step: 0, calls: 0, cost: 0, skill: "", source: null,
+               startedAt: 0, timer: null };
 
 function setRunningUI(running) {
   $("btn-start").disabled = running;
@@ -274,17 +442,19 @@ function openStream() {
   source.addEventListener("run", (e) => {
     const data = JSON.parse(e.data);
     $("c-runid").textContent = data.run_id;
-  });
+    $("feed")._runId = data.run_id;   // sent before any llm frame, so the
+  });                                 // screenshots have a run to come from
   source.addEventListener("event", (e) => {
     const ev = JSON.parse(e.data);
-    $("feed").appendChild(renderEvent(ev));
-    $("feed").lastElementChild.scrollIntoView({ block: "nearest" });
+    const feed = $("feed");
+    const el = renderEvent(ev, feed);
+    if (el) followPageTail(feed, () => feed.appendChild(el));
     updateCountersFromEvent(ev);
   });
   source.addEventListener("llm", (e) => {
     const feed = $("feed");
-    handleLlmEvent(JSON.parse(e.data), feed);
-    feed.lastElementChild.scrollIntoView({ block: "nearest" });
+    const ev = JSON.parse(e.data);
+    followPageTail(feed, () => handleLlmEvent(ev, feed));
   });
   source.addEventListener("state", (e) => {
     const st = JSON.parse(e.data);
@@ -328,9 +498,13 @@ function runOptions() {
 }
 
 function beginLive() {
-  live.step = 0; live.calls = 0; live.cost = 0; live.startedAt = Date.now() / 1000;
+  live.step = 0; live.calls = 0; live.cost = 0; live.skill = "";
+  live.startedAt = Date.now() / 1000;
   $("feed").innerHTML = "";
+  armPageTail();  // a new run is followed however the last one was left
   $("feed")._llm = null;
+  $("feed")._runId = "";
+  $("feed")._skill = "";
   $("c-runid").textContent = "starting…";
   paintCounters();
   setRunningUI(true);
@@ -435,6 +609,21 @@ async function loadRuns() {
   $("run-detail-view").style.display = "none";
 }
 
+/* Every skill a run had in its prompt, in the order it picked them up.
+   Consecutive repeats collapse, because `active_skill` is recorded per step.
+   A goal spanning two apps whose chain names only one is the tell that the
+   other had no skill on disk to load -- which is worth seeing without reading
+   the whole feed. */
+function skillChain(events) {
+  const chain = [];
+  for (const ev of events || []) {
+    if (ev.kind === "active_skill" && ev.name && chain[chain.length - 1] !== ev.name) {
+      chain.push(ev.name);
+    }
+  }
+  return chain;
+}
+
 async function openRunDetail(id) {
   $("runs-list-view").style.display = "none";
   $("run-detail-view").style.display = "block";
@@ -442,9 +631,11 @@ async function openRunDetail(id) {
   const feed = $("detail-feed");
   feed.innerHTML = "";
   feed._llm = null;
+  feed._runId = id;
+  feed._skill = "";
   try {
     const d = await api("/api/runs/" + encodeURIComponent(id));
-    const s = d.summary, st = d.stats;
+    const s = d.summary, st = d.stats, chain = skillChain(d.events);
     const resumeBtn = $("btn-resume-run");
     resumeBtn.style.display = s.resumable ? "" : "none";
     resumeBtn.onclick = () => resumeRun(id);
@@ -458,6 +649,7 @@ async function openRunDetail(id) {
       `<span>prompt tok <b>${st.prompt_tokens.toLocaleString()}</b></span>` +
       `<span>completion tok <b>${st.completion_tokens.toLocaleString()}</b></span>` +
       (st.sweep_reads ? `<span>sweep reads <b>${st.sweep_reads}</b></span>` : "") +
+      (chain.length ? `<span>skills <b>${esc(chain.join(" → "))}</b></span>` : "") +
       `</div>`;
     if (d.scratchpad) {
       $("detail-scratch").style.display = "block";
@@ -470,7 +662,8 @@ async function openRunDetail(id) {
       if (typeof ev.kind === "string" && ev.kind.startsWith("llm_")) {
         handleLlmEvent(ev, feed);
       } else {
-        feed.appendChild(renderEvent(ev));
+        const el = renderEvent(ev, feed);
+        if (el) feed.appendChild(el);
       }
     }
     finalizeLlm(feed, null);  // a run that died mid-call has no llm_end
@@ -691,8 +884,8 @@ $("btn-gen").addEventListener("click", async () => {
   const poll = setInterval(async () => {
     try {
       const job = await api("/api/jobs/" + jobId);
-      $("gen-log").textContent = job.output_tail.join("\n");
-      $("gen-log").scrollTop = $("gen-log").scrollHeight;
+      followTail($("gen-log"),
+                 () => { $("gen-log").textContent = job.output_tail.join("\n"); });
       if (!job.running) {
         clearInterval(poll);
         $("gen-status").textContent =

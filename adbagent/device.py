@@ -14,6 +14,7 @@ minutes.
 
 from __future__ import annotations
 
+import atexit
 import base64
 import io
 import logging
@@ -386,6 +387,14 @@ class _Restore:
     user_rotation: Optional[str] = None
 
 
+#: Wall-clock ceiling on the whole of `Device.close`, shared across its steps.
+#: Teardown happens after the run has already printed its result, so the only
+#: thing waiting on it is the user's prompt. Generous enough for a healthy phone
+#: (a normal teardown is well under a second, and `stop_uiautomator` alone can
+#: legitimately take ~13s), short enough that a dead link costs a pause rather
+#: than a hang.
+TEARDOWN_BUDGET_S = 45.0
+
 #: Names the on-device server accepts for `press`. Anything else silently
 #: returns false rather than raising, so we validate before sending.
 PRESS_KEYS = frozenset({
@@ -437,22 +446,69 @@ class Device:
         return self
 
     def close(self) -> None:
-        """Put back everything we changed. Safe to call twice."""
-        if self._d is None:
+        """Put back everything we changed. Safe to call twice.
+
+        `self._d` is cleared at the *end*, not the start: every restore below
+        reaches the phone through `self.shell`, which reads it, so clearing it
+        first turned all four of them into `device is not open` and left the
+        phone with animations off, rotation locked, the agent's IME selected and
+        a 30-minute screen timeout.
+
+        The whole thing runs under one deadline. `shell` has its own watchdog,
+        but the last two steps talk to adbutils and u2 directly, and there the
+        floor is adbutils' 600s socket timeout -- so a wireless link that goes
+        quiet during teardown wedges the exit for ten minutes with the run
+        already finished and printed. `_guard` runs each step on a daemon
+        thread, which is what makes an abandoned one harmless.
+        """
+        d = self._d
+        if d is None:
             return
-        d, self._d = self._d, None
-        for label, fn in (
-            ("animations", lambda: self._restore_animations()),
-            ("auto-rotate", lambda: self._restore_auto_rotate()),
-            ("ime", lambda: self._restore_ime()),
-            ("screen timeout", lambda: self._restore_screen_timeout()),
-            ("stay-awake", lambda: d.adb_device.shell("svc power stayon false", timeout=10)),
-            ("uiautomator server", lambda: d.stop_uiautomator()),
-        ):
-            try:
-                fn()
-            except Exception as exc:  # noqa: BLE001 - teardown must not mask errors
-                log.warning("teardown: could not restore %s: %s", label, exc)
+        deadline = time.monotonic() + TEARDOWN_BUDGET_S
+        try:
+            for label, fn in (
+                ("animations", self._restore_animations),
+                ("auto-rotate", self._restore_auto_rotate),
+                ("ime", self._restore_ime),
+                ("screen timeout", self._restore_screen_timeout),
+                ("stay-awake", lambda: d.adb_device.shell("svc power stayon false", timeout=10)),
+                ("uiautomator server", lambda: d.stop_uiautomator()),
+            ):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    log.warning("teardown: out of time, skipped %s", label)
+                    continue
+                try:
+                    _guard(fn, left, f"teardown({label})")
+                except Exception as exc:  # noqa: BLE001 - teardown must not mask errors
+                    log.warning("teardown: could not restore %s: %s", label, exc)
+        finally:
+            self._drop_u2_atexit_hook(d)
+            self._d = None
+
+    @staticmethod
+    def _drop_u2_atexit_hook(d: Optional[u2.Device]) -> None:
+        """Take u2's own `stop_uiautomator` off the atexit list for `d`.
+
+        Every `u2.connect()` registers one, bound to that object, and they all
+        take the same per-(serial, port) server lock. Two things make leaving
+        them there dangerous. A teardown step abandoned on a stalled socket
+        leaves its daemon thread holding that lock, so the handler blocks
+        interpreter shutdown *forever* -- after the last line of output, with
+        Ctrl-C the only way out. And `_reconnect` swaps in a fresh device
+        without dropping the old one's handler, so a run that recovered twice
+        arrives at exit with three of them queued, each on a link we already
+        know was wedged.
+
+        We stop the server ourselves in `close`, on whichever device is current,
+        so the handlers are redundant as well as hazardous.
+        """
+        if d is None:
+            return
+        try:
+            atexit.unregister(d.stop_uiautomator)
+        except Exception as exc:  # noqa: BLE001 - never worth failing over
+            log.debug("could not unregister u2 atexit hook: %s", exc)
 
 
     def __enter__(self) -> "Device":
@@ -816,6 +872,9 @@ class Device:
             return False
 
     def _reconnect(self) -> None:
+        # The outgoing device is about to be unreachable from here, so its
+        # atexit handler has to go now or nothing will ever take it off the list.
+        self._drop_u2_atexit_hook(self._d)
         self._d = u2.connect(self.serial) if self.serial else u2.connect()
         self._d.settings["max_depth"] = self.cfg.device.max_depth
         self._size = tuple(self._d.window_size())  # type: ignore[assignment]

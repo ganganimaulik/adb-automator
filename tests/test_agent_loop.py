@@ -316,7 +316,8 @@ def test_stream_tap_whitelists_fields(cfg, tmp_path):
     rec = Recorder(cfg, "run_stream_tap")
     tap = _stream_tap(rec, lambda kind, **kw: seen.append((kind, kw)))
     tap("llm_start", step=2, purpose="decide", model="m", screenshot=True,
-        effort="high", hard_because="new screen")
+        shot="step_002_decide_deadbeef.jpg", effort="high",
+        hard_because="new screen")
     tap("llm_stream", stream_type="thinking", text="hmm ")
     tap("llm_stream", stream_type="content", text='{"action":')
     tap("llm_end", step=2, purpose="decide", elapsed=1.5, call=Call(),
@@ -333,6 +334,8 @@ def test_stream_tap_whitelists_fields(cfg, tmp_path):
     assert [r["kind"] for r in records] == ["llm_start", "llm_stream",
                                             "llm_stream", "llm_end"]
     assert records[0]["screenshot"] is True and records[0]["effort"] == "high"
+    # The kept frame travels with the call, so the UI can show what it was shown.
+    assert records[0]["shot"] == "step_002_decide_deadbeef.jpg"
     assert "hard_because" not in records[0]
     assert records[1]["stream_type"] == "thinking" and records[1]["text"] == "hmm "
     end = records[3]
@@ -357,6 +360,63 @@ def test_recorder_dump_messages(cfg, tmp_path):
     assert data[0]["content"] == "sys prompt"
     assert "base64 image payload" in data[1]["content"][1]["image_url"]["url"]
     rec.close()
+
+
+def test_recorder_keeps_a_submitted_screenshot(cfg, tmp_path):
+    """The frames a model was shown land beside that step's prompt dump, one file
+    per distinct frame however many calls saw it."""
+    from adbagent.agent import Recorder
+    rec = Recorder(cfg, "run_shots")
+    d = tmp_path / "runs" / "run_shots"
+
+    name = rec.screenshot(4, b"\xff\xd8jpeg-one", "analyze_image")
+    assert name.startswith("step_004_analyze_image_") and name.endswith(".jpg")
+    assert (d / name).read_bytes() == b"\xff\xd8jpeg-one"
+
+    # Same bytes, same name: one frame shown twice is not two files.
+    assert rec.screenshot(4, b"\xff\xd8jpeg-one", "analyze_image") == name
+    # Different bytes on the same step do not overwrite it (the judge's frame is
+    # not the loop's), and nothing to show returns nothing.
+    other = rec.screenshot(4, b"\xff\xd8jpeg-two", "analyze_image")
+    assert other != name and (d / other).is_file()
+    assert rec.screenshot(4, b"", "analyze_image") == ""
+    assert len(list(d.glob("*.jpg"))) == 2
+    rec.close()
+
+
+def _stream_records(tmp_path, run_id, kind, purpose):
+    path = tmp_path / "runs" / run_id / "stream.jsonl"
+    return [r for r in (json.loads(l) for l in path.read_text().splitlines()
+                        if l.strip())
+            if r["kind"] == kind and r.get("purpose") == purpose]
+
+
+def test_the_decider_keeps_the_frame_when_it_is_the_one_looking(cfg, mem, tmp_path):
+    """`vision_in_decider` sends the image to the deciding model itself, so that
+    is the call the kept frame belongs to and the UI hangs it off."""
+    cfg.run.always_screenshot = True
+    cfg.llm.vision_in_decider = True
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    kept = sorted(p.name for p in (tmp_path / "runs" / state.run_id).glob("*.jpg"))
+    assert kept and all("_decide_" in name for name in kept)
+    starts = _stream_records(tmp_path, state.run_id, "llm_start", "decide")
+    assert starts and all(r["shot"] in kept for r in starts)
+
+
+def test_a_blind_decider_is_given_no_frame_of_its_own(cfg, mem, tmp_path):
+    """Without it the decider reads prose, and the vision pass is the call that
+    was shown the screenshot -- so the decide panel must not claim one."""
+    cfg.run.always_screenshot = True          # vision_in_decider stays off
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert not list((tmp_path / "runs" / state.run_id).glob("*_decide_*.jpg"))
+    starts = _stream_records(tmp_path, state.run_id, "llm_start", "decide")
+    assert starts and all(r["shot"] == "" for r in starts)
 
 
 def test_progress_log_retains_only_latest():

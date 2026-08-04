@@ -385,7 +385,8 @@ def test_stream_includes_llm_frames(web, tmp_path, monkeypatch):
             d = make_run_dir(runs, run_id="live2")
             write_stream(d, [
                 {"t": 1000.5, "kind": "llm_start", "step": 1,
-                 "purpose": "decide", "model": "m"},
+                 "purpose": "analyze_image", "model": "m", "screenshot": True,
+                 "shot": "step_001_analyze_image_00c0ffee.jpg"},
                 {"t": 1000.6, "kind": "llm_stream", "stream_type": "thinking",
                  "text": "wifi is under network"},
             ])
@@ -399,6 +400,9 @@ def test_stream_includes_llm_frames(web, tmp_path, monkeypatch):
     assert "event: llm" in body              # and the raw stream beside them
     assert '"kind": "llm_start"' in body
     assert "wifi is under network" in body
+    # The frame that call was shown, named so the page can fetch it while the
+    # run is still going.
+    assert "step_001_analyze_image_00c0ffee.jpg" in body
     assert "event: end" in body
 
 
@@ -415,6 +419,38 @@ def test_runs_list_detail_and_log(web, tmp_path):
     assert "line one" in log["text"]
 
     assert web.get("/api/runs/nope").status_code == 404
+
+
+def test_a_submitted_frame_is_served_back(web, tmp_path):
+    """The screenshot a call was shown, by the name its `llm_start` carries."""
+    d = make_run_dir(tmp_path / "runs", run_id=RUN_ID)
+    name = "step_004_analyze_image_00c0ffee.jpg"
+    (d / name).write_bytes(b"\xff\xd8jpeg")
+
+    res = web.get(f"/api/runs/{RUN_ID}/shot/{name}")
+    assert res.status_code == 200
+    assert res.content == b"\xff\xd8jpeg"
+    assert res.headers["content-type"] == "image/jpeg"
+    assert "immutable" in res.headers["cache-control"]
+
+    # A name in the pattern but no such frame.
+    assert web.get(f"/api/runs/{RUN_ID}/shot/"
+                   "step_009_decide_deadbeef.jpg").status_code == 404
+    assert web.get(f"/api/runs/nope/shot/{name}").status_code == 404
+
+
+@pytest.mark.parametrize("name", [
+    "run.log",                       # a real file in the directory, not a frame
+    "events.jsonl",
+    "step_001_decide_messages.json",
+    "..%2f..%2fetc%2fpasswd",
+    "step_001_decide_deadbeef.jpg.log",
+])
+def test_only_the_run_frames_are_served(web, tmp_path, name):
+    """The name is matched against the pattern the recorder writes, so nothing
+    else in a run directory can be fetched through this route."""
+    make_run_dir(tmp_path / "runs", run_id=RUN_ID)
+    assert web.get(f"/api/runs/{RUN_ID}/shot/{name}").status_code == 404
 
 
 # ---------------------------------------------------------------------------
