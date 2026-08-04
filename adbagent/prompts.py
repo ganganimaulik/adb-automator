@@ -247,24 +247,6 @@ to bottom" or similar: that undoes all your scrolling progress.
 "scrolled up past 10:30am, now at 9:15am"). That is your spatial memory.
 - If no new content appears, you have seen everything in that direction. Stop."""
 
-GALLERY_ADVICE = """\
-BROWSING A GALLERY, CAROUSEL OR ALBUM (this screen shows ONE item of a set):
-- The element list looks identical for every item, so you cannot tell where you \
-are by looking at it. Trust the item label and the ledger in this NOTE block over \
-your own recollection.
-- Swipe the pager element named above. Reusing that same #N every turn is \
-CORRECT — it is the only element that moves to the next item.
-- Read the item, put what it actually shows in `observation` (the number, name or \
-price asked for), and only then swipe. One item per turn; your `observation` is \
-recorded against that item permanently.
-- If your last swipe did not change the item, do not repeat it: flick harder \
-(scroll_amount=2, duration=0.12) or accept that you are at the end of the set.
-- Thumbnail grids often expose only two or three tiles even when the album holds \
-many more. Do not try to reach item 10 by scrolling a grid — open one item and \
-swipe through the set.
-- When every item has been read, STOP browsing and report. Do not start over to \
-double-check."""
-
 MULTI_APP_ADVICE = """\
 SWITCHING APPS:
 - Use "list_apps" to find a package name you do not know, then "open_app" to \
@@ -293,20 +275,17 @@ def _mentions(goal: str, words: Sequence[str]) -> bool:
     return any(word in low for word in words)
 
 
-def situational_notes(*, goal: str = "", is_pager: bool = False,
+def situational_notes(*, goal: str = "",
                       scrolls: int = 0, has_scroller: bool = False,
                       packages_seen: int = 1) -> str:
     """The advice that applies to *this* turn, and nothing else.
 
-    Gated on facts the loop already has. The gallery block is exactly as
-    situational as the pager it describes. The scrolling block applies once the
+    Gated on facts the loop already has. The scrolling block applies once the
     agent is scrolling, or immediately on a goal that plainly spans screenfuls and
     a screen that can actually scroll. The app-switching block applies once the
     run has crossed apps, or on a goal that says it will.
     """
     parts = []
-    if is_pager:
-        parts.append(GALLERY_ADVICE)
     if scrolls > 0 or (has_scroller and _mentions(goal, _SEARCH_WORDS)):
         parts.append(SCROLLING_ADVICE)
     if packages_seen > 1 or _mentions(goal, _SWITCH_WORDS):

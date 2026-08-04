@@ -622,13 +622,12 @@ def test_a_repeated_action_folds_in_the_history_the_loop_keeps(cfg, mem):
 
 
 def test_the_situational_advice_only_shows_up_when_it_applies(cfg, mem):
-    """The gallery, scrolling and app-switching blocks are 36% of what the system
+    """The scrolling and app-switching blocks are a big chunk of what the system
     prompt used to be, and irrelevant on a turn like this one."""
     dev = fake.FakeDevice(cfg)
     _, _, llm = run(dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
 
     assert llm.notes, "no NOTE block was built at all"
-    assert not any("BROWSING A GALLERY" in note for note in llm.notes)
     assert not any("SWITCHING APPS" in note for note in llm.notes)
 
 

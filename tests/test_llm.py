@@ -1010,7 +1010,6 @@ def test_a_vision_model_that_cannot_hold_the_schema_does_not_fail_the_step(monke
 def test_the_system_prompt_no_longer_carries_the_situational_blocks():
     from adbagent import prompts
     assert "SCROLLING STRATEGY" not in prompts.SYSTEM
-    assert "BROWSING A GALLERY" not in prompts.SYSTEM
     assert "MULTI-APP NAVIGATION" not in prompts.SYSTEM
     # It kept the parts that apply on every single turn.
     assert "THE ACTIONS" in prompts.SYSTEM
@@ -1021,13 +1020,6 @@ def test_the_system_prompt_no_longer_carries_the_situational_blocks():
 def test_an_ordinary_turn_gets_no_situational_advice():
     from adbagent.prompts import situational_notes
     assert situational_notes(goal="turn on wifi") == ""
-
-
-def test_a_pager_turn_gets_the_gallery_block_only():
-    from adbagent.prompts import situational_notes
-    note = situational_notes(goal="turn on wifi", is_pager=True)
-    assert "BROWSING A GALLERY" in note
-    assert "SCROLLING STRATEGY" not in note
 
 
 def test_scrolling_advice_arrives_once_scrolling_starts():
@@ -1066,10 +1058,10 @@ def test_a_goal_that_says_it_will_switch_apps_gets_the_advice_up_front():
 
 def test_the_blocks_stack_when_they_all_apply():
     from adbagent.prompts import situational_notes
-    note = situational_notes(goal="find and share every photo", is_pager=True,
+    note = situational_notes(goal="find and share every photo",
                              scrolls=3, packages_seen=2)
     assert all(block in note for block in
-               ("BROWSING A GALLERY", "SCROLLING STRATEGY", "SWITCHING APPS"))
+               ("SCROLLING STRATEGY", "SWITCHING APPS"))
 
 
 # ---------------------------------------------------------------------------
