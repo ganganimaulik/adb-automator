@@ -177,3 +177,68 @@ def test_escalating_on_most_turns_points_at_the_policy_instead(capsys):
 def test_an_uncapped_run_is_still_told_to_cap_it(capsys):
     _cost_summary(Out(), events(decides=3))
     assert "setting llm.reasoning_effort" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Models that do not reason
+# ---------------------------------------------------------------------------
+
+def reasoning_report(**llm) -> str:
+    import io, contextlib
+    from adbagent.cli import _report_reasoning
+    from adbagent.config import Config
+
+    cfg = Config()
+    cfg.llm.reasoning_effort = "none"
+    cfg.llm.reasoning_effort_hard = "high"
+    for key, value in llm.items():
+        setattr(cfg.llm, key, value)
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        _report_reasoning(Out(), cfg)
+    return buffer.getvalue()
+
+
+def test_a_non_reasoning_model_is_not_reported_as_a_problem():
+    """Most models do not reason. That is the normal case, not a misconfiguration,
+    and it needs no action."""
+    text = reasoning_report(model="llama-v3p3-70b-instruct")
+    assert "does not reason -- nothing to cap" in text
+    assert "WARN" not in text
+    assert "reasoning_style" not in text        # forcing one would break it
+
+
+def test_an_unfamiliar_model_says_which_of_the_two_it_might_be():
+    """Advice that assumes it reasons would break every call if it does not."""
+    text = reasoning_report(model="brand-new-model-2027")
+    assert "WARN" in text
+    assert "if it does reason, set llm.reasoning_style" in text
+    assert "if it does not, nothing to fix" in text
+
+
+def test_a_mixed_setup_is_reported_per_model():
+    """A reasoning decider next to a vision model that does not think is a
+    perfectly ordinary setup, so one verdict for the whole config would be wrong."""
+    text = reasoning_report(model="deepseek-v4-flash",
+                            model_image="llama-v3p3-70b-instruct")
+    assert "deepseek-v4-flash (deciding/judging/skills)" in text
+    assert '"thinking": true' in text
+    assert "llama-v3p3-70b-instruct (vision) does not reason" in text
+
+
+def test_nothing_is_said_about_bodies_when_none_were_printed():
+    text = reasoning_report(model="llama-v3p3-70b-instruct")
+    assert "confirm the bodies above" not in text
+
+
+def test_the_depths_a_model_will_actually_be_asked_for_are_the_ones_shown():
+    """The decider varies turn to turn; a vision model never reasons at all."""
+    text = reasoning_report(model="deepseek-v4-flash")
+    decider = text.split("deciding")[1]
+    assert '"thinking": false' in decider      # routine
+    assert '"thinking": true' in decider       # when stuck
+
+
+def test_the_feature_being_off_is_stated_plainly():
+    assert "left to the model" in reasoning_report(
+        model="deepseek-v4-flash", reasoning_effort="")

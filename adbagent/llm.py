@@ -411,18 +411,65 @@ REASONING_LEVELS = ("none", "low", "medium", "high")
 EFFORT_FAMILIES = ("gpt-oss", "gpt-5", "o1", "o3", "o4")
 #: Families taking `chat_template_kwargs: {"thinking": bool}` -- a hybrid model
 #: with one switch rather than a dial, so any non-"none" depth just turns it on.
-THINKING_FAMILIES = ("deepseek-v3", "deepseek-v4", "qwen3", "glm-4", "glm-5",
-                     "minimax-m", "kimi-k2-thinking", "kimi-k3")
+#:
+#: Version markers are deliberate. Most models do not reason at all, and within a
+#: family the split is by version rather than by name: DeepSeek is hybrid from 3.1,
+#: GLM from 4.5, Kimi from k2-thinking. An earlier table matched bare "deepseek-v3"
+#: and "glm-4", which aimed the flag at three models that do not think.
+THINKING_FAMILIES = ("deepseek-v3p1", "deepseek-v3.1", "deepseek-v4",
+                     "qwen3", "glm-4p5", "glm-4.5", "glm-4p6", "glm-4.6",
+                     "glm-5", "minimax-m", "kimi-k2-thinking", "kimi-k2p7",
+                     "kimi-k3")
+
+#: Families that do not reason at all, so there is nothing to cap and nothing
+#: wrong. Listed only so `doctor` can say which of the two silences it is in --
+#: "this model does not think" needs no action, while "I do not recognise this
+#: model" may need `llm.reasoning_style` set by hand.
+NON_REASONING_FAMILIES = ("llama", "mixtral", "mistral", "gemma", "phi",
+                          "gpt-4o", "gpt-4-", "gpt-3", "qwen2", "qwen1",
+                          "deepseek-v2", "kimi-k2p6", "kimi-k2-instruct",
+                          "firefunction", "embedding", "whisper")
 
 
 def reasoning_style_for(model: str) -> str:
-    """Which convention `model` is expected to take: "effort", "thinking", "off"."""
+    """Which convention `model` takes: "effort", "thinking", or "off".
+
+    A default rather than a detection. Nothing in the OpenAI protocol reports
+    whether a model reasons or how to ask it to stop, and most models do not
+    reason at all -- so an unrecognised name gets "off" and the request goes out
+    unchanged. `llm.reasoning_style` overrides this, and `_post` drops the field
+    for good if the provider turns out to reject it.
+    """
     name = (model or "").lower()
     if any(family in name for family in EFFORT_FAMILIES):
         return "effort"
     if any(family in name for family in THINKING_FAMILIES):
         return "thinking"
     return "off"
+
+
+#: Request fields this module adds to control reasoning, and nothing else -- so
+#: dropping them cannot take a `prompt_cache_key` or a `service_tier` with it.
+REASONING_KEYS = ("reasoning_effort", "chat_template_kwargs")
+
+#: Statuses that mean "the request was malformed" rather than "try again later".
+#: A rejected reasoning field lands here, so this is where it is caught.
+REJECTED_STATUS = frozenset({400, 422})
+
+
+def reasoning_fields(extra_body: Optional[Dict[str, Any]]) -> List[str]:
+    """Which reasoning fields a request body is carrying, if any."""
+    if not extra_body:
+        return []
+    return [key for key in REASONING_KEYS if key in extra_body]
+
+
+def known_non_reasoning(model: str) -> bool:
+    """True when `model` is a familiar model that simply does not think."""
+    name = (model or "").lower()
+    if any(family in name for family in NON_REASONING_FAMILIES):
+        return True
+    return False
 
 
 def reasoning_body(model: str, effort: str, style: str = "auto") -> Dict[str, Any]:
@@ -575,6 +622,11 @@ class LLMClient:
         self.model_image = qualify(self.provider, cfg.llm.image())
         self.ledger = Ledger()
         self.limiter = shared_limiter(self.provider.name, cfg.llm.rpm)
+        #: Models the provider has told us do not take a reasoning field. Most
+        #: models do not reason, no catalogue says which, and the family table is
+        #: a guess -- so the authoritative answer is the one the API gives, and it
+        #: is remembered rather than rediscovered on every call.
+        self._rejects_reasoning: set = set()
         self._client = OpenAI(
             base_url=cfg.llm.base_url or self.provider.base_url,
             api_key=self.api_key,
@@ -587,6 +639,8 @@ class LLMClient:
 
     def _extra_body(self, model: str = "", effort: str = "") -> Dict[str, Any]:
         extra: Dict[str, Any] = {}
+        if model in self._rejects_reasoning:
+            effort = ""
         if self.provider.name == "fireworks":
             extra.update({
                 # Pin the run to one replica so the static prefix keeps hitting the
@@ -658,6 +712,27 @@ class LLMClient:
             except (APIConnectionError, APITimeoutError) as exc:
                 last = exc
             except APIStatusError as exc:
+                # Most models do not reason, and asking one of them to think less
+                # is a bad request. That must not end a run 90 steps in over an
+                # optimisation, so the field is dropped, the model is remembered,
+                # and the call is reissued exactly once. If it fails again the
+                # reasoning field was not the problem and the error stands.
+                if (exc.status_code in REJECTED_STATUS
+                        and reasoning_fields(kwargs.get("extra_body"))):
+                    dropped = reasoning_fields(kwargs["extra_body"])
+                    log.warning("%s rejected %s (%s); continuing without it",
+                                model, ", ".join(dropped),
+                                getattr(exc, "message", exc))
+                    self._rejects_reasoning.add(model)
+                    kwargs["extra_body"] = {
+                        k: v for k, v in kwargs["extra_body"].items()
+                        if k not in REASONING_KEYS} or None
+                    if kwargs["extra_body"] is None:
+                        kwargs.pop("extra_body")
+                    if on_event:
+                        on_event("reasoning_unsupported", model=model,
+                                 fields=dropped, purpose=purpose)
+                    continue
                 if exc.status_code not in RETRY_STATUS:
                     raise LLMError(
                         f"{exc.status_code} from {self.provider.name}: "

@@ -1089,3 +1089,192 @@ def test_a_schema_violation_escalates_its_own_repair(monkeypatch):
                                effort="none")
     assert action.action == "press_key"
     assert efforts == ["none", "high"]
+
+
+# ---------------------------------------------------------------------------
+# Models that do not support reasoning
+# ---------------------------------------------------------------------------
+#
+# Most models do not reason, nothing in the catalogue says which do, and the
+# family table is a guess about names. So the guess must be cheap to be wrong
+# about: the provider's rejection is the authoritative answer, and taking it
+# costs one call rather than the run.
+
+@pytest.mark.parametrize("model", [
+    "llama-v3p3-70b-instruct", "mixtral-8x22b-instruct", "gpt-4o",
+    "qwen2p5-72b-instruct", "deepseek-v2", "kimi-k2p6", "gemma-2-9b",
+    "mistral-small", "phi-3", "nomic-embedding-text-v1p5",
+])
+def test_a_model_that_does_not_reason_is_asked_for_nothing(model):
+    from adbagent.llm import known_non_reasoning, reasoning_body
+
+    assert known_non_reasoning(model), model
+    assert reasoning_body(model, "none") == {}, model
+    assert reasoning_body(model, "high") == {}, model
+
+
+@pytest.mark.parametrize("model", [
+    "deepseek-v3p1", "deepseek-v4-flash", "qwen3-235b-a22b", "glm-4p6",
+    "glm-5", "kimi-k3", "kimi-k2-thinking", "minimax-m2", "gpt-oss-120b",
+])
+def test_a_model_that_does_reason_is_asked(model):
+    from adbagent.llm import known_non_reasoning, reasoning_body
+
+    assert not known_non_reasoning(model), model
+    assert reasoning_body(model, "high"), model
+
+
+def test_the_version_that_gained_reasoning_is_respected():
+    """Within a family the split is by version, not by name. An earlier table
+    matched bare "deepseek-v3" and "glm-4" and aimed the flag at models that do
+    not think."""
+    from adbagent.llm import reasoning_style_for
+
+    assert reasoning_style_for("deepseek-v3") == "off"      # pre-3.1, not hybrid
+    assert reasoning_style_for("deepseek-v3p1") == "thinking"
+    assert reasoning_style_for("glm-4-9b") == "off"
+    assert reasoning_style_for("glm-4p6") == "thinking"
+    assert reasoning_style_for("kimi-k2p6") == "off"
+    assert reasoning_style_for("kimi-k3") == "thinking"
+
+
+def test_the_reasoning_fields_are_named_so_dropping_them_takes_nothing_else():
+    from adbagent.llm import reasoning_fields
+
+    body = {"prompt_cache_key": "run-1", "service_tier": "priority",
+            "chat_template_kwargs": {"thinking": False}}
+    assert reasoning_fields(body) == ["chat_template_kwargs"]
+    assert reasoning_fields({"reasoning_effort": "low"}) == ["reasoning_effort"]
+    assert reasoning_fields({"prompt_cache_key": "x"}) == []
+    assert reasoning_fields(None) == []
+
+
+def _rejecting_client(monkeypatch, status=400, reject_times=1):
+    """A client whose provider rejects any request carrying a reasoning field."""
+    from adbagent.llm import LLMClient
+    from openai import APIStatusError
+    import httpx
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = cfg_with(effort="none", hard="high")
+    cfg.llm.model = "deepseek-v4-flash"
+    client = LLMClient(cfg)
+
+    sent = []
+    state = {"rejections": 0}
+
+    class Chunk:
+        def __init__(self):
+            self.id = "req-1"
+            self.usage = None
+            self.choices = [type("C", (), {
+                "finish_reason": "stop",
+                "delta": type("D", (), {"content": "ok", "model_extra": None})(),
+            })()]
+
+    def create(**kwargs):
+        sent.append(kwargs.get("extra_body") or {})
+        if ("chat_template_kwargs" in (kwargs.get("extra_body") or {})
+                and state["rejections"] < reject_times):
+            state["rejections"] += 1
+            raise APIStatusError(
+                "chat_template_kwargs is not supported for this model",
+                response=httpx.Response(status, request=httpx.Request("POST", "http://x")),
+                body=None)
+        return iter([Chunk()])
+
+    monkeypatch.setattr(client._client.chat.completions, "create", create)
+    return client, sent
+
+
+def test_a_rejected_reasoning_field_is_dropped_rather_than_ending_the_run(monkeypatch):
+    """A 400 ninety steps into a run, over an optimisation, is not acceptable."""
+    client, sent = _rejecting_client(monkeypatch)
+
+    raw, call = client._post([{"role": "user", "content": "hi"}],
+                             model=client.model, schema=None, max_tokens=100,
+                             purpose="decide")
+    assert raw == "ok"
+    assert len(sent) == 2                              # rejected, then retried
+    assert "chat_template_kwargs" in sent[0]
+    assert "chat_template_kwargs" not in sent[1]
+
+
+def test_dropping_the_field_keeps_the_rest_of_the_body(monkeypatch):
+    """`prompt_cache_key` is where most of the input discount comes from; losing
+    it to a reasoning retry would be an expensive way to fix a cheap problem."""
+    client, sent = _rejecting_client(monkeypatch)
+    client._post([{"role": "user", "content": "hi"}], model=client.model,
+                 schema=None, max_tokens=100, purpose="decide")
+    assert sent[1]["prompt_cache_key"]
+    assert sent[1]["context_length_exceeded_behavior"] == "error"
+
+
+def test_the_rejection_is_remembered_so_it_costs_one_call_not_every_call(monkeypatch):
+    client, sent = _rejecting_client(monkeypatch)
+    for _ in range(3):
+        client._post([{"role": "user", "content": "hi"}], model=client.model,
+                     schema=None, max_tokens=100, purpose="decide")
+    # One rejection, then three clean calls -- not three rejections.
+    assert sum(1 for body in sent if "chat_template_kwargs" in body) == 1
+    assert client.model in client._rejects_reasoning
+
+
+def test_a_rejection_that_was_not_about_reasoning_still_raises(monkeypatch):
+    """The drop-and-retry must not swallow a genuine bad request."""
+    from adbagent.llm import LLMClient, LLMError
+    from openai import APIStatusError
+    import httpx
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    client = LLMClient(cfg_with(effort="none"))     # no reasoning field sent
+
+    def create(**kwargs):
+        raise APIStatusError(
+            "messages: too many images",
+            response=httpx.Response(400, request=httpx.Request("POST", "http://x")),
+            body=None)
+
+    monkeypatch.setattr(client._client.chat.completions, "create", create)
+    with pytest.raises(LLMError, match="400"):
+        client._post([{"role": "user", "content": "hi"}], model="llama-v3p3-70b",
+                     schema=None, max_tokens=100, purpose="decide")
+
+
+def test_a_second_rejection_after_dropping_is_not_hidden(monkeypatch):
+    """If it fails again the reasoning field was never the problem."""
+    from adbagent.llm import LLMError
+
+    client, sent = _rejecting_client(monkeypatch, reject_times=1)
+
+    # Make the *retry* fail too, for an unrelated reason.
+    from openai import APIStatusError
+    import httpx
+
+    calls = {"n": 0}
+
+    def create(**kwargs):
+        calls["n"] += 1
+        raise APIStatusError(
+            "something else entirely",
+            response=httpx.Response(400, request=httpx.Request("POST", "http://x")),
+            body=None)
+
+    monkeypatch.setattr(client._client.chat.completions, "create", create)
+    with pytest.raises(LLMError):
+        client._post([{"role": "user", "content": "hi"}], model=client.model,
+                     schema=None, max_tokens=100, purpose="decide")
+
+
+def test_the_drop_is_announced_rather_than_silent(monkeypatch):
+    """Silently continuing would leave someone believing the depth was capped."""
+    client, _ = _rejecting_client(monkeypatch)
+    events = []
+    client._post([{"role": "user", "content": "hi"}], model=client.model,
+                 schema=None, max_tokens=100, purpose="decide",
+                 on_event=lambda kind, **kw: events.append((kind, kw)))
+    kinds = [kind for kind, _ in events]
+    assert "reasoning_unsupported" in kinds
+    payload = next(kw for kind, kw in events if kind == "reasoning_unsupported")
+    assert payload["fields"] == ["chat_template_kwargs"]
+    assert payload["model"] == client.model
