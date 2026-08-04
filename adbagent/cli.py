@@ -127,6 +127,7 @@ OVERRIDES = {
     "never_screenshot": "run.never_screenshot",
     "allow_destructive": "safety.allow_destructive",
     "unattended": "safety.unattended",
+    "learn_after_run": "skills.learn_after_run",
 }
 
 
@@ -150,6 +151,47 @@ def build_config(args: argparse.Namespace):
 # ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
+
+def _report_reasoning(out: Out, cfg) -> None:
+    """Print the exact request fields the reasoning setting will send.
+
+    Two conventions exist for this on the OpenAI wire protocol and no model
+    advertises which it takes, so a wrong guess either 400s or -- far worse --
+    is ignored, leaving the latency and the bill unchanged while looking fixed.
+    Printing the body means it can be checked against the provider's docs before
+    a long run depends on it.
+    """
+    from .llm import qualify, reasoning_body, reasoning_style_for, PROVIDERS
+
+    if not cfg.llm.reasoning_effort:
+        out.say(out.dim("        reasoning depth left to the model "
+                        "(set llm.reasoning_effort to cap it)"))
+        return
+
+    provider = PROVIDERS.get(cfg.llm.provider)
+    model = qualify(provider, cfg.llm.model) if provider else cfg.llm.model
+    style = cfg.llm.reasoning_style
+    resolved = style if style in ("effort", "thinking", "off") else \
+        reasoning_style_for(model)
+
+    routine = reasoning_body(model, cfg.llm.effort_for("decide"), style)
+    hard = reasoning_body(model, cfg.llm.effort_for("decide", hard=True), style)
+    if not routine and not hard:
+        out.warn(f"llm.reasoning_effort is set but nothing will be sent: "
+                 f"{cfg.llm.model} matches no known reasoning convention")
+        out.say(out.dim("        set llm.reasoning_style to 'effort' or "
+                        "'thinking' to say which it takes"))
+        return
+
+    out.ok(f"reasoning depth {cfg.llm.reasoning_effort!r} routine, "
+           f"{cfg.llm.effort_for('decide', hard=True)!r} when stuck "
+           f"({resolved} convention"
+           f"{', from the model name' if style == 'auto' else ', configured'})")
+    out.say(out.dim(f"        routine turn sends {json.dumps(routine)}"))
+    out.say(out.dim(f"        hard turn sends    {json.dumps(hard)}"))
+    out.say(out.dim("        confirm those against your provider's docs -- an "
+                    "ignored field looks exactly like a working one"))
+
 
 def cmd_doctor(args) -> int:
     from . import device as devmod
@@ -220,6 +262,7 @@ def cmd_doctor(args) -> int:
             out.ok(f"small model {cfg.llm.model_small}")
         if cfg.llm.model_image:
             out.ok(f"vision model {cfg.llm.model_image}")
+        _report_reasoning(out, cfg)
     else:
         out.warn("no model chosen -- run: adbagent models")
         problems += 1
@@ -775,7 +818,34 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
     return report
 
 
+def _learn(out: Out, trace, llm, cfg, goal: str) -> None:
+    """Fold what the finished run learned into that app's skill.
+
+    Reported rather than done quietly: it spends a call and rewrites a file the
+    next run will obey, and a silent rewrite of the agent's own instructions is
+    not something to discover later. A failure here never fails the run -- the
+    goal was already met or missed before this point.
+    """
+    from .skills import SkillRegistry, learn_from_run
+
+    try:
+        registry = SkillRegistry(cfg.skills.skills_dir)
+        skill = learn_from_run(trace, llm, registry, goal=goal)
+    except Exception as exc:  # noqa: BLE001
+        out.warn(f"could not update the app skill: {exc}")
+        return
+    if skill is None:
+        out.say(out.dim(f"  learned nothing new about "
+                        f"{trace.package or 'this run'} ({trace.steps} steps, "
+                        f"{len(trace.screens)} screens)"))
+        return
+    out.say(out.cyan(f"  skill '{skill.name}' updated from this run "
+                     f"({len(skill.workflows)} workflows, {len(skill.nuances)} nuances) "
+                     f"-> {registry.path_for(skill)}"))
+
+
 def cmd_run(args) -> int:
+    from . import skills as skillmod
     from .agent import Agent, Oracle
     from .device import Device
     from .llm import LLMClient
@@ -807,8 +877,13 @@ def cmd_run(args) -> int:
             iteration += 1
             llm.run_id = f"run-{int(time.time())}-{iteration}"
             spent_before = llm.ledger.total_usd
-            agent = Agent(dev, mem, llm, cfg, oracle=oracle,
-                          on_event=_live_reporter(out, max_steps=cfg.run.max_steps))
+            # The trace wraps the reporter, so the run pays nothing for it beyond
+            # a screenshot of each new screen -- and a new Agent per iteration
+            # reads back whatever the last one learned.
+            trace = skillmod.TraceCollector(
+                dev, skillmod.AppTrace(tasks=args.goal),
+                on_event=_live_reporter(out, max_steps=cfg.run.max_steps))
+            agent = Agent(dev, mem, llm, cfg, oracle=oracle, on_event=trace)
             if infinite or total > 1:
                 out.say(out.bold(f"\n  iteration {iteration}"))
             started = time.monotonic()
@@ -830,6 +905,8 @@ def cmd_run(args) -> int:
             out.say(f"  {colour(outcome.upper())}  "
                     f"{state.step} steps, {state.llm_calls} LLM calls, "
                     f"{tilde}${spent:.4f}, {elapsed:.1f}s")
+            if cfg.skills.enabled and cfg.skills.learn_after_run:
+                _learn(out, trace.finish(outcome, state), llm, cfg, args.goal)
             if outcome != "success":
                 exit_code = 1
             if outcome in ("aborted", "needs_user"):
@@ -927,6 +1004,16 @@ def _cost_summary(out: Out, events: List[Dict[str, Any]]) -> None:
 
         if len(buckets) > 1:
             out.say(f"  {label} ({len(rows)})")
+        # How the reasoning budget was actually spent, when it was capped at all.
+        # A run that escalated on every turn has a policy that is not helping;
+        # one that never escalated may have been shallow through a failure.
+        efforts = [e.get("effort") for e in rows if e.get("effort")]
+        shallow = sum(1 for e in efforts if e == "none")
+        if efforts:
+            out.say(out.dim(
+                f"  thinking depth  {len(efforts) - shallow} of {len(efforts)} "
+                f"turn(s) escalated"
+                + (f", {shallow} at the floor" if shallow else "")))
         out.say(f"  latency/step   {_median(latency):6.1f}s median   "
                 f"{_percentile(latency, 0.9):6.1f}s p90   "
                 f"{sum(latency):8.0f}s total")
@@ -944,9 +1031,14 @@ def _cost_summary(out: Out, events: List[Dict[str, Any]]) -> None:
         # no prefix worth caching, so scolding it for a cold cache is noise.
         if label != "decisions":
             continue
-        if think_share >= 50:
+        if think_share >= 50 and not efforts:
             advice.append("Reasoning tokens dominate output, so they dominate "
-                          "latency: try a lower reasoning effort.")
+                          "latency: try setting llm.reasoning_effort.")
+        elif think_share >= 50 and efforts and len(efforts) - shallow > len(efforts) / 2:
+            # Already capped, and escalating anyway on most turns -- so the
+            # thinking is not the setting's fault, it is the run's difficulty.
+            advice.append("Most turns escalated, so the depth cap is buying "
+                          "little: look at why they were graded hard.")
         if total_prompt and hit_rate < 40:
             advice.append("Low prompt-cache hit rate: something near the top of "
                           "the prompt is changing every turn.")
@@ -1254,78 +1346,74 @@ def cmd_skills(args) -> int:
         return 0
 
     if action == "generate":
-        from .agent import Agent
+        from . import skills as skillmod
         from .memory import Memory
 
-        app_target = getattr(args, "app", "") or getattr(args, "target", "")
-        user_tasks = getattr(args, "tasks", "") or "Explore key screens and workflows in the app"
+        # The positional form is the documented one -- `skills generate whatsapp`
+        # -- and `--app` stays as an alias for anyone who already types it.
+        app_target = (getattr(args, "target", "") or getattr(args, "app", "") or "").strip()
+        user_tasks = (getattr(args, "tasks", "") or "").strip()
 
-        if not app_target:
-            out.bad("Please specify an app name or package via --app or argument. Example: adbagent skills generate --app com.whatsapp --tasks 'search contact, send message'")
+        if not cfg.llm.model:
+            out.bad("no model chosen. Run `adbagent models` and pass --model.")
+            return 1
+        if not cfg.api_key():
+            out.bad(f"no API key: exploring the app needs one. Set ${cfg.llm.api_key_env}.")
             return 1
 
-        api_key = cfg.api_key()
-        model_name = cfg.llm.skill()
-        llm = LLMClient(cfg, api_key=api_key) if api_key else None
+        # An open-ended "look around" must not inherit a step budget sized for a
+        # collection run; --max-steps still wins when it is given.
+        if getattr(args, "max_steps", None) is None:
+            cfg.run.max_steps = skillmod.DEFAULT_EXPLORE_STEPS
 
-        out.say(out.bold(f"  Exploring app '{app_target}' live on device & generating Skill using model '{model_name}'..."))
-        out.say(out.dim(f"  Tasks to perform and verify: {user_tasks}"))
+        # A tour is never the moment to confirm an irreversible action. The brief
+        # tells it not to reach for one, and a prompt half way through either
+        # stalls an unattended run or asks about a control nobody meant to press,
+        # so it refuses instead. `safety.allow_destructive` still overrides.
+        if not cfg.safety.allow_destructive:
+            cfg.safety.unattended = True
+
+        _ensure_device(args, cfg, out)
+
+        out.say(out.bold(f"  Exploring {app_target or 'the app your tasks name'} live on the phone"))
+        out.say(out.dim(f"  tasks:     {user_tasks or skillmod.DEFAULT_EXPLORE_TASKS}"))
+        out.say(out.dim(f"  budget:    up to {cfg.run.max_steps} steps, ${cfg.safety.budget_usd:.2f}"))
+        out.say(out.dim(f"  synthesis: {cfg.llm.skill()}"))
         out.say()
 
-        screen_summaries: List[str] = []
-        actions_taken: List[str] = []
-        screenshots: List[bytes] = []
-
+        llm = LLMClient(cfg, run_id=f"skill-{int(time.time())}")
         try:
             with Device(cfg, getattr(args, "device", "") or "") as dev, Memory(cfg) as mem:
-                dev.open_app(app_target)
-                screen_init = dev.observe()
-                try:
-                    shot_init = dev.screenshot()
-                    if shot_init:
-                        screenshots.append(shot_init)
-                except Exception:  # noqa: BLE001
-                    pass
+                exp = skillmod.explore_app(
+                    dev, mem, llm, cfg, query=app_target, tasks=user_tasks,
+                    on_event=_live_reporter(out, max_steps=cfg.run.max_steps))
+        except skillmod.ExplorationBlocked as exc:
+            out.bad(f"nothing was explored: {exc}")
+            return 1
 
-                screen_summaries.append(f"Initial Package: {screen_init.package}, Title/Elements: {[e.best_text for e in screen_init.elements[:15] if e.best_text]}")
-                actions_taken.append(f"Opened target app {app_target}")
-
-                if llm:
-                    live_reporter = _live_reporter(out, max_steps=cfg.run.max_steps)
-
-                    def exploration_tracer(kind: str, **kw: Any) -> None:
-                        live_reporter(kind, **kw)
-                        if kind == "step":
-                            s = kw.get("screen")
-                            act = kw.get("action")
-                            if s:
-                                elems = [e.best_text for e in s.elements[:15] if e.best_text]
-                                screen_summaries.append(f"Package: {s.package}, Elements: {elems}")
-                            if act:
-                                desc = act.describe() if hasattr(act, "describe") else str(act)
-                                obs = getattr(act, "observation", "")
-                                actions_taken.append(f"Executed action: {desc}" + (f" (Observed: {obs})" if obs else ""))
-                            try:
-                                shot = dev.screenshot()
-                                if shot and len(screenshots) < 10:
-                                    screenshots.append(shot)
-                            except Exception as shot_exc:  # noqa: BLE001
-                                log.warning("Could not capture screenshot during exploration step: %s", shot_exc)
-
-                    goal_text = f"Explore app {app_target} and perform the following tasks: {user_tasks}"
-                    agent = Agent(dev, mem, llm, cfg, on_event=exploration_tracer)
-                    out.say(out.bold("  ── Live App Exploration Run ──"))
-                    agent.run(goal_text)
-        except Exception as exc:  # noqa: BLE001
-            out.warn(f"Live device interaction encounters warning: {exc}. Proceeding with LLM synthesis based on available trace.")
-
-        generator = SkillGenerator(registry)
-        skill = generator.generate_from_exploration(
-            app_target, user_tasks, screen_summaries, actions_taken, llm or cfg, screenshots=screenshots
-        )
-        saved_path = registry.save_skill(skill)
+        colour = out.green if exp.outcome == "success" else out.yellow
+        chose = {"tasks": " (picked from your --tasks)",
+                 "foreground": " (the app that was in front)"}.get(exp.chosen_by, "")
         out.say()
-        out.ok(f"Verified live actions and saved skill for '{skill.name}' to {saved_path}")
+        out.say(f"  explored {out.bold(exp.package)}{chose}: {exp.steps} steps, "
+                f"{len(exp.screens)} distinct screens, {len(exp.screenshots)} screenshots, "
+                f"{colour(exp.outcome.upper())}, ~${llm.ledger.total_usd:.4f}")
+        if exp.notes:
+            out.say()
+            out.say(out.bold("  ── What it found ──"))
+            out.say()
+            for line in exp.notes.splitlines():
+                out.say(f"  {line}")
+        if not exp.looked_around:
+            out.warn("the run never left the first screen, so the skill below rests on "
+                     "one screen. Give --tasks something concrete to do in the app.")
+        out.say()
+
+        skill = SkillGenerator(registry).generate_from_exploration(
+            app_target or exp.package, exp.tasks, exp.screens, exp.actions, llm,
+            screenshots=exp.screenshots, package=exp.package,
+            notes=exp.notes, outcome=exp.outcome)
+        out.ok(f"saved skill '{skill.name}' to {registry.path_for(skill)}")
         out.say()
         out.say(skill.to_markdown())
         return 0
@@ -1430,6 +1518,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="do not ask before irreversible actions")
     p.add_argument("--unattended", action="store_true",
                    help="never prompt; refuse instead of asking")
+    p.add_argument("--no-learn", dest="learn_after_run", action="store_false",
+                   default=None,
+                   help="do not update the app's skill from what this run learned")
     p.add_argument("--artifacts-dir", dest="artifacts_dir")
     _add_common(p)
     _add_device(p)
@@ -1477,12 +1568,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_device(p)
     p.set_defaults(func=cmd_apps)
 
+    from .skills import DEFAULT_EXPLORE_STEPS
+
     p = sub.add_parser("skills", help="manage app skills (list, view, create, generate)")
     p.add_argument("skills_action", nargs="?", choices=["list", "view", "create", "generate"],
                    default="list", help="action to perform (default: list)")
-    p.add_argument("target", nargs="?", help="app name or package for view, create, or generate")
-    p.add_argument("--app", help="app package or name for skill generation")
-    p.add_argument("--tasks", help="user-defined task instructions to perform in app during exploration")
+    p.add_argument("target", nargs="?",
+                   help="app name or package to view, create, or explore. "
+                        "'generate' with no app explores whatever is on screen")
+    p.add_argument("--app", help="alias for the positional app argument")
+    p.add_argument("--tasks", help="what to do in the app while exploring "
+                                   "(default: tour its main screens)")
+    p.add_argument("--max-steps", dest="max_steps", type=int,
+                   help=f"step budget for the exploration (default {DEFAULT_EXPLORE_STEPS})")
+    p.add_argument("--budget-usd", dest="budget_usd", type=float)
     _add_common(p)
     _add_device(p)
     p.set_defaults(func=cmd_skills)

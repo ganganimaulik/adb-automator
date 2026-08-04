@@ -253,12 +253,73 @@ the prompt when the agent is in that app.
 adbagent skills list
 adbagent skills view whatsapp
 adbagent skills create whatsapp
-adbagent skills generate --app whatsapp --tasks "open a chat and read the last message"
+adbagent skills generate whatsapp
+adbagent skills generate whatsapp --tasks "open a chat and read the last message"
+adbagent skills generate --tasks "open Bumble and tour the chats"   # app inferred
+adbagent skills generate            # explore whatever is on screen right now
 ```
 
-`generate` drives the app to perform the tasks you name, then writes what it
-learned to `skills/<name>.json`. Skills are plain JSON or Markdown; edit them by
-hand.
+`generate` explores the app on the phone and writes what it learned to
+`skills/<name>.json`. An app name is enough — it is resolved to an installed
+package the same way the `open_app` action resolves one, launched, and *verified*
+to be in front before the tour starts, so the skill is filed under the package
+the agent will actually report being in.
+
+**You rarely need to name the app twice.** When there is no app argument, the
+tasks are read for one: `--tasks "open Bumble and tour the chats"` explores
+`com.bumble.app`. Matching is on whole package segments, and an app you installed
+beats one that shipped with the phone — so "tour the settings screen in Bumble"
+means Bumble, not the seven system packages with `settings` in the name. Tasks
+naming two installed apps are referred back to you rather than guessed at, and
+tasks naming none fall through to the foreground app, which is the only way to
+build a skill for a screen you cannot reach from a cold launch. The output always
+says which of the three happened.
+
+The tour itself is an ordinary agent run against a brief that says what to record
+(flows, per-screen purpose, quirks and what to do instead), to come back with
+`back` between destinations, and to touch nothing that sends, buys or deletes.
+What it writes down is the primary source for the skill; the distinct screens it
+reached and up to 12 screenshots of them go along with it. Nothing is invented to
+fill a gap — a run that only reached one screen says so instead.
+
+It stops with a reason rather than filing a guess when the phone is locked (only
+you can enter the PIN), when no installed app matches the name, or when the app
+will not come to the foreground. `--max-steps` bounds the tour (40 by default,
+rather than the `run.max_steps` you set for collection runs) and `--budget-usd`
+bounds the spend.
+
+Skills are plain JSON or Markdown; edit them by hand. Running `generate` again
+merges into the existing skill rather than replacing it — and a nuance whose
+distinctive words all appear in a longer one is dropped as a restatement, so a
+skill regenerated twenty times does not carry twenty phrasings of one quirk into
+every prompt. Containment, not similarity: two entries that merely overlap, each
+holding a detail the other lacks, are both kept.
+
+### Learning from every run
+
+`adbagent run` does the same thing afterwards, without being asked. Any run is a
+tour of the app it ran in, so when it finishes, what it saw — the distinct
+screens, the actions with the model's own observations, whatever it wrote to the
+scratchpad, and how it ended — is folded into that app's skill and saved. The
+next run reads it back. That is the loop that makes the agent better at an app the
+more it is driven there, and `Skill.merge` is why run 20 still knows what runs 1
+to 19 found.
+
+It costs one call on `llm.model_skill` per run and says what it did:
+
+```
+  skill 'WhatsApp' updated from this run (7 workflows, 15 nuances) -> skills/whatsapp.json
+```
+
+A run that went nowhere teaches nothing and is skipped — fewer than three steps,
+or only one screen reached, or the steps were spent in the launcher rather than an
+app. A run that *failed* is not skipped: "tapping this row does nothing" and "back
+leaves the app from here" are only ever learned the hard way, and they are what a
+skill is for. A goal that crosses apps updates the skill for the app the steps
+were spent in, not whichever happened to be in front at the end.
+
+Turn it off per run with `--no-learn`, or for good with `skills.learn_after_run:
+false`.
 
 ## What it remembers
 
@@ -271,10 +332,57 @@ was broken last night may be fixed this morning.
 
 ## Tuning
 
-Speed and cost knobs, all in `config.json`:
+### Reasoning depth
+
+The single largest lever on latency. A reasoning model spends about 4,200 of its
+4,400 output tokens thinking, and on a step whose answer is "swipe left again"
+almost all of that is waste — 26s median per step, 96s at the ninetieth
+percentile, against 3.4s to actually act.
+
+```json
+"llm": {
+  "reasoning_effort": "none",
+  "reasoning_effort_hard": "high"
+}
+```
+
+Routine turns then think at the floor and hard ones think properly. The loop
+decides which is which from evidence it already has: the last action failed, the
+model said it was unsure, this screen is new, a loop was detected, or actions here
+are already known to lead nowhere. A reply that misses the schema also escalates
+its own repair, because a malformed answer is the clearest evidence there is that
+the turn was harder than assumed.
+
+Left unset, nothing is sent and the model thinks as it pleases. **Check
+`adbagent doctor` after setting it**, because two conventions exist for this on
+the OpenAI wire protocol and no model advertises which it takes:
+
+```
+  OK    reasoning depth 'none' routine, 'high' when stuck (thinking convention, from the model name)
+        routine turn sends {"chat_template_kwargs": {"thinking": false}}
+        hard turn sends    {"chat_template_kwargs": {"thinking": true}}
+```
+
+`llm.reasoning_style` overrides the guess — `"effort"` sends
+`reasoning_effort`, `"thinking"` sends `chat_template_kwargs`, `"off"` sends
+nothing. An unrecognised model sends nothing rather than guessing, and `doctor`
+says so, because a field the model ignores looks exactly like a field that worked
+while the bill and the clock say otherwise.
+
+Then measure it, rather than believing it:
+
+```bash
+adbagent replay runs/<id>        # did any decision change?
+adbagent report runs/<id>        # did the reasoning tokens actually drop?
+```
+
+### Everything else
 
 | setting | default | what it does |
 |---|---|---|
+| `llm.reasoning_effort` | `""` | Depth for a routine turn: `none`, `low`, `medium`, `high`. Empty switches the whole feature off. |
+| `llm.reasoning_effort_hard` | `high` | Depth for a turn the loop can see is hard. |
+| `llm.reasoning_style` | `auto` | Which wire convention to use: `auto`, `effort`, `thinking`, `off`. |
 | `run.pager_sweep` | `true` | Page through carousels in code once the model has chosen to. See above. |
 | `run.pager_sweep_max` | `12` | Items per sweep before control returns to the model. |
 | `llm.vision_in_decider` | `false` | Set when `llm.model` itself accepts images: the screenshot then goes straight to the deciding call instead of being described first by `llm.model_image` — one round trip per screenshot turn instead of two. Leave off for a text-only model; an image part would fail the whole call. |

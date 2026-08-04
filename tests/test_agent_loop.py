@@ -587,3 +587,137 @@ def test_this_runs_bans_are_not_repeated_as_remembered_ones(cfg, mem):
         if "BANNED ACTIONS" in note and signature in note:
             after = note.split("BANNED ACTIONS", 1)[1]
             assert after.count(signature) == 1, note
+
+
+# ---------------------------------------------------------------------------
+# How hard to think about this turn
+# ---------------------------------------------------------------------------
+#
+# Reasoning tokens are the run's wall clock, so the default is shallow. The whole
+# safety of that rests on the loop noticing the turns that are not routine, from
+# evidence it already has.
+
+def deep(cfg):
+    cfg.llm.reasoning_effort = "none"
+    cfg.llm.reasoning_effort_hard = "high"
+    return cfg
+
+
+def effort(cfg, **kw):
+    from adbagent.agent import needs_reasoning
+
+    state = RunState(goal="g", run_id="r", intent_id="i")
+    for key, value in kw.items():
+        if key not in ("visit", "blocked", "hint"):
+            setattr(state, key, value)
+    return needs_reasoning(state, cfg, visit=kw.get("visit", 1),
+                           blocked=kw.get("blocked", False),
+                           hint=kw.get("hint", ""))
+
+
+def test_the_feature_is_off_until_it_is_configured(cfg):
+    """An unset depth must leave every request exactly as it was."""
+    assert effort(cfg) == ("", "")
+    assert effort(cfg, consecutive_failures=3) == ("", "")
+
+
+def test_a_routine_turn_thinks_shallowly(cfg):
+    assert effort(deep(cfg)) == ("none", "")
+
+
+def test_a_failure_buys_deeper_thinking(cfg):
+    chosen, why = effort(deep(cfg), consecutive_failures=1)
+    assert chosen == "high"
+    assert "did not work" in why
+
+
+def test_a_new_screen_buys_deeper_thinking(cfg):
+    chosen, why = effort(deep(cfg), visit=0)
+    assert chosen == "high"
+    assert "not been seen before" in why
+
+
+def test_saying_it_was_unsure_buys_deeper_thinking(cfg):
+    chosen, why = effort(deep(cfg), want_screenshot=True)
+    assert chosen == "high"
+    assert "unsure" in why
+
+
+def test_a_known_dead_end_here_buys_deeper_thinking(cfg):
+    chosen, why = effort(deep(cfg), blocked=True)
+    assert chosen == "high"
+    assert "lead nowhere" in why
+
+
+def test_a_loop_warning_buys_deeper_thinking(cfg):
+    chosen, why = effort(deep(cfg), hint="you have been here before")
+    assert chosen == "high"
+    assert "loop detector" in why
+
+
+def test_a_rejected_action_buys_deeper_thinking(cfg):
+    chosen, why = effort(deep(cfg), last_failure="your 'done' was rejected")
+    assert chosen == "high"
+    assert "rejected" in why
+
+
+def test_the_first_step_of_a_run_is_always_a_hard_one(cfg, mem, tmp_path):
+    """visit == 0 on the opening screen, which is the turn that picks the whole
+    approach -- exactly the wrong one to skimp on."""
+    deep(cfg)
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    first = next(e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide")
+    assert first["effort"] == "high"
+    assert first["hard_because"]
+
+
+def test_a_settled_walk_runs_shallow(cfg, mem, tmp_path):
+    """Revisiting a screen that has caused no trouble costs the floor.
+
+    Every step here succeeds, so the only escalations are the two first sightings
+    -- and coming back to a screen already walked is the routine case the shallow
+    default exists for.
+    """
+    deep(cfg)
+    dev = fake.FakeDevice(cfg)
+    calls = {"n": 0}
+
+    def policy(screen, llm):
+        calls["n"] += 1
+        if calls["n"] == 1:                       # home (new) -> wifi
+            el = next(e for e in screen.elements if e.best_text == "Wi-Fi")
+            return AgentAction(observation="settings", reasoning="open Wi-Fi",
+                               action="tap", target={"index": el.index})
+        if calls["n"] == 2:                       # wifi (new) -> back to home
+            return AgentAction(observation="wifi", reasoning="go back",
+                               action="press_key", key="back")
+        return AgentAction(observation="settings", reasoning="finished",
+                           action="done", text="done")
+
+    llm = fake.FakeLLM(dev, policy)
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
+    shown = [(e["step"], e["effort"], e["hard_because"]) for e in decides]
+    assert decides[0]["effort"] == "high", shown    # the opening screen is new
+    assert decides[1]["effort"] == "high", shown    # so is the one it lands on
+    # Back on a screen already walked, with nothing amiss: the floor.
+    assert decides[2]["effort"] == "none", shown
+    assert decides[2]["hard_because"] == "", shown
+
+
+def test_the_chosen_depth_is_recorded_for_every_decision(cfg, mem, tmp_path):
+    """Without this in the artifact there is no way to tell whether a run that
+    got slower got deeper, or a run that got cheaper got shallower."""
+    deep(cfg)
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    for event in _events(tmp_path, state.run_id):
+        if event["kind"] == "decide":
+            assert event["effort"] in ("none", "high")
+            assert "hard_because" in event

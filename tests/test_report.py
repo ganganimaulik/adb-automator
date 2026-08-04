@@ -119,3 +119,61 @@ def test_report_renders_the_summary_end_to_end(tmp_path, capsys):
     assert "SUCCESS" in text
     # The metrics block is summarised, never dumped as a dict.
     assert "'reasoning_tokens'" not in text
+
+
+# ---------------------------------------------------------------------------
+# Reasoning depth
+# ---------------------------------------------------------------------------
+
+def depth_events(*, escalated: int, shallow: int):
+    """Decide events with a recorded reasoning depth, deep ones costing more."""
+    out = [{"t": 0, "kind": "run_start", "goal": "g", "model": "m"}]
+    step = 0
+    for _ in range(escalated):
+        step += 1
+        out.append({"t": step, "kind": "decide", "step": step, "wall_s": 26.0,
+                    "effort": "high", "hard_because": "the last action failed",
+                    "llm": dict(DECIDE), "action": {"action": "tap"}})
+    for _ in range(shallow):
+        step += 1
+        out.append({"t": step, "kind": "decide", "step": step, "wall_s": 2.1,
+                    "effort": "none", "hard_because": "",
+                    "llm": dict(DECIDE, completion_tokens=200,
+                               reasoning_tokens=60, latency_s=2.1),
+                    "action": {"action": "swipe"}})
+    return out
+
+
+def test_the_split_between_deep_and_shallow_turns_is_reported(capsys):
+    _cost_summary(Out(), depth_events(escalated=4, shallow=8))
+    text = capsys.readouterr().out
+    assert "thinking depth  4 of 12 turn(s) escalated, 8 at the floor" in text
+
+
+def test_a_run_with_no_depth_recorded_says_nothing_about_it(capsys):
+    """Runs from before the setting existed must not grow a misleading line."""
+    _cost_summary(Out(), events(decides=3))
+    assert "thinking depth" not in capsys.readouterr().out
+
+
+def test_a_capped_run_is_not_told_to_cap_it(capsys):
+    """The advice existed before the setting did. Repeating it to someone who has
+    already taken it is how a report teaches people to stop reading it."""
+    _cost_summary(Out(), depth_events(escalated=1, shallow=11))
+    text = capsys.readouterr().out
+    assert "setting llm.reasoning_effort" not in text
+    assert "Most turns escalated" not in text        # only 1 of 12 did
+
+
+def test_escalating_on_most_turns_points_at_the_policy_instead(capsys):
+    """A cap that never applies is not the cap's fault, and telling someone to
+    lower it further would be the wrong advice."""
+    _cost_summary(Out(), depth_events(escalated=11, shallow=1))
+    text = capsys.readouterr().out
+    assert "Most turns escalated" in text
+    assert "setting llm.reasoning_effort" not in text
+
+
+def test_an_uncapped_run_is_still_told_to_cap_it(capsys):
+    _cost_summary(Out(), events(decides=3))
+    assert "setting llm.reasoning_effort" in capsys.readouterr().out
