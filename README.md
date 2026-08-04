@@ -70,7 +70,7 @@ Any model in the provider's catalogue works. Pass it with `--model`, or set it i
 (`llm.api_key`, which is gitignored) or via the `FIREWORKS_API_KEY` environment
 variable.
 
-Four models are configurable and each is used for one job:
+Five models are configurable and each is used for one job:
 
 | setting | used for |
 |---|---|
@@ -78,6 +78,7 @@ Four models are configurable and each is used for one job:
 | `llm.model_image` | reading screenshots |
 | `llm.model_small` | judging whether a `done` claim is true |
 | `llm.model_skill` | writing app skills |
+| `llm.model_skill_image` | reading the screenshots taken while writing app skills (falls back to `llm.model_image`) |
 
 ## Run
 

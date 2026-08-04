@@ -713,7 +713,7 @@ $("btn-dev-reload").addEventListener("click", () => loadDevices().catch((e) => n
 const CFG_SPEC = [
   ["llm", [
     ["provider", "text"], ["model", "text"], ["model_small", "text"],
-    ["model_image", "text"], ["model_skill", "text"],
+    ["model_image", "text"], ["model_skill", "text"], ["model_skill_image", "text"],
     ["temperature", "number"], ["max_tokens", "number"], ["max_tokens_image", "number"],
     ["rpm", "number"], ["base_url", "text"], ["service_tier", "text"],
     ["api_key", "password"], ["api_key_env", "text"],

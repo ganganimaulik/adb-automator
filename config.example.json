@@ -5,6 +5,7 @@
     "model_small": "accounts/fireworks/models/deepseek-v4-flash",
     "model_image": "",
     "model_skill": "",
+    "model_skill_image": "",
     "temperature": 0.0,
     "max_tokens": 10000,
     "max_tokens_image": 4096,

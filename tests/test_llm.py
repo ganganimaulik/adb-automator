@@ -199,6 +199,15 @@ def test_llm_config_model_fallbacks():
     assert cfg_custom.image() == "vision-model"
 
 
+def test_skill_image_falls_back_through_the_vision_model():
+    from adbagent.config import LLMConfig
+
+    assert LLMConfig(model="main-model").skill_image() == "main-model"
+    assert LLMConfig(model="main-model", model_image="vision-model").skill_image() == "vision-model"
+    assert LLMConfig(model="main-model", model_image="vision-model",
+                     model_skill_image="skill-vision").skill_image() == "skill-vision"
+
+
 def test_judge_uses_config_max_tokens(monkeypatch):
     from adbagent.config import Config
     from adbagent.llm import LLMClient
