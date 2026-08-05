@@ -860,6 +860,13 @@ const CFG_SPEC = [
   ]],
   ["run", [
     ["max_steps", "number"], ["max_wall_clock_s", "number"], ["artifacts_dir", "text"],
+    ["max_consecutive_failures", "number"],
+    // The stall ladder. A run started from here already obeys these -- the UI
+    // spawns the CLI, which reads config.json -- so leaving them off the form
+    // meant the only way to see why a run stopped at 14 steps was to open the
+    // file by hand. `0` switches a tier off; see `config.RunConfig`.
+    ["stall_nudge_at", "number"], ["stall_block_at", "number"],
+    ["stall_replan_at", "number"], ["stall_give_up_at", "number"],
     ["pager_sweep", "bool"], ["pager_sweep_max", "number"],
     ["always_screenshot", "bool"], ["never_screenshot", "bool"], ["dry_run", "bool"],
   ]],
