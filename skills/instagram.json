@@ -12,7 +12,7 @@
   "workflows": [
     {
       "name": "open_explore_and_like_posts",
-      "steps": "Tap the 'Search and explore' tab (magnifying glass icon) in the bottom nav to open the Explore grid. Tap a reel/post thumbnail in the grid to open the full-screen Reel viewer. Tap the Like button (heart icon, resource id=like_button) in the UFI row to like it; the heart turns red/selected. To like multiple posts, press Back to return to the Explore grid and tap the next thumbnail, then like again. Do NOT rely on swiping left to advance between explore reels (see nuances)."
+      "steps": "Tap the 'Search and explore' tab (magnifying glass icon) in the bottom nav to open the Explore grid. Tap a reel/post thumbnail in the grid to open the full-screen Reel viewer (top bar shows a Back arrow and 'Explore' title). Tap the Like button (heart icon, resource id=like_button) in the UFI row to like it; the heart turns red/selected and the like count increments by one. To like multiple posts, press Back to return to the Explore grid and tap the next thumbnail, then like again. Do NOT rely on swiping left to advance between explore reels (see nuances)."
     },
     {
       "name": "open_reels_tab_and_like_reels",
@@ -46,7 +46,9 @@
     "Home feed video/reel posts frequently show a 'Watch more reels' overlay pill (with 'Watch again' text) covering the center of the media. The overlay can persist across several scrolls; tapping the post or overlay opens the full-screen Reels viewer for that reel. To keep browsing the feed instead, scroll past it without tapping the center.",
     "Home feed scrolling is incremental: a single scroll of amount=1.0 often only nudges the feed so the next post is partially visible at the bottom edge. Expect to need multiple scrolls to move from one post to the next, and re-observe after each scroll to identify which post is now in view.",
     "The home feed mixes content types: regular video posts, reels labeled 'Suggested Reel by ...', carousel posts with a 'photo X of N' indicator, and sponsored posts. Suggested/sponsored content from accounts the user does not follow appears inline with a 'Suggested for you' label and a Follow button in the post header.",
-    "Tapping a feed post (even near its header area) can open the full-screen Reels viewer instead of staying in the feed; if the goal is to keep browsing the feed, press Back or avoid tapping the media area and use scrolls only."
+    "Tapping a feed post (even near its header area) can open the full-screen Reels viewer instead of staying in the feed; if the goal is to keep browsing the feed, press Back or avoid tapping the media area and use scrolls only.",
+    "The Explore grid can show the same author's reel at multiple grid positions (e.g., the same username appeared at row 2 column 2 and row 3 column 1). When a task requires liking N DISTINCT posts, tapping two thumbnails can open the same reel twice; track which authors have already been liked and skip duplicates.",
+    "In the Explore reel viewer, the heart icon's state is readable in the observation: an outlined heart means not yet liked, a filled/red heart (with the like count incremented by one) means already liked. Check this before tapping to avoid unliking a reel that was already liked."
   ],
   "recommendations": [
     "Always locate interactive buttons (Like, Follow, Comment) by their resource ids (like_button, profile_header_follow_button) rather than by element index, as indices shift between screens and turns.",
@@ -56,7 +58,8 @@
     "To verify a like succeeded, check that the heart icon appears red/selected in the next observation rather than re-tapping it (which would unlike).",
     "Use the bottom navigation bar (Home, Reels, Message, Search and explore, Profile) as the primary navigation mechanism; it is present on most main screens.",
     "When asked to enumerate the first N home feed posts, scroll one step at a time and record each post's author, type (video/reel/carousel), and visible stats from the UFI row; do not tap the post media, as that opens the Reels viewer and leaves the feed context.",
-    "If a 'Watch more reels' overlay blocks the center of a feed post, either ignore it and keep scrolling, or tap it deliberately when the goal is to open that reel full-screen."
+    "If a 'Watch more reels' overlay blocks the center of a feed post, either ignore it and keep scrolling, or tap it deliberately when the goal is to open that reel full-screen.",
+    "When a task requires liking the top N Explore posts, keep a running list of the authors already liked (read the username in the reel viewer header) and verify each newly opened reel is by a new author before tapping Like; if it is a duplicate, press Back and pick a different thumbnail."
   ],
   "custom_prompt": ""
 }

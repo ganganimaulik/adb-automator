@@ -27,14 +27,16 @@
     "After typing a query and pressing enter, results do not appear instantly — the screen may still show the search field with the typed query (and a 'Clipboard / Dismiss copied text' element). Wait and re-observe rather than concluding there are no results.",
     "Search results mix 'Sponsored'/'Ad' tiles with organic products, and the same brand appears in several pack sizes (e.g. 200 ml, 1 L, pack of 6) at different prices — always check the pack-size line on the card.",
     "Zepto screens report misleading activity names: the search and Select Location screens appear as 'com.zeptoconsumerapp.Conversation', and a '.DEFAULT' screen was seen exposing no labelled elements at all (WebView/canvas). Do not rely on the activity name to know which screen you are on.",
-    "The search screen keeps 'Recent searches' chips with a 'Clear' action, and the query field has an X to reset it; a cart pill at the bottom shows the current item count once anything is in the cart."
+    "The search screen keeps 'Recent searches' chips with a 'Clear' action, and the query field has an X to reset it; a cart pill at the bottom shows the current item count once anything is in the cart.",
+    "A 'SHOP & EARN Rewards' overlay (e.g. 'Get up to ₹50 cashback') can appear over the results grid and block interaction; dismiss it via its close control before reading or tapping product cards."
   ],
   "recommendations": [
     "Prefer confirming the saved address over enabling GPS to get past the launch location sheet quickly.",
     "Include brand and pack size in the search query, and verify the size on the product card before reading the price.",
     "Insert a wait after open_app and again after pressing enter in search before judging what is on screen.",
     "For price-comparison tasks, record the Zepto price before switching apps, and launch the other app by its resolved package name rather than its display name.",
-    "If the exact variant is not visible in the first rows of results, scroll the grid — sponsored cards occupy the top positions."
+    "If the exact variant is not visible in the first rows of results, scroll the grid — sponsored cards occupy the top positions.",
+    "If a rewards or cashback overlay covers the results, close it first so product cards and prices are tappable and readable."
   ],
   "custom_prompt": ""
 }

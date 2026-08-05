@@ -26,14 +26,18 @@
     "The same brand appears in several variants (e.g. 200 ml, 1 ltr, Pack of 6, Combo); always verify the size label printed under the product image before reading the price.",
     "Each card shows two prices: a bold selling price and a struck-through MRP. The bold figure is the actual price.",
     "A 'Get FREE delivery on your order above ₹99' promo banner with a page indicator ('1/2') overlays the bottom of home and results screens and can cover the lowest row of content; it has an X to dismiss it.",
-    "The bottom navigation includes a red 'zomato' shortcut that leaves Blinkit for another app; avoid tapping it when the task is inside Blinkit."
+    "The bottom navigation includes a red 'zomato' shortcut that leaves Blinkit for another app; avoid tapping it when the task is inside Blinkit.",
+    "On cold start, a full-screen welcome overlay ('Everything you need, delivered at your doorstep') can cover the home screen; tap through it (e.g. 'Got it, thanks!') to reach the home screen.",
+    "A promotional banner overlay with a 'Got it, thanks!' button can appear over the home screen; dismiss it before interacting with the search bar.",
+    "open_app on the Blinkit home screen has been observed to lead nowhere; if the app does not come to the foreground, retry or tap the app icon directly."
   ],
   "recommendations": [
     "Use the search bar for specific product lookups instead of browsing category tabs.",
     "For price-comparison tasks, capture the pack-size label along with the price so the comparison is like-for-like across apps.",
     "If the target product is not visible in the first results viewport, scroll the grid before concluding it is unavailable.",
     "Dismiss the free-delivery banner via its X if it covers product cards you need to read.",
-    "Prefer typing the full product name (brand + product, e.g. 'yu coconut water') to surface the exact variant near the top of results."
+    "Prefer typing the full product name (brand + product, e.g. 'yu coconut water') to surface the exact variant near the top of results.",
+    "If a welcome or promotional overlay blocks the home screen, tap its dismiss button (e.g. 'Got it, thanks!') before proceeding."
   ],
   "custom_prompt": ""
 }
