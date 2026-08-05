@@ -11,7 +11,7 @@ import pytest
 from adbagent.actions import AgentAction
 from adbagent.llm import (Call, Ledger, LLMError, ModelInfo, PROVIDERS, RateLimiter,
                           ScreenAnalysis, extract_json, harden_schema, image_part,
-                          qualify, text_part)
+                          list_models, qualify, text_part)
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +99,105 @@ def test_model_info_row_shows_capabilities():
     row = ModelInfo(id="kimi-k2p6", context_length=262144, vision=True,
                     tools=True).row()
     assert "kimi-k2p6" in row and "vision" in row and "tools" in row and "256k" in row
+
+
+#: Catalogue entries as the provider returns them, trimmed to the fields the
+#: parser reads. The embedder and the reranker are the shape of the real thing:
+#: `kind` is `EMBEDDING_MODEL`, and both carry the chat template they inherited
+#: from their base model -- which is why `conversationConfig` cannot tell them
+#: apart from a model that can be driven.
+CATALOGUE_ENTRIES = [
+    {"name": "accounts/fireworks/models/kimi-k3", "kind": "HF_BASE_MODEL",
+     "state": "READY", "contextLength": 1048576, "supportsTools": True,
+     "supportsImageInput": True, "conversationConfig": {"style": ""}},
+    # A closed model served through the provider is filed under its own kind.
+    {"name": "accounts/fireworks/models/qwen3p7-plus", "kind": "CUSTOM_MODEL",
+     "state": "READY", "supportsTools": True, "supportsImageInput": True,
+     "conversationConfig": {"style": ""}},
+    {"name": "accounts/fireworks/models/qwen3-embedding-8b",
+     "kind": "EMBEDDING_MODEL", "state": "READY", "contextLength": 40960,
+     "conversationConfig": {"style": "jinja",
+                            "template": "{%- if tools %}<|im_start|>"}},
+    {"name": "accounts/fireworks/models/qwen3-reranker-8b",
+     "kind": "EMBEDDING_MODEL", "state": "READY", "contextLength": 40960,
+     "conversationConfig": {"style": "jinja",
+                            "template": "{%- if tools %}<|im_start|>"}},
+    # Still uploading, and one the chat API is not enabled for at all.
+    {"name": "accounts/fireworks/models/half-uploaded", "kind": "HF_BASE_MODEL",
+     "state": "UPLOADING", "conversationConfig": {"style": ""}},
+    {"name": "accounts/fireworks/models/not-a-chat-model", "kind": "HF_BASE_MODEL",
+     "state": "READY"},
+]
+
+
+def fake_catalogue(monkeypatch, entries):
+    """Stand in for the provider's catalogue endpoint, over two pages.
+
+    Returns the list of query params it was asked with, so the caller can check
+    the paging was followed rather than the first page taken as the whole.
+    """
+    import httpx
+
+    asked = []
+
+    class Resp:
+        status_code = 200
+
+        def __init__(self, body):
+            self._body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._body
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, params=None, headers=None):
+            asked.append(dict(params or {}))
+            if "pageToken" not in (params or {}):
+                return Resp({"models": entries[:1], "nextPageToken": "page-2"})
+            return Resp({"models": entries[1:]})
+
+    monkeypatch.setattr(httpx, "Client", Client)
+    return asked
+
+
+def test_the_catalogue_lists_only_what_a_chat_call_can_be_made_against(monkeypatch):
+    """An embedding model is not a model the agent can be pointed at.
+
+    Both of these were offered by `adbagent models` and selectable in the web
+    UI's config dropdowns, where picking one only fails once a call is made --
+    mid-run, several steps in.
+    """
+    asked = fake_catalogue(monkeypatch, CATALOGUE_ENTRIES)
+    models = list_models(PROVIDERS["fireworks"], "sk-test")
+
+    assert [m.id for m in models] == ["kimi-k3", "qwen3p7-plus"]
+    # Both pages were read, the second with the token the first handed back.
+    assert len(asked) == 2 and asked[1]["pageToken"] == "page-2"
+    kimi = models[0]
+    assert (kimi.context_length, kimi.vision, kimi.tools) == (1048576, True, True)
+
+
+def test_an_unfamiliar_kind_is_still_offered(monkeypatch):
+    """The provider's `kind` enum grows, so the filter is a denylist: a picker
+    that hides a model the account can really use is the worse failure."""
+    entries = [dict(CATALOGUE_ENTRIES[0],
+                    name="accounts/fireworks/models/next-thing",
+                    kind="KIND_INVENTED_NEXT_QUARTER")]
+    fake_catalogue(monkeypatch, entries)
+    assert [m.id for m in list_models(PROVIDERS["fireworks"], "sk-test")] == \
+        ["next-thing"]
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +364,100 @@ def test_decide_messages_cache_friendly_structure(monkeypatch):
     assert "collected notes" in msgs[4]["content"]
     assert "YOUR PROGRESS" in msgs[4]["content"]
     assert "CURRENT SCREEN:\nscreen 1" in msgs[5]["content"][0]["text"]
+
+
+def _capture_decide(monkeypatch, **kwargs):
+    """Run one `decide` and hand back the messages it would have sent."""
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+    from adbagent.actions import Target
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    client = LLMClient(Config())
+    captured = []
+
+    def mock_structured(messages, model_cls, model, purpose, **kw):
+        captured.append(messages)
+        return AgentAction(observation="on home", reasoning="tap home",
+                           action="tap", target=Target(index=1))
+
+    monkeypatch.setattr(client, "structured", mock_structured)
+    base = dict(goal="test goal", width=720, height=1600, package="com.example",
+                history=["1. tap #1"], rendered="screen 1")
+    base.update(kwargs)
+    client.decide(**base)
+    return captured[0]
+
+
+def test_skill_sits_above_the_history_not_in_the_screen_note(monkeypatch):
+    """A skill is chosen per app, not per turn.
+
+    Carried in the NOTE block it rode at the end of the last message and was
+    re-sent uncached every step -- 1,210 tokens median over the runs in
+    ``runs/``. Above the history it survives in the prompt cache for as long as
+    the run stays in one app, which is the overwhelming majority of turns.
+    """
+    skill = "APP SKILL & GUIDANCE (WhatsApp):\nWorkflows:\n  - open: tap search"
+    msgs = _capture_decide(monkeypatch, skill=skill)
+
+    assert msgs[2]["content"] == "GOAL: test goal"
+    assert msgs[3]["content"] == skill
+    assert msgs[4]["content"].startswith("HISTORY")
+    # And it is not also trailing the screen, where it used to live.
+    screen = msgs[-1]["content"][0]["text"]
+    assert "APP SKILL" not in screen
+
+
+def test_no_skill_leaves_the_message_layout_untouched(monkeypatch):
+    """The block is absent, not empty: a blank message would be a cache-visible
+    difference between a run with a skill and a run without one."""
+    msgs = _capture_decide(monkeypatch)
+    assert len(msgs) == 5          # system, device, goal, history, screen
+    assert msgs[3]["content"].startswith("HISTORY")
+    assert not any("APP SKILL" in str(m["content"]) for m in msgs)
+
+
+def test_cache_key_names_the_prefix_so_it_survives_across_runs(monkeypatch):
+    """Keyed on the run id, every run began on a cold replica and re-bought a
+    system prompt that is byte-identical across every run ever made."""
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    first = LLMClient(Config(), run_id="run-one")
+    second = LLMClient(Config(), run_id="run-two")
+
+    assert first.cache_key == second.cache_key
+    assert "run-one" not in first.cache_key
+    assert first._extra_body()["prompt_cache_key"] == first.cache_key
+
+
+def test_cache_key_rolls_when_the_prompt_it_names_changes(monkeypatch):
+    """A key naming a prefix that is no longer sent points at a replica warm for
+    the wrong bytes."""
+    from adbagent import prompts
+    from adbagent.llm import prefix_cache_key
+
+    before = prefix_cache_key()
+    monkeypatch.setattr(prompts, "SYSTEM", prompts.SYSTEM + "\nnew rule.")
+    assert prefix_cache_key() != before
+
+
+def test_session_affinity_header_carries_the_same_key(monkeypatch):
+    """Fireworks documents the body field in the API reference and the header in
+    the caching guide, and does not say which the serving path reads."""
+    client, sent = _rejecting_client(monkeypatch)
+    headers = []
+    original = client._client.chat.completions.create
+
+    def spy(**kw):
+        headers.append(kw.get("extra_headers"))
+        return original(**kw)
+
+    monkeypatch.setattr(client._client.chat.completions, "create", spy)
+    client._post([{"role": "user", "content": "hi"}], model=client.model,
+                 schema=None, max_tokens=100, purpose="decide")
+    assert headers[0] == {"x-session-affinity": client.cache_key}
 
 
 def test_service_tier_extra_body(monkeypatch):
@@ -681,13 +874,17 @@ def test_the_window_is_quantised_but_can_be_turned_off():
 
 def test_the_judge_sees_far_more_of_the_run_than_a_decide_turn():
     """A verdict on "did this run collect what was asked for", reached from the
-    last ten steps, is a verdict reached from the wrong evidence."""
+    tail of it, is a verdict reached from the wrong evidence. The decide window
+    is tuned for what one turn needs next; the judge gets the whole run."""
     from adbagent import prompts
 
-    history = [f"{i}. tap #{i} -> success" for i in range(1, 60)]
+    history = [f"{i}. tap #{i} -> success" for i in range(1, 71)]
     judged = prompts.judge_user("g", history, "screen")
     decided = prompts.history_only_block(history)
-    assert judged.count("-> success") > decided.count("-> success") * 3
+    # Short enough to fit JUDGE_HISTORY_KEEP whole, long enough that a decide
+    # turn has had to drop the start of it.
+    assert judged.count("-> success") == len(history)
+    assert judged.count("-> success") > decided.count("-> success") * 2
     assert "1. tap #1 -> success" in judged
 
 
@@ -1019,49 +1216,46 @@ def test_the_system_prompt_no_longer_carries_the_situational_blocks():
 
 def test_an_ordinary_turn_gets_no_situational_advice():
     from adbagent.prompts import situational_notes
-    assert situational_notes(goal="turn on wifi") == ""
+    assert situational_notes() == ""
 
 
 def test_scrolling_advice_arrives_once_scrolling_starts():
     from adbagent.prompts import situational_notes
-    assert "SCROLLING STRATEGY" not in situational_notes(goal="turn on wifi")
-    assert "SCROLLING STRATEGY" in situational_notes(goal="turn on wifi", scrolls=1)
-
-
-def test_a_search_goal_gets_scrolling_advice_before_the_first_scroll():
-    """Waiting for the first scroll would withhold "start fast, slow down near the
-    target" from the turn that chooses the first scroll's size."""
-    from adbagent.prompts import situational_notes
-    note = situational_notes(goal="find every message about the menu",
-                             has_scroller=True)
-    assert "SCROLLING STRATEGY" in note
-
-
-def test_a_search_goal_on_an_unscrollable_screen_gets_nothing():
-    from adbagent.prompts import situational_notes
-    assert situational_notes(goal="find the wifi setting", has_scroller=False) == ""
+    assert "SCROLLING STRATEGY" not in situational_notes()
+    assert "SCROLLING STRATEGY" in situational_notes(scrolls=1)
 
 
 def test_app_switching_advice_arrives_once_the_run_crosses_apps():
     from adbagent.prompts import situational_notes
-    assert "SWITCHING APPS" not in situational_notes(goal="read my chats",
-                                                    packages_seen=1)
-    assert "SWITCHING APPS" in situational_notes(goal="read my chats",
-                                                packages_seen=2)
-
-
-def test_a_goal_that_says_it_will_switch_apps_gets_the_advice_up_front():
-    from adbagent.prompts import situational_notes
-    note = situational_notes(goal="copy the address and paste it into maps")
-    assert "SWITCHING APPS" in note
+    assert "SWITCHING APPS" not in situational_notes(packages_seen=1)
+    assert "SWITCHING APPS" in situational_notes(packages_seen=2)
 
 
 def test_the_blocks_stack_when_they_all_apply():
     from adbagent.prompts import situational_notes
-    note = situational_notes(goal="find and share every photo",
-                             scrolls=3, packages_seen=2)
+    note = situational_notes(scrolls=3, packages_seen=2)
     assert all(block in note for block in
                ("SCROLLING STRATEGY", "SWITCHING APPS"))
+
+
+def test_advice_is_gated_on_behaviour_not_on_the_goals_wording():
+    """These gates used to guess the situation from English substrings.
+
+    Every goal below was handed a page of scrolling strategy for what is a
+    one-tap task, because "install" contains "all ", "call" contains "all " and
+    "account" contains "count". The signature no longer takes a goal at all, so
+    the whole class of mismatch is gone rather than patched word by word -- and
+    a goal written in any other language now behaves the same as an English one,
+    which it could not before.
+    """
+    from adbagent.prompts import situational_notes
+    import inspect
+
+    assert "goal" not in inspect.signature(situational_notes).parameters
+    for scrolls, packages, expected in ((0, 1, ""), (1, 1, "SCROLLING"),
+                                        (0, 2, "SWITCHING")):
+        note = situational_notes(scrolls=scrolls, packages_seen=packages)
+        assert (expected in note) if expected else note == ""
 
 
 # ---------------------------------------------------------------------------

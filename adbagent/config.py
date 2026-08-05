@@ -126,6 +126,12 @@ class DeviceConfig:
     #: Adaptive settle: re-dump until two consecutive hashes match, or this budget.
     settle_budget_s: float = 2.0
     settle_interval_s: float = 0.18
+    #: How long `open_app` waits for the package to actually reach the foreground.
+    #: `app_start` returns before the window exists, and a cold start on a loaded
+    #: phone can take several seconds; observing before then reads the launch, not
+    #: the app.
+    launch_timeout_s: float = 8.0
+    launch_poll_s: float = 0.25
     #: Hard ceiling on any single device round trip. u2's own `timeout=` argument
     #: is inert -- the underlying socket defaults to 600s -- so we enforce our own.
     watchdog_s: float = 60.0
@@ -179,6 +185,32 @@ class RunConfig:
     #: its own at an edge, a hidden caption or a full ledger; this is the cap for
     #: when none of those arrive, so an endless feed cannot run away with the run.
     pager_sweep_max: int = 12
+
+    # -- the stall ladder --------------------------------------------------
+    #
+    # `consecutive_failures` counts actions that did not work, and for most of
+    # this project's life it was the only give-up signal there was. It cannot
+    # see the dominant failure: an agent whose every action succeeds and whose
+    # run goes nowhere. `runs/2521862d7a23` navigated between two screens for
+    # twenty steps with `consecutive_failures` pinned at zero.
+    #
+    # So the loop also counts steps since it last learned anything -- a screen
+    # it had not seen, a record written, content that moved, a state it changed
+    # (see `Agent._progress_made`) -- and escalates on that count. The tiers go
+    # cheap to expensive on purpose: say something, then refuse something, then
+    # spend a call rethinking, then stop.
+    #
+    # Set any of them to 0 to switch that tier off.
+
+    #: Tell the model it is stalling, take a screenshot, and think harder.
+    stall_nudge_at: int = 3
+    #: Stop asking: mechanically refuse an action already tried on this screen.
+    stall_block_at: int = 5
+    #: Spend one call on a fresh strategy, from outside the decide history.
+    stall_replan_at: int = 8
+    #: Give up. The collected data survives -- the CLI prints it, and the
+    #: checkpoint keeps it for `--resume`.
+    stall_give_up_at: int = 14
 
 
 @dataclass

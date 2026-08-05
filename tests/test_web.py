@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import threading
 import time
 from pathlib import Path
@@ -86,6 +87,7 @@ class FakeProc:
         self._returncode = None
         self.stdout = iter([])
         self._stay = stay_running
+        self.signals = []  # which one arrived matters: SIGINT restores the phone
         if on_spawn:
             on_spawn(argv)
         if not stay_running:
@@ -100,6 +102,7 @@ class FakeProc:
         return 0
 
     def send_signal(self, sig):
+        self.signals.append(sig)
         self._returncode = 130
         self._done.set()
 
@@ -175,6 +178,48 @@ def test_run_detail_merges_the_llm_stream(tmp_path):
     assert detail["summary"]["n_events"] == 4
 
 
+def test_run_detail_folds_the_stream_into_one_record_per_run(tmp_path):
+    """A saved run is not watched token by token, and the file has one line per
+    token. Consecutive chunks of the same kind arrive joined."""
+    d = make_run_dir(tmp_path)
+    write_stream(d, [
+        {"t": 1000.5, "kind": "llm_start", "step": 1, "purpose": "decide"},
+        *[{"t": 1000.5 + i / 100, "kind": "llm_stream",
+           "stream_type": "thinking", "text": f"tok{i} "} for i in range(500)],
+        {"t": 1000.8, "kind": "llm_stream", "stream_type": "content",
+         "text": '{"action":'},
+        {"t": 1000.9, "kind": "llm_stream", "stream_type": "content",
+         "text": ' "tap"}'},
+        {"t": 1000.95, "kind": "llm_end", "step": 1, "purpose": "decide"},
+    ])
+    feed = runparse.run_detail(d)["events"]
+    chunks = [e for e in feed if e["kind"] == "llm_stream"]
+    assert len(chunks) == 2                       # one thinking, one content
+    assert chunks[0]["text"].startswith("tok0 ") and "tok499" in chunks[0]["text"]
+    assert chunks[1]["text"] == '{"action": "tap"}'
+    # The join keeps the first chunk's timestamp, so it still sorts where the
+    # model started talking -- after the call it belongs to, before the decision.
+    assert chunks[0]["t"] == pytest.approx(1000.5)
+    assert [e["kind"] for e in feed] == [
+        "run_start", "llm_start", "llm_stream", "llm_stream", "llm_end",
+        "decide", "verify", "run_end"]
+
+
+def test_fold_stream_breaks_runs_at_call_boundaries():
+    """Two calls' worth of thinking is two records, not one: a boundary event
+    between them is what keeps the panels separate."""
+    folded = runparse.fold_stream([
+        {"kind": "llm_start"},
+        {"kind": "llm_stream", "stream_type": "thinking", "text": "a"},
+        {"kind": "llm_stream", "stream_type": "thinking", "text": "b"},
+        {"kind": "llm_end"},
+        {"kind": "llm_start"},
+        {"kind": "llm_stream", "stream_type": "thinking", "text": "c"},
+    ])
+    assert [e.get("text") for e in folded if e["kind"] == "llm_stream"] == ["ab", "c"]
+    assert len(folded) == 5
+
+
 def test_list_runs_newest_first(tmp_path):
     older = make_run_dir(tmp_path, run_id="aaa")
     newer = make_run_dir(tmp_path, run_id="bbb")
@@ -235,6 +280,62 @@ def test_config_rejects_unknown_keys(web):
     assert res.status_code == 400
     # And a bad save writes nothing.
     assert web.get("/api/config").json()["config"]["safety"]["budget_usd"] == 2.0
+
+
+# ---------------------------------------------------------------------------
+# the model catalogue behind the config dropdowns
+# ---------------------------------------------------------------------------
+
+def test_models_serves_the_catalogue_qualified_and_cached(web, monkeypatch):
+    from adbagent import llm
+
+    fetches = []
+
+    def fake_list(provider, api_key, timeout=30.0):
+        fetches.append(api_key)
+        return [llm.ModelInfo(id="kimi-k2p6", context_length=262144, tools=True),
+                llm.ModelInfo(id="qwen3-vl-235b", vision=True, tools=True)]
+
+    monkeypatch.setattr(llm, "list_models", fake_list)
+    monkeypatch.setenv("FIREWORKS_API_KEY", "sk-test")
+
+    d = web.get("/api/models").json()
+    assert d["error"] == ""
+    assert d["provider"] == "fireworks"
+    # The value a dropdown saves is the one the wire wants, not the short id.
+    assert [m["value"] for m in d["models"]] == [
+        "accounts/fireworks/models/kimi-k2p6",
+        "accounts/fireworks/models/qwen3-vl-235b"]
+    assert [m["id"] for m in d["models"]] == ["kimi-k2p6", "qwen3-vl-235b"]
+    assert [m["vision"] for m in d["models"]] == [False, True]
+
+    # Several paged HTTP calls: the config tab must not pay for them twice.
+    assert web.get("/api/models").json()["cached"] is True
+    assert len(fetches) == 1
+    assert web.get("/api/models?refresh=1").json()["cached"] is False
+    assert len(fetches) == 2
+
+
+def test_models_reports_trouble_instead_of_failing(web, monkeypatch):
+    from adbagent import llm
+
+    # No key: the UI answers this with a text box, so it is not an error status.
+    monkeypatch.delenv("FIREWORKS_API_KEY", raising=False)
+    d = web.get("/api/models").json()
+    assert d["models"] == []
+    assert "API key" in d["error"]
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "sk-test")
+    monkeypatch.setattr(llm, "list_models", lambda *a, **kw: (_ for _ in ()).throw(
+        llm.LLMError("catalogue rejected the API key (401)")))
+    d = web.get("/api/models").json()
+    assert d["models"] == []
+    assert "401" in d["error"]
+
+    web.put("/api/config", json={"sections": {"llm": {"provider": "nope"}}})
+    d = web.get("/api/models").json()
+    assert "unknown provider" in d["error"]
+    assert "fireworks" in d["error"]  # and what it could have been
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +627,90 @@ def test_generate_skill_job(web, monkeypatch):
     assert "skills" in job["argv"] and "generate" in job["argv"]
     assert "whatsapp" in job["argv"]
     assert web.get("/api/jobs/9999").status_code == 404
+
+
+def test_generation_streams_its_tour_like_a_run(web, tmp_path, monkeypatch):
+    """A tour writes the same files a run does, so it is watched the same way:
+    the events, the thinking stream and the frame each call was shown."""
+    runs = tmp_path / "runs"
+
+    def fake_popen(argv, **kwargs):
+        def on_spawn(_argv):
+            d = make_run_dir(runs, run_id="tour1")
+            write_stream(d, [
+                {"t": 1000.5, "kind": "llm_start", "step": 1, "purpose": "decide",
+                 "model": "m", "shot": "step_001_decide_00c0ffee.jpg"},
+                {"t": 1000.6, "kind": "llm_stream", "stream_type": "thinking",
+                 "text": "the composer is at the bottom"},
+            ])
+        return FakeProc(argv, on_spawn=on_spawn, **kwargs)
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", fake_popen)
+    job = web.post("/api/skills/generate", json={"name": "whatsapp"}).json()["job"]
+
+    body = web.get(f"/api/jobs/{job}/stream").text
+    assert '"run_id": "tour1"' in body       # which run the frames come from
+    assert "event: event" in body            # the steps it took
+    assert "event: llm" in body              # and what it was thinking
+    assert "the composer is at the bottom" in body
+    assert "step_001_decide_00c0ffee.jpg" in body
+    assert "event: end" in body
+
+    assert web.get("/api/jobs/9999/stream").status_code == 404
+
+
+def test_a_tour_that_never_reached_the_phone_ends_the_stream(web, monkeypatch):
+    """A generation refused before it opened anything -- no key, no such app --
+    writes no run at all. The stream says so rather than waiting a minute for a
+    directory that is never coming."""
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: FakeProc(argv, **kw))
+    job = web.post("/api/skills/generate", json={"name": "nope"}).json()["job"]
+    body = web.get(f"/api/jobs/{job}/stream").text
+    assert "event: end" in body
+    assert "never appeared" in body or "no active run" in body
+
+
+def test_a_generation_can_be_stopped(web, monkeypatch):
+    """It holds the phone, and the guard above means a tour nobody can stop
+    would block every run after it."""
+    spawned = []
+
+    def fake_popen(argv, **kwargs):
+        proc = FakeProc(argv, stay_running=True, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", fake_popen)
+    job = web.post("/api/skills/generate", json={"name": "whatsapp"}).json()["job"]
+
+    assert web.post(f"/api/jobs/{job}/stop").status_code == 200
+    assert spawned[0].poll() is not None
+    # SIGINT, not a kill: the CLI catches it and puts the phone back as it was.
+    assert spawned[0].signals == [signal.SIGINT]
+    # And with the phone released, a run can start.
+    assert web.post(f"/api/jobs/{job}/stop").status_code == 409
+    assert web.post("/api/jobs/9999/stop").status_code == 404
+    assert web.post("/api/runs", json={"goal": "turn on wifi"}).status_code == 200
+    web.post("/api/runs/stop")
+
+
+def test_one_phone_one_agent(web, monkeypatch):
+    """A tour and a goal run drive the phone the same way, so they cannot
+    overlap: each would read the other's taps as its own."""
+    monkeypatch.setattr(
+        "adbagent.web.runner.subprocess.Popen",
+        lambda argv, **kw: FakeProc(argv, stay_running=True, **kw))
+
+    job = web.post("/api/skills/generate", json={"name": "whatsapp"})
+    assert job.status_code == 200
+    res = web.post("/api/runs", json={"goal": "turn on wifi"})
+    assert res.status_code == 409
+    assert "generated" in res.json()["detail"]
+    # And the other way about, once the generation has the phone released.
+    assert web.get("/api/status").json()["job"]["id"] == job.json()["job"]
+    assert web.post("/api/skills/generate",
+                    json={"name": "again"}).status_code == 409
 
 
 # ---------------------------------------------------------------------------

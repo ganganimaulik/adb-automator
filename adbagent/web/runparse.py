@@ -130,14 +130,42 @@ def summarise(path: Path) -> Dict[str, Any]:
     return summary
 
 
+def fold_stream(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Join each run of consecutive `llm_stream` chunks into one record.
+
+    The file has one line per chunk because that is how the model talks: a
+    measured 46-call run left 56,902 of them carrying 206 KB of text, in a 6 MB
+    file. Replaying a finished run has no use for that granularity -- nobody
+    watches a saved run arrive token by token -- and shipping it to the browser
+    costs more than the text does by an order of magnitude.
+
+    A run is broken by anything else: the start or end of a call, or the model
+    switching between thinking and answering. The first chunk's timestamp is
+    kept, so the joined record still sorts where the stream began.
+    """
+    folded: List[Dict[str, Any]] = []
+    for record in records:
+        if record.get("kind") != "llm_stream":
+            folded.append(record)
+            continue
+        last = folded[-1] if folded else None
+        if (last is not None and last.get("kind") == "llm_stream"
+                and last.get("stream_type") == record.get("stream_type")):
+            last["text"] = (last.get("text") or "") + (record.get("text") or "")
+        else:
+            folded.append(dict(record))
+    return folded
+
+
 def run_detail(path: Path) -> Dict[str, Any]:
     """Everything the history detail view renders: summary, cost-of-thinking
     stats (mirroring `adbagent report`), scratchpad, and the events.
 
-    The feed itself is the decision events merged with the raw LLM stream,
-    so a finished run shows the same per-call thinking panels the live view
-    did -- all of them collapsed. Stats keep reading the decision events
-    alone: stream lines carry no cost block and would only dilute them.
+    The feed itself is the decision events merged with the raw LLM stream --
+    folded, see `fold_stream` -- so a finished run shows the same per-call
+    thinking panels the live view did, all of them collapsed. Stats keep
+    reading the decision events alone: stream lines carry no cost block and
+    would only dilute them.
     """
     events = read_events(path)
     summary = summarise(path)
@@ -162,7 +190,7 @@ def run_detail(path: Path) -> Dict[str, Any]:
         "llm_calls": int(totals["n_calls"]),
         "usd": round(totals["usd"], 6),
     }
-    feed = sorted(events + read_events(path, STREAM_NAME),
+    feed = sorted(events + fold_stream(read_events(path, STREAM_NAME)),
                   key=lambda e: e.get("t", 0.0))
     return {"summary": summary, "stats": stats,
             "scratchpad": _scratchpad_text(events), "events": feed}

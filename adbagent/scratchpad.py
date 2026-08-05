@@ -262,7 +262,7 @@ class NoteLedger:
     def _lines(self, max_chars: int = 0) -> Tuple[List[str], int]:
         """The rendered records that fit, and how many did not.
 
-        Trimmed from the front when a budget is set, matching `pager.ItemLedger`:
+        Trimmed from the front when a budget is set:
         the oldest records are the ones most likely already acted on. What was
         trimmed is returned rather than swallowed -- a ledger that quietly shrank
         reads exactly like a complete one.
