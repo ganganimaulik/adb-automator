@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "adbagent-ui",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "adbagent", "ui", "--port", "8765"],
+      "port": 8765
+    }
+  ]
+}

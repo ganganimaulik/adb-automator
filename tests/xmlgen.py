@@ -444,3 +444,121 @@ def video_feed(author: str = "lzlift", liked: bool = False) -> str:
              children=[content])
     return dump(N("android.widget.FrameLayout", (0, 0, W, H), rid="content",
                   package=IG, children=[status_bar(), tabs, nav_bar()]))
+
+
+# ---------------------------------------------------------------------------
+# A direct-message thread: header with the correspondent's name, a scrolling
+# list of bubbles, a composer and a Send control.
+# ---------------------------------------------------------------------------
+
+def chat_header(title: str = "khushi", title_rid: str = "thread_title") -> N:
+    """Back arrow, avatar, name, call buttons -- the usual chat top bar."""
+    return N("android.widget.LinearLayout", (0, 80, W, 300), rid="thread_toolbar",
+             package=IG, children=[
+                 N("android.widget.ImageButton", (16, 130, 136, 250),
+                   desc="Back", rid="back", package=IG,
+                   clickable=True, focusable=True),
+                 N("android.widget.ImageView", (150, 130, 270, 250),
+                   desc="Profile picture", rid="avatar", package=IG),
+                 N("android.widget.TextView", (290, 150, 700, 230), text=title,
+                   rid=title_rid, package=IG),
+                 N("android.widget.ImageButton", (820, 130, 940, 250),
+                   desc="Audio call", rid="call", package=IG, clickable=True),
+                 N("android.widget.ImageButton", (950, 130, 1070, 250),
+                   desc="Video call", rid="video_call", package=IG, clickable=True),
+             ])
+
+
+def chat_thread(title: str = "khushi",
+                messages: Optional[List[str]] = None,
+                draft: str = "",
+                stamp: str = "2m",
+                composer_focused: bool = False,
+                title_rid: str = "thread_title",
+                with_send: bool = True,
+                with_header: bool = True) -> str:
+    """One open conversation.
+
+    `stamp` is a relative timestamp rendered beside the last bubble -- the thing
+    that moves on its own and must not read as a new message.
+    """
+    texts = messages if messages is not None else ["hey", "you around?"]
+    bubbles: List[N] = []
+    top = 320
+    for i, msg in enumerate(texts):
+        # Incoming on the left, outgoing on the right -- the extractor must not
+        # need to tell them apart, and alternating here proves it does not.
+        left = 40 if i % 2 == 0 else 500
+        bubbles.append(N("android.widget.TextView",
+                         (left, top, left + 520, top + 120), text=msg,
+                         rid="message_text", package=IG))
+        top += 140
+    if stamp:
+        bubbles.append(N("android.widget.TextView", (40, top, 300, top + 60),
+                         text=stamp, rid="timestamp", package=IG))
+
+    kids: List[N] = [status_bar()]
+    if with_header:
+        kids.append(chat_header(title, title_rid))
+    kids.append(N("androidx.recyclerview.widget.RecyclerView",
+                  (0, 300, W, 1900), rid="message_list", package=IG,
+                  scrollable=True, children=bubbles))
+
+    composer: List[N] = [
+        N("android.widget.EditText", (40, 1960, 860, 2080), text=draft,
+          hint="Message...", rid="composer", package=IG,
+          clickable=True, focusable=True, focused=composer_focused),
+    ]
+    if with_send:
+        composer.append(N("android.widget.Button", (880, 1960, 1040, 2080),
+                          text="Send", rid="send_button", package=IG,
+                          clickable=True, focusable=True))
+    kids.append(N("android.widget.LinearLayout", (0, 1940, W, 2100),
+                  rid="composer_row", package=IG, children=composer))
+
+    return dump(N("android.widget.FrameLayout", (0, 0, W, H), rid="content",
+                  package=IG, children=kids))
+
+
+def chat_thread_nested(title: str = "khushi",
+                       messages: Optional[List[str]] = None,
+                       stamp: str = "2m") -> str:
+    """A thread wrapped in a full-screen outer pager, as Instagram draws it.
+
+    Observed live: on `com.instagram.android` the largest scrollable is
+    `swipeable_tab_view_pager`, which spans the whole window and contains the
+    thread header as well as the message list. A "largest scroller is the message
+    list" heuristic reads the header as part of the conversation here and finds no
+    title above it, so every send would be refused.
+    """
+    texts = messages if messages is not None else ["hey", "you around?"]
+    bubbles: List[N] = []
+    top = 320
+    for i, msg in enumerate(texts):
+        left = 40 if i % 2 == 0 else 500
+        bubbles.append(N("android.widget.TextView",
+                         (left, top, left + 520, top + 120), text=msg,
+                         rid="message_text", package=IG))
+        top += 140
+    if stamp:
+        bubbles.append(N("android.widget.TextView", (40, top, 300, top + 60),
+                         text=stamp, rid="timestamp", package=IG))
+
+    inner = N("androidx.recyclerview.widget.RecyclerView", (0, 300, W, 1900),
+              rid="message_list", package=IG, scrollable=True, children=bubbles)
+    composer = N("android.widget.LinearLayout", (0, 1940, W, 2100),
+                 rid="composer_row", package=IG, children=[
+                     N("android.widget.EditText", (40, 1960, 860, 2080),
+                       hint="Message...", rid="composer", package=IG,
+                       clickable=True, focusable=True),
+                     N("android.widget.Button", (880, 1960, 1040, 2080),
+                       text="Send", rid="send_button", package=IG,
+                       clickable=True, focusable=True),
+                 ])
+    # The outer pager is taller and larger than the message list, and holds the
+    # header inside it.
+    pager = N("androidx.viewpager.widget.ViewPager", (0, 0, W, H),
+              rid="swipeable_tab_view_pager", package=IG, scrollable=True,
+              children=[chat_header(title), inner, composer])
+    return dump(N("android.widget.FrameLayout", (0, 0, W, H), rid="content",
+                  package=IG, children=[status_bar(), pager]))

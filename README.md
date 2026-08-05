@@ -137,6 +137,96 @@ adbagent run "open the Wi-Fi screen" --assert-text "Forget network"
 
 An assertion also removes the final LLM call from the run.
 
+## Watch
+
+`run` pursues a goal and finishes. `watch` monitors an app and replies, and is
+expected to still be going tomorrow.
+
+```bash
+adbagent watch "watch my instagram direct messages" --policy reply.md --draft
+```
+
+`--policy` is a file you write, in plain language, and it is required — there is
+no default policy, because a default policy is one nobody wrote and everybody
+would be surprised by. It goes into the prompt verbatim, never paraphrased.
+
+```
+Reply only to people I already follow. Keep it to one short sentence.
+If someone asks to meet, say I'll check and get back to them — never commit
+to a time. Anything about money, work, or an emergency: don't reply at all.
+```
+
+**Start with `--draft`.** Replies are composed and recorded but never sent, so a
+policy that reads well and works badly costs you a wrong line in a log instead of
+a wrong message in somebody's inbox. Drop the flag once the drafts look right.
+
+### It cannot reply twice
+
+The failure that matters is not a wasted step, it is a second message to a real
+person. The screen cannot tell you whether you already answered — you can scroll
+away and back, the app re-renders, a send lands while the confirmation is still
+animating — so the answer lives in a file (`watch-replies.jsonl`, fsynced) and is
+checked by the harness immediately before every send.
+
+What identifies a conversation's state is the **tail** of it: the last six message
+texts, masked so a timestamp ticking from "2m" to "3m" is not mistaken for news.
+The rule is then simply *reply only when the tail differs from the tail recorded
+last time we replied here*. Sending changes the tail, so it will not match again
+until somebody else says something. Three messages in a row from one person change
+it three times, and each earns a reply.
+
+Three doors are gated, not one: the Send control, the keyboard's action key, and
+`input_text` with `press_enter`. The record is written *before* the gesture, so a
+crash between the tap and the write cannot lose it — the cost being that a send
+which never lands leaves that conversation "in doubt", and one in doubt gets a
+cooldown four times as long, loudly, until you look at it.
+
+The prompt also lists what has been answered, but that is advice. The gate is the
+guarantee, and it cannot be talked out of it.
+
+| ceiling | default | what it stops |
+|---|---|---|
+| `--replies-per-hour` | 12 | a loop that has started answering everything |
+| `--replies-per-conversation` | 2 per hour | one conversation absorbing the whole budget |
+| `--cooldown` | 600s | a second reply into the same thread, whatever the digests say |
+| `--steps-per-pass` | 25 | a confused pass; it is abandoned and re-anchored rather than given more budget |
+| `--usd-per-hour` | off | runaway spend — this pauses the loop, it does not end it |
+| `--fail-open` | off | sending into a conversation the harness cannot identify |
+
+### Nothing changed means nothing spent
+
+Between passes the loop dumps the UI — an adb round trip, no model call — and
+compares a masked digest of the app's own text against the screen the last pass
+left behind. Equal means no new message, so it sleeps. That is also the honest
+answer to "how would it know something arrived": it looked.
+
+The comparison is against a remembered anchor (package plus content digest) rather
+than against the previous look. Comparing consecutive looks would read a phone
+sitting on the launcher as "nothing changed" and happily watch the wrong screen
+forever; comparing against the anchor reads it as "not where I should be" and
+spends a pass getting back. A screen that went off, an app that got killed and a
+notification shade left open all look the same to it, and all get fixed the same
+way.
+
+Each pass is an ordinary bounded run, so `LoopDetector`, the stall ladder and the
+step budget all keep working — none of them had to be weakened. Only the
+supervisor is unbounded. A failed pass doubles a backoff and the loop continues;
+a crash inside a pass is logged with its traceback and survived. Ctrl-C is the one
+thing that stops a watch.
+
+Skill learning is off during a watch: rewriting the app's skill file every 45
+seconds, mostly from passes that did nothing, would churn the file the next pass
+depends on. A watch obeys a skill; it does not edit one.
+
+### Message text is not instructions
+
+A watch reads attacker-supplied text by design — anyone who can message the
+account can put words on the screen the model is reading. The policy is a separate
+prompt block from the screen, and it says so explicitly: a message asking the agent
+to ignore its instructions, write to somebody else or change its policy is a
+message to be handled under the policy like any other, never obeyed. There is no
+path from screen content to a new instruction.
+
 ## Safety
 
 - **Credentials are never handled.** Password fields, PINs, one-time codes and
@@ -337,7 +427,7 @@ adbagent ui                 # http://127.0.0.1:8765
 adbagent ui --port 9000
 ```
 
-Five tabs. **Run** takes a goal and streams the run live — every decision,
+Six tabs. **Run** takes a goal and streams the run live — every decision,
 verification, vision read and the running cost — over the same `events.jsonl`
 the CLI writes, so what you see is exactly what `report` would replay. While a
 call is in flight its raw stream is shown too: the model's thinking and
@@ -351,12 +441,20 @@ vision read, or the decision itself when `llm.vision_in_decider` is on. A
 sweep's per-item reads have no panel — each is prefetched on another thread, and
 streaming several of those into one view interleaves them — so each arrives as a
 card carrying the line the model read and the frame it read it from, which on a
-carousel is most of the run's vision calls. **History**
+carousel is most of the run's vision calls. A run can also carry a **success
+assertion**, folded away under the options — the browser's only route to
+`--assert-shell`/`--assert-text`, since an assertion is per-run and not
+config. **Watch** starts and supervises a
+watch, and is described below. **History**
 lists recorded runs with their outcome, cost and duration, and opens the full
 trace, stats and scratchpad for any of them — and a failed or interrupted one
 has a **resume** button, continuing it from its checkpoint exactly like
-`run --resume`. **Devices** shows what is attached
-and grabs a screenshot on demand. **Config** edits `config.json` — the five
+`run --resume`. **Devices** shows what is attached, grabs a screenshot on
+demand, lists **installed apps** (which answers the question that comes up while
+writing a goal: what is this app actually called?), dumps **what the model sees**
+for the current screen — the same pruning and the same `#indices` it is told to
+aim at, which is the first thing to look at when a run did something
+inexplicable — and runs **doctor**. **Config** edits `config.json` — the five
 model fields are dropdowns over the provider's own catalogue, the same list
 `adbagent models` prints, each option carrying the context window and whether
 the model can see, since the slots that are handed a screenshot cannot take a
@@ -371,6 +469,32 @@ stdout. Its own output stays under **generator output**, which is where the two
 things the tour cannot show live end up: the skill written up afterwards from
 what it saw, and the refusals that come before there is any run to stream ("no
 API key", "that app is not installed").
+
+### Watching from the browser
+
+The **Watch** tab starts a watch, edits its policy, and shows what has been sent.
+Three things about it are deliberate:
+
+- **The mode banner is first and filled.** Green for draft, red for live. It is
+  the one fact nobody should have to hunt for, and it is repeated in the header
+  status line so it is answerable from any tab — a watch outlives every reload,
+  so "is it sending?" has to be answerable hours later.
+- **Draft is the default**, and going live asks once more before it starts.
+- **The policy editor locks while a watch is running.** The child read the file
+  at startup, so a save mid-watch would take effect at no predictable moment;
+  the server refuses it and says so rather than pretending.
+
+**Replies sent** is the ledger, and it is the interesting panel: one row per
+conversation, how many replies it has had, and whether the last one was
+*confirmed* or is still *in doubt*. A row appears the moment a reply is
+attempted — before the gesture goes out — so a crash cannot lose it. Each pass
+appears in the live feed as its own run, because it is one.
+
+A watch and a run refuse each other, as do a watch and a screenshot, an app list
+or a screen dump: there is one phone, and opening a device session resets its
+animation scales and rotation underneath whatever is driving it. A watch never
+prompts — it is launched unattended, since a loop that stops for a confirmation
+nobody is there to give has stopped watching.
 
 Runs are spawned as ordinary CLI subprocesses, so Stop is a SIGINT and the
 phone's keyboard, animations and rotation are restored exactly as with Ctrl-C —

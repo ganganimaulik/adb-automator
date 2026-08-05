@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -23,7 +24,7 @@ from ..config import Config, _set_path, find_config_file, load_config
 from ..runlog import SHOT_RE, STREAM_NAME
 from ..skills import Skill, SkillRegistry
 from . import runparse
-from .runner import ChildProcess, JobManager, RunManager, sse
+from .runner import ChildProcess, JobManager, RunManager, WatchManager, sse
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -40,9 +41,35 @@ class RunRequest(BaseModel):
     allow_destructive: bool = False
     no_learn: bool = False
     serial: str = ""
+    #: A machine-checkable definition of done. Free, instant, and it cannot be
+    #: argued with -- and it removes the completion-judge call from the run.
+    assert_shell: str = ""
+    assert_equals: str = ""
+    assert_text: str = ""
     #: A run id to continue from its checkpoint. When set, `goal` is ignored
     #: -- the checkpoint's own goal is the one being pursued.
     resume: str = ""
+
+
+class WatchRequest(BaseModel):
+    goal: str = ""
+    #: Path to the reply policy. Required -- there is no default policy, for the
+    #: same reason the CLI has none.
+    policy: str = ""
+    draft: bool = False
+    interval_s: Optional[float] = None
+    max_steps: Optional[int] = None
+    replies_per_hour: Optional[int] = None
+    replies_per_conversation: Optional[int] = None
+    cooldown_s: Optional[float] = None
+    usd_per_hour: Optional[float] = None
+    ledger: str = ""
+    serial: str = ""
+
+
+class PolicyUpdate(BaseModel):
+    path: str = ""
+    text: str = ""
 
 
 class ConfigUpdate(BaseModel):
@@ -70,7 +97,9 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
     runs_dir = Path(artifacts_dir)
     manager = RunManager(runs_dir, config_path=config_path)
     # The same artifacts directory: a `skills generate` tour writes a run there
-    # like any other, and the browser tails it through the same live view.
+    # like any other, and the browser tails it through the same live view. A
+    # watch writes one such directory per pass, and is tailed the same way.
+    watcher = WatchManager(runs_dir, config_path=config_path)
     jobs = JobManager(runs_dir)
 
     def phone_busy() -> str:
@@ -82,6 +111,11 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         """
         if manager.state()["running"]:
             return "a run is already in progress"
+        if watcher.state()["running"]:
+            # Said with the remedy in it: a watch does not end on its own, so
+            # "busy, try later" would be advice to wait forever.
+            return ("a watch is running; stop it from the Watch tab before "
+                    "driving the phone by hand")
         job = jobs.active()
         if job is not None:
             return f"a skill is being generated (job {job.id}); the phone is busy"
@@ -122,6 +156,9 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             "device_serial": cfg.device.serial,
             "artifacts_dir": str(runs_dir),
             "run": manager.state(),
+            # Reported alongside the run for the same reason a tour is: a page
+            # reloaded hours later has to know there is a watch to reattach to.
+            "watch": watcher.state(),
             "job": None if job is None else {
                 "id": job.id,
                 "running": True,
@@ -148,9 +185,13 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
 
     @app.get("/api/devices/screenshot")
     def screenshot(serial: str = "") -> Response:
-        if manager.state()["running"]:
-            raise HTTPException(status_code=409,
-                                detail="screenshots are paused while a run is active")
+        # `phone_busy` rather than the run alone: opening a `Device` session
+        # zeroes the animation scales and forces portrait on entry and restores
+        # them on exit, so doing it under a running agent -- a run, a watch or a
+        # tour -- changes the phone beneath it.
+        busy = phone_busy()
+        if busy:
+            raise HTTPException(status_code=409, detail=busy)
         from ..device import Device
         try:
             with Device(load_cfg(), serial) as dev:
@@ -158,6 +199,78 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=str(exc))
         return Response(content=jpeg, media_type="image/jpeg")
+
+    @app.get("/api/apps")
+    def apps(search: str = "", third_party: bool = False,
+             serial: str = "") -> Dict[str, Any]:
+        """Installed packages -- `adbagent apps`, as data.
+
+        Worth having in the browser because it answers the question that comes up
+        while writing a goal: what is this app actually called? A goal that names
+        an app the phone does not have fails on step one.
+        """
+        busy = phone_busy()
+        if busy:
+            raise HTTPException(status_code=409, detail=busy)
+        from ..device import Device
+        try:
+            with Device(load_cfg(), serial) as dev:
+                pkgs = dev.list_apps(query=search, third_party_only=third_party)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=str(exc))
+        return {"apps": pkgs, "count": len(pkgs), "search": search,
+                "third_party": third_party}
+
+    @app.get("/api/dump")
+    def dump(serial: str = "", raw: bool = False) -> Dict[str, Any]:
+        """Exactly what the model would be shown for the current screen.
+
+        The single most useful thing for working out why a run did something
+        strange: the tree the model saw, with the same pruning and the same
+        indices it was told to aim at.
+        """
+        busy = phone_busy()
+        if busy:
+            raise HTTPException(status_code=409, detail=busy)
+        from ..device import Device
+        from ..screen import render
+        try:
+            with Device(load_cfg(), serial) as dev:
+                screen = dev.observe(settle=True)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=str(exc))
+        return {
+            "package": screen.package,
+            "activity": screen.activity,
+            "width": screen.width,
+            "height": screen.height,
+            "skeleton_id": screen.skeleton_id,
+            "elements": len(screen.elements),
+            "nodes": len(screen.nodes),
+            "keyboard_open": screen.keyboard_open,
+            "rendered": render(screen),
+            "xml": screen.xml if raw else "",
+        }
+
+    @app.get("/api/doctor")
+    def doctor() -> Dict[str, Any]:
+        """`adbagent doctor`, run as itself.
+
+        Shelled out rather than reimplemented: the checks drift the moment there
+        are two copies, and this is the one endpoint whose whole value is being
+        the same answer the CLI gives. `Out` prints plain when it is not a
+        terminal, so the text arrives without escape codes.
+        """
+        argv = [sys.executable, "-m", "adbagent", "doctor"]
+        if config_path:
+            argv += ["-c", config_path]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True,
+                                  timeout=120, errors="replace")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        return {"text": (proc.stdout or "") + (proc.stderr or ""),
+                "ok": proc.returncode == 0, "returncode": proc.returncode}
 
     # -- config ----------------------------------------------------------
 
@@ -300,6 +413,9 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
                                  dry_run=req.dry_run,
                                  allow_destructive=req.allow_destructive,
                                  no_learn=req.no_learn, serial=req.serial,
+                                 assert_shell=req.assert_shell,
+                                 assert_equals=req.assert_equals,
+                                 assert_text=req.assert_text,
                                  resume=req.resume)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
@@ -346,6 +462,136 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             return {"text": ""}
         data = log_file.read_bytes()[-max(0, tail):]
         return {"text": data.decode("utf-8", errors="replace")}
+
+    # -- watch -----------------------------------------------------------
+
+    def _policy_path(explicit: str = "") -> str:
+        """The policy file, or "" when none is set anywhere.
+
+        Returns a string rather than a Path on purpose: `Path("")` is
+        `PosixPath('.')`, whose string is "." -- truthy, so a "no policy set"
+        guard written against the Path silently passes and the write lands on a
+        directory.
+        """
+        raw = (explicit or load_cfg().watch.policy or "").strip()
+        return str(Path(raw).expanduser()) if raw else ""
+
+    # Declared before any /api/watch/{...} route so the literal paths win, the
+    # same ordering /api/runs/stream needs.
+    @app.get("/api/watch/stream")
+    def watch_stream() -> StreamingResponse:
+        return StreamingResponse(_event_stream(watcher),
+                                 media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache"})
+
+    @app.get("/api/watch")
+    def watch_state() -> Dict[str, Any]:
+        cfg = load_cfg()
+        return {"active": watcher.state(),
+                "defaults": dataclasses.asdict(cfg.watch),
+                "policy_path": _policy_path(),
+                "ledger_path": str(Path(cfg.watch.ledger).expanduser())}
+
+    @app.get("/api/watch/policy")
+    def get_policy(path: str = "") -> Dict[str, Any]:
+        """The reply instructions, for the editor.
+
+        A missing file is not an error here -- it is the normal state before one
+        has been written -- so it comes back as empty text with `exists: false`
+        rather than a 404 the editor would have to special-case.
+        """
+        found = _policy_path(path)
+        if not found:
+            return {"path": "", "text": "", "exists": False}
+        p = Path(found)
+        if not p.is_file():
+            return {"path": found, "text": "", "exists": False}
+        return {"path": found, "text": p.read_text(encoding="utf-8"),
+                "exists": True}
+
+    @app.put("/api/watch/policy")
+    def put_policy(update: PolicyUpdate) -> Dict[str, Any]:
+        found = _policy_path(update.path)
+        if not found:
+            raise HTTPException(status_code=400,
+                                detail="no policy path given, and none in config")
+        p = Path(found)
+        if watcher.state()["running"]:
+            # The child read the file once at startup, so a save now would take
+            # effect at no predictable moment. Refusing says which it is.
+            raise HTTPException(
+                status_code=409,
+                detail="stop the watch before editing its policy -- a running "
+                       "watch has already read the file")
+        if not update.text.strip():
+            raise HTTPException(status_code=400,
+                                detail="an empty policy would let the model "
+                                       "decide for itself what to say")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(update.text, encoding="utf-8")
+        return {"saved": True, "path": found}
+
+    @app.get("/api/watch/ledger")
+    def get_ledger(limit: int = 100) -> Dict[str, Any]:
+        """What has actually been sent, newest first.
+
+        The watch's most important artifact by a distance: it is the only place
+        that answers "what did it say to whom", and it is the record the
+        never-double-reply guarantee is built on.
+        """
+        from ..ledger import ReplyLedger
+        cfg = load_cfg()
+        path = Path(cfg.watch.ledger).expanduser()
+        led = ReplyLedger(path)
+        return {
+            "path": str(path),
+            "exists": path.is_file(),
+            "total": len(led),
+            "threads": [{
+                "thread_key": st.thread_key,
+                "preview": st.preview,
+                "last_attempt_at": st.last_attempt_at,
+                "reply_count": st.reply_count,
+                "confirmed": st.confirmed,
+            } for st in led.recent(limit)],
+        }
+
+    @app.post("/api/watch")
+    def start_watch(req: WatchRequest) -> Dict[str, Any]:
+        cfg = load_cfg()
+        goal = req.goal.strip()
+        if not goal:
+            raise HTTPException(status_code=400, detail="goal is required")
+        policy = _policy_path(req.policy)
+        if not policy:
+            raise HTTPException(
+                status_code=400,
+                detail="a watch needs a policy file: the instructions that "
+                       "decide what gets replied to and what it says")
+        if not Path(policy).is_file():
+            raise HTTPException(status_code=400,
+                                detail=f"no policy file at {policy}")
+        if not cfg.llm.model:
+            raise HTTPException(status_code=400, detail="no model configured")
+        busy = phone_busy()
+        if busy:
+            raise HTTPException(status_code=409, detail=busy)
+        try:
+            return watcher.start(
+                goal, policy=policy, draft=req.draft,
+                interval_s=req.interval_s, max_steps=req.max_steps,
+                replies_per_hour=req.replies_per_hour,
+                replies_per_conversation=req.replies_per_conversation,
+                cooldown_s=req.cooldown_s, usd_per_hour=req.usd_per_hour,
+                ledger=req.ledger, serial=req.serial)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+    @app.post("/api/watch/stop")
+    def stop_watch() -> Dict[str, Any]:
+        if not watcher.stop():
+            raise HTTPException(status_code=409, detail="no watch is running")
+        return {"stopping": True}
 
     # -- skills ----------------------------------------------------------
 
