@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import threading
 import time
@@ -813,3 +814,96 @@ def test_run_manager_discovers_run_dir(tmp_path):
         assert mgr.wait_for_run_dir(timeout_s=5) == tmp_path / "newrun"
     finally:
         runner_mod.subprocess.Popen = real_popen
+
+
+# ---------------------------------------------------------------------------
+# the settings form against the schema it edits
+# ---------------------------------------------------------------------------
+#
+# `CFG_SPEC` in app.js is a hand-written list, and nothing tied it to the
+# dataclasses in `config.py`. So it drifted silently in both directions: a
+# setting added to `RunConfig` never appeared on the form, and a setting renamed
+# there would have left a field that saves a key the server rejects with a 400.
+# The stall ladder is what made that visible -- a run started from the UI obeyed
+# four settings the UI could not show.
+
+APP_JS = Path(__file__).resolve().parent.parent / "adbagent" / "web" / "static" / "app.js"
+
+#: Fields the form deliberately leaves out. Each needs a reason, so that
+#: "not on the form" stays a decision rather than an oversight.
+CFG_SPEC_OMISSIONS = {
+    # Dump and connection mechanics. Wrong here breaks every run, and none of
+    # it is tuned by eye.
+    "device.max_depth", "device.compressed", "device.launch_timeout_s",
+    "device.watchdog_s", "device.settle_interval_s", "device.launch_poll_s",
+    # Transport tuning, not run behaviour.
+    "llm.max_retries", "llm.temperature", "llm.read_timeout",
+    # A ceiling on prompt rendering; nothing a user tunes from a form.
+    "run.scratchpad_max_chars",
+}
+
+
+def cfg_spec_fields() -> dict:
+    """`{section: [key, ...]}` as the settings form declares them.
+
+    Depth-aware rather than a flat regex. The entries are nested three deep --
+    ``[section, [[key, type, opts], ...]]`` -- and a regex for `["word"` also
+    matches the option arrays, so `["reasoning_style", ["auto", ...]]` read as a
+    field called `auto` and the real key went unchecked.
+    """
+    text = APP_JS.read_text(encoding="utf-8")
+    start = text.index("const CFG_SPEC = [")
+    body = re.sub(r"//[^\n]*", "", text[start + len("const CFG_SPEC = "):])
+
+    out: dict = {}
+    section = None
+    depth = 0
+    for i, ch in enumerate(body):
+        if ch == "[":
+            depth += 1
+            opened = re.match(r'\[\s*"([^"]*)"', body[i:])
+            if not opened:
+                continue
+            if depth == 2:                      # ["llm", [ ...
+                section = opened.group(1)
+                out.setdefault(section, [])
+            elif depth == 4 and section:        # ...   ["provider", "text"],
+                out[section].append(opened.group(1))
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                break
+    assert out, "CFG_SPEC is no longer shaped the way this test parses it"
+    return out
+
+
+def test_the_settings_form_only_offers_real_config_keys():
+    """A field naming a key the dataclass does not have saves as a 400."""
+    from adbagent.config import Config
+    cfg = Config()
+    unknown = []
+    for section, keys in cfg_spec_fields().items():
+        holder = getattr(cfg, section, None)
+        assert holder is not None, f"CFG_SPEC has no such section: {section}"
+        unknown += [f"{section}.{k}" for k in keys if not hasattr(holder, k)]
+    assert not unknown, f"the settings form edits keys that do not exist: {unknown}"
+
+
+def test_every_config_key_is_on_the_settings_form_or_deliberately_not():
+    from dataclasses import fields as dc_fields
+    from adbagent.config import Config
+
+    spec = cfg_spec_fields()
+    missing = []
+    for section in dc_fields(Config):
+        holder = getattr(Config(), section.name)
+        for f in dc_fields(holder):
+            dotted = f"{section.name}.{f.name}"
+            if f.name in spec.get(section.name, []):
+                continue
+            if dotted in CFG_SPEC_OMISSIONS:
+                continue
+            missing.append(dotted)
+    assert not missing, (
+        f"these settings exist but the UI cannot show them: {missing}. Add them "
+        f"to CFG_SPEC in app.js, or to CFG_SPEC_OMISSIONS with a reason.")
