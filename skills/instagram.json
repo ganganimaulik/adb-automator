@@ -8,7 +8,7 @@
     "insta",
     "ig"
   ],
-  "description": "Instagram is a social media app for sharing photos, videos, and stories. Primary workflows include browsing the home feed, exploring content via the Explore grid, watching and interacting with Reels, searching for users, viewing profiles, following accounts, and using Direct Messages.",
+  "description": "Instagram is a social media app for sharing photos, videos, and stories. Primary workflows include browsing the home feed (posts, reels, and carousels), exploring content via the Explore grid, watching and interacting with Reels, searching for users, viewing profiles, following accounts, and using Direct Messages.",
   "workflows": [
     {
       "name": "open_explore_and_like_posts",
@@ -29,6 +29,10 @@
     {
       "name": "open_direct_messages",
       "steps": "Tap the 'Message' tab (paper plane / messenger icon) in the bottom nav to open the Direct inbox. The inbox shows Primary/Requests/General filter tabs, a search bar labeled 'Search or ask Meta AI', and a list of conversation threads."
+    },
+    {
+      "name": "browse_home_feed_posts",
+      "steps": "Open Instagram; it lands on the Home tab (MainTabActivity) with a stories tray at top ('Your story' and friends' stories) and the feed below. Scroll the feed list down to advance through posts. Each post shows the author header (profile picture, username, Follow button, 'Suggested for you' label), the media, and a UFI row with Like, Comment, Repost, Share counts and a Save icon. Video/reel posts in the feed may show a 'Watch more reels' overlay in the center; tapping the post or the overlay opens the full-screen Reels viewer. Carousel posts show a 'photo X of N' indicator. Continue scrolling to reach subsequent posts; the next post becomes partially visible at the bottom edge before it fully enters view."
     }
   ],
   "nuances": [
@@ -38,7 +42,11 @@
     "The Explore grid shows reel thumbnails with view counts overlaid; tapping any thumbnail opens the full-screen Reel viewer for that specific reel, with a Back button and 'Explore' title at top.",
     "The Reels tab opens directly into a full-screen reel viewer (not a grid). The top shows 'Reels' and 'Friends' tabs; the bottom nav remains visible.",
     "Search results may show a 'Searching…' spinner briefly before populating. Wait for the Accounts section to load before tapping a result row.",
-    "After following a user, the Follow button label changes to 'Following' and gains a dropdown arrow; tapping it again would open an unfollow menu, so do not tap it again to confirm."
+    "After following a user, the Follow button label changes to 'Following' and gains a dropdown arrow; tapping it again would open an unfollow menu, so do not tap it again to confirm.",
+    "Home feed video/reel posts frequently show a 'Watch more reels' overlay pill (with 'Watch again' text) covering the center of the media. The overlay can persist across several scrolls; tapping the post or overlay opens the full-screen Reels viewer for that reel. To keep browsing the feed instead, scroll past it without tapping the center.",
+    "Home feed scrolling is incremental: a single scroll of amount=1.0 often only nudges the feed so the next post is partially visible at the bottom edge. Expect to need multiple scrolls to move from one post to the next, and re-observe after each scroll to identify which post is now in view.",
+    "The home feed mixes content types: regular video posts, reels labeled 'Suggested Reel by ...', carousel posts with a 'photo X of N' indicator, and sponsored posts. Suggested/sponsored content from accounts the user does not follow appears inline with a 'Suggested for you' label and a Follow button in the post header.",
+    "Tapping a feed post (even near its header area) can open the full-screen Reels viewer instead of staying in the feed; if the goal is to keep browsing the feed, press Back or avoid tapping the media area and use scrolls only."
   ],
   "recommendations": [
     "Always locate interactive buttons (Like, Follow, Comment) by their resource ids (like_button, profile_header_follow_button) rather than by element index, as indices shift between screens and turns.",
@@ -46,7 +54,9 @@
     "When liking multiple reels in the Reels tab, use the pattern: like -> swipe UP on inner recycler -> like -> swipe UP. Never swipe left in the Reels tab.",
     "After typing a search query, wait one turn for results to load before attempting to tap a result row, as the list populates asynchronously.",
     "To verify a like succeeded, check that the heart icon appears red/selected in the next observation rather than re-tapping it (which would unlike).",
-    "Use the bottom navigation bar (Home, Reels, Message, Search and explore, Profile) as the primary navigation mechanism; it is present on most main screens."
+    "Use the bottom navigation bar (Home, Reels, Message, Search and explore, Profile) as the primary navigation mechanism; it is present on most main screens.",
+    "When asked to enumerate the first N home feed posts, scroll one step at a time and record each post's author, type (video/reel/carousel), and visible stats from the UFI row; do not tap the post media, as that opens the Reels viewer and leaves the feed context.",
+    "If a 'Watch more reels' overlay blocks the center of a feed post, either ignore it and keep scrolling, or tap it deliberately when the goal is to open that reel full-screen."
   ],
   "custom_prompt": ""
 }

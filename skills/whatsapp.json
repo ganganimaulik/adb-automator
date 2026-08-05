@@ -9,7 +9,7 @@
     "wa",
     "com.whatsapp"
   ],
-  "description": "App skill for WhatsApp (com.whatsapp & com.whatsapp.w4b) covering chat list inspection (unread badges, read-only counts), chat navigation, media inspection, group chat workflows, and avoiding contact sheet loops.",
+  "description": "App skill for WhatsApp (com.whatsapp & com.whatsapp.w4b) covering chat list inspection (unread badges, read-only counts), chat navigation, sending long multi-line text messages, media inspection, group chat workflows, and avoiding contact sheet and accidental voice-recording loops.",
   "workflows": [
     {
       "name": "search_and_open_chat",
@@ -17,7 +17,7 @@
     },
     {
       "name": "send_message",
-      "steps": "1. Open target chat. 2. Tap the message input box 'Message' at the bottom. 3. Type text. 4. Tap the green circular Send button (paper plane icon)."
+      "steps": "1. Open target chat. 2. Tap the message input box 'Message' at the bottom. 3. Type text. 4. Tap the green circular Send button (paper plane icon). 5. Confirm the message appears in the chat history with a timestamp and status (e.g. 'Delivered')."
     },
     {
       "name": "attach_media",
@@ -42,6 +42,14 @@
     {
       "name": "verify_photos_against_reference_message",
       "steps": "1. Open the target group chat. 2. Locate the reference message (e.g. a menu or spec) in the chat history; if it is truncated, tap 'Read more' to expand it and record its full content in `observation` before moving on. 3. Find the photo album bubble ('Photo album, N items') and tap its FIRST thumbnail to open the full-screen viewer. 4. For each photo: read the scale/reading shown, note the title bar timestamp as the photo's identity, record both in `observation`, then swipe left once on the full-screen image element. 5. Continue until a swipe left no longer changes the photo — that is the end of the album. 6. Compare each recorded reading against the reference message and report mismatches, unreadable readings, and photos where no item name is visible to match against. 7. Do NOT send any message unless the task explicitly asks for it."
+    },
+    {
+      "name": "send_long_multiline_message",
+      "steps": "1. Open the target chat. 2. Tap the 'Message' input field. 3. Use input_text with the full text including newlines; the field accepts multi-line content and the keyboard stays open. 4. After typing, the input area shows the tail of the message and the green Send button replaces the mic button. 5. Tap the green Send button ONCE and verify the message bubble appears in history with a timestamp and 'Delivered' status. 6. Do NOT tap the mic/voice area afterwards — a stray tap there starts a voice recording draft (see VOICE RECORDING TRAP nuance)."
+    },
+    {
+      "name": "discard_accidental_voice_draft",
+      "steps": "1. If the input area shows a recording UI (waveform, timer like '0:21', 'Pause'/'Resume', a red trash icon, and a green Send arrow), a voice draft is active. 2. Tap the red trash icon labeled 'Discard voice message' at the left of the input bar to delete the draft. 3. If the recording is still running, tap 'Pause' first if needed, then 'Discard voice message'. 4. Verify the input area returns to the plain 'Message' field. 5. Note: leaving the chat with the draft active makes the chat-list row show a draft voice message instead of the last sent text — discard before exiting."
     }
   ],
   "nuances": [
@@ -67,7 +75,11 @@
     "UNREAD DIVIDER: when a chat with unread messages is opened, a 'N unread messages' divider pill appears inline in the history above the first unread message; it is a marker, not a tappable control.",
     "ALBUM BUBBLE IN CHAT: a multi-photo message appears in the chat as a bubble labeled 'Photo album, N items' with per-item 'View photo, k of N' entries and per-thumbnail timestamps. Tapping a thumbnail opens the full-screen viewer at that item.",
     "SCALE/LCD READINGS IN PHOTOS: when verifying photos of digital displays (e.g. kitchen scales), the LCD can be faint or unreadable in the photo. Record it as 'unreadable — cannot verify' rather than guessing the digit, and flag it in the final report.",
-    "SCROLL-DOWN FLAKINESS: scroll 'down' fails verification intermittently in this app (3 failures vs 5 passes across recent runs). If a scroll down reports no change, retry it once or twice before concluding the list ended."
+    "SCROLL-DOWN FLAKINESS: scroll 'down' fails verification intermittently in this app (3 failures vs 5 passes across recent runs). If a scroll down reports no change, retry it once or twice before concluding the list ended.",
+    "VOICE RECORDING TRAP: the mic button at the far right of the input bar starts a voice recording on a single tap (its label reads 'Button. Double tap and hold to record, slide left to cancel...' but a plain tap also starts one). Once started, the input bar becomes a recording UI with a waveform, timer, 'Pause'/'Resume', a red 'Discard voice message' trash icon, and a green Send arrow. A stray tap after sending a text can silently start a recording; the draft persists even after leaving the chat, and the chat-list row then shows a draft voice message instead of the last sent text. Always check the input area after sending and discard any unintended draft with the red trash icon before exiting.",
+    "SEND BUTTON SWAP: with an empty input field the right-most button is the mic; once text is typed it becomes the green Send arrow. When targeting Send after typing, tap the green arrow — do not tap the position blindly after the field is cleared, or you may hit the mic and start a recording.",
+    "INPUT BAR CONTROLS: the conversation input row exposes 'Emoji, GIFs and stickers', 'Message', 'Attach' (paperclip), 'Payment', 'Camera', and the mic/Send button. The 'Attach' paperclip is the correct entry for documents/gallery; 'Camera' opens the in-app camera.",
+    "OPEN_APP VERIFICATION FLAKINESS: open_app 'com.whatsapp' has failed verification 2 of 5 recent launches — the frame captured mid-launch is com.android.systemui or the launcher, not the app. Retry open_app or wait and re-check the foreground activity before concluding the launch failed."
   ],
   "recommendations": [
     "To check every photo of an album, open the first one and swipe left through the whole album in one pass, recording each photo's content in `observation` as you go. Leaving the viewer and coming back restarts you at photo 1 or 2.",
@@ -82,7 +94,10 @@
     "For read-only unread counts, combine the green badge on the 'Chats' bottom-nav tab with per-row 'N unread message' text; scroll the list to cover all rows and never open a chat, since that clears its badge.",
     "After open_app, confirm com.whatsapp is actually in the foreground before acting: the frame captured mid-launch is com.android.systemui, not the app, and a check made on it fails. Retry or wait rather than concluding the launch went to the wrong app.",
     "For photo-verification tasks (e.g. checking scale readings against a menu), first expand and record the reference message with 'Read more', then swipe through the album in one pass logging each photo's timestamp and reading in `observation`; report unreadable displays and photos lacking an identifiable item as issues instead of guessing.",
-    "If a scroll down reports no change, retry the same scroll once or twice before treating the position as the end of the list — scroll-down verification is intermittently flaky in this app."
+    "If a scroll down reports no change, retry the same scroll once or twice before treating the position as the end of the list — scroll-down verification is intermittently flaky in this app.",
+    "For long multi-line messages, pass the entire text with newlines in a single input_text call — the Message field accepts it and the keyboard remains open; then tap the green Send arrow once and confirm the bubble shows a timestamp and 'Delivered' status.",
+    "After every send, inspect the input bar before leaving the chat: if a waveform/timer or 'Discard voice message' trash icon is present, an accidental voice draft is active — tap the red trash icon to discard it, otherwise the draft persists and the chat-list row shows a voice draft instead of your sent message.",
+    "Tap Send by its green arrow icon/label, not by memorized coordinates: the right-most input button is the mic when the field is empty and Send only when text is present, so a stale coordinate tap can start a voice recording."
   ],
   "custom_prompt": ""
 }

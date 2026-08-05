@@ -323,14 +323,35 @@ def skeleton_id(screen: Screen, tokens: Optional[Sequence[str]] = None) -> str:
 
 
 def exact_id(screen: Screen) -> str:
-    """Includes all text. Used for change detection and loop detection only."""
+    """Includes all text. Used for change detection.
+
+    Reads `content_elements`, so the status bar cannot move it.
+    `check_postcondition("screen_changed")` grades an action purely on this hash
+    differing, so a status bar that drifts on its own -- a signal icon dropping
+    a bar -- graded a tap that did nothing as a success.
+
+    "All text" has to mean `label` as well as `text` and `content_desc`. A
+    tappable list row is usually a clickable ``LinearLayout`` whose text lives
+    in child ``TextView``s; `screen._absorb_labels` hoists that text onto the
+    row and `prune` then drops the children, so for the commonest list in
+    Android *none* of the visible text reached this hash. Two pages of a list
+    could differ in every row and hash identically -- which `_scroll_changed`
+    reads as "scrolling did not reveal new content", i.e. as the end of the
+    list. An agent told that stops scrolling and reports the thing it was
+    looking for as absent.
+
+    Loop detection deliberately no longer reads this. It counts repeats, and a
+    hash carrying every element's bounds differs on nearly every visit to a
+    live screen; see `safety.LoopDetector`.
+    """
     parts: List[str] = [app_key(screen), str(screen.rotation)]
-    for el in screen.elements:
+    for el in screen.content_elements:
         parts.append("|".join((
             class_eq(el.cls),
             el.resource_id,
             mask_text(el.text),
             mask_text(el.content_desc),
+            mask_text(el.label),
             "1" if el.checked else "0",
             "1" if el.selected else "0",
             "1" if el.enabled else "0",
@@ -360,7 +381,7 @@ def simhash_features(screen: Screen) -> List[Tuple[str, int]]:
     width = screen.width or 1
     height = screen.height or 1
     feats: List[Tuple[str, int]] = []
-    for el in screen.elements:
+    for el in screen.content_elements:
         if el.depth > MAX_DEPTH:
             continue
         ce = class_eq(el.cls)
@@ -516,10 +537,8 @@ def attach(screen: Screen) -> Screen:
     screen.exact_id = exact_id(screen)
     if screen.screenshot and screen.dhash is None:
         screen.dhash = compute_dhash(screen.screenshot)
-    # Item identity is a fifth level, and the only one that survives `mask_text`
-    # collapsing every gallery item onto the same hash. Imported here because
-    # `pager` needs the hashes above.
-    from .pager import attach_item
-    attach_item(screen)
+    # `pager.attach_item` used to run here, stamping a per-item identity onto the
+    # screen. Nothing stamps one now: whether two frames differ is asked of the
+    # pair, by `pager.content_moved`, not answered in advance about one of them.
     return screen
 

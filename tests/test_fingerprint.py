@@ -201,6 +201,54 @@ def test_exact_id_does_track_state():
     assert plain.exact_id != toggled.exact_id
 
 
+def _with_system_chrome(*texts: str) -> str:
+    """The base screen plus arbitrary extra text drawn by the system UI."""
+    extra = X.N("android.widget.LinearLayout", (0, 0, X.W, 80),
+                package="com.android.systemui", rid="quick_status",
+                children=[X.N("android.widget.TextView", (300 + 80 * i, 20,
+                                                          360 + 80 * i, 60),
+                              desc=t, rid=f"sys_{i}",
+                              package="com.android.systemui")
+                          for i, t in enumerate(texts)])
+    return X.settings_screen(extra_roots=[extra])
+
+
+def test_exact_id_ignores_everything_the_system_ui_draws():
+    """The rule is general, not a list of known status-bar strings.
+
+    ``mask_text`` already neutralises the clock, the battery and the badge, so
+    those three looked covered. Anything else the status bar renders was not:
+    a signal icon whose content-desc goes "Phone signal full." -> "two bars."
+    moved ``exact_id``, and two things read that hash. ``check_postcondition``
+    grades an action on it, so a tap that did nothing was graded a success; and
+    ``LoopDetector.repeats`` counts by it, so the drift reset the loop counter
+    that exists to catch exactly that. Filtering by *who drew it* covers the
+    strings nobody has thought of yet.
+    """
+    full = screen(_with_system_chrome("Phone signal full.", "Wi-Fi three bars."))
+    weak = screen(_with_system_chrome("Phone signal two bars.", "Wi-Fi off."))
+    assert full.exact_id == weak.exact_id
+    assert full.simhash == weak.simhash
+
+
+def test_exact_id_still_tracks_the_app_itself():
+    """The filter must not buy stability by going blind."""
+    assert screen(_with_system_chrome("Wi-Fi off.")).exact_id != \
+        screen(X.settings_screen(title="Sound & vibration")).exact_id
+
+
+def test_when_the_system_ui_is_the_content_nothing_is_filtered():
+    """Pull the shade down and the system UI *is* the screen under test."""
+    shade = fp.attach(parse(X.dump(X.N(
+        "android.widget.FrameLayout", (0, 0, X.W, X.H), rid="shade",
+        package="com.android.systemui", children=[
+            X.N("android.widget.TextView", (24, 200, 700, 260), text="Silent",
+                rid="header", package="com.android.systemui")])),
+        width=X.W, height=X.H))
+    assert shade.content_elements
+    assert len(shade.content_elements) == len(shade.elements)
+
+
 def test_count_capping_makes_list_length_irrelevant():
     a = screen(X.settings_screen(rows=7))
     b = screen(X.settings_screen(rows=30))

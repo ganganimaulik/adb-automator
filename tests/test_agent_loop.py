@@ -1021,3 +1021,224 @@ def test_a_dismissal_that_works_is_not_held_against_the_next_one(cfg, mem):
     Agent(dev, mem, llm, cfg).run(GOAL)
 
     assert len(dev.taps) == 2, "both nags should have been dismissed"
+
+
+# ---------------------------------------------------------------------------
+# The stall ladder
+# ---------------------------------------------------------------------------
+#
+# `consecutive_failures` counts actions that failed. The failure that actually
+# loses runs is every action succeeding while the run goes nowhere, and none of
+# the guards that existed before this could see it -- in `runs/2521862d7a23` a
+# two-cycle ran for twenty steps, every step graded `success`, until the person
+# watching pressed Ctrl-C.
+
+
+def _two_cycle_policy(dev):
+    """tap into the detail screen, press back, forever -- and it all works.
+
+    The point of the fixture is that nothing here fails. Every tap opens a
+    screen, every back returns, `verify` grades all of it `success`, and the
+    run learns nothing after step 2.
+    """
+    def policy(screen, llm):
+        if dev.state == "home":
+            el = next(e for e in screen.elements
+                      if e.best_text == "Wi-Fi" and e.interactive)
+            return AgentAction(observation="the settings list",
+                               reasoning="open Wi-Fi", action="tap",
+                               target={"index": el.index})
+        return AgentAction(observation="the Wi-Fi screen",
+                           reasoning="go back for the next one",
+                           action="press_key", key="back")
+    return policy
+
+
+def test_a_two_cycle_where_every_step_succeeds_is_stopped(cfg, mem, tmp_path):
+    """The regression test for `runs/2521862d7a23`."""
+    cfg.run.max_steps = 60
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert outcome == "failed"
+    # Well inside the budget: the old loop only stopped at `max_steps`.
+    assert state.step < 20, f"took {state.step} steps to notice"
+
+    kinds = [e["kind"] for e in _events(tmp_path, state.run_id)]
+    assert "stall_block" in kinds, "the repeat was never refused"
+    assert "stalled_out" in kinds, "the run never gave up"
+    assert llm.replans == 1, "one stall episode should buy exactly one replan"
+
+
+def test_the_stall_is_put_to_the_model_before_anything_is_refused(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    nudges = [n for n in llm.notes if "NO PROGRESS FOR" in n]
+    assert nudges, "the model was never told it had stopped getting anywhere"
+    # The first one arrives before the harness starts refusing things.
+    assert "REFUSING" not in nudges[0]
+    assert any("REFUSING" in n for n in nudges), "the refusal was never named"
+
+
+def test_the_replan_is_shown_what_has_been_tried(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert llm.replans_seen, "no replan ran"
+    tried = dict(llm.replans_seen[0])
+    assert any(sig.startswith("tap/") for sig in tried), tried
+    assert max(tried.values()) >= 2, "it was not shown the repetition"
+
+
+def test_the_agreed_strategy_is_carried_into_later_turns(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
+    llm.replan_strategy = "open Bluetooth from the list instead"
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert any("open Bluetooth from the list instead" in n for n in llm.notes)
+
+
+def test_a_replan_that_abandons_ends_the_run_there(cfg, mem, tmp_path):
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
+    llm.replan_abandon = True
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert outcome == "failed"
+    replans = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "replan"]
+    assert replans and replans[-1]["abandon"] is True
+    # It stopped on the replan rather than running on to the give-up tier.
+    assert "stalled_out" not in [e["kind"] for e in _events(tmp_path, state.run_id)]
+
+
+def test_a_run_that_keeps_learning_is_never_nudged(cfg, mem):
+    """The ladder must stay invisible to a run that is working."""
+    dev = fake.FakeDevice(cfg)
+    outcome, state, llm = run(dev, mem, cfg,
+                              fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    assert outcome == "success"
+    assert state.steps_since_progress == 0
+    assert llm.replans == 0
+    assert not any("NO PROGRESS" in n for n in llm.notes)
+
+
+def test_collecting_data_on_one_screen_is_progress(cfg, mem):
+    """A read-only goal never leaves its screen and must not read as a stall."""
+    cfg.run.max_steps = 12
+    dev = fake.FakeDevice(cfg)
+    seen = {"n": 0}
+
+    def collector(screen, llm):
+        seen["n"] += 1
+        if seen["n"] > 8:
+            return AgentAction(observation="done", reasoning="collected",
+                               action="done", text="all of it")
+        return AgentAction(observation="the settings list",
+                           reasoning="record what is on it",
+                           action="wait", duration=0.05,
+                           notes=[{"key": f"row {seen['n']}",
+                                   "value": f"value {seen['n']}"}])
+
+    llm = fake.FakeLLM(dev, collector)
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    assert outcome == "success"
+    assert llm.replans == 0
+    assert not any("NO PROGRESS" in n for n in llm.notes)
+
+
+def test_a_terminal_action_is_never_refused_by_the_stall_guard(cfg, mem, tmp_path):
+    """`done` and `fail` are the exits a stall is trying to push the agent to.
+
+    The `fail` here is issued on a turn where the harness is already refusing
+    the two-cycle's own actions, so a guard that did not exempt terminals would
+    swallow it and the run would carry on to the give-up tier instead.
+    """
+    dev = fake.FakeDevice(cfg)
+    turns = {"n": 0}
+    cycle = _two_cycle_policy(dev)
+
+    def policy(screen, llm):
+        turns["n"] += 1
+        # Late enough that turns 7 and 8 are refused first, so the `fail` on
+        # turn 9 is issued while the guard is live rather than before it.
+        if turns["n"] > 8:
+            return AgentAction(observation="stuck", reasoning="stop",
+                               action="fail", text="cannot do it")
+        return cycle(screen, llm)
+
+    llm = fake.FakeLLM(dev, policy)
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    events = _events(tmp_path, state.run_id)
+    kinds = [e["kind"] for e in events]
+    assert "stall_block" in kinds, "the fixture never reached the refusing tier"
+    gave_up = [e for e in events if e["kind"] == "gave_up"]
+    assert gave_up and gave_up[-1]["reason"] == "cannot do it"
+    assert outcome == "failed"
+    assert "stalled_out" not in kinds, "the fail was swallowed by the guard"
+
+
+def test_a_long_scroll_that_keeps_revealing_content_is_not_a_stall(cfg, mem):
+    """The main false positive to guard against.
+
+    A model searching a long feed writes no records and never leaves the
+    screen, so the two loudest progress signals are both silent. What keeps it
+    off the ladder is the third: the content moved. If that did not count, every
+    feed search would be refused at step 5.
+    """
+    cfg.run.max_steps = 20
+    dev = fake.FakeDevice(cfg)
+    row = {"n": 0}
+
+    def scroll(direction, **kw):
+        dev.actions.append(f"scroll({direction})")
+        row["n"] += 1          # each scroll really does bring new rows into view
+
+    dev.scroll = scroll                                   # type: ignore[assignment]
+    dev._xml = lambda: X.settings_screen(                 # type: ignore[assignment]
+        rows=3, labels=[f"row {row['n'] * 3 + i}" for i in range(3)])
+
+    def searcher(screen, llm):
+        if row["n"] >= 10:
+            return AgentAction(observation="found the end", reasoning="stop",
+                               action="done", text="searched the whole feed")
+        return AgentAction(observation="a long feed", reasoning="keep looking",
+                           action="scroll", direction="down")
+
+    llm = fake.FakeLLM(dev, searcher)
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert outcome == "success"
+    assert llm.replans == 0, "a working search was sent to the replan tier"
+    assert not any("NO PROGRESS" in n for n in llm.notes)
+
+
+def test_a_scroll_that_reveals_nothing_still_stalls(cfg, mem, tmp_path):
+    """The other side of it: scrolling a wall is not progress just because it
+    is a scroll. `verify` answers "probably moved" for a gesture it has no
+    image to check, and taking that at face value here would make the ladder
+    unreachable for any run whose model only ever scrolls.
+
+    `max_consecutive_failures` is lifted out of the way so the ladder is what
+    is being tested. In a default configuration that counter gets there first,
+    because a scroll against a wall grades `no_change` and so is a failure as
+    well as a non-advance -- which is fine, and faster."""
+    cfg.run.max_steps = 40
+    cfg.run.max_consecutive_failures = 99
+    dev = fake.FakeDevice(cfg)
+
+    def searcher(screen, llm):
+        return AgentAction(observation="a wall", reasoning="keep looking",
+                           action="scroll", direction="down")
+
+    llm = fake.FakeLLM(dev, searcher)
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert outcome == "failed"
+    assert state.step < cfg.run.max_steps, f"ran {state.step} steps against a wall"
+    assert "stalled_out" in [e["kind"] for e in _events(tmp_path, state.run_id)]

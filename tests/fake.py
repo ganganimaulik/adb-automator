@@ -19,7 +19,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from adbagent.actions import AgentAction
 from adbagent.config import Config
 from adbagent.fingerprint import attach
-from adbagent.llm import Call, Ledger, ScreenAnalysis, Verdict
+from adbagent.llm import Call, Ledger, ScreenAnalysis, Strategy, Verdict
 from adbagent.screen import Screen, parse
 
 from . import xmlgen as X
@@ -232,6 +232,15 @@ class FakeLLM:
         self.analyses = 0
         self.vision_reading = ""
         self.vision_label = ""
+        #: Tier 3 of the stall ladder. Counted apart from `calls` for the same
+        #: reason the sweep's reads are: a test asserting how many reasoning
+        #: turns a change costs must not have a rescue call folded into it.
+        self.replans = 0
+        #: The `tried` list each replan was shown, so a test can assert the call
+        #: was given the evidence it is supposed to reason from.
+        self.replans_seen: List[tuple] = []
+        self.replan_strategy = "use the search box instead of the grid"
+        self.replan_abandon = False
 
     @property
     def needs_vision_pass(self) -> bool:
@@ -273,6 +282,25 @@ class FakeLLM:
         self.ledger.record(Call(model=self.model, prompt_tokens=1000,
                                 completion_tokens=50, purpose="decide"))
         return self.policy(self.dev.observe(), self)
+
+    def replan(self, *, goal: str, rendered: str, tried=(), stalled: int = 0,
+               scratchpad: str = "", progress: str = "", packages=(),
+               screenshot: Optional[bytes] = None,
+               image_analysis: Optional[str] = None, **kwargs) -> Strategy:
+        """One different approach, asked for when the run has stopped moving.
+
+        Returns whatever the test set on `replan_strategy` / `replan_abandon`.
+        The default is a plausible strategy rather than an empty one, because a
+        fake that returns nothing would make every stalled test look like the
+        ladder had failed when it had merely been mocked away.
+        """
+        self.replans += 1
+        self.replans_seen.append(tuple(tried))
+        self.ledger.record(Call(model=self.model, prompt_tokens=800,
+                                completion_tokens=60, purpose="replan"))
+        return Strategy(assessment="the same control keeps being tapped",
+                        strategy=self.replan_strategy,
+                        abandon=self.replan_abandon)
 
     def judge(self, *, goal: str, rendered: str, history,
               screenshot: Optional[bytes] = None,

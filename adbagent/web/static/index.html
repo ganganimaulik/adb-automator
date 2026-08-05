@@ -115,10 +115,15 @@
   <section class="tab" id="tab-config">
     <div class="split">
       <button class="primary" id="btn-cfg-save">Save config</button>
+      <button class="ghost" id="btn-cfg-models"
+        title="Page through the provider's catalogue again — for a model released since this page loaded.">reload models</button>
       <span class="small mono" id="cfg-path"></span>
     </div>
+    <p class="small" id="cfg-models-status"></p>
     <div id="cfg-form"></div>
-    <p class="small">The API key is read from the environment only and is never written here.</p>
+    <p class="small">A key typed into <span class="mono">api_key</span> is written to the config
+      file, which is gitignored. Left blank it keeps whatever is stored, falling back to the
+      environment variable named by <span class="mono">api_key_env</span>.</p>
   </section>
 
   <!-- -------------------------------------------------------- Skills -->
@@ -146,9 +151,31 @@
           </div>
           <div class="split">
             <button class="ghost" id="btn-gen">Generate</button>
+            <button type="button" class="danger" id="btn-gen-stop" disabled>Stop</button>
             <span class="small" id="gen-status"></span>
           </div>
-          <pre class="log" id="gen-log" style="display:none"></pre>
+
+          <!-- The tour, watched as the run it is: same counters, same cards,
+               same thinking panels and submitted frames as the Run tab. -->
+          <div id="gen-live" style="display:none">
+            <div class="counters">
+              <span>run <b id="gc-runid">—</b></span>
+              <span>step <b id="gc-step">0</b></span>
+              <span>llm calls <b id="gc-calls">0</b></span>
+              <span>cost <b id="gc-cost">$0.0000</b></span>
+              <span>elapsed <b id="gc-elapsed">0s</b></span>
+              <span>status <b id="gc-state">running</b></span>
+              <span>skill <b id="gc-skill">—</b></span>
+            </div>
+            <div class="feed" id="gen-feed"></div>
+          </div>
+
+          <!-- What the tour itself cannot show: the write-up afterwards, and
+               the refusals that come before there is a run at all. -->
+          <details id="gen-log-wrap" style="display:none;margin-top:12px">
+            <summary class="small">generator output</summary>
+            <pre class="log" id="gen-log" style="margin-top:8px"></pre>
+          </details>
         </div>
       </div>
     </div>

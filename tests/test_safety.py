@@ -215,6 +215,86 @@ def test_oscillation_between_two_screens_is_detected():
     assert loops.oscillating()
 
 
+def test_walking_a_list_is_not_oscillation_though_the_screens_repeat():
+    """The case that forces the action into the key.
+
+    Opening ten grid items in turn bounces between exactly two screens, which
+    is what a stuck two-cycle looks like if you only compare screen ids. The
+    difference is entirely in the action: ``tap/#1``, ``tap/#2``, ``tap/#3``.
+    """
+    loops = safety.LoopDetector()
+    for i in range(1, 6):
+        loops.record("grid", f"tap/#{i}")
+        loops.record("item", "press_key/back")
+    assert not loops.oscillating()
+
+    # Whereas the same walk stuck on one item is a loop, and this is the shape
+    # `runs/2521862d7a23` ran for twenty steps without anything noticing.
+    stuck = safety.LoopDetector()
+    for _ in range(5):
+        stuck.record("grid", "tap/#7")
+        stuck.record("item", "press_key/back")
+    assert stuck.oscillating()
+
+
+def test_paging_one_gesture_is_not_oscillation():
+    """Doing one thing over and over is not a cycle, and must not read as one.
+
+    ``[A,A,A,A,...]`` satisfies the period-2 and period-3 patterns trivially, so
+    without the distinct-entries rule an album walk -- twelve identical swipes
+    on one screen -- was reported as oscillation. The remedy that fires on it is
+    a back press, which ejects the agent from the album it is halfway through.
+
+    Repeating one action is `should_force_back`'s question, and that one knows
+    a browsing gesture from a thrashing one.
+    """
+    loops = safety.LoopDetector()
+    for _ in range(12):
+        loops.record("album", "swipe/#4/left")
+    assert not loops.oscillating()
+    assert not loops.should_force_back("album")
+
+    # Vertical feeds page the same way and are excluded on the same grounds.
+    feed = safety.LoopDetector()
+    for _ in range(12):
+        feed.record("reels", "scroll/up")
+    assert not feed.oscillating()
+    assert not feed.should_force_back("reels")
+
+
+def test_force_back_counts_one_action_not_every_action():
+    """Nine different taps on a hub screen are work; nine identical ones are not."""
+    working = safety.LoopDetector()
+    for i in range(1, 10):
+        working.record("hub", f"tap/#{i}")
+    assert not working.should_force_back("hub")
+
+    stuck = safety.LoopDetector()
+    for _ in range(9):
+        stuck.record("hub", "tap/#3")
+    assert stuck.should_force_back("hub")
+
+
+def test_attempts_outlive_the_ring_buffer():
+    """`history` keeps twenty entries; "have I tried this here" outlasts them."""
+    loops = safety.LoopDetector()
+    loops.record("grid", "tap/#7")
+    for i in range(safety.WINDOW * 2):
+        loops.record(f"elsewhere{i}", "tap/#1")
+    assert not any(sid == "grid" for sid, _ in loops.history)
+    assert loops.times_on("grid", "tap/#7") == 1
+    assert loops.times_on("grid", "tap/#9") == 0
+
+
+def test_tried_on_reports_the_worn_paths_first():
+    loops = safety.LoopDetector()
+    for _ in range(3):
+        loops.record("grid", "tap/#7")
+    loops.record("grid", "press_key/back")
+    loops.record("other", "tap/#2")
+    assert loops.tried_on("grid") == [("tap/#7", 3), ("press_key/back", 1)]
+
+
 def test_a_normal_walk_is_not_oscillation():
     loops = safety.LoopDetector()
     for name in "abcdef":
@@ -253,6 +333,28 @@ def test_element_history_tracking_and_hints():
     assert "PREVIOUS ACTIONS ON THIS SCREEN: step 29: tap #6 [View photo 1 of 10]" in hint
     assert "do NOT repeat an element index (#N)" in hint
     assert loops.element_history_hint("other_screen") is None
+
+
+def test_the_pager_exemption_only_excuses_the_pager_gesture():
+    """Taken from ``runs/2521862d7a23``, which lost its goal to this hint.
+
+    The agent was in a hard two-cycle -- tap #7, back, tap #7, back -- on a
+    screen that had a pager at #4. The hint recited five consecutive back
+    presses and then told the agent that "repeating it is correct" and not to
+    substitute a different index. Nothing in the loop touched #4.
+    """
+    loops = safety.LoopDetector()
+    for step in (10, 12, 14, 16, 18):
+        loops.record_element_action("reels", step, "press_key/back", "press_key back")
+
+    hint = loops.element_history_hint("reels", repeatable=4)
+    assert "repeating it is correct" not in hint
+    assert "do NOT repeat an element index (#N)" in hint
+
+    # But a real pager sweep still gets its exemption, which is why it exists.
+    loops.record_element_action("reels", 20, "swipe/#4/left", "swipe #4 left")
+    swept = loops.element_history_hint("reels", repeatable=4)
+    assert "repeating it is correct" in swept
 
 
 # ---------------------------------------------------------------------------

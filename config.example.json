@@ -25,6 +25,7 @@
     "max_depth": 40,
     "compressed": true,
     "settle_budget_s": 2.0,
+    "launch_timeout_s": 8.0,
     "watchdog_s": 60.0,
     "disable_animations": true,
     "disable_auto_rotate": true
@@ -49,7 +50,11 @@
     "never_screenshot": false,
     "scratchpad_max_chars": 50000,
     "pager_sweep": true,
-    "pager_sweep_max": 12
+    "pager_sweep_max": 12,
+    "stall_nudge_at": 3,
+    "stall_block_at": 5,
+    "stall_replan_at": 8,
+    "stall_give_up_at": 14
   },
 
   "skills": {

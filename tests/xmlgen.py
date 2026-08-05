@@ -317,16 +317,47 @@ def nav_bar() -> N:
              ])
 
 
+def mid_launch(clock: str = "7:05") -> str:
+    """The dump a phone returns while one app's window replaces another's.
+
+    Only the two windows that are always there. Reproduces the tree that
+    ``runs/71295f360ea5`` handed the model while WhatsApp was on screen; see
+    `Screen.chrome_only`.
+    """
+    return dump(status_bar(clock), nav_bar())
+
+
+def system_home(clock: str = "7:05") -> str:
+    """A launcher whose icons the *system UI* draws, as on some OEM builds.
+
+    The mid-launch dump above and this one share a package and an activity, so
+    only the app icons in the middle of the screen tell them apart. This fixture
+    exists to keep `chrome_only` from swallowing a real home screen.
+    """
+    icons = [N("android.widget.TextView", (60 + i * 250, 900, 260 + i * 250, 1100),
+               text=name, package="com.android.systemui", clickable=True,
+               focusable=True)
+             for i, name in enumerate(("Phone", "Messages", "Camera", "Chrome"))]
+    return dump(status_bar(clock),
+                N("android.widget.FrameLayout", (0, 80, W, H - 120),
+                  rid="workspace", package="com.android.systemui", children=icons),
+                nav_bar())
+
+
 def media_viewer(timestamp: str = "9:33 am", sender: str = "+91 93275 84664",
-                 chrome: bool = True) -> str:
+                 chrome: bool = True, clock: str = "9:41") -> str:
     """One photo of an album in the full-screen viewer.
 
     ``chrome=False`` is the state the overlay fades to: the pager is the only
     thing left, and the photo has no caption anywhere in the tree.
     """
+    # Real viewers render under a status bar, and its clock is the exact thing
+    # that used to be mistaken for the photo's caption -- so it belongs in the
+    # fixture. Without it this file could not reproduce the failure that cost
+    # ``runs/2521862d7a23`` 45 steps.
     pager = N("androidx.viewpager.widget.ViewPager", (0, 0, W, H - 120),
               desc="Image", rid="pager", package=WA, scrollable=True)
-    kids = [pager]
+    kids = [status_bar(clock), pager]
     if chrome:
         kids += [
             N("android.widget.LinearLayout", (0, 80, W, 260), rid="action_bar",
@@ -362,6 +393,7 @@ def media_album(header: str = "9:30 am", total: str = "15 photos",
     """The album grid, which publishes only its first two tiles to the tree."""
     return dump(N("android.widget.FrameLayout", (0, 0, W, H), rid="content",
                   package=WA, children=[
+                      status_bar(),
                       N("android.widget.LinearLayout", (0, 80, W, 260),
                         rid="action_bar", package=WA, children=[
                             N("android.widget.ImageButton", (24, 120, 144, 240),
@@ -385,3 +417,30 @@ def media_album(header: str = "9:30 am", total: str = "15 photos",
                         ]),
                       nav_bar(),
                   ]))
+
+
+#: A short-video feed: a vertical ViewPager2 nested under a tab strip, no
+#: caption anywhere, exactly the shape the old carousel model could not read.
+#: The tab pager is *larger* than the content pager, which is how the old
+#: "largest full-bleed horizontal scroller" rule picked the navigation.
+IG = "com.instagram.android"
+REELS_ACTIVITY = ".activity.MainTabActivity"
+
+
+def video_feed(author: str = "lzlift", liked: bool = False) -> str:
+    """One item of an endless vertical feed. No caption, no total, no ends."""
+    content = N("androidx.viewpager2.widget.ViewPager2", (0, 80, W, H - 200),
+                rid="clips_viewer_view_pager", package=IG, scrollable=True,
+                children=[
+                    N("android.widget.FrameLayout", (0, 80, W, H - 200),
+                      desc=f"Reel by {author}. Double tap to play or pause.",
+                      rid="clips_video_container", package=IG, clickable=True),
+                    N("android.widget.ImageView", (960, 1400, 1060, 1500),
+                      desc="Like", rid="like_button", package=IG,
+                      clickable=True, selected=liked),
+                ])
+    tabs = N("androidx.viewpager.widget.ViewPager", (0, 0, W, H),
+             rid="swipeable_tab_view_pager", package=IG, scrollable=True,
+             children=[content])
+    return dump(N("android.widget.FrameLayout", (0, 0, W, H), rid="content",
+                  package=IG, children=[status_bar(), tabs, nav_bar()]))

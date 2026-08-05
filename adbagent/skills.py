@@ -835,7 +835,10 @@ class AppTrace:
 
 
 def _summarise(screen: "Screen", step: int) -> str:
-    labels = [e.best_text for e in screen.elements if e.best_text][:18]
+    # `content_elements`: the first labels on a screen are usually the status
+    # bar's, so an unfiltered slice spent much of its budget teaching the skill
+    # synthesiser the time of day and the Wi-Fi strength.
+    labels = [e.best_text for e in screen.content_elements if e.best_text][:18]
     head = f"step {step}: {screen.package}{screen.activity}"
     return f"{head} | {', '.join(labels)}" if labels else f"{head} | (nothing labelled)"
 

@@ -106,6 +106,26 @@ def test_degenerate_webview_is_flagged():
     assert not s(X.settings_screen()).degenerate
 
 
+def test_a_mid_launch_dump_is_recognised_as_a_frame_of_nothing():
+    """The tree that got a launched WhatsApp reported as the home screen.
+
+    Nothing here is wrong on its face -- a clock, a battery, three nav buttons --
+    which is why it has to be caught structurally rather than described.
+    """
+    blank = s(X.mid_launch())
+    assert blank.chrome_only
+    assert blank.package == "com.android.systemui"
+
+    # The real screens it must not be confused with: an app, and a home screen
+    # the system UI itself draws (same package, same activity, icons in between).
+    assert not s(X.settings_screen()).chrome_only
+    assert not s(X.system_home()).chrome_only
+    assert not s(X.media_viewer(chrome=False)).chrome_only
+    # An empty dump is `degenerate`; answering "chrome only" as well would send
+    # `observe` re-dumping a screen that is not going to change.
+    assert not s("").chrome_only
+
+
 def test_ambiguity_detection():
     twins = [X.N("android.widget.Button", (100, 620 + i * 120, 400, 720 + i * 120),
                  text="Open", clickable=True) for i in range(2)]

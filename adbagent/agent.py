@@ -30,8 +30,9 @@ from .config import Config
 from .device import Device, DeviceTimeout, DeviceLost
 from .llm import (BudgetExceeded, LLMClient, LLMError, Prefetch, ScreenAnalysis)
 from .memory import Memory, intent_key
-from .pager import (ItemLedger, attach_item, can_sweep, loop_id, pager_element,
-                    set_id as pager_set_id, stop_sweeping, sweep_summary)
+from .pager import (SweepLog, can_repeat,
+                    content_moved as pager_content_moved,
+                    stop_repeating, sweep_summary)
 from .safety import Aborted, LoopDetector
 from .scratchpad import NoteLedger
 from .screen import Screen, render
@@ -110,25 +111,63 @@ class RunState:
     #: -- glancing at the launcher for one step reads the same as forty steps of
     #: work -- and `history` needs that to find the recorded runs for one app.
     package_steps: Dict[str, int] = field(default_factory=dict)
-    #: Which items of a gallery / carousel have actually been looked at. Kept by
-    #: code rather than by the model, because a ledger the model rewrites by hand
-    #: every turn silently loses an entry the moment it forgets to repeat one.
-    items: ItemLedger = field(default_factory=ItemLedger)
-    #: What verification concluded about the last gesture on a pager: True the
-    #: item advanced, False it did not, None not applicable.
-    item_moved: Optional[bool] = None
-    #: Key of the item on screen this turn, once resolved.
-    item_key: str = ""
+    #: Readings collected by the last mechanical sweep, in the order they were
+    #: read. Not a ledger of a set -- see `pager.SweepLog`.
+    sweep: SweepLog = field(default_factory=SweepLog)
+    #: What verification concluded about the last gesture: True the app's content
+    #: moved, False it did not, None not observable (no screenshot).
+    content_moved: Optional[bool] = None
+    #: True once a directional gesture has been *seen* to move content without
+    #: leaving the screen -- i.e. this screen pages. A property of the gesture
+    #: that was tried, not of the screen, which is why it lives here and not on
+    #: `Screen`.
+    paging: bool = False
+    #: Skeleton the `paging` evidence was gathered on; leaving it clears them.
+    last_skeleton: str = ""
+    #: ``#N`` of the target the paging gesture was aimed at, so the loop detector
+    #: can tell "repeating the thing that works" from "stuck".
+    repeatable_index: int = 0
+    #: The gesture observed to page, e.g. ``("swipe", "left")``.
+    paging_gesture: Tuple[str, str] = ("", "")
     #: ``exact_id/label`` of the control the harness last auto-dismissed, and how
     #: many times it has tried it on that screen. A dismissal that changes
     #: nothing means the control is part of the screen rather than a popup over
     #: it, and repeating it is how a whole step budget goes on one button.
     last_dismiss: str = ""
     dismiss_tries: int = 0
+    #: Steps since the run last learned anything -- see `Agent._note_outcome` for
+    #: what counts. This is the counter `consecutive_failures` cannot be: that
+    #: one counts actions that *failed*, and the dominant way a run is lost is
+    #: every action succeeding while the run goes nowhere. In
+    #: ``runs/2521862d7a23`` a two-cycle ran for twenty steps with
+    #: `consecutive_failures` pinned at zero and every step graded ``success``.
+    steps_since_progress: int = 0
+    #: What reset it last, for the log, the events and the stall note.
+    last_progress: str = "the run started"
+    #: The approach a `replan` call handed back. Carried in the prompt until
+    #: progress resumes, because a plan outlives the turn that asked for it --
+    #: which is the whole reason the replan asks for a plan and not an action.
+    strategy: str = ""
+    #: `steps_since_progress` when the last replan ran, so one stall episode
+    #: buys one replan rather than one every turn it persists.
+    replanned_at: int = 0
 
     @property
     def elapsed(self) -> float:
         return time.monotonic() - self.started_at
+
+    def note_progress(self, reason: str) -> None:
+        """Record that the run just learned something; reset the stall ladder.
+
+        The strategy goes with it. It was bought to break a stall, and a run
+        that is moving again should not keep being told to abandon the approach
+        that started working -- if it stalls a second time the next replan sees
+        the newer situation anyway.
+        """
+        self.steps_since_progress = 0
+        self.last_progress = reason
+        self.strategy = ""
+        self.replanned_at = 0
 
     def remember(self, entry: str) -> None:
         """Add a history line, folding it into the previous one if it repeats it.
@@ -330,6 +369,10 @@ def needs_reasoning(state: RunState, cfg: Config, *, visit: int,
     reason = ""
     if state.consecutive_failures:
         reason = (f"the last {state.consecutive_failures} action(s) did not work")
+    elif (cfg.run.stall_nudge_at
+            and state.steps_since_progress >= cfg.run.stall_nudge_at):
+        reason = (f"nothing new has been learned for "
+                  f"{state.steps_since_progress} steps")
     elif state.last_failure:
         reason = "the last action was rejected"
     elif state.want_screenshot:
@@ -360,12 +403,19 @@ def needs_screenshot(state: RunState, screen: Screen, cfg: Config) -> Tuple[bool
     # screenshot per *unread item* is what stops the agent swiping blind through
     # an album and inferring, wrongly, which photo it is looking at. It is also
     # self-limiting: revisiting an item already read costs nothing.
-    if screen.is_pager and not state.items.was_read(state.item_key):
-        return True, ("this screen shows one item of a gallery and its content is "
-                      "only in the image -- read the item from the screenshot and "
-                      "record what it shows before moving on")
+    if state.paging and state.content_moved is not False:
+        return True, ("a gesture just moved this screen's content, which lives in "
+                      "the image rather than the tree -- read what is now shown "
+                      "from the screenshot before moving on")
     if state.consecutive_failures >= 1:
         return True, "the last action did not work; look carefully at the screen"
+    if (cfg.run.stall_nudge_at
+            and state.steps_since_progress >= cfg.run.stall_nudge_at):
+        # Being stuck for several steps while every action reports success is
+        # usually the tree describing something the pixels contradict -- a
+        # control that is drawn disabled, an overlay the dump does not carry.
+        return True, ("nothing new has been learned for several steps; look at "
+                      "the screen itself rather than at the element list")
     if state.want_screenshot:
         return True, "you said you were unsure last time"
     if screen.ambiguous:
@@ -551,6 +601,13 @@ class Agent:
             limits=f"max_steps={cfg.run.max_steps} "
                    f"max_wall_clock_s={cfg.run.max_wall_clock_s:g} "
                    f"budget_usd={cfg.safety.budget_usd:g}",
+            # A run that stopped at tier 4 reads as an ordinary failure unless
+            # the file says which ladder it was climbing.
+            stall=f"nudge={cfg.run.stall_nudge_at} "
+                  f"block={cfg.run.stall_block_at} "
+                  f"replan={cfg.run.stall_replan_at} "
+                  f"give_up={cfg.run.stall_give_up_at} "
+                  f"max_consecutive_failures={cfg.run.max_consecutive_failures}",
             vision=f"always={cfg.run.always_screenshot} "
                    f"never={cfg.run.never_screenshot}",
             pager=f"sweep={cfg.run.pager_sweep} max={cfg.run.pager_sweep_max}",
@@ -582,6 +639,11 @@ class Agent:
             # leaves something `--resume` can pick up.
             checkpoint.save(cfg, state)
             state.step += 1
+            # Counted up here, at the top, and reset wherever progress is found
+            # below. Every `continue` in this loop is a step that learned nothing
+            # -- a rejected action, a failed one, a dismissed nag -- and counting
+            # at the bottom instead would let all of them through for free.
+            state.steps_since_progress += 1
 
             # ---- 1. perceive (no LLM) -----------------------------------
             if screen is None:
@@ -595,6 +657,8 @@ class Agent:
                     continue
                 self.on_event("perceive", step=state.step, elapsed=time.monotonic() - t0_perceive)
             if screen.package:
+                if screen.package not in state.packages:
+                    state.note_progress(f"it reached {screen.package}")
                 state.packages.add(screen.package)
                 state.package_steps[screen.package] = \
                     state.package_steps.get(screen.package, 0) + 1
@@ -646,44 +710,39 @@ class Agent:
                         f"rather than a popup over it. Decide what to do with "
                         f"it yourself.")
 
-            # ---- 2b. where are we in a gallery? -------------------------
-            # Resolved before anything else needs it: the screenshot policy, the
-            # loop detector and the prompt all key off the item, not the screen.
-            pager_el = pager_element(screen) if screen.is_pager else None
-            if screen.is_pager:
-                state.items.rebase(pager_set_id(screen))
-                state.item_key = state.items.resolve(screen, moved=state.item_moved)
-            else:
-                # Left the set: a confirmed move inside it means nothing now.
-                state.item_key = ""
-                state.item_moved = None
+            # ---- 2b. is this screen paging? -----------------------------
+            # Not asked of the screen -- answered by what the last gesture did.
+            # A screen stops counting as paging the moment the agent navigates
+            # away from it, because the evidence was about *that* screen.
+            if screen.skeleton_id != state.last_skeleton:
+                state.paging = False
+                state.content_moved = None
+            state.last_skeleton = screen.skeleton_id
 
-            hint = state.loops.hint(loop_id(screen))
+            hint = state.loops.hint(screen.skeleton_id)
 
             # Scroll awareness: give the LLM full context about its
-            # scrolling pattern so it can course-correct on its own.
-            # Paging through a gallery is horizontal and has its own guidance, so
-            # the vertical-scrolling advice ("scroll UP for older content") is
-            # suppressed there -- it is not merely unhelpful on a carousel, it
-            # points the agent at the wrong axis.
-            scroll_ctx = state.loops.scroll_context(
-                axis="horizontal" if screen.is_pager else "")
+            # scrolling pattern so it can course-correct on its own. Suppressed
+            # while the screen is known to page, where repeating one gesture is
+            # the way forward and "you keep scrolling the same way" is noise.
+            scroll_ctx = "" if state.paging else state.loops.scroll_context()
             if scroll_ctx:
                 hint = scroll_ctx
                 if (state.loops.scroll_oscillating()
                         or state.loops.direction_reversals() >= 5):
-                    for _, sig in state.loops.history:
-                        if not sig.startswith("scroll/"):
+                    # Only the gestures recorded on *this* screen. `history`
+                    # spans every screen of the last twenty steps, so banning
+                    # everything in it pinned a scroll this screen had never seen
+                    # -- and swipes were skipped entirely, though
+                    # `scroll_oscillating` counts them.
+                    for sid, sig in state.loops.history:
+                        if sid != screen.skeleton_id:
                             continue
-                        # Never ban a horizontal gesture. On a carousel the same
-                        # swipe on the same element is the only way forward, so a
-                        # ban strands the agent mid-album -- and in the run that
-                        # motivated this, it did exactly that.
-                        if sig.rsplit("/", 1)[-1] in ("left", "right"):
+                        if not sig.startswith(("scroll/", "swipe/")):
                             continue
                         state.loops.ban(screen.skeleton_id, sig)
 
-            if state.loops.should_force_back(loop_id(screen)) or state.loops.oscillating():
+            if state.loops.should_force_back(screen.skeleton_id) or state.loops.oscillating():
                 if state.loops.in_back_loop():
                     # Pressing back repeatedly is not helping; let the LLM
                     # try a different approach this turn.
@@ -698,15 +757,18 @@ class Agent:
                              "done/fail.")
                     hint = f"{hint} {extra}" if hint else extra
                     state.loops.consecutive_backs = 0
-                    state.loops.ban(screen.skeleton_id, "forced-back")
+                    # No ban here. This used to ban "forced-back", which is not a
+                    # signature any action can produce -- `AgentAction.signature`
+                    # cannot emit it -- so it blocked nothing and put one
+                    # meaningless entry in the list of banned actions the model
+                    # is shown.
                 else:
                     log.warning("step %d: stuck in a loop; going back",
                                 state.step)
                     self.on_event("loop_warning", message=f"step {state.step}: stuck in a loop; going back")
-                    rec.event("loop_break", exact_id=screen.exact_id,
-                              item=state.item_key)
+                    rec.event("loop_break", exact_id=screen.exact_id)
                     self.dev.press("back")
-                    state.loops.record(loop_id(screen), "forced-back")
+                    state.loops.record(screen.skeleton_id, "forced-back")
                     state.loops.consecutive_backs += 1
                     screen = None
                     continue
@@ -714,23 +776,54 @@ class Agent:
             # ---- 3. visit tracking --------------------------------------
             visit = state.visits.get(screen.skeleton_id, 0)
             state.visits[screen.skeleton_id] = visit + 1
+            if visit == 0:
+                state.note_progress("it reached a screen it had not seen before")
+
+            # ---- 3b. the stall ladder -----------------------------------
+            # Everything above this point can reset the counter, so this is the
+            # first place that knows whether the run is actually getting
+            # anywhere. The tiers run cheap to expensive: say something, refuse
+            # something, spend a call rethinking, stop. See `config.RunConfig`.
+            stalled = state.steps_since_progress
+            limits = cfg.run
+
+            if limits.stall_give_up_at and stalled >= limits.stall_give_up_at:
+                log.error("no progress for %d steps (last: %s); giving up",
+                          stalled, state.last_progress)
+                rec.event("stalled_out", step=state.step, stalled=stalled,
+                          last_progress=state.last_progress)
+                self.on_event("loop_warning",
+                              message=f"step {state.step}: nothing new for "
+                                      f"{stalled} steps; stopping")
+                state.finished = "failed"
+                return
+
+            # Actions already tried on this screen more than once. Twice with
+            # nothing learned is evidence; once is not, so a single previous
+            # attempt stays legal and the model keeps somewhere to go.
+            refused: set = set()
+            if limits.stall_block_at and stalled >= limits.stall_block_at:
+                refused = {sig for sig, n in state.loops.tried_on(screen.skeleton_id)
+                           if n >= 2}
+
+            if (limits.stall_replan_at and self.llm is not None
+                    and stalled >= limits.stall_replan_at
+                    and stalled - state.replanned_at >= limits.stall_replan_at):
+                state.replanned_at = stalled
+                if self._replan(state, rec, screen, stalled) is False:
+                    return
 
             # ---- 4. ask the model ---------------------------------------
             screenshot: Optional[bytes] = None
             want, note = needs_screenshot(state, screen, cfg)
             if want:
                 screenshot = self._ensure_screenshot(screen)
-                if screen.is_pager and not state.item_key:
-                    # The caption was hidden, so the item had no key until now;
-                    # the screenshot gives it a pixel-derived one.
-                    state.item_key = state.items.resolve(
-                        attach_item(screen), moved=state.item_moved)
 
             # The vision pass runs here rather than inside `decide` so its
             # structured fields reach the ledgers below: a `reading` the image
-            # model took off this item is the same fact the pager ledger keeps per
-            # item, and routing it through prose for the decider to re-extract
-            # loses it the moment the decider paraphrases.
+            # model took off this frame is the fact the run is collecting, and
+            # routing it through prose for the decider to re-extract loses it the
+            # moment the decider paraphrases.
             #
             # The step's cost mark and clock both start *before* it, because a
             # screenshot turn is an analysis and then a decision, and charging the
@@ -746,28 +839,13 @@ class Agent:
                     screenshot, goal=state.goal, rendered=render(screen),
                     step=state.step, recorder=rec, on_event=self.on_event)
 
-            # A pager item is ledgered here, once its identity and whether we
-            # have vision on it are both settled. `read` is deliberately keyed to
-            # the screenshot and not to the sighting: having seen an item's
-            # caption is not the same as having looked at the item.
-            pager_note = ""
-            if screen.is_pager:
-                state.items.note(state.item_key, screen, state.step,
-                                 read=bool(screenshot),
-                                 detail=analysis.reading if analysis else "",
-                                 label=analysis.item_label if analysis else "")
-                if screen.item_label:
-                    # `item_moved` is a latch, not a per-turn flag: it has to
-                    # survive the turns where the caption is hidden, because the
-                    # tap that reveals the caption again is not itself a move.
-                    # Here a caption was available, so the latch has been spent.
-                    state.item_moved = None
-                pager_note = state.items.render(state.item_key,
-                                                screen.item_label)
-                rec.event("pager_item", step=state.step, key=state.item_key,
-                          label=screen.item_label, read=bool(screenshot),
-                          read_count=state.items.read_count,
-                          total=state.items.total)
+            # Whatever the last mechanical sweep read, handed back once and then
+            # dropped. It is a record of what *this* run saw, in order, with no
+            # claim about what else exists -- the model is told to copy anything
+            # it needs into `notes`, which is the memory that actually persists.
+            pager_note = state.sweep.render()
+            if pager_note:
+                state.sweep.start(state.sweep.gesture)  # handed over; clear it
 
             # Two sources, one note. `loops` remembers what failed in this run;
             # `mem.dead_ends` remembers what failed in *earlier* runs on this
@@ -813,22 +891,35 @@ class Agent:
                         self._active_skill_name = active_skill.name
                         self.on_event("skill_loaded", name=active_skill.name, package=skill_pkg)
 
+            # `repeatable` names a target whose repetition is legitimate. It
+            # used to be "the pager element" -- a classification. It is now the
+            # target of the gesture that was *observed* to move content, which is
+            # the same claim without the guess.
             elem_hint = state.loops.element_history_hint(
                 screen.skeleton_id,
-                repeatable=pager_el.index if pager_el is not None else 0)
+                repeatable=state.repeatable_index if state.paging else 0)
             # Advice that only applies sometimes lives here rather than in the
             # system prompt: this block is rebuilt every turn anyway, so varying
             # it is free, whereas varying the system message evicts the whole
             # prompt prefix from the provider's cache.
             situational = prompts.situational_notes(
-                goal=state.goal,
                 scrolls=state.loops.total_scroll_count,
-                has_scroller=any(el.scrollable and not el.is_horizontal
-                                 for el in screen.elements),
                 packages_seen=len(state.packages))
-            notes = "\n\n".join(filter(None, (note, pager_note,
+            # Placed ahead of the older hints on purpose: when the run has
+            # stopped getting anywhere, that is the most important thing on the
+            # turn, and it is the only block that names the actions the harness
+            # has begun refusing outright.
+            stall_text = ""
+            if limits.stall_nudge_at and stalled >= limits.stall_nudge_at:
+                stall_text = prompts.stall_note(
+                    stalled, tried=state.loops.tried_on(screen.skeleton_id),
+                    refused=sorted(refused), strategy=state.strategy)
+            # `skill_note` is deliberately not in here: it goes to its own
+            # message above the history instead, because it changes per app
+            # rather than per turn. See `prompts.skill_block`.
+            notes = "\n\n".join(filter(None, (note, stall_text, pager_note,
                                              hint, elem_hint, ban_note,
-                                             state.last_failure, skill_note,
+                                             state.last_failure,
                                              situational)))
             effort, hard_because = needs_reasoning(
                 state, cfg, visit=visit,
@@ -851,7 +942,7 @@ class Agent:
                 width=screen.width, height=screen.height, package=screen.package,
                 screenshot=screenshot, note=notes,
                 scratchpad=state.scratchpad.render(cfg.run.scratchpad_max_chars),
-                progress="\n".join(state.progress_log),
+                progress="\n".join(state.progress_log), skill=skill_note,
                 image_analysis=analysis.render() if analysis else None,
                 step=state.step, recorder=rec, effort=effort,
                 on_event=self.on_event)
@@ -927,6 +1018,12 @@ class Agent:
                 if written:
                     rec.event("scratchpad", step=state.step, keys=written,
                               total=len(state.scratchpad))
+                    # The clearest progress signal there is on a collection goal:
+                    # a record the run did not have a moment ago. `update`
+                    # returns only the keys that were new or corrected, so a
+                    # model restating what it already sent cannot buy time here.
+                    state.note_progress(f"it recorded {len(written)} new "
+                                        f"data record(s)")
 
             # -- attach what the model read off this item --------------------
             # The observation describes the screen the model was just shown, so
@@ -944,19 +1041,22 @@ class Agent:
             # restatement is where a figure gets rounded or paraphrased away. The
             # observation is what there is when the decider has its own eyes and
             # there was no separate pass.
-            if (screen.is_pager and state.item_key and action.observation
-                    and screenshot and not (analysis and analysis.reading)):
-                state.items.note(state.item_key, screen, state.step,
-                                 detail=action.observation)
-
             # -- accumulate progress ----------------------------------------
             if getattr(action, "progress", None):
                 prog_text = action.progress.strip()
                 if prog_text:
+                    if state.progress_log[:1] != [prog_text]:
+                        state.note_progress("it updated its own progress note")
                     state.progress_log = [prog_text]
 
             rec.event("decide", step=state.step, source=source,
-                      skeleton=screen.skeleton_id, action=action.model_dump(),
+                      skeleton=screen.skeleton_id,
+                      # The hash the loop detector no longer runs on, kept
+                      # because change detection still does and because a trace
+                      # that records only one of the two cannot answer "did the
+                      # screen really repeat" after the fact.
+                      exact=screen.exact_id,
+                      stalled=stalled, action=action.model_dump(),
                       screenshot=bool(screenshot),
                       effort=effort, hard_because=hard_because,
                       wall_s=round(t_step_llm, 3), llm=step_metrics(step_calls))
@@ -979,6 +1079,43 @@ class Agent:
                     rec.event("refused", label=label)
                     continue
 
+            # Tier 2 of the stall ladder. Telling the model to stop repeating
+            # itself is known not to be enough: in `runs/2521862d7a23` the
+            # element-history hint said exactly that on ten consecutive turns and
+            # the model tapped the same index ten more times. So past a point the
+            # harness stops asking and refuses, the way `scroll_blocked` above
+            # already does for gestures.
+            #
+            # Terminal actions are never refused. `done`, `fail` and `ask_user`
+            # are the ways out of a stall, and a guard that blocked them would be
+            # sealing the exit it is trying to push the agent through.
+            if refused and not action.is_terminal \
+                    and action.signature() in refused:
+                sig = action.signature()
+                tries = state.loops.times_on(screen.skeleton_id, sig)
+                log.warning("step %d: refusing %s -- tried %d times here and the "
+                            "run has learned nothing for %d steps",
+                            state.step, sig, tries, stalled)
+                self.on_event("loop_warning",
+                              message=f"step {state.step}: refusing {sig} "
+                                      f"(tried {tries}x here, no progress)")
+                rec.event("stall_block", step=state.step, action=sig,
+                          tries=tries, stalled=stalled)
+                state.last_failure = (
+                    f"{sig} was refused: you have already done it {tries} times "
+                    f"on this screen and the run has learned nothing in "
+                    f"{stalled} steps. It will keep being refused. Choose "
+                    f"something you have not tried, or report done/fail.")
+                state.loops.ban(screen.skeleton_id, sig)
+                state.remember(format_history_entry(
+                    state.step, action, screen=screen, grade="refused",
+                    reason=f"already tried {tries}x here with no progress"))
+                # Deliberately not counted as a `consecutive_failure`. That
+                # counter has its own terminator, and letting a stall feed it
+                # would end the run at `max_consecutive_failures` -- four blocked
+                # turns -- before the replan tier below ever got a chance to run.
+                continue
+
             if action.is_terminal:
                 state.finished = self._terminal(state, screen, action, rec)
                 if state.finished is None:
@@ -995,6 +1132,14 @@ class Agent:
 
             # ---- 6. act -------------------------------------------------
             t0_act = time.monotonic()
+            # "Did this gesture move the content" is answered by comparing two
+            # frames, so the *before* frame has to exist before the gesture goes
+            # out. A capture is a device round trip, not an LLM call, and without
+            # it a directional gesture can never accumulate the evidence that
+            # authorises repeating it -- the sweep would simply never start.
+            if (action.action in ("scroll", "swipe") and action.direction
+                    and cfg.run.pager_sweep and not cfg.run.never_screenshot):
+                self._ensure_screenshot(screen)
             try:
                 element = execute(self.dev, action, screen)
             except (ActionError, ValueError) as exc:
@@ -1045,14 +1190,14 @@ class Agent:
             # and the item does not move. One stronger attempt here is far
             # cheaper than an LLM turn spent rediscovering that -- and before the
             # item-identity signal existed, the drop was not even detectable.
-            if (outcome.grade == "no_change" and screen.is_pager
+            if (outcome.grade == "no_change" and state.paging
                     and action.action in ("scroll", "swipe")
-                    and action.direction in ("left", "right")):
+                    and action.direction):
                 retry = action.model_copy(update={
                     "action": "swipe", "duration": 0.12,
                     "scroll_amount": min(5.0, max(2.0, action.scroll_amount * 2)),
                 })
-                log.info("step %d: pager did not advance; retrying harder",
+                log.info("step %d: content did not move; retrying harder",
                          state.step)
                 rec.event("pager_retry", step=state.step, action=retry.describe())
                 try:
@@ -1069,16 +1214,23 @@ class Agent:
                     screen = None   # the retry landed; re-read the phone
                     continue
 
-            # Whether the item advanced is what the next turn's ledger keys off.
-            if action.action in ("scroll", "swipe") and (screen.is_pager
-                                                         or after.is_pager):
-                state.item_moved = outcome.grade != "no_change"
-                if (not state.item_moved
-                        and action.direction in ("left", "right")):
-                    # Two gestures in a row moved nothing, so this is an end of
-                    # the set. Most apps never say how many items a set holds, so
-                    # this is the only signal that the album is finished.
-                    state.items.edges.add(action.direction)
+            # Did this gesture page the screen? Answered by observation, and it
+            # is the only thing that makes the sweep below legal. Note the
+            # direction is not restricted: a vertical feed pages exactly like a
+            # horizontal album, and refusing to notice that was what kept the
+            # sweep off every short-video surface it would have helped on.
+            if action.action in ("scroll", "swipe") and action.direction:
+                # Asked of the pixels directly rather than read off `grade`.
+                # `verify` falls back to "a swipe probably worked" when it has no
+                # image to check, which is a fair default for grading an action
+                # but not evidence, and `can_repeat` below turns this into the
+                # authority to act thirty more times without asking.
+                state.content_moved = pager_content_moved(screen, after)
+                if state.content_moved and after.skeleton_id == screen.skeleton_id:
+                    state.paging = True
+                    state.repeatable_index = (element.index if element is not None
+                                              else 0)
+                    state.paging_gesture = (action.action, action.direction)
 
             self.on_event("verify_end", step=state.step, elapsed=t_settle, grade=outcome.grade, reason=outcome.reason)
 
@@ -1086,6 +1238,29 @@ class Agent:
                       reason=outcome.reason, after=after.skeleton_id)
 
             # ---- 8. learn (no LLM) --------------------------------------
+            # Two more ways a step can count as progress, both about the device
+            # rather than about what the model said. A gesture that moved content
+            # revealed something that was not on screen before -- that is what
+            # keeps a long feed search from reading as a stall. And an action
+            # that changed device state did the thing it was for, whether or not
+            # it navigated anywhere: typing into a field and flipping a toggle
+            # both leave the screen looking much as it did.
+            if action.action in ("scroll", "swipe"):
+                # Not read off `grade`. `verify` answers "probably" for a swipe
+                # it has no image to check -- a fair default for grading one
+                # action, but as a progress signal it is a hole: under
+                # `never_screenshot` every swipe would buy another step and a
+                # run flinging at a wall could never stall. Pixels when there
+                # are pixels, the tree when there are not.
+                moved = state.content_moved
+                if moved is None:
+                    moved = after.exact_id != screen.exact_id
+                if moved:
+                    state.note_progress("a gesture revealed new content")
+            elif outcome.ok and (action.action == "input_text"
+                                 or (element is not None and element.checkable)):
+                state.note_progress("it changed something on the device")
+
             if not outcome.ok:
                 state.consecutive_failures += 1
                 state.last_failure = f"{action.describe()} failed: {outcome.reason}"
@@ -1104,32 +1279,16 @@ class Agent:
                     h_dir = action.direction in ("left", "right")
                     axis = "horizontal" if h_dir else "vertical"
                     act_name = "Swiping" if action.action == "swipe" else "Scrolling"
-                    if screen.is_pager and h_dir:
-                        # "You have reached the end" is a claim, and on a pager it
-                        # is often the wrong one: the harder retry above has just
-                        # failed too, so say what is actually known and let the
-                        # ledger decide whether there is anywhere left to go.
+                    if state.paging:
+                        # Say only what was seen. This used to add a verdict from
+                        # the ledger -- "every item has been read", "4 items are
+                        # still unread" -- which was a claim about a set nothing
+                        # could actually count.
                         state.last_failure = (
-                            f"The item did not change after swiping "
-                            f"{action.direction} twice, so you are at the "
-                            f"{'start' if action.direction == 'right' else 'end'} "
-                            f"of this set.")
-                        unread = [r.label for r in state.items.items.values()
-                                  if not r.read]
-                        if state.items.complete:
-                            state.last_failure += (
-                                " Every item has been read \u2014 stop browsing "
-                                "and report what you found.")
-                        elif unread:
-                            state.last_failure += (
-                                f" {len(unread)} item(s) of this set are still "
-                                f"unread ({', '.join(unread[:6])}); swipe the "
-                                f"other way to reach them, or go back to the "
-                                f"list this set came from.")
-                        else:
-                            state.last_failure += (
-                                " Swipe the other way if you have not covered "
-                                "the whole set, otherwise report what you found.")
+                            f"{act_name} {action.direction} twice did not change "
+                            f"the content, so that gesture no longer advances "
+                            f"here. Try the opposite direction, or leave this "
+                            f"screen.")
                     else:
                         state.last_failure = (
                             f"{act_name} {action.direction} did not reveal new "
@@ -1137,7 +1296,7 @@ class Agent:
                             f"{axis} scrollable area. Do not {action.action} "
                             f"{action.direction} again here.")
 
-            state.loops.record(loop_id(screen), action.signature())
+            state.loops.record(screen.skeleton_id, action.signature())
             state.loops.record_element_action(
                 screen.skeleton_id, state.step, action.signature(), action.describe(element=element)
             )
@@ -1157,43 +1316,51 @@ class Agent:
             # instead of a reasoning turn per item.
             if (cfg.run.pager_sweep and state.finished is None
                     and not cfg.run.never_screenshot  # nothing to read with
-                    and can_sweep(screen, state.items, action=action.action,
-                                  direction=action.direction or "",
-                                  moved=state.item_moved is True)):
-                swept = self._sweep_pager(state, rec, screen,
-                                          action.direction or "left")
+                    and can_repeat(action=action.action,
+                                   direction=action.direction or "",
+                                   moved=state.content_moved)):
+                swept = self._sweep_pager(state, rec, screen, action,
+                                          element)
                 if swept is not None:
                     screen = swept
 
-    # -- sweeping a carousel -----------------------------------------------
+    # -- repeating a gesture that works -------------------------------------
 
     def _sweep_pager(self, state: RunState, rec: Recorder, screen: Screen,
-                     direction: str) -> Optional[Screen]:
-        """Page through the rest of a set without asking the model each time.
+                     action: AgentAction, element) -> Optional[Screen]:
+        """Repeat the gesture the model just made, for as long as it keeps working.
 
-        Entered only from `can_sweep`, so the model has already chosen this
-        gesture on this screen and it has already been shown to move the item.
-        Each iteration reads the item it is standing on, flings once in the same
-        direction, and verifies. The read is started *before* the fling and
-        collected after it, so a ~1.5s vision call overlaps the swipe and the
-        settle rather than following them.
+        Entered only from `can_repeat`, so the model has already chosen this
+        gesture on this screen and it has already been *seen* to move the app's
+        content. Each iteration reads what is currently shown, repeats the
+        gesture, and checks whether anything moved. The read is started before
+        the gesture and collected after it, so a ~1.5s vision call overlaps the
+        swipe and the settle rather than following them.
+
+        There is no set being walked here and no ledger being filled. The loop
+        runs while the gesture keeps changing the content and stops when it does
+        not -- which is the same rule for a photo album, a horizontal card stack
+        and a vertical video feed, none of which it needs to tell apart.
 
         Returns the screen the sweep ended on, or None if it did nothing.
         """
         cfg = self.cfg
         first_step = state.step + 1
+        direction = action.direction or ""
+        gesture_name = f"{action.action} {direction}".strip()
         swept = 0
         read = 0
         reason = ""
         package = screen.package
+        state.sweep.start(gesture_name)
 
         while True:
-            reason = stop_sweeping(screen, state.items, direction=direction,
-                                   package=package)
+            reason = stop_repeating(screen, package=package,
+                                    moved=state.content_moved)
             if reason:
                 break
             if swept >= cfg.run.pager_sweep_max:
-                reason = f"the {cfg.run.pager_sweep_max}-item sweep limit was reached"
+                reason = f"the {cfg.run.pager_sweep_max}-repeat limit was reached"
                 break
             if state.step + 1 >= cfg.run.max_steps:
                 reason = "the step budget is nearly exhausted"
@@ -1214,26 +1381,11 @@ class Agent:
 
             state.step += 1
 
-            # -- where are we? ---------------------------------------------
-            # The main loop resolves the item at the *top* of a turn, so on entry
-            # `state.item_key` still names the item we swiped away from. Resolving
-            # here, once per iteration, is what keeps the ledger keyed to the item
-            # actually on screen -- and `item_moved` is the latch that separates
-            # two items sharing a caption.
-            state.items.rebase(pager_set_id(screen))
-            here = state.items.resolve(screen, moved=state.item_moved)
-            state.item_key = here
-            state.items.note(here, screen, state.step, read=False)
-            if screen.item_label:
-                state.item_moved = None
-            label = screen.item_label
-
-            # -- read the item we are on, in the background ----------------
+            # -- read what is on screen now, in the background --------------
             reading: Optional[Prefetch] = None
             shot_name = ""
             ledger_mark = self.llm.ledger.mark() if self.llm else 0
-            if (self.llm is not None and not cfg.run.never_screenshot
-                    and not state.items.was_read(here)):
+            if self.llm is not None and not cfg.run.never_screenshot:
                 shot = self._ensure_screenshot(screen)
                 # Kept here rather than inside `read_item`: the read runs on
                 # another thread, and the name has to be in hand on this one to
@@ -1241,21 +1393,24 @@ class Agent:
                 # of a run's vision calls, and "what did it read off item 7" is
                 # not answerable from the reading alone.
                 shot_name = rec.screenshot(state.step, shot, "read_item")
-                reading = Prefetch(lambda s=shot, l=label: self.llm.read_item(
-                    s, goal=state.goal, label=l, step=state.step))
+                reading = Prefetch(lambda s=shot: self.llm.read_item(
+                    s, goal=state.goal, step=state.step))
 
-            # -- fling to the next one -------------------------------------
-            gesture = AgentAction(
-                observation=f"sweeping {direction} through the set",
-                reasoning="continuing the paging the model chose",
-                action="swipe", direction=direction, duration=0.15)
+            # -- repeat the gesture ----------------------------------------
+            # A copy of what the model issued, so the sweep can take no action
+            # the model did not already authorise -- including its target, which
+            # is why this is a copy rather than a fresh full-screen fling.
+            repeat = action.model_copy(update={
+                "observation": f"repeating `{gesture_name}`",
+                "reasoning": "continuing the gesture the model chose",
+            })
             try:
-                execute(self.dev, gesture, screen)
+                execute(self.dev, repeat, screen)
                 after = self.dev.observe(settle=True)
                 self._ensure_screenshot(after)
             except (ActionError, ValueError) as exc:
-                reason = f"the swipe could not be carried out ({exc})"
-                if reading is not None and self._file_reading(state, screen, here,
+                reason = f"the gesture could not be carried out ({exc})"
+                if reading is not None and self._file_reading(state, screen,
                                                               reading, rec,
                                                               shot=shot_name):
                     read += 1
@@ -1265,17 +1420,17 @@ class Agent:
                     state.finished = "aborted"
                 return self._screen_after_recovery(state, screen)
 
-            moved = verify(gesture, screen, after,
-                           synthesise_postcondition(gesture, None),
+            moved = verify(repeat, screen, after,
+                           synthesise_postcondition(repeat, None),
                            None).grade != "no_change"
 
             if not moved:
                 # A ViewPager silently drops a fling it judges too short or too
                 # slow. The main loop retries harder before believing it, and a
                 # sweep that skipped that step would read one dropped gesture as
-                # the end of the album and hand back four photos early.
-                harder = gesture.model_copy(update={"scroll_amount": 2.0,
-                                                    "duration": 0.12})
+                # the end and hand back several items early.
+                harder = repeat.model_copy(update={"scroll_amount": 2.0,
+                                                   "duration": 0.12})
                 rec.event("pager_retry", step=state.step, during="sweep",
                           action=harder.describe())
                 try:
@@ -1292,10 +1447,8 @@ class Agent:
                         state.finished = "aborted"
                     return self._screen_after_recovery(state, screen)
 
-            # -- collect the reading, against the item it was taken of -----
-            # Filed before `screen` moves on, because `note` reads the label and
-            # the total off the screen the reading was taken of.
-            if reading is not None and self._file_reading(state, screen, here,
+            # -- collect the reading, against the frame it was taken of -----
+            if reading is not None and self._file_reading(state, screen,
                                                           reading, rec,
                                                           shot=shot_name):
                 read += 1
@@ -1304,22 +1457,19 @@ class Agent:
             # Costed like any other step: a sweep step is a real LLM call, and a
             # report that only totalled `decide` events would show the sweep as
             # free and quietly understate the run.
-            rec.event("sweep_step", step=state.step, direction=direction,
-                      item=here, label=label, moved=moved,
-                      read_count=state.items.read_count,
+            rec.event("sweep_step", step=state.step, gesture=gesture_name,
+                      moved=moved, read_count=state.sweep.read_count,
                       llm=step_metrics(self.llm.ledger.since(ledger_mark)
                                        if self.llm else []))
-            self.on_event("sweep_step", step=state.step, direction=direction,
-                          label=label, moved=moved, swept=swept,
-                          read_count=state.items.read_count,
-                          total=state.items.total)
+            self.on_event("sweep_step", step=state.step, gesture=gesture_name,
+                          moved=moved, swept=swept,
+                          read_count=state.sweep.read_count)
 
-            state.item_moved = moved
+            state.content_moved = moved
+            state.sweep.repeats = swept
             if not moved:
-                # The same evidence the main loop uses: a gesture that changed
-                # nothing on a pager is the edge of the set.
-                state.items.edges.add(direction)
-                reason = f"the item stopped moving, so this is the {direction} end"
+                reason = ("the content stopped changing, so the gesture no "
+                          "longer advances")
                 screen = after
                 break
             screen = after
@@ -1327,40 +1477,55 @@ class Agent:
         if not swept:
             return None
 
-        log.info("sweep: %d item(s) %s, %d read (%s)", swept, direction, read,
-                 reason or "stopped")
+        log.info("sweep: repeated `%s` %d time(s), %d read (%s)", gesture_name,
+                 swept, read, reason or "stopped")
         rec.event("sweep", first_step=first_step, last_step=state.step,
-                  direction=direction, swept=swept, read=read, reason=reason,
-                  read_count=state.items.read_count)
+                  gesture=gesture_name, swept=swept, read=read, reason=reason,
+                  read_count=state.sweep.read_count)
         self.on_event("sweep_end", first_step=first_step, last_step=state.step,
-                      direction=direction, swept=swept, read=read, reason=reason)
-        state.remember(sweep_summary(first_step, state.step, direction,
-                                           swept, read, reason or "it stopped"))
+                      gesture=gesture_name, swept=swept, read=read,
+                      reason=reason)
+        state.sweep.reason = reason or "it stopped"
+        state.remember(sweep_summary(first_step, state.step, gesture_name,
+                                     swept, read, state.sweep.reason))
         # The sweep is browsing, not thrashing, so it is deliberately kept out of
         # the loop detector: twelve flings on one `skeleton_id` is exactly the
         # shape that makes `should_force_back` press back and eject the agent.
         state.last_failure = ""
         state.consecutive_failures = 0
+        if read:
+            state.note_progress(f"a sweep read {read} item(s)")
         self._maybe_give_up(state)
         return screen
 
-    def _file_reading(self, state: RunState, screen: Screen, key: str,
+    def _file_reading(self, state: RunState, screen: Screen,
                       reading: "Prefetch", rec: Recorder, shot: str = "") -> bool:
-        """Attach a prefetched item reading to the item it was taken of.
+        """File a prefetched reading against the sweep that took it.
+
+        Appended in order rather than filed under an item key: the key used to be
+        the app's caption for the item, which is exactly the identity this module
+        stopped claiming to know.
 
         `shot` is the frame the reading was taken from, so the record carries
         both halves of the call: a sweep read has no live panel -- it runs on
         another thread, and streaming two of those into one terminal interleaves
         them into nonsense -- so this event is the whole of it.
         """
-        text = reading.result(default="")
+        # Bounded, because `Prefetch.result()` defaults to joining forever. A
+        # vision read that hangs gets `llm.read_timeout` (300s by default) times
+        # `llm.max_retries` before the client itself gives up, and the loop's
+        # wall-clock guard is only consulted between steps -- so one stuck call
+        # could hold the run open for twenty minutes past its budget with no
+        # step advancing and nothing in the log to say why. Losing the reading is
+        # the cheaper failure: it degrades a sweep, it does not end a run.
+        text = reading.result(default="", timeout=self.cfg.llm.read_timeout)
         if not text:
             return False
-        state.items.note(key, screen, state.step, detail=text, read=True)
-        rec.event("item_reading", step=state.step, item=key, reading=text,
-                  shot=shot)
-        self.on_event("item_reading", step=state.step, label=screen.item_label,
-                      reading=text, shot=shot)
+        state.sweep.add(text)
+        rec.event("item_reading", step=state.step,
+                  position=state.sweep.read_count, reading=text, shot=shot)
+        self.on_event("item_reading", step=state.step,
+                      position=state.sweep.read_count, reading=text, shot=shot)
         return True
 
     # -- terminal actions --------------------------------------------------
@@ -1442,6 +1607,68 @@ class Agent:
                       state.consecutive_failures)
             return "failed"
         return None
+
+    def _replan(self, state: RunState, rec: Recorder, screen: Screen,
+                stalled: int) -> bool:
+        """Buy one different approach. False when the run should stop.
+
+        Tier 3 of the stall ladder, and the only tier that costs a call. It is
+        worth one because the two cheap tiers have a shared blind spot: both
+        speak to the decider, and the decider is looking at a history of the
+        approach that is failing. `LLMClient.replan` is not shown that history.
+
+        A failure here is swallowed. The run is already in trouble; losing it to
+        an exception raised by the thing sent to rescue it would be worse than
+        carrying on stuck, and the give-up tier is still ahead.
+        """
+        shot: Optional[bytes] = None
+        if not self.cfg.run.never_screenshot:
+            try:
+                shot = self._ensure_screenshot(screen)
+            except (DeviceTimeout, DeviceLost) as exc:
+                log.warning("replan could not take a screenshot: %s", exc)
+
+        self.on_event("llm_start", step=state.step, purpose="replan",
+                      model=getattr(self.llm, "model", ""), screenshot=bool(shot))
+        t0 = time.monotonic()
+        ledger_mark = self.llm.ledger.mark()
+        try:
+            plan = self.llm.replan(                        ### LLM ###
+                goal=state.goal, rendered=render(screen),
+                tried=state.loops.tried_on(screen.skeleton_id),
+                stalled=stalled,
+                scratchpad=state.scratchpad.plain(self.cfg.run.scratchpad_max_chars),
+                progress="\n".join(state.progress_log),
+                packages=sorted(state.packages), screenshot=shot,
+                step=state.step, recorder=rec, on_event=self.on_event)
+        except LLMError as exc:
+            log.warning("replan produced nothing usable (%s); carrying on", exc)
+            rec.event("replan_failed", step=state.step, error=str(exc))
+            return True
+        elapsed = time.monotonic() - t0
+        calls = self.llm.ledger.since(ledger_mark)
+        self.on_event("llm_end", step=state.step, purpose="replan",
+                      elapsed=elapsed, call=calls[-1] if calls else None)
+        state.llm_calls += 1
+        rec.event("replan", step=state.step, stalled=stalled,
+                  assessment=plan.assessment, strategy=plan.strategy,
+                  abandon=plan.abandon, wall_s=round(elapsed, 3),
+                  llm=step_metrics(calls))
+
+        if plan.abandon:
+            log.error("replan says the goal is not reachable from here: %s",
+                      plan.assessment or plan.strategy)
+            state.remember(f"{state.step}. gave up after a replan: "
+                           f"{plan.assessment or plan.strategy}")
+            state.finished = "failed"
+            return False
+
+        state.strategy = " ".join((plan.strategy or "").split())
+        if state.strategy:
+            log.info("step %d: new approach -- %s", state.step, state.strategy)
+            self.on_event("replan", step=state.step,
+                          assessment=plan.assessment, strategy=state.strategy)
+        return True
 
     def _hand_over(self, state: RunState, reason: str) -> None:
         """Stop and give the phone back to the person."""
