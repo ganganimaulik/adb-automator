@@ -23,11 +23,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import __version__, checkpoint, prompts, runlog, safety
+from . import __version__, checkpoint, conversation, prompts, runlog, safety
 from .actions import (ActionError, AgentAction, append_history, execute,
                       format_history_entry, synthesise_postcondition, verify)
 from .config import Config
 from .device import Device, DeviceTimeout, DeviceLost
+from .ledger import ReplyLedger
 from .llm import (BudgetExceeded, LLMClient, LLMError, Prefetch, ScreenAnalysis)
 from .memory import Memory, intent_key
 from .pager import (SweepLog, can_repeat,
@@ -431,7 +432,8 @@ def needs_screenshot(state: RunState, screen: Screen, cfg: Config) -> Tuple[bool
 class Agent:
     def __init__(self, dev: Device, mem: Memory, llm: Optional[LLMClient],
                  cfg: Config, *, oracle: Optional[Oracle] = None,
-                 on_event=None):
+                 on_event=None, ledger: Optional[ReplyLedger] = None,
+                 policy: str = ""):
         self.dev = dev
         self.mem = mem
         self.llm = llm
@@ -439,6 +441,11 @@ class Agent:
         self.oracle = oracle or Oracle()
         self.on_event = on_event or (lambda *a, **k: None)
         self.skills = SkillRegistry(cfg.skills.skills_dir)
+        #: Set by `watch`, left None by `run`. When None no send is gated and no
+        #: reply is recorded, so an ordinary run behaves exactly as it always did.
+        self.ledger = ledger
+        #: The operator's reply instructions, verbatim. Empty for a run.
+        self.policy = policy
 
     # -- perception helpers ------------------------------------------------
 
@@ -917,10 +924,18 @@ class Agent:
             # `skill_note` is deliberately not in here: it goes to its own
             # message above the history instead, because it changes per app
             # rather than per turn. See `prompts.skill_block`.
+            # Which conversations are already answered. Advisory only -- the
+            # guarantee is `conversation.reply_gate` -- and it rides in `notes`
+            # rather than beside the policy because it changes as replies go out,
+            # and this block is rebuilt every turn anyway.
+            handled_note = ""
+            if self.ledger is not None:
+                handled_note = prompts.handled_block(
+                    [st.preview for st in self.ledger.recent() if st.preview])
             notes = "\n\n".join(filter(None, (note, stall_text, pager_note,
                                              hint, elem_hint, ban_note,
                                              state.last_failure,
-                                             situational)))
+                                             handled_note, situational)))
             effort, hard_because = needs_reasoning(
                 state, cfg, visit=visit,
                 blocked=bool(banned_actions or remembered), hint=hint)
@@ -943,6 +958,7 @@ class Agent:
                 screenshot=screenshot, note=notes,
                 scratchpad=state.scratchpad.render(cfg.run.scratchpad_max_chars),
                 progress="\n".join(state.progress_log), skill=skill_note,
+                policy=self.policy,
                 image_analysis=analysis.render() if analysis else None,
                 step=state.step, recorder=rec, effort=effort,
                 on_event=self.on_event)
@@ -1130,6 +1146,52 @@ class Agent:
                 )
                 continue
 
+            # ---- 5b. the never-double-reply gate ------------------------
+            # The harness half of the guarantee. The prompt also lists what has
+            # been handled, but a prompt is advice; this runs on the very screen
+            # the gesture is about to land on, and it is what a model that has
+            # talked itself into answering the same message twice runs into.
+            #
+            # Placed here rather than beside the other guards so that the two
+            # things between -- the stall block and the dry-run short circuit --
+            # cannot leave an attempt recorded for a gesture that never went out.
+            # `self.ledger` is None for an ordinary run, which is what leaves
+            # `adbagent run` behaving exactly as it did.
+            pending_reply: Optional[conversation.Conversation] = None
+            if self.ledger is not None:
+                verdict = conversation.reply_gate(action, screen, self.ledger, cfg)
+                if not verdict:
+                    log.warning("step %d: not sending -- %s",
+                                state.step, verdict.reason)
+                    self.on_event("safety_warning",
+                                  message=f"step {state.step}: send refused -- "
+                                          f"{verdict.reason}")
+                    rec.event("send_refused", step=state.step,
+                              reason=verdict.reason)
+                    state.last_failure = (
+                        f"the reply was not sent: {verdict.reason}. Do not try to "
+                        f"send it again -- leave this conversation and deal with "
+                        f"another one, or report done.")
+                    state.remember(format_history_entry(
+                        state.step, action, screen=screen, grade="refused",
+                        reason=verdict.reason))
+                    continue
+                if conversation.send_label(action, screen):
+                    convo = conversation.read_conversation(screen)
+                    if convo.readable:
+                        # Written *before* the gesture, on purpose: a record made
+                        # afterwards is one a crash between the tap and the write
+                        # can lose, and a lost record is a second reply. The price
+                        # of this ordering is that a send which never lands leaves
+                        # the thread in doubt, which is what the ledger's long
+                        # cooldown exists to absorb.
+                        self.ledger.record_attempt(convo.key, convo.digest,
+                                                   convo.preview())
+                        pending_reply = convo
+                        rec.event("reply_attempt", step=state.step,
+                                  thread=convo.key, digest=convo.digest,
+                                  preview=convo.preview())
+
             # ---- 6. act -------------------------------------------------
             t0_act = time.monotonic()
             # "Did this gesture move the content" is answered by comparing two
@@ -1236,6 +1298,35 @@ class Agent:
 
             rec.event("verify", step=state.step, grade=outcome.grade,
                       reason=outcome.reason, after=after.skeleton_id)
+
+            # The post-send tail, now that our own message has joined it. Two
+            # jobs: it is what stops the next poll from reading our own reply as
+            # new incoming content, and it lifts the thread out of the doubt that
+            # `record_attempt` deliberately left it in.
+            #
+            # A reply that cannot be confirmed on the screen it landed on is left
+            # in doubt rather than assumed sent -- the long cooldown then keeps
+            # anything else out of that conversation until a human has looked.
+            if pending_reply is not None:
+                landed = conversation.read_conversation(after)
+                digest = (landed.digest
+                          if landed.readable and landed.key == pending_reply.key
+                          else "")
+                if digest:
+                    self.ledger.record_confirmed(pending_reply.key, digest,
+                                                 landed.preview())
+                    rec.event("reply_confirmed", step=state.step,
+                              thread=pending_reply.key, digest=digest)
+                else:
+                    log.warning("step %d: the reply to %r could not be confirmed "
+                                "on the screen after it -- that conversation now "
+                                "gets the long cooldown",
+                                state.step, pending_reply.title)
+                    self.on_event("safety_warning",
+                                  message=f"step {state.step}: reply to "
+                                          f"{pending_reply.title!r} unconfirmed")
+                    rec.event("reply_unconfirmed", step=state.step,
+                              thread=pending_reply.key)
 
             # ---- 8. learn (no LLM) --------------------------------------
             # Two more ways a step can count as progress, both about the device

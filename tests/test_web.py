@@ -907,3 +907,360 @@ def test_every_config_key_is_on_the_settings_form_or_deliberately_not():
     assert not missing, (
         f"these settings exist but the UI cannot show them: {missing}. Add them "
         f"to CFG_SPEC in app.js, or to CFG_SPEC_OMISSIONS with a reason.")
+
+
+# ---------------------------------------------------------------------------
+# watch over the API
+# ---------------------------------------------------------------------------
+
+def _policy(tmp_path, text="reply only to people I follow") -> Path:
+    p = tmp_path / "policy.md"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def _configure_watch(tmp_path, **watch):
+    """Point the app's config file at a policy and a ledger under tmp."""
+    cfg = tmp_path / "config.json"
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    data.setdefault("llm", {})["model"] = "fake/model"
+    data.setdefault("watch", {}).update(watch)
+    cfg.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_watch_state_reports_defaults(web, tmp_path):
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    body = web.get("/api/watch").json()
+    assert body["active"]["running"] is False
+    assert body["defaults"]["interval_s"] == 45.0
+    assert body["defaults"]["fail_closed"] is True
+    assert body["policy_path"].endswith("policy.md")
+
+
+def test_watch_needs_a_goal(web, tmp_path):
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    assert web.post("/api/watch", json={"goal": ""}).status_code == 400
+
+
+def test_watch_needs_a_policy_file(web, tmp_path):
+    _configure_watch(tmp_path, policy="")
+    res = web.post("/api/watch", json={"goal": "watch dms"})
+    assert res.status_code == 400
+    assert "policy" in res.json()["detail"].lower()
+
+
+def test_watch_rejects_a_policy_path_that_is_not_there(web, tmp_path):
+    _configure_watch(tmp_path, policy=str(tmp_path / "nope.md"))
+    res = web.post("/api/watch", json={"goal": "watch dms"})
+    assert res.status_code == 400
+    assert "no policy file" in res.json()["detail"]
+
+
+def test_stopping_a_watch_that_is_not_running_is_a_conflict(web):
+    assert web.post("/api/watch/stop").status_code == 409
+
+
+def test_watch_lifecycle_and_argv(web, tmp_path, monkeypatch):
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    spawned = []
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: spawned.append(
+                            FakeProc(argv, stay_running=True, **kw))
+                        or spawned[-1])
+
+    res = web.post("/api/watch", json={
+        "goal": "watch my instagram dms", "draft": True,
+        "interval_s": 30, "max_steps": 12, "replies_per_hour": 5,
+        "replies_per_conversation": 1, "cooldown_s": 300, "usd_per_hour": 0.5,
+    })
+    assert res.status_code == 200
+    argv = spawned[0].argv
+    assert argv[3] == "watch" or "watch" in argv
+    assert "watch my instagram dms" in argv
+    assert "--draft" in argv
+    for flag, value in (("--interval", "30.0"), ("--steps-per-pass", "12"),
+                        ("--replies-per-hour", "5"),
+                        ("--replies-per-conversation", "1"),
+                        ("--cooldown", "300.0"), ("--usd-per-hour", "0.5")):
+        assert flag in argv, flag
+        assert argv[argv.index(flag) + 1] == value, flag
+
+    assert web.get("/api/watch").json()["active"]["running"] is True
+    # One watch at a time.
+    assert web.post("/api/watch", json={"goal": "again"}).status_code == 409
+    assert web.post("/api/watch/stop").status_code == 200
+    assert signal.SIGINT in spawned[0].signals   # so the phone is restored
+
+
+def test_live_watch_omits_the_draft_flag(web, tmp_path, monkeypatch):
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    spawned = []
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: spawned.append(
+                            FakeProc(argv, stay_running=True, **kw))
+                        or spawned[-1])
+    web.post("/api/watch", json={"goal": "watch dms", "draft": False})
+    assert "--draft" not in spawned[0].argv
+
+
+def test_a_watch_and_a_run_refuse_each_other(web, tmp_path, monkeypatch):
+    """One phone. A watch quietly displaced by a run is no longer watching."""
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: FakeProc(argv, stay_running=True, **kw))
+
+    assert web.post("/api/watch", json={"goal": "watch dms"}).status_code == 200
+    res = web.post("/api/runs", json={"goal": "turn on wifi"})
+    assert res.status_code == 409
+    assert "watch" in res.json()["detail"].lower()
+    # The screenshot, dump and apps endpoints hold the same line: they open a
+    # Device session, which resets animations and rotation under the watch.
+    for path in ("/api/devices/screenshot", "/api/dump", "/api/apps"):
+        assert web.get(path).status_code == 409, path
+
+
+def test_watch_is_reported_on_status(web, tmp_path, monkeypatch):
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: FakeProc(argv, stay_running=True, **kw))
+    web.post("/api/watch", json={"goal": "watch dms", "draft": True})
+    st = web.get("/api/status").json()
+    assert st["watch"]["running"] is True
+    assert st["watch"]["draft"] is True
+    assert st["watch"]["goal"] == "watch dms"
+
+
+# -- the policy file --------------------------------------------------------
+
+def test_policy_round_trips(web, tmp_path):
+    path = tmp_path / "policy.md"
+    _configure_watch(tmp_path, policy=str(path))
+    # Not written yet: an empty editor, not a 404.
+    body = web.get("/api/watch/policy").json()
+    assert body["exists"] is False and body["text"] == ""
+
+    res = web.put("/api/watch/policy", json={"text": "be brief"})
+    assert res.status_code == 200
+    assert path.read_text(encoding="utf-8") == "be brief"
+    assert web.get("/api/watch/policy").json()["text"] == "be brief"
+
+
+def test_an_empty_policy_is_refused(web, tmp_path):
+    _configure_watch(tmp_path, policy=str(tmp_path / "policy.md"))
+    assert web.put("/api/watch/policy", json={"text": "  \n"}).status_code == 400
+
+
+def test_policy_cannot_be_edited_under_a_running_watch(web, tmp_path, monkeypatch):
+    """The child read the file at startup; a save now lands at no known moment."""
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: FakeProc(argv, stay_running=True, **kw))
+    web.post("/api/watch", json={"goal": "watch dms"})
+    res = web.put("/api/watch/policy", json={"text": "something else"})
+    assert res.status_code == 409
+    assert "stop the watch" in res.json()["detail"]
+
+
+def test_policy_with_no_path_anywhere_is_a_bad_request(web, tmp_path):
+    _configure_watch(tmp_path, policy="")
+    assert web.put("/api/watch/policy", json={"text": "hi"}).status_code == 400
+
+
+# -- the reply ledger -------------------------------------------------------
+
+def test_ledger_is_empty_before_anything_is_sent(web, tmp_path):
+    _configure_watch(tmp_path, ledger=str(tmp_path / "replies.jsonl"))
+    body = web.get("/api/watch/ledger").json()
+    assert body["exists"] is False
+    assert body["total"] == 0 and body["threads"] == []
+
+
+def test_ledger_lists_threads_newest_first(web, tmp_path):
+    from adbagent.ledger import ReplyLedger, content_digest, thread_key
+    path = tmp_path / "replies.jsonl"
+    _configure_watch(tmp_path, ledger=str(path))
+    led = ReplyLedger(path)
+    led.record_attempt(thread_key("khushi"), content_digest(["hey"]),
+                       preview="khushi: hey", at=1000)
+    led.record_confirmed(thread_key("khushi"), content_digest(["hey", "hi"]),
+                         preview="khushi: hi", at=1001)
+    led.record_attempt(thread_key("shreya"), content_digest(["yo"]),
+                       preview="shreya: yo", at=2000)
+
+    body = web.get("/api/watch/ledger").json()
+    assert body["exists"] is True
+    assert body["total"] == 2                       # attempts, not confirmations
+    assert [t["preview"] for t in body["threads"]] == ["shreya: yo", "khushi: hi"]
+    assert body["threads"][0]["confirmed"] is False  # in doubt, and shown as such
+    assert body["threads"][1]["confirmed"] is True
+
+
+# ---------------------------------------------------------------------------
+# apps / dump / doctor
+# ---------------------------------------------------------------------------
+
+class FakeDev:
+    """Just the surface these three endpoints touch."""
+
+    def __init__(self, *a, **kw):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def list_apps(self, query="", third_party_only=False):
+        pool = ["com.instagram.android", "com.whatsapp", "com.android.settings"]
+        if third_party_only:
+            pool = [p for p in pool if not p.startswith("com.android.")]
+        return [p for p in pool if query in p]
+
+    def observe(self, settle=False):
+        from adbagent.fingerprint import attach
+        from adbagent.screen import parse
+        from . import xmlgen as X
+        return attach(parse(X.settings_screen(), width=X.W, height=X.H))
+
+
+def test_apps_lists_and_filters(web, monkeypatch):
+    monkeypatch.setattr("adbagent.device.Device", FakeDev)
+    # The endpoint lists everything by default; the form's checkbox is what asks
+    # for third-party only, and it passes the flag explicitly.
+    body = web.get("/api/apps").json()
+    assert body["count"] == 3 and "com.android.settings" in body["apps"]
+    body = web.get("/api/apps?third_party=true").json()
+    assert body["count"] == 2 and "com.android.settings" not in body["apps"]
+    body = web.get("/api/apps?search=insta").json()
+    assert body["apps"] == ["com.instagram.android"]
+
+
+def test_dump_returns_what_the_model_would_see(web, monkeypatch):
+    monkeypatch.setattr("adbagent.device.Device", FakeDev)
+    body = web.get("/api/dump").json()
+    assert body["package"] == "com.android.settings"
+    assert body["elements"] > 0 and body["nodes"] >= body["elements"]
+    assert body["skeleton_id"]
+    assert "#" in body["rendered"]        # the indices the model is told to aim at
+    assert body["xml"] == ""              # not asked for
+
+
+def test_dump_can_include_raw_xml(web, monkeypatch):
+    monkeypatch.setattr("adbagent.device.Device", FakeDev)
+    body = web.get("/api/dump?raw=true").json()
+    assert body["xml"].startswith("<?xml")
+
+
+def test_dump_reports_a_device_failure_as_a_bad_gateway(web, monkeypatch):
+    class Boom(FakeDev):
+        def __enter__(self):
+            raise RuntimeError("adb is not there")
+    monkeypatch.setattr("adbagent.device.Device", Boom)
+    assert web.get("/api/dump").status_code == 502
+
+
+def test_doctor_shells_out_to_the_real_command(web, monkeypatch):
+    seen = {}
+
+    class Done:
+        stdout, stderr, returncode = "adbagent 0.1.0\nEnvironment\n", "", 0
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        return Done()
+
+    monkeypatch.setattr("adbagent.web.server.subprocess.run", fake_run)
+    body = web.get("/api/doctor").json()
+    assert body["ok"] is True
+    assert "adbagent 0.1.0" in body["text"]
+    assert seen["argv"][2:4] == ["adbagent", "doctor"]
+
+
+# ---------------------------------------------------------------------------
+# the run oracle, which had no UI at all
+# ---------------------------------------------------------------------------
+
+def test_assertions_reach_the_cli(web, monkeypatch):
+    spawned = []
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: spawned.append(
+                            FakeProc(argv, stay_running=True, **kw))
+                        or spawned[-1])
+    web.post("/api/runs", json={
+        "goal": "turn on airplane mode",
+        "assert_shell": "settings get global airplane_mode_on",
+        "assert_equals": "1",
+    })
+    argv = spawned[0].argv
+    assert argv[argv.index("--assert-shell") + 1] == \
+        "settings get global airplane_mode_on"
+    assert argv[argv.index("--assert-equals") + 1] == "1"
+
+
+def test_no_assertion_flags_when_none_given(web, monkeypatch):
+    spawned = []
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: spawned.append(
+                            FakeProc(argv, stay_running=True, **kw))
+                        or spawned[-1])
+    web.post("/api/runs", json={"goal": "turn on wifi"})
+    assert "--assert-shell" not in spawned[0].argv
+    assert "--assert-text" not in spawned[0].argv
+
+
+# ---------------------------------------------------------------------------
+# the static pair: every id the script reaches for must exist in the page
+# ---------------------------------------------------------------------------
+
+INDEX_HTML = Path(__file__).resolve().parents[1] / \
+    "adbagent/web/static/index.html"
+
+#: Counter ids `makeLive` derives that a surface deliberately does not have.
+#: `paintCounters` guards on `iterWrap`, because a `skills generate` tour is one
+#: pass by definition and has no iteration to count.
+DERIVED_ID_OMISSIONS = {"gc-iter", "gc-iter-wrap"}
+
+
+def html_ids() -> set:
+    return set(re.findall(r'id="([^"]+)"', INDEX_HTML.read_text(encoding="utf-8")))
+
+
+def test_every_scripted_id_exists_in_the_page():
+    """A typo'd `$("...")` is a null, and the first line to touch it throws.
+
+    Cheap to check and impossible to notice by reading: the failure shows up as
+    one dead button, in one tab, at the moment somebody needs it.
+    """
+    js = APP_JS.read_text(encoding="utf-8")
+    referenced = set(re.findall(r'\$\("([^"]+)"\)', js))
+    missing = sorted(referenced - html_ids())
+    assert not missing, f"app.js reaches for ids the page does not have: {missing}"
+
+
+def test_every_derived_counter_id_exists_or_is_declared():
+    """The `makeLive(prefix)` x `el(suffix)` grid, which no grep over literals
+    would catch."""
+    js = APP_JS.read_text(encoding="utf-8")
+    prefixes = re.findall(r'makeLive\("([^"]*)"', js)
+    suffixes = set(re.findall(r'el\("([^"]+)"\)', js))
+    assert prefixes and suffixes, "the makeLive pattern moved; update this test"
+    derived = {p + s for p in prefixes for s in suffixes}
+    missing = sorted(derived - html_ids() - DERIVED_ID_OMISSIONS)
+    assert not missing, (
+        f"these counter ids are derived but absent: {missing}. Add them to the "
+        f"page, or to DERIVED_ID_OMISSIONS with the reason.")
+
+
+def test_every_tab_button_has_a_section_and_a_loader():
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    tabs = set(re.findall(r'data-tab="([^"]+)"', html))
+    sections = {i[4:] for i in html_ids() if i.startswith("tab-")}
+    assert tabs == sections, f"tab buttons and sections disagree: {tabs ^ sections}"
+    body = js[js.index("const tabLoaders = {"):]
+    body = body[:body.index("};")]
+    loaders = set(re.findall(r'^\s*(\w+):', body, re.M))
+    assert tabs == loaders, (
+        f"every tab needs a loader (a missing one throws on first click): "
+        f"{tabs ^ loaders}")

@@ -197,6 +197,29 @@ button.ghost:hover { background: var(--bg-hover); }
 .banner.failed, .banner.aborted { border-color: var(--red); }
 .banner.needs_user { border-color: var(--yellow); }
 
+/* The watch's mode banner. Filled rather than merely outlined, because unlike
+   the outcome banners above this one is a statement about what is *about* to
+   happen -- whether messages will reach real people -- and it has to be
+   unmissable from across the room, not just legible. */
+.banner.ok { border-color: var(--green); background: rgba(63, 185, 80, 0.10); }
+.banner.danger {
+  border-color: var(--red);
+  background: rgba(248, 81, 73, 0.12);
+  color: var(--red);
+}
+.banner.danger .small { color: var(--text); }
+
+/* `.ok`/`.warn` were scoped to the header status line; the ledger table and the
+   watch banner want the same two colours. */
+.ok { color: var(--green); }
+.warn { color: var(--yellow); }
+
+/* A fold for options that matter but are rarely set, so the common form stays
+   short. */
+.opts-more { margin: 6px 0 0; }
+.opts-more > summary { cursor: pointer; color: var(--text-dim); }
+.opts-more[open] > summary { margin-bottom: 6px; }
+
 /* Where the run picked up an app's guidance. Purple, matching the step numbers:
    both say "context for what follows" rather than "outcome of what came before",
    which is what the green/red/yellow banners are for. */

@@ -1,0 +1,362 @@
+"""The unbounded monitor loop: poll, act when something changed, never die.
+
+A run is bounded, may fail, and is over. A watch is expected to outlive
+transient failures and still be going tomorrow. That difference drives every
+decision in this file.
+
+**One bounded iteration at a time.** The loop does not make the agent's inner
+loop unbounded -- that would put it at war with the machinery that keeps a run
+honest. `safety.LoopDetector` treats a repeated (screen, action) pair as being
+stuck, and a poll loop is nothing but repeated (screen, action) pairs; the stall
+ladder gives up after `stall_give_up_at` steps without learning anything, and a
+quiet inbox teaches you nothing by design. So instead each pass is an ordinary
+bounded run of ~25 steps with all of that intact, and the *supervisor* is what
+never ends. Nothing inside the agent had to be weakened to make this work.
+
+**Nothing changed means nothing spent.** Between passes the loop dumps the UI --
+an adb round trip, no model call -- and compares a masked digest of the app's own
+text against the screen the last pass left behind. Equal means no new message, so
+it sleeps. That is what turns "an LLM call every 45 seconds forever" into "an LLM
+call per actual new message", and it is also the honest answer to "how would you
+know something arrived": you looked.
+
+The comparison is against a remembered *anchor* -- package plus digest -- rather
+than against the previous probe. Comparing consecutive probes would read a phone
+sitting on the launcher as "nothing changed" and watch the wrong screen forever;
+comparing against the anchor reads it as "not where I should be" and spends a
+pass getting back. Self-healing falls out of that: a screen that went off, an
+app that got killed, a notification shade left open all look like "not the
+anchor", and the fix is the same pass that handles a new message.
+
+**Failure is a pause, never an exit.** A failed pass doubles a backoff and the
+loop continues. Only a keyboard interrupt stops it. A watch that exits because
+the phone dropped off Wi-Fi for a minute is not a watch.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, List, Optional, Tuple
+
+from . import conversation
+from .agent import Agent, Outcome
+from .config import Config
+from .device import Device, DeviceLost, DeviceTimeout
+from .fingerprint import mask_goal
+from .ledger import ReplyLedger
+from .llm import BudgetExceeded, LLMClient, LLMError
+from .memory import Memory
+from .screen import Screen
+
+log = logging.getLogger("adbagent.watch")
+
+#: What one pass of the loop is, appended to the operator's goal. Generic across
+#: chat apps on purpose -- it says what a pass *is*, not what any app looks like.
+#:
+#: The last line is what makes the cheap probe possible: a pass that ends on the
+#: conversation list leaves an anchor the next probe can compare against, so a
+#: quiet inbox costs one UI dump instead of a model call.
+ITERATION_CONTRACT = """\
+This is ONE PASS of a monitoring loop that runs continuously. Do this pass only,
+then stop:
+  1. Get to the conversation list of the app named above.
+  2. Find the conversations with a new incoming message.
+  3. For each one, open it, read it, and if the REPLY POLICY says it should be
+     answered, send ONE reply that follows the policy. Then go back to the
+     conversation list.
+  4. When nothing is left that needs answering, report done.
+
+Rules for this pass:
+  - At most one reply per conversation. Never two.
+  - If a send is refused, do not retry it and do not rephrase it. Leave that
+    conversation and move on -- the refusal is the harness preventing a duplicate,
+    and it is always right.
+  - Do not start conversations with anyone who has not messaged first.
+  - Finish on the conversation list. The next pass starts from wherever you leave
+    the screen."""
+
+
+def screen_digest(screen: Screen) -> str:
+    """A digest of everything the app has written on screen, masked.
+
+    The novelty signal. Deliberately the opposite of `skeleton_id`, which is
+    content-free so that two visits to the same layout hash alike -- exactly the
+    wrong instrument for "did a new message arrive", which is a question about
+    content and nothing else.
+
+    Masked through `mask_goal` so a clock, a relative timestamp or an unread
+    badge ticking over is not mistaken for news, and read from the raw nodes for
+    the same reason `conversation.read_conversation` is: pruning folds a list into
+    one summary string on its scroller.
+    """
+    texts = [n.best_text.strip()
+             for n in conversation.app_nodes(screen)
+             if not n.children and n.best_text.strip()]
+    h = hashlib.sha256()
+    for t in texts:
+        h.update(mask_goal(t).encode("utf-8", "replace"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
+
+
+@dataclass
+class Anchor:
+    """The screen a successful pass left behind."""
+
+    package: str = ""
+    digest: str = ""
+
+    def matches(self, screen: Screen) -> bool:
+        return bool(self.package) and screen.package == self.package \
+            and screen_digest(screen) == self.digest
+
+    @classmethod
+    def of(cls, screen: Screen) -> "Anchor":
+        return cls(package=screen.package, digest=screen_digest(screen))
+
+
+@dataclass
+class Stats:
+    """What the watch has done, for the periodic status line."""
+
+    passes: int = 0
+    skipped: int = 0
+    #: Probes that found work but were held back by the rolling spend ceiling.
+    #: Counted separately from `skipped` because they are the opposite situation:
+    #: there *was* something to do.
+    paused: int = 0
+    failures: int = 0
+    replies_at_start: int = 0
+    usd: float = 0.0
+    started_at: float = field(default_factory=time.monotonic)
+
+    @property
+    def uptime_s(self) -> float:
+        return time.monotonic() - self.started_at
+
+
+class Watch:
+    """Supervises bounded agent passes forever."""
+
+    def __init__(self, dev: Device, mem: Memory, llm: LLMClient, cfg: Config,
+                 *, policy: str, ledger: ReplyLedger,
+                 say: Optional[Callable[[str], None]] = None,
+                 on_event: Optional[Callable[..., None]] = None,
+                 make_agent: Optional[Callable[..., Agent]] = None,
+                 sleep: Optional[Callable[[float], None]] = None):
+        self.dev = dev
+        self.mem = mem
+        self.llm = llm
+        self.cfg = cfg
+        self.policy = policy
+        self.ledger = ledger
+        self.say = say or (lambda msg: None)
+        self.on_event = on_event
+        # Injected so the loop can be tested without a device or a model.
+        self._make_agent = make_agent or self._default_agent
+        self._sleep = sleep or time.sleep
+        # A pass is bounded by `watch.max_steps`, not by `run.max_steps`: the
+        # run-level budget is sized for a whole task and a pass is one sweep of an
+        # inbox. Set here rather than left to the caller so that a `Watch`
+        # constructed any way at all cannot run 60-step passes by accident.
+        if cfg.watch.max_steps and cfg.run.max_steps != cfg.watch.max_steps:
+            log.debug("bounding each pass to %d steps (run.max_steps was %d)",
+                      cfg.watch.max_steps, cfg.run.max_steps)
+            cfg.run.max_steps = cfg.watch.max_steps
+        self.stats = Stats(replies_at_start=len(ledger))
+        self.anchor = Anchor()
+        #: (finished_at, usd) per pass, for the rolling spend ceiling.
+        self._spend: List[Tuple[float, float]] = []
+        self._stop = False
+
+    # -- construction ------------------------------------------------------
+
+    def _default_agent(self) -> Agent:
+        """A fresh agent per pass.
+
+        Fresh on purpose: a pass is a run, and the per-run state -- history, loop
+        detector, stall counters, scratchpad -- should not carry across. What must
+        survive between passes is exactly what the ledger holds, and that is read
+        back from disk rather than kept in memory.
+
+        Note that no skill learning happens here, unlike `cmd_run`: rewriting the
+        app's skill file every 45 seconds, mostly from passes that did nothing,
+        would churn the file the next pass depends on. A watch obeys a skill; it
+        does not edit one.
+        """
+        kw = {}
+        if self.on_event is not None:
+            kw["on_event"] = self.on_event
+        return Agent(self.dev, self.mem, self.llm, self.cfg,
+                     ledger=self.ledger, policy=self.policy, **kw)
+
+    # -- the loop ----------------------------------------------------------
+
+    def stop(self) -> None:
+        """Ask the loop to finish the pass it is on and return."""
+        self._stop = True
+
+    def run(self, goal: str, max_passes: int = 0) -> Stats:
+        """Watch until interrupted. `max_passes` bounds it, for tests.
+
+        Returns the stats rather than an exit code: the caller decides what a
+        stopped watch means.
+        """
+        full_goal = f"{goal.strip()}\n\n{ITERATION_CONTRACT}"
+        consecutive_failures = 0
+        w = self.cfg.watch
+
+        while not self._stop:
+            s = self.stats
+            if max_passes and s.passes + s.skipped + s.paused >= max_passes:
+                return self.stats
+
+            # -- is there anything to do? (no model call) ------------------
+            try:
+                screen = self.dev.observe()
+            except (DeviceTimeout, DeviceLost) as exc:
+                consecutive_failures += 1
+                delay = self._backoff(consecutive_failures)
+                log.warning("probe failed (%s); retrying in %.0fs", exc, delay)
+                self.say(f"  device unreachable ({exc}); retrying in {delay:.0f}s")
+                self._sleep(delay)
+                continue
+
+            if self.anchor.matches(screen):
+                self.stats.skipped += 1
+                log.debug("nothing new on %s; sleeping %.0fs",
+                          screen.package, w.interval_s)
+                self._sleep(w.interval_s)
+                continue
+
+            # -- is the loop allowed to spend? -----------------------------
+            paused = self._spend_pause()
+            if paused > 0:
+                self.stats.paused += 1
+                self.say(f"  hourly spend ceiling reached; pausing {paused:.0f}s")
+                log.warning("rolling spend ceiling ($%.2f/h) reached; pausing "
+                            "%.0fs", w.max_usd_per_hour, paused)
+                self._sleep(paused)
+                continue
+
+            # -- one bounded pass ------------------------------------------
+            outcome, usd = self._one_pass(full_goal)
+            self.stats.passes += 1
+            self.stats.usd += usd
+            self._spend.append((time.monotonic(), usd))
+
+            if outcome in ("success", "needs_user"):
+                consecutive_failures = 0
+                # Re-read rather than trusting the pass's last frame: the anchor
+                # has to describe the screen as it is *now*, or the next probe
+                # compares against something already stale.
+                self.anchor = self._read_anchor()
+                sent = len(self.ledger) - self.stats.replies_at_start
+                self.say(f"  pass {self.stats.passes}: {outcome} "
+                         f"({sent} repl(ies) sent so far, ${self.stats.usd:.4f})")
+                if outcome == "needs_user":
+                    # Not a failure -- the pass did what it could and stopped for
+                    # a human. Said loudly because nobody is watching the log.
+                    self.say("  a pass stopped and asked for a human; "
+                             "continuing to watch")
+                self._sleep(w.interval_s)
+            else:
+                consecutive_failures += 1
+                self.stats.failures += 1
+                delay = self._backoff(consecutive_failures)
+                self.say(f"  pass {outcome} ({consecutive_failures} in a row); "
+                         f"retrying in {delay:.0f}s")
+                log.warning("pass %s; %d consecutive failure(s), backing off "
+                            "%.0fs", outcome, consecutive_failures, delay)
+                # The anchor is dropped on failure on purpose: a failed pass left
+                # the screen somewhere unknown, and an anchor pointing at it would
+                # make the next probe skip work it needs to do.
+                self.anchor = Anchor()
+                self._sleep(delay)
+
+        return self.stats
+
+    # -- one pass ----------------------------------------------------------
+
+    def _one_pass(self, full_goal: str) -> Tuple[Outcome, float]:
+        """Run one bounded agent pass. Never raises for an ordinary failure."""
+        before = self.llm.ledger.total_usd
+        agent = self._make_agent()
+        try:
+            outcome, _state = agent.run(full_goal)
+        except (BudgetExceeded, LLMError) as exc:
+            # The session budget is a run-level guard; for a watch it is one more
+            # thing to back off from rather than a reason to stop watching.
+            log.warning("pass aborted: %s", exc)
+            outcome = "aborted"
+        except (DeviceTimeout, DeviceLost) as exc:
+            log.warning("pass lost the device: %s", exc)
+            outcome = "aborted"
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- a watch outlives surprises
+            # Logged with a traceback and survived. An unhandled exception in one
+            # pass is a bug to fix, not a reason for the watch to be gone when
+            # somebody comes back to it tomorrow.
+            log.exception("pass raised %s", type(exc).__name__)
+            outcome = "failed"
+        return outcome, self.llm.ledger.total_usd - before
+
+    def _read_anchor(self) -> Anchor:
+        try:
+            return Anchor.of(self.dev.observe())
+        except (DeviceTimeout, DeviceLost) as exc:
+            log.warning("could not read the anchor screen (%s); the next pass "
+                        "will run unconditionally", exc)
+            return Anchor()
+
+    # -- ceilings ----------------------------------------------------------
+
+    def _backoff(self, consecutive: int) -> float:
+        w = self.cfg.watch
+        delay = w.backoff_initial_s * (2 ** max(0, consecutive - 1))
+        return float(min(delay, w.backoff_max_s))
+
+    def _spend_pause(self) -> float:
+        """Seconds to wait before spending again, or 0."""
+        ceiling = self.cfg.watch.max_usd_per_hour
+        if ceiling <= 0:
+            return 0.0
+        now = time.monotonic()
+        window = [(t, u) for t, u in self._spend if now - t < 3600.0]
+        self._spend = window
+        if sum(u for _t, u in window) < ceiling:
+            return 0.0
+        oldest = min(t for t, _u in window)
+        return max(1.0, 3600.0 - (now - oldest))
+
+    # -- reporting ---------------------------------------------------------
+
+    def status(self) -> str:
+        s = self.stats
+        sent = len(self.ledger) - s.replies_at_start
+        bits = [f"{s.passes} pass(es)", f"{s.skipped} skipped"]
+        if s.paused:
+            bits.append(f"{s.paused} paused")
+        bits += [f"{s.failures} failed", f"{sent} repl(ies) sent",
+                 f"${s.usd:.4f}", f"up {s.uptime_s / 3600:.1f}h"]
+        return ", ".join(bits)
+
+
+def load_policy(path: str) -> str:
+    """The operator's reply instructions. Raises if unreadable.
+
+    A watch without a policy is a loop that decides for itself what to say to
+    people, so an unreadable policy file is fatal rather than a warning.
+    """
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise FileNotFoundError(f"no policy file at {p}")
+    text = p.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"the policy file {p} is empty")
+    return text

@@ -15,6 +15,7 @@
 
 <nav id="tabs">
   <button data-tab="run" class="active">Run</button>
+  <button data-tab="watch">Watch</button>
   <button data-tab="history">History</button>
   <button data-tab="devices">Devices</button>
   <button data-tab="config">Config</button>
@@ -38,6 +39,22 @@
         <label><input type="checkbox" id="opt-destructive"> allow destructive</label>
         <label><input type="checkbox" id="opt-no-learn"> don't learn</label>
       </div>
+      <!-- A machine-checkable definition of done. Free, instant, cannot be
+           argued with, and it removes the completion-judge call from the run.
+           Per-run rather than config, so this is the only place to set one. -->
+      <details class="opts-more">
+        <summary class="small">success assertion (optional)</summary>
+        <div class="opts">
+          <label>shell <input type="text" id="opt-assert-shell" size="34"
+            placeholder="settings get global airplane_mode_on"></label>
+          <label>equals <input type="text" id="opt-assert-equals" size="8"
+            placeholder="1"></label>
+          <label>or text on screen <input type="text" id="opt-assert-text" size="22"
+            placeholder="Forget network"></label>
+        </div>
+      </details>
+      <div class="opts">
+      </div>
       <div class="split">
         <button type="submit" class="primary" id="btn-start">Start run</button>
         <button type="button" class="danger" id="btn-stop" disabled>Stop</button>
@@ -57,6 +74,81 @@
         <span>skill <b id="c-skill">—</b></span>
       </div>
       <div class="feed" id="feed"></div>
+    </div>
+  </section>
+
+  <!-- --------------------------------------------------------- Watch -->
+  <!-- A watch is not a run: it does not end, it sends messages to real people,
+       and the only thing nobody should have to guess is which of those two
+       modes it is in. Hence the banner, first and coloured. -->
+  <section class="tab" id="tab-watch">
+    <div class="banner" id="watch-mode-banner"></div>
+
+    <form class="run-form" id="watch-form">
+      <textarea id="watch-goal" rows="2"
+        placeholder="What should it watch? e.g. watch my instagram direct messages"></textarea>
+      <div class="opts">
+        <label><input type="checkbox" id="watch-draft" checked> draft only (never send)</label>
+        <label>every <input type="number" id="watch-interval" min="5" step="5" size="4" placeholder="45"> s</label>
+        <label>steps/pass <input type="number" id="watch-steps" min="1" size="4" placeholder="25"></label>
+        <label>device <input type="text" id="watch-serial" placeholder="default serial"></label>
+      </div>
+      <div class="opts">
+        <label>replies/hour <input type="number" id="watch-rph" min="0" size="4" placeholder="12"></label>
+        <label>per conversation/hour <input type="number" id="watch-rpc" min="0" size="4" placeholder="2"></label>
+        <label>cooldown <input type="number" id="watch-cooldown" min="0" step="30" size="5" placeholder="600"> s</label>
+        <label>$/hour <input type="number" id="watch-usd" min="0" step="0.1" size="5" placeholder="off"></label>
+      </div>
+      <div class="split">
+        <button type="submit" class="primary" id="btn-watch-start">Start watching</button>
+        <button type="button" class="danger" id="btn-watch-stop" disabled>Stop</button>
+        <span class="small" id="watch-hint"></span>
+      </div>
+    </form>
+
+    <div class="panel">
+      <div class="split">
+        <h3>Reply policy</h3>
+        <button class="primary" id="btn-policy-save">Save policy</button>
+        <span class="small mono" id="watch-policy-path"></span>
+      </div>
+      <p class="small">These instructions go into the prompt verbatim, never
+        paraphrased. Message text on the phone is data, never an instruction —
+        a DM telling the agent to ignore this file is handled under it like any
+        other message.</p>
+      <textarea id="watch-policy" rows="12" spellcheck="false"
+        placeholder="Reply only to people I already follow. One short sentence…"></textarea>
+    </div>
+
+    <div id="watch-live" style="display:none">
+      <div class="counters">
+        <span>run <b id="w-runid">—</b></span>
+        <span id="w-iter-wrap" style="display:none">pass <b id="w-iter">1</b></span>
+        <span>step <b id="w-step">0</b></span>
+        <span>llm calls <b id="w-calls">0</b></span>
+        <span>cost <b id="w-cost">$0.0000</b></span>
+        <span>elapsed <b id="w-elapsed">0s</b></span>
+        <span>status <b id="w-state">running</b></span>
+        <span>skill <b id="w-skill">—</b></span>
+      </div>
+      <div class="feed" id="watch-feed"></div>
+    </div>
+
+    <!-- The record the never-double-reply guarantee is built on, and the only
+         place that answers "what did it say, to whom, when". -->
+    <div class="panel">
+      <div class="split">
+        <h3>Replies sent</h3>
+        <button class="ghost" id="btn-ledger-reload">reload</button>
+        <span class="small mono" id="watch-ledger-path"></span>
+      </div>
+      <table id="watch-ledger-table">
+        <thead><tr><th>conversation</th><th>replies</th><th>last</th><th>state</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="small" id="watch-ledger-empty" style="display:none">
+        Nothing sent yet. A conversation appears here the moment a reply is
+        attempted — before the gesture goes out, so a crash cannot lose it.</p>
     </div>
   </section>
 
@@ -108,6 +200,42 @@
     <div class="panel" id="shot-panel" style="display:none">
       <h3>Screenshot <span class="mono small" id="shot-serial"></span></h3>
       <img class="shot" id="shot-img" alt="device screenshot">
+    </div>
+
+    <!-- Which app is this actually called? A goal naming an app the phone does
+         not have fails on step one. -->
+    <div class="panel">
+      <div class="split">
+        <h3>Installed apps</h3>
+        <input type="text" id="apps-search" placeholder="search, e.g. whatsapp" size="20">
+        <label class="small"><input type="checkbox" id="apps-third-party" checked> third-party only</label>
+        <button class="ghost" id="btn-apps-load">list apps</button>
+        <span class="small" id="apps-status"></span>
+      </div>
+      <pre class="log" id="apps-out" style="display:none"></pre>
+    </div>
+
+    <!-- Exactly what the model is shown for the current screen: the same
+         pruning, the same #indices it is told to aim at. The first thing to look
+         at when a run did something inexplicable. -->
+    <div class="panel">
+      <div class="split">
+        <h3>What the model sees</h3>
+        <label class="small"><input type="checkbox" id="dump-raw"> include raw XML</label>
+        <button class="ghost" id="btn-dump">dump screen</button>
+        <span class="small" id="dump-status"></span>
+      </div>
+      <p class="small mono" id="dump-meta"></p>
+      <pre class="log" id="dump-out" style="display:none"></pre>
+    </div>
+
+    <div class="panel">
+      <div class="split">
+        <h3>Diagnostics</h3>
+        <button class="ghost" id="btn-doctor">run doctor</button>
+        <span class="small" id="doctor-status"></span>
+      </div>
+      <pre class="log" id="doctor-out" style="display:none"></pre>
     </div>
   </section>
 

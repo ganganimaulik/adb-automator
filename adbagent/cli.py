@@ -137,6 +137,19 @@ OVERRIDES = {
     "allow_destructive": "safety.allow_destructive",
     "unattended": "safety.unattended",
     "learn_after_run": "skills.learn_after_run",
+    # `watch` only. Distinct dest names because `watch.max_steps` and
+    # `run.max_steps` are different budgets and sharing `--max-steps` between
+    # them would silently drop whichever one lost -- see `Watch.__init__`.
+    "watch_interval": "watch.interval_s",
+    "watch_max_steps": "watch.max_steps",
+    "watch_draft": "watch.draft",
+    "watch_policy": "watch.policy",
+    "watch_ledger": "watch.ledger",
+    "watch_cooldown": "watch.thread_cooldown_s",
+    "watch_replies_per_hour": "watch.max_replies_per_hour",
+    "watch_replies_per_thread": "watch.max_replies_per_thread_per_hour",
+    "watch_usd_per_hour": "watch.max_usd_per_hour",
+    "watch_fail_closed": "watch.fail_closed",
 }
 
 
@@ -1068,6 +1081,104 @@ def cmd_run(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# watch
+# ---------------------------------------------------------------------------
+
+def _watch_banner(out: Out, cfg, goal: str, policy: str, ledger) -> None:
+    """Say exactly what is about to happen, in the loudest terms available.
+
+    A watch is unattended and it sends messages to real people. The one thing
+    nobody should ever have to guess is whether this invocation is going to put
+    words in somebody's inbox, so that line is first, coloured, and unambiguous.
+    """
+    w = cfg.watch
+    out.say()
+    out.say(f"  {out.bold('WATCH')}  {goal}")
+    if w.draft:
+        out.say(f"  {out.green('DRAFT MODE')} -- replies are composed and "
+                f"recorded, and never sent.")
+    else:
+        out.say(f"  {out.red('LIVE')} -- replies WILL be sent to real people "
+                f"from this device.")
+    out.say(out.dim(f"  policy: {w.policy} ({len(policy)} chars)"))
+    out.say(out.dim(f"  ledger: {ledger.path} "
+                    f"({len(ledger)} repl(ies) already recorded)"))
+    out.say(out.dim(
+        f"  every {w.interval_s:g}s | <={w.max_steps} steps/pass | "
+        f"<={w.max_replies_per_hour}/h | "
+        f"<={w.max_replies_per_thread_per_hour}/conversation/h | "
+        f"{w.thread_cooldown_s:g}s cooldown | "
+        f"fail_{'closed' if w.fail_closed else 'OPEN'}"))
+    if w.max_usd_per_hour:
+        out.say(out.dim(f"  spend ceiling: ${w.max_usd_per_hour:g}/h"))
+    out.say(out.dim("  Ctrl-C to stop"))
+    out.say()
+
+
+def cmd_watch(args) -> int:
+    from .device import Device
+    from .ledger import ReplyLedger
+    from .llm import LLMClient
+    from .memory import Memory
+    from .watch import Watch, load_policy
+
+    out = Out()
+    cfg = build_config(args)
+
+    goal = args.goal or ""
+    if not goal:
+        out.bad("no goal given -- say what to watch, e.g. "
+                "\"watch my instagram direct messages\"")
+        return 1
+    if not cfg.llm.model:
+        out.bad("no model chosen. Run `adbagent models` and pass --model.")
+        return 1
+    if not cfg.watch.policy:
+        out.bad("a watch needs --policy FILE: the instructions that decide what "
+                "gets replied to and what it says. There is no default -- a "
+                "default policy is one nobody wrote.")
+        return 1
+    try:
+        policy = load_policy(cfg.watch.policy)
+    except (OSError, ValueError) as exc:
+        out.bad(str(exc))
+        return 1
+
+    # A watch is unattended by definition: it runs for days with nobody at the
+    # terminal. Left as it comes, `safety.confirm` would reach `input()` the
+    # first time the agent touched a destructive control and block the loop
+    # forever -- and under the web UI there is not even a tty to block on.
+    # Refusing is the only answer that keeps a watch watching. `allow_destructive`
+    # in config still wins, for anyone who has decided otherwise.
+    if not cfg.safety.allow_destructive and not cfg.safety.unattended:
+        cfg.safety.unattended = True
+
+    _ensure_device(args, cfg, out)
+
+    ledger = ReplyLedger(cfg.watch.ledger)
+    _watch_banner(out, cfg, goal, policy, ledger)
+
+    # Per-step reporting only under -v. One line per pass is what a loop meant to
+    # run for days should print; the full step trace is megabytes by morning.
+    on_event = _live_reporter(out, max_steps=cfg.watch.max_steps) \
+        if args.verbose else None
+
+    with Device(cfg, args.device or "") as dev, Memory(cfg) as mem:
+        # One client for the whole watch, so the rolling ceilings and the ledger
+        # both see the session rather than a single pass.
+        llm = LLMClient(cfg, run_id=f"watch-{int(time.time())}")
+        watch = Watch(dev, mem, llm, cfg, policy=policy, ledger=ledger,
+                      say=out.say, on_event=on_event)
+        try:
+            watch.run(goal)
+        except KeyboardInterrupt:
+            out.say()
+            out.say("  stopped")
+        out.say(out.dim(f"  {watch.status()}"))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # report
 # ---------------------------------------------------------------------------
 
@@ -1758,6 +1869,53 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_run)
 
 
+
+    p = sub.add_parser("watch",
+                       help="monitor an app and reply, continuously")
+    p.add_argument("goal", nargs="?",
+                   help="what to watch, in plain language, e.g. "
+                        "\"watch my instagram direct messages\"")
+    p.add_argument("--policy", dest="watch_policy", metavar="FILE",
+                   help="required: file holding the reply instructions -- what "
+                        "to answer, what to ignore, and what to say")
+    p.add_argument("--draft", dest="watch_draft", action="store_true",
+                   default=None,
+                   help="compose and record replies but never send them; run "
+                        "this first whenever the policy has changed")
+    p.add_argument("--interval", dest="watch_interval", type=float,
+                   metavar="SECONDS",
+                   help="how often to look when nothing has changed "
+                        "(default 45)")
+    p.add_argument("--steps-per-pass", dest="watch_max_steps", type=int,
+                   metavar="N",
+                   help="step budget for one pass over the inbox (default 25)")
+    p.add_argument("--replies-per-hour", dest="watch_replies_per_hour",
+                   type=int, metavar="N",
+                   help="circuit breaker on total replies (default 12)")
+    p.add_argument("--replies-per-conversation",
+                   dest="watch_replies_per_thread", type=int, metavar="N",
+                   help="circuit breaker per conversation, per hour (default 2)")
+    p.add_argument("--cooldown", dest="watch_cooldown", type=float,
+                   metavar="SECONDS",
+                   help="minimum gap between two replies to the same "
+                        "conversation (default 600)")
+    p.add_argument("--ledger", dest="watch_ledger", metavar="FILE",
+                   help="where the record of sent replies lives "
+                        "(default watch-replies.jsonl). Deleting it allows "
+                        "every conversation to be answered again")
+    p.add_argument("--usd-per-hour", dest="watch_usd_per_hour", type=float,
+                   metavar="USD",
+                   help="pause the loop when spend in the last hour reaches "
+                        "this (default 0, meaning no ceiling)")
+    p.add_argument("--fail-open", dest="watch_fail_closed",
+                   action="store_false", default=None,
+                   help="send even when the conversation on screen cannot be "
+                        "identified. Off by default, and off is the safe setting: "
+                        "an unidentifiable conversation is one where a duplicate "
+                        "cannot be ruled out")
+    _add_common(p)
+    _add_device(p)
+    p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("report", help="summarise a recorded run")
     p.add_argument("run", nargs="?", default="latest",
