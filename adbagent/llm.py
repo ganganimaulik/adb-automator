@@ -15,6 +15,7 @@ agent loop only ever sees `decide()` and `judge()`.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import random
@@ -99,9 +100,20 @@ class ModelInfo:
         return f"{self.id:<58} {ctx:>6}  {','.join(caps) or '-':<13}{flag}"
 
 
+#: Catalogue `kind`s that do not serve chat completions, so cannot be what any
+#: of the `llm.model*` settings points at.
+#:
+#: A denylist and not an allowlist: the kinds a provider files chat models under
+#: grow -- this one catalogue already spreads them over `HF_BASE_MODEL` and
+#: `CUSTOM_MODEL` -- and a picker that hides a model the account can really use
+#: is worse than one that lists a model it cannot. Add a kind here when one turns
+#: up that a chat call cannot be made against.
+NON_CHAT_KINDS = frozenset({"EMBEDDING_MODEL"})
+
+
 def list_models(provider: Provider, api_key: str,
                 timeout: float = 30.0) -> List[ModelInfo]:
-    """Page the catalogue so the user can pick any model.
+    """Page the catalogue for the chat models the user can pick from.
 
     Note the filter grammar takes snake_case field names while the JSON response
     is camelCase.
@@ -125,8 +137,14 @@ def list_models(provider: Provider, api_key: str,
             for entry in body.get("models", []):
                 if entry.get("state") not in (None, "READY"):
                     continue
-                # conversationConfig present == the chat API is enabled for it.
+                # `conversationConfig` is necessary but not sufficient, which is
+                # what this filter used to assume on its own: an embedding model
+                # carries the chat template it inherited from its base model, so
+                # both the embedder and the reranker came through it looking like
+                # models to drive a phone with. `kind` is what separates them.
                 if "conversationConfig" not in entry:
+                    continue
+                if entry.get("kind") in NON_CHAT_KINDS:
                     continue
                 name = entry.get("name", "")
                 dep = entry.get("deprecationDate") or {}
@@ -471,6 +489,32 @@ def reasoning_style_for(model: str) -> str:
 #: dropping them cannot take a `prompt_cache_key` or a `service_tier` with it.
 REASONING_KEYS = ("reasoning_effort", "chat_template_kwargs")
 
+
+def prefix_cache_key() -> str:
+    """Affinity key naming the *prompt prefix*, not the run.
+
+    The key exists to route requests that share a prefix to the replica that
+    already holds it. Keying it on the run id -- which is what this used to do --
+    named the wrong thing: every run got a fresh key, so every run started on an
+    arbitrary replica with a cold cache and paid full price for a system prompt
+    that is byte-identical across every run the agent has ever made. Over the
+    traces in ``runs/`` that showed up as an 8.4% cache hit rate against a layout
+    that supports about 55%.
+
+    Hashing the system text instead means all runs of one agent version share a
+    replica and the prefix stays warm between them, while editing the prompt
+    rolls the key -- which is what you want, since the old replica is warm for
+    text that no longer gets sent.
+
+    The tradeoff is that one key concentrates load on one replica. That is right
+    for a single-tenant agent driving one phone; a multi-tenant deployment wants
+    a per-tenant suffix here.
+    """
+    from . import prompts
+    digest = hashlib.sha256(prompts.SYSTEM.encode("utf-8")).hexdigest()
+    return f"adbagent-{digest[:16]}"
+
+
 #: Statuses that mean "the request was malformed" rather than "try again later".
 #: A rejected reasoning field lands here, so this is where it is caught.
 REJECTED_STATUS = frozenset({400, 422})
@@ -657,6 +701,11 @@ class LLMClient:
         self.model_image = qualify(self.provider, cfg.llm.image())
         self.ledger = Ledger()
         self.limiter = shared_limiter(self.provider.name, cfg.llm.rpm)
+        #: Names the prompt prefix rather than the run, so the static system text
+        #: stays warm on one replica across runs. Sent both ways: Fireworks
+        #: documents the body field in the API reference and the header in the
+        #: caching guide, and they cost nothing together.
+        self.cache_key = prefix_cache_key()
         #: Models the provider has told us do not take a reasoning field. Most
         #: models do not reason, no catalogue says which, and the family table is
         #: a guess -- so the authoritative answer is the one the API gives, and it
@@ -678,9 +727,9 @@ class LLMClient:
             effort = ""
         if self.provider.name == "fireworks":
             extra.update({
-                # Pin the run to one replica so the static prefix keeps hitting the
-                # prompt cache, which is where most of the input discount comes from.
-                "prompt_cache_key": self.run_id or "adbagent",
+                # Pin to one replica so the static prefix keeps hitting the prompt
+                # cache, which is where most of the input discount comes from.
+                "prompt_cache_key": self.cache_key,
                 # Fireworks silently truncates an over-long prompt by default. For an
                 # agent that would mean acting on a screen it only half saw.
                 "context_length_exceeded_behavior": "error",
@@ -724,6 +773,11 @@ class LLMClient:
         extra = self._extra_body(model, effort or self.cfg.llm.effort_for(purpose))
         if extra:
             kwargs["extra_body"] = extra
+        if self.provider.name == "fireworks":
+            # Same key as `prompt_cache_key` above. The API reference documents
+            # the body field and the caching guide documents this header; which
+            # one the serving path actually reads is not stated, so send both.
+            kwargs["extra_headers"] = {"x-session-affinity": self.cache_key}
 
         last: Optional[Exception] = None
         retries = self.cfg.llm.max_retries
@@ -1092,7 +1146,7 @@ class LLMClient:
     def decide(self, *, goal: str, rendered: str, history: Sequence[str],
                width: int, height: int, package: str = "",
                screenshot: Optional[bytes] = None, note: str = "",
-               scratchpad: str = "", progress: str = "",
+               scratchpad: str = "", progress: str = "", skill: str = "",
                step: int = 0, recorder: Optional[Any] = None,
                purpose: str = "decide", effort: str = "",
                image_analysis: Optional[str] = None,
@@ -1126,8 +1180,12 @@ class LLMClient:
             {"role": "user",
              "content": prompts.device_profile(width, height)},
             {"role": "user", "content": prompts.goal_block(goal)},
-            {"role": "user", "content": prompts.history_only_block(history)},
         ]
+        if skill:
+            # Above the history on purpose -- see `prompts.skill_block`.
+            messages.append({"role": "user", "content": prompts.skill_block(skill)})
+        messages.append(
+            {"role": "user", "content": prompts.history_only_block(history)})
         if state_text:
             messages.append({"role": "user", "content": state_text})
         messages.append({"role": "user", "content": content})
@@ -1180,9 +1238,74 @@ class LLMClient:
                                effort=self.cfg.llm.effort_for("judge", hard=True),
                                **kw)
 
+    def replan(self, *, goal: str, rendered: str,
+               tried: Sequence[Tuple[str, int]] = (), stalled: int = 0,
+               scratchpad: str = "", progress: str = "",
+               packages: Sequence[str] = (),
+               screenshot: Optional[bytes] = None,
+               image_analysis: Optional[str] = None,
+               step: int = 0, recorder: Optional[Any] = None,
+               on_event: Optional[Callable[..., None]] = None) -> "Strategy":
+        """One call for a different approach, made from outside the step history.
+
+        Runs on the deciding model at the hard effort: this is the single
+        hardest question the run will ask, and it is asked at most a few times.
+        The step history is deliberately *not* in the prompt -- it is a record of
+        the approach that is failing, and handing it over is what would argue
+        for one more go at it.
+        """
+        from . import prompts
+
+        inline_image = bool(screenshot) and self.cfg.llm.vision_in_decider
+        if screenshot and not image_analysis and not inline_image:
+            image_analysis = self.analyze_image(
+                screenshot, goal=goal, rendered=rendered, step=step,
+                recorder=recorder, on_event=on_event).render()
+
+        body = prompts.replan_user(goal, rendered=rendered, tried=tried,
+                                   stalled=stalled, scratchpad=scratchpad,
+                                   progress=progress, packages=packages)
+        if image_analysis:
+            body += f"\n\nVISUAL SCREEN ANALYSIS (from image model):\n{image_analysis}"
+        content: List[Dict[str, Any]] = [text_part(body)]
+        if inline_image:
+            content.append(image_part(screenshot))  # type: ignore[arg-type]
+        messages = [
+            {"role": "system", "content": prompts.REPLAN_SYSTEM},
+            {"role": "user", "content": content},
+        ]
+        if recorder is not None:
+            recorder.dump_messages(step, messages, purpose="replan")
+        kw = {}
+        if on_event is not None:
+            kw["on_event"] = on_event
+        return self.structured(messages, Strategy, model=self.model,
+                               purpose="replan",
+                               effort=self.cfg.llm.effort_for("decide", hard=True),
+                               **kw)
+
 
 class Verdict(BaseModel):
     """Independent check that the goal is actually satisfied."""
 
     satisfied: bool
     evidence: str = ""
+
+
+class Strategy(BaseModel):
+    """A way out, asked for once when a run has stopped getting anywhere.
+
+    Deliberately not an action. The decider already answers with actions and is
+    the thing that got stuck; what it is missing is not another turn but a
+    different plan, and a plan can be carried across turns while an action
+    cannot. See :data:`prompts.REPLAN_SYSTEM`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    assessment: str = Field("", description="One sentence: why the current "
+                                            "approach is not working.")
+    strategy: str = Field("", description="A concretely different approach for "
+                                          "the agent to follow.")
+    abandon: bool = Field(False, description="True when the goal cannot be "
+                                             "reached from here at all.")

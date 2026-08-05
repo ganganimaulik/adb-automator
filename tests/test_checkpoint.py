@@ -17,7 +17,6 @@ from adbagent.actions import AgentAction
 from adbagent.agent import Agent, RunState
 from adbagent.config import Config
 from adbagent.memory import Memory
-from adbagent.pager import ItemRecord
 
 from . import fake
 
@@ -64,16 +63,14 @@ def populated_state() -> RunState:
     state.progress_log.append("read 3 of 5 items")
     state.packages.add("com.android.settings")
     state.package_steps["com.android.settings"] = 6
-    state.items.items["photo1"] = ItemRecord(
-        key="photo1", label="first photo", first_step=2, last_step=2,
-        read=True, detail="a cat on a scale", visits=1)
-    state.items.items["photo2#2"] = ItemRecord(
-        key="photo2", label="second photo (#2)", first_step=3, last_step=4,
-        read=False, detail="", visits=2)
-    state.items.total = 5
-    state.items.set_id = "set-1"
-    state.items.cursor = "photo2#2"
-    state.items.edges.add("left")
+    state.sweep.start("swipe left")
+    state.sweep.add("a cat on a scale, 4.2 kg")
+    state.sweep.add("a bowl of oats, 101 g")
+    state.sweep.repeats = 2
+    state.steps_since_progress = 6
+    state.last_progress = "it recorded 1 new data record(s)"
+    state.strategy = "use the search box instead of the grid"
+    state.replanned_at = 5
     return state
 
 
@@ -117,17 +114,24 @@ def test_round_trip_preserves_everything_the_loop_needs(cfg):
     assert "9:30: water 280g" in rendered
     assert "water 275g" in rendered          # the superseded reading survives
 
-    # The item ledger keeps its keys verbatim: a `#2` suffix is how two items
-    # sharing a caption stay apart, and losing it would merge them.
-    assert set(fresh.items.items) == {"photo1", "photo2#2"}
-    assert fresh.items.items["photo1"].read is True
-    assert fresh.items.items["photo1"].detail == "a cat on a scale"
-    assert fresh.items.items["photo2#2"].key == "photo2"
-    assert fresh.items.items["photo2#2"].visits == 2
-    assert fresh.items.total == 5
-    assert fresh.items.set_id == "set-1"
-    assert fresh.items.cursor == "photo2#2"
-    assert fresh.items.edges == {"left"}
+    # A sweep in flight keeps its readings, in order. There is no item ledger to
+    # restore any more -- the captions, totals and set membership it persisted
+    # were never knowable; see `pager.py`.
+    assert fresh.sweep.gesture == "swipe left"
+    assert fresh.sweep.readings == ["a cat on a scale, 4.2 kg",
+                                    "a bowl of oats, 101 g"]
+    assert fresh.sweep.repeats == 2
+
+    # The stall ladder. Dropping these would restart a resumed run at tier zero,
+    # so it would spend another eight steps rediscovering the stall it stopped
+    # in -- and buy a second replan to be told the same thing.
+    assert fresh.steps_since_progress == 6
+    assert fresh.last_progress == "it recorded 1 new data record(s)"
+    assert fresh.strategy == "use the search box instead of the grid"
+    assert fresh.replanned_at == 5
+    # `attempts` is not the ring buffer and must not be rebuilt from it: the
+    # question it answers is about steps that have already fallen out.
+    assert fresh.loops.times_on("exact1", "tap/#4") == 1
 
 
 def test_load_returns_none_when_there_is_nothing_to_load(cfg, tmp_path):

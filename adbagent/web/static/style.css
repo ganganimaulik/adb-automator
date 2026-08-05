@@ -131,7 +131,12 @@ button.primary, button.danger, button.ghost {
 }
 
 button.primary { background: var(--accent); border-color: var(--accent); color: #0d1117; font-weight: 600; }
-button.primary:disabled { opacity: 0.4; cursor: default; }
+/* Every kind of button, not just the primary one: a Stop that looks pressable
+   while there is nothing to stop invites the click and then ignores it. */
+button.primary:disabled, button.danger:disabled, button.ghost:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
 button.danger { background: none; color: var(--red); border-color: var(--red); }
 button.ghost { background: var(--bg-raise); color: var(--text); }
 button.ghost:hover { background: var(--bg-hover); }

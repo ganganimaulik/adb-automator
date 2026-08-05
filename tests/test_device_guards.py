@@ -14,6 +14,8 @@ import pytest
 from adbagent.device import (DENY_PATTERNS, DeviceTimeout, PRESS_KEYS, ShellDenied,
                              _guard, check_shell, patch_socket_timeout)
 
+from . import xmlgen as X
+
 
 @pytest.mark.parametrize("command", [
     # wipe / policy
@@ -122,6 +124,126 @@ def test_press_key_vocabulary_matches_the_server():
     assert {"back", "home", "enter", "recent", "delete"} <= PRESS_KEYS
     assert "escape" not in PRESS_KEYS
     assert "tab" not in PRESS_KEYS
+
+
+# ---------------------------------------------------------------------------
+# Observation across a launch
+#
+# `runs/71295f360ea5`: WhatsApp was in front, the screenshot showed its chat
+# list, and the tree the model was given held a clock, a battery and three nav
+# buttons -- so the step reported "the Android home screen is visible". Two
+# defects, one per test group below: `app_start` was not waited on, and the
+# settle loop certified two identical frames-of-nothing as a stable screen.
+# ---------------------------------------------------------------------------
+
+def _replaying_device(dumps, front=("", "")):
+    """A `Device` that replays scripted dumps. No phone, no sleeping to speak of."""
+    from adbagent.config import Config
+    from adbagent.device import Device
+
+    dev = Device.__new__(Device)
+    dev.cfg = Config()
+    dev.cfg.device.settle_interval_s = 0.005
+    dev._size = (X.W, X.H)
+    remaining = list(dumps)
+    dev.taken = []
+
+    def dump():
+        # The last dump repeats: a phone does not run out of screens.
+        xml = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        dev.taken.append(xml)
+        return xml
+
+    dev.dump = dump
+    dev.current_app = lambda: front
+    return dev
+
+
+def test_observe_re_dumps_past_a_mid_launch_frame():
+    app = X.media_viewer()
+    dev = _replaying_device([X.mid_launch(), X.mid_launch(), app],
+                            front=("com.whatsapp", ".Main"))
+    screen = dev.observe(settle=True)
+    assert not screen.chrome_only
+    assert screen.package == "com.whatsapp"
+    assert len(dev.taken) >= 3
+
+
+def test_two_identical_mid_launch_frames_do_not_count_as_settled():
+    """Equality is no defence: a frame of nothing agrees with the next one."""
+    dev = _replaying_device([X.mid_launch()], front=("com.whatsapp", ".Main"))
+    dev.cfg.device.settle_budget_s = 0.05
+    screen = dev.observe(settle=True)
+    # Nothing better ever arrived, so it is handed over rather than blocking --
+    # but only after the budget was spent trying, not on the second matching dump.
+    assert screen.chrome_only
+    assert len(dev.taken) > 2
+
+
+def test_a_blank_frame_between_two_identical_frames_still_settles():
+    app = X.media_viewer()
+    dev = _replaying_device([app, X.mid_launch(), app],
+                            front=("com.whatsapp", ".Main"))
+    screen = dev.observe(settle=True)
+    assert screen.package == "com.whatsapp"
+    # The blank was skipped, not treated as a change: the third dump matched the
+    # first, so three dumps were enough.
+    assert len(dev.taken) == 3
+
+
+def test_a_mid_launch_dump_is_not_re_dumped_forever_when_settle_is_off():
+    dev = _replaying_device([X.mid_launch()], front=("com.whatsapp", ".Main"))
+    dev.cfg.device.settle_budget_s = 0.05
+    start = time.monotonic()
+    assert dev.observe().chrome_only
+    assert time.monotonic() - start < 1.0
+
+
+def _launching_device(fronts, **device_cfg):
+    """A `Device` whose foreground package follows `fronts`, one per poll."""
+    from adbagent.config import Config
+    from adbagent.device import Device
+
+    class DummyU2:
+        def __init__(self):
+            self.started = []
+
+        def app_start(self, package, stop=False):
+            self.started.append(package)
+
+    dev = Device.__new__(Device)
+    dev.cfg = Config()
+    dev.cfg.device.launch_poll_s = 0.0
+    for key, value in device_cfg.items():
+        setattr(dev.cfg.device, key, value)
+    dev._d = DummyU2()
+    remaining = list(fronts)
+    dev.polls = []
+
+    def current_app():
+        pkg = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        dev.polls.append(pkg)
+        return pkg, ""
+
+    dev.current_app = current_app
+    return dev
+
+
+def test_open_app_waits_until_the_package_is_really_in_front():
+    """`app_start` returns before the window exists; the launch is not the app."""
+    dev = _launching_device(["com.android.systemui", "com.android.systemui",
+                             "com.whatsapp"])
+    assert dev.open_app("com.whatsapp") is True
+    assert dev._d.started == ["com.whatsapp"]
+    assert dev.polls == ["com.android.systemui", "com.android.systemui",
+                         "com.whatsapp"]
+
+
+def test_open_app_reports_a_launch_that_never_lands():
+    """Not installed, or too slow to matter. Either way the caller must know."""
+    dev = _launching_device(["com.android.systemui"], launch_timeout_s=0.05)
+    assert dev.open_app("com.whatsapp") is False
+    assert len(dev.polls) > 1
 
 
 def test_device_scroll_gesture_directions_and_duration(capsys):

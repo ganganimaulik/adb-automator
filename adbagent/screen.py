@@ -43,7 +43,10 @@ _HORIZONTAL_SCROLLER_SUFFIXES = (
 # presence must not change a screen's identity, so it is dropped during parse.
 IME_PACKAGE_HINTS = ("inputmethod", "latin", "keyboard", "swiftkey", "gboard")
 
-_SYSTEM_UI_PACKAGES = {
+#: Packages that draw the status bar, the navigation bar and system dialogs.
+#: Public because `pager` needs it too: the status bar carries a clock, and a
+#: clock read as an item caption renames every item once a minute.
+SYSTEM_UI_PACKAGES = {
     "com.android.systemui",
     "android",
 }
@@ -157,6 +160,11 @@ class Element:
         """Whatever a human would call this element."""
         return self.text or self.content_desc or self.label or self.hint
 
+    @property
+    def is_system_chrome(self) -> bool:
+        """Drawn by the OS, not by the app: the status bar and the nav bar."""
+        return self.package in SYSTEM_UI_PACKAGES
+
     def ancestors(self) -> Iterable["Element"]:
         node = self.parent
         while node is not None:
@@ -215,14 +223,11 @@ class Screen:
     tokens: Tuple[str, ...] = ()
     screenshot: Optional[bytes] = None
     dhash: Optional[int] = None
-    #: Populated by pager.attach_item() via fingerprint.attach(). A pager shows
-    #: one item of a sequence, so the screen's identity does not distinguish
-    #: photo 7 from photo 8 -- these fields do. See `pager.py`.
-    is_pager: bool = False
-    item_label: str = ""
-    item_key: str = ""
-    item_position: int = 0
-    item_total: int = 0
+    # A screen used to carry `is_pager`, `item_label`, `item_key`,
+    # `item_position` and `item_total`, filled in by the pager module. They are
+    # gone because none of them were properties of a screen: whether a gesture
+    # pages is a property of the *gesture*, learned by trying it, and the
+    # captions and totals were guesses. See `pager.py`.
 
     def by_index(self, i: int) -> Optional[Element]:
         for el in self.elements:
@@ -233,6 +238,28 @@ class Screen:
     @property
     def actionable(self) -> List[Element]:
         return [e for e in self.elements if e.interactive]
+
+    @property
+    def content_elements(self) -> List[Element]:
+        """The elements the *app* drew -- the screen minus the system chrome.
+
+        Every heuristic that asks a question about the app's content should ask
+        it of these, not of `elements`. The status bar is the reason: it sits
+        outside every scroller and every app, and it changes on its own. Read as
+        content it has, in this codebase alone, named a carousel item after the
+        clock and graded a tap that did nothing as a success because the signal
+        icon moved. Neither bug is about clocks or signal icons specifically --
+        both are about asking the app a question and letting the OS answer.
+
+        When the system UI *is* the content -- the notification shade pulled
+        down, the volume panel, a system dialog with the screen to itself --
+        nothing is excluded, because then it is exactly what the agent is
+        working on. Same reasoning as `_dominant_package`, which is what decides
+        whose screen this is.
+        """
+        if not self.package or self.package in SYSTEM_UI_PACKAGES:
+            return list(self.elements)
+        return [e for e in self.elements if not e.is_system_chrome]
 
     @property
     def ambiguous(self) -> bool:
@@ -254,9 +281,36 @@ class Screen:
         """Too few actionable nodes to drive from XML -- WebView/Canvas/game."""
         return len(self.actionable) < 3
 
+    @property
+    def chrome_only(self) -> bool:
+        """Nothing but the status bar and the nav bar: a frame of nothing.
+
+        A dump contains the windows that exist at that instant, so one taken
+        between an app's window going away and the next one's being added holds
+        only the two windows that are always there. The danger is that it does
+        not read as an error -- it reads as a perfectly plausible screen, with a
+        clock, a battery and three nav buttons. In ``runs/71295f360ea5`` WhatsApp
+        was in front and in the screenshot, the tree was this, and the model
+        dutifully reported "the Android home screen is visible with the clock,
+        status bar icons, and navigation buttons".
+
+        Two conditions, so that a real system screen never matches: no app owns
+        the dump, and nothing at all is drawn between the two bars. A launcher
+        with icons, the notification shade and the volume panel all fill the
+        middle of the screen. A mid-transition dump leaves it empty.
+        """
+        # An empty dump is `degenerate` -- a different signal with its own answer.
+        if not self.elements or self.height <= 0:
+            return False
+        if self.package and self.package not in SYSTEM_UI_PACKAGES:
+            return False
+        top, bottom = int(self.height * 0.12), int(self.height * 0.88)
+        return not any(el.bounds[3] > top and el.bounds[1] < bottom
+                       for el in self.elements)
+
     def has_system_dialog(self) -> bool:
         target = self.package
-        return any(p != target and p not in _SYSTEM_UI_PACKAGES
+        return any(p != target and p not in SYSTEM_UI_PACKAGES
                    for p in self.packages)
 
 
@@ -357,7 +411,7 @@ def _dominant_package(nodes: Sequence[Element]) -> str:
         area[n.package] = area.get(n.package, 0) + n.area
     if not area:
         return ""
-    non_system = {p: a for p, a in area.items() if p not in _SYSTEM_UI_PACKAGES}
+    non_system = {p: a for p, a in area.items() if p not in SYSTEM_UI_PACKAGES}
     pool = non_system or area
     return max(pool.items(), key=lambda kv: kv[1])[0]
 

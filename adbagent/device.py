@@ -660,18 +660,38 @@ class Device:
         budget expires. That is both cheaper on average and more correct than a
         fixed sleep: fast screens return immediately, slow ones get the time
         they need.
+
+        Either way, a dump holding nothing but the status and navigation bars is
+        never handed back while there is budget left to take another one. Such a
+        dump is a frame of nothing -- see `Screen.chrome_only` -- and equality is
+        no defence against it: two of them in a row agree, so the settle loop
+        used to certify one as a stable screen and pass it to the model.
         """
         budget = self.cfg.device.settle_budget_s
         interval = self.cfg.device.settle_interval_s
         deadline = time.monotonic() + budget
 
         screen = self._observe_once()
+        while screen.chrome_only and time.monotonic() < deadline:
+            time.sleep(interval)
+            screen = self._observe_once()
+        if screen.chrome_only:
+            # Out of budget. Nothing better is coming, so hand it over rather
+            # than block; `activity` is the only clue left about what is in front.
+            log.debug("dump held nothing but system chrome after %.1fs (activity %s)",
+                      budget, screen.activity or "?")
+            return screen
         if not settle:
             return screen
 
         while time.monotonic() < deadline:
             time.sleep(interval)
             nxt = self._observe_once()
+            # A frame of nothing is not a stable state, and it must not reset the
+            # comparison either: the two real frames either side of it are what
+            # this loop is here to match.
+            if nxt.chrome_only:
+                continue
             if nxt.exact_id == screen.exact_id:
                 return nxt
             screen = nxt
@@ -797,8 +817,39 @@ class Device:
             log.debug("set_clipboard u2 failed (%s); using shell", exc)
             self._safe(lambda: self.shell(f"cmd clipboard set {text!r}", timeout=10))
 
-    def open_app(self, package: str) -> None:
+    def open_app(self, package: str, timeout_s: Optional[float] = None) -> bool:
+        """Launch `package` and wait until it is the app in front.
+
+        `app_start` is fire-and-forget twice over: handed a package that is not
+        installed it returns happily having done nothing, and handed a real one it
+        returns before the window is added. Returning there leaves the caller
+        observing whatever the phone happened to be showing mid-launch -- usually
+        the status and nav bars alone, which is how a launched app came to be
+        described as the home screen in `runs/71295f360ea5`.
+
+        Returns whether `package` reached the foreground within the budget. False
+        is not necessarily fatal (a slow cold start still lands, just later), so
+        it is reported rather than raised.
+        """
         self._act(lambda: self.u2.app_start(package, stop=False), "open_app")
+        budget = (self.cfg.device.launch_timeout_s if timeout_s is None
+                  else timeout_s)
+        return self.wait_foreground(package, budget)
+
+    def wait_foreground(self, package: str, timeout_s: float) -> bool:
+        """Poll until `package` is the foreground app, or the budget expires."""
+        if not package or timeout_s <= 0:
+            return False
+        deadline = time.monotonic() + timeout_s
+        while True:
+            current, _ = self.current_app()
+            if current == package:
+                return True
+            if time.monotonic() >= deadline:
+                log.debug("%s was not in front within %.1fs (front: %s)",
+                          package, timeout_s, current or "?")
+                return False
+            time.sleep(self.cfg.device.launch_poll_s)
 
     def list_apps(self, query: str = "", third_party_only: bool = False) -> List[str]:
         """List installed application packages on the device, optionally filtered by query string."""

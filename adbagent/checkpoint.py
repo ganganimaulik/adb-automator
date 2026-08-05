@@ -27,12 +27,10 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from . import runlog
-from .pager import ItemRecord
 from .scratchpad import Entry, normalise_key
 
 log = logging.getLogger("adbagent.checkpoint")
@@ -70,6 +68,12 @@ def save(cfg: Any, state: Any) -> None:
         "loops": {
             "history": [list(pair) for pair in state.loops.history],
             "banned": {k: sorted(v) for k, v in state.loops.banned.items()},
+            # Flattened because the key is a tuple and JSON keys are strings.
+            # Kept rather than rebuilt from `history`, which is a twenty-entry
+            # ring buffer: "have I tried this here before" is asked precisely
+            # about the steps that have already fallen out of it.
+            "attempts": [[sid, sig, n]
+                         for (sid, sig), n in state.loops.attempts.items()],
             "element_actions": {
                 k: [list(entry) for entry in v]
                 for k, v in state.loops.element_actions.items()
@@ -81,6 +85,13 @@ def save(cfg: Any, state: Any) -> None:
         "want_screenshot": state.want_screenshot,
         "last_failure": state.last_failure,
         "scroll_warnings": state.scroll_warnings,
+        # The stall ladder. A resumed run that dropped these would restart at
+        # tier zero and have to rediscover, over another eight steps, the
+        # stall it was already in the middle of.
+        "steps_since_progress": state.steps_since_progress,
+        "last_progress": state.last_progress,
+        "strategy": state.strategy,
+        "replanned_at": state.replanned_at,
         "scratchpad": {
             "entries": [
                 {"key": e.key, "value": e.value,
@@ -93,20 +104,15 @@ def save(cfg: Any, state: Any) -> None:
         "progress_log": state.progress_log,
         "packages": sorted(state.packages),
         "package_steps": state.package_steps,
-        "items": {
-            # The dict key and the record's own `key` differ: the first is the
-            # ledger key, which a `#2` suffix disambiguates when two items
-            # share a caption; the second is the raw key both were minted from.
-            "items": [
-                {"ledger_key": ledger_key, "key": r.key, "label": r.label,
-                 "first_step": r.first_step, "last_step": r.last_step,
-                 "read": r.read, "detail": r.detail, "visits": r.visits}
-                for ledger_key, r in state.items.items.items()
-            ],
-            "total": state.items.total,
-            "set_id": state.items.set_id,
-            "cursor": state.items.cursor,
-            "edges": sorted(state.items.edges),
+        # A whole item ledger used to be persisted here -- per-item captions,
+        # read flags, the set's size and which ends had been hit. None of it
+        # survives, because none of it was knowable; see `pager.py`. What is
+        # left is the readings of a sweep still in flight, which are lost
+        # anyway if the process dies mid-sweep.
+        "sweep": {
+            "gesture": state.sweep.gesture,
+            "readings": list(state.sweep.readings),
+            "repeats": state.sweep.repeats,
         },
     }
     try:
@@ -171,6 +177,10 @@ def restore(state: Any, data: Dict[str, Any]) -> None:
     state.want_screenshot = bool(data.get("want_screenshot"))
     state.last_failure = str(data.get("last_failure") or "")
     state.scroll_warnings = int(data.get("scroll_warnings") or 0)
+    state.steps_since_progress = int(data.get("steps_since_progress") or 0)
+    state.last_progress = str(data.get("last_progress") or "the run was resumed")
+    state.strategy = str(data.get("strategy") or "")
+    state.replanned_at = int(data.get("replanned_at") or 0)
     state.progress_log = [str(line) for line in data.get("progress_log") or []]
     state.packages = set(data.get("packages") or [])
     state.package_steps = {str(k): int(v)
@@ -180,6 +190,13 @@ def restore(state: Any, data: Dict[str, Any]) -> None:
     state.loops.history = [tuple(pair) for pair in loops.get("history") or []]
     state.loops.banned = {str(k): set(v)
                           for k, v in (loops.get("banned") or {}).items()}
+    state.loops.attempts = {}
+    for row in loops.get("attempts") or []:
+        try:
+            sid, sig, n = row
+        except (TypeError, ValueError):
+            continue
+        state.loops.attempts[(str(sid), str(sig))] = int(n)
     state.loops.element_actions = {
         str(k): [tuple(entry) for entry in v]
         for k, v in (loops.get("element_actions") or {}).items()
@@ -200,21 +217,7 @@ def restore(state: Any, data: Dict[str, Any]) -> None:
             superseded=[str(v) for v in raw.get("superseded") or []])
     state.scratchpad.evicted = int(scratch.get("evicted") or 0)
 
-    items = data.get("items") or {}
-    for raw in items.get("items") or []:
-        ledger_key = str(raw.get("ledger_key") or raw.get("key") or "")
-        if not ledger_key:
-            continue
-        state.items.items[ledger_key] = ItemRecord(
-            key=str(raw.get("key") or ledger_key),
-            label=str(raw.get("label") or ledger_key),
-            first_step=int(raw.get("first_step") or 0),
-            last_step=int(raw.get("last_step") or 0),
-            read=bool(raw.get("read")),
-            detail=str(raw.get("detail") or ""),
-            visits=int(raw.get("visits") or 1))
-    state.items.items = OrderedDict(state.items.items)
-    state.items.total = int(items.get("total") or 0)
-    state.items.set_id = str(items.get("set_id") or "")
-    state.items.cursor = str(items.get("cursor") or "")
-    state.items.edges = set(items.get("edges") or [])
+    sweep = data.get("sweep") or {}
+    state.sweep.gesture = str(sweep.get("gesture") or "")
+    state.sweep.readings = [str(r) for r in sweep.get("readings") or []]
+    state.sweep.repeats = int(sweep.get("repeats") or 0)

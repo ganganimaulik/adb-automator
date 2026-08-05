@@ -23,7 +23,7 @@ from ..config import Config, _set_path, find_config_file, load_config
 from ..runlog import SHOT_RE, STREAM_NAME
 from ..skills import Skill, SkillRegistry
 from . import runparse
-from .runner import JobManager, RunManager, sse
+from .runner import ChildProcess, JobManager, RunManager, sse
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -69,7 +69,23 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
                config_path: str = "") -> FastAPI:
     runs_dir = Path(artifacts_dir)
     manager = RunManager(runs_dir, config_path=config_path)
-    jobs = JobManager()
+    # The same artifacts directory: a `skills generate` tour writes a run there
+    # like any other, and the browser tails it through the same live view.
+    jobs = JobManager(runs_dir)
+
+    def phone_busy() -> str:
+        """Why the phone cannot be driven right now, or "".
+
+        One phone, one agent. A tour and a goal run reading each other's taps
+        as their own is the failure this prevents; that both are started from
+        different corners of the page is what makes it easy to ask for.
+        """
+        if manager.state()["running"]:
+            return "a run is already in progress"
+        job = jobs.active()
+        if job is not None:
+            return f"a skill is being generated (job {job.id}); the phone is busy"
+        return ""
 
     def load_cfg() -> Config:
         return load_config(config_path or None).config
@@ -95,6 +111,10 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
     def status() -> Dict[str, Any]:
         loaded = load_config(config_path or None)
         cfg = loaded.config
+        # A generation in flight is reported alongside the run for the same
+        # reason: a page reloaded mid-tour has to know there is something to
+        # reattach to, and which job to ask for it.
+        job = jobs.active()
         return {
             "config_path": str(loaded.path) if loaded.path else "",
             "model": cfg.llm.model,
@@ -102,6 +122,12 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             "device_serial": cfg.device.serial,
             "artifacts_dir": str(runs_dir),
             "run": manager.state(),
+            "job": None if job is None else {
+                "id": job.id,
+                "running": True,
+                "started_at": job.state()["started_at"],
+                "run_id": job.state()["run_id"],
+            },
         }
 
     @app.get("/api/devices")
@@ -177,6 +203,64 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
         return {"saved": True, "path": str(path)}
 
+    # -- models ----------------------------------------------------------
+
+    #: The catalogue costs several paged HTTP calls, so hold the answer rather
+    #: than page through it again for every visit to the config tab. Keyed on the
+    #: provider alone -- two keys against one provider see the same serverless
+    #: list -- and aged out, so a model released mid-session is at most this
+    #: stale. `?refresh=1` fetches now.
+    catalogue: Dict[str, Any] = {"provider": "", "at": 0.0, "models": []}
+    catalogue_ttl_s = 600.0
+
+    @app.get("/api/models")
+    def models(refresh: bool = False) -> Dict[str, Any]:
+        """What `llm.model` and its siblings can be set to, for the dropdowns.
+
+        Never fails: no key yet, or a catalogue that cannot be reached, is a
+        normal state for this endpoint -- the UI answers it by offering a text
+        box instead of a list -- so the trouble travels in `error` rather than
+        as a status code.
+        """
+        from ..llm import PROVIDERS, list_models, qualify
+
+        cfg = load_cfg()
+        answer: Dict[str, Any] = {"provider": cfg.llm.provider, "models": [],
+                                  "cached": False, "error": ""}
+        provider = PROVIDERS.get(cfg.llm.provider)
+        if provider is None:
+            answer["error"] = (f"unknown provider {cfg.llm.provider!r}; "
+                               f"known: {', '.join(sorted(PROVIDERS))}")
+            return answer
+        if not cfg.api_key():
+            answer["error"] = ("no API key: set llm.api_key below, or "
+                               f"${cfg.llm.api_key_env} in the environment")
+            return answer
+
+        cached = (not refresh and catalogue["provider"] == cfg.llm.provider
+                  and time.monotonic() - catalogue["at"] < catalogue_ttl_s)
+        if not cached:
+            try:
+                found = list_models(provider, cfg.api_key())
+            except Exception as exc:  # noqa: BLE001 - offline, 401, throttled
+                answer["error"] = str(exc)
+                return answer
+            catalogue.update(
+                provider=cfg.llm.provider, at=time.monotonic(),
+                models=[{
+                    "id": m.id,
+                    # What the config file should hold: the id the wire wants,
+                    # which on fireworks is the fully-qualified one.
+                    "value": qualify(provider, m.id),
+                    "display_name": m.display_name,
+                    "context_length": m.context_length,
+                    "vision": m.vision, "tools": m.tools,
+                    "deprecated": m.deprecated,
+                } for m in found])
+        answer["models"] = catalogue["models"]
+        answer["cached"] = cached
+        return answer
+
     # -- runs ------------------------------------------------------------
 
     # Declared before /api/runs/{run_id} so the literal path wins.
@@ -207,6 +291,9 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             goal = data.get("goal", "")
         if not goal:
             raise HTTPException(status_code=400, detail="goal is required")
+        busy = phone_busy()
+        if busy:
+            raise HTTPException(status_code=409, detail=busy)
         try:
             return manager.start(goal, max_steps=req.max_steps,
                                  budget_usd=req.budget_usd, repeat=req.repeat,
@@ -292,6 +379,9 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
 
     @app.post("/api/skills/generate")
     def generate_skill(req: GenerateRequest) -> Dict[str, Any]:
+        busy = phone_busy()
+        if busy:
+            raise HTTPException(status_code=409, detail=busy)
         argv = [sys.executable, "-m", "adbagent", "skills", "generate"]
         if req.name.strip():
             argv.append(req.name.strip())
@@ -314,11 +404,45 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             raise HTTPException(status_code=404, detail="job not found")
         return job
 
+    @app.post("/api/jobs/{job_id}/stop")
+    def stop_job(job_id: int) -> Dict[str, Any]:
+        """Stop a generation. It holds the phone, so there has to be a way out
+        of the browser -- otherwise a tour that will not finish blocks every run
+        after it."""
+        job = jobs.job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        if not job.stop():
+            raise HTTPException(status_code=409, detail="that job is already done")
+        return {"stopping": True}
+
+    @app.get("/api/jobs/{job_id}/stream")
+    def job_stream(job_id: int) -> StreamingResponse:
+        """The tour a generation is doing, as the run it is.
+
+        The same frames off the same files as `/api/runs/stream`: a generation
+        drives the phone through the same agent and leaves the same
+        `events.jsonl` behind it, so the browser has no reason to settle for the
+        child's stdout. What stdout still carries is the part that happens after
+        the loop -- the skill written up from what the tour saw -- which is why
+        `/api/jobs/{id}` stays.
+        """
+        job = jobs.job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return StreamingResponse(_event_stream(job),
+                                 media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache"})
+
     return app
 
 
-def _event_stream(manager: RunManager) -> Generator[str, None, None]:
-    """Replay then follow the active run's event files as SSE frames.
+def _event_stream(child: ChildProcess) -> Generator[str, None, None]:
+    """Replay then follow a child's run files as SSE frames.
+
+    Any child that drives the phone: the goal run behind the Run tab, or the
+    tour behind a `skills generate`. Both write the same files, so both are
+    watched with the same frames -- and the browser renders them with one view.
 
     Two files, two frame types: `events.jsonl` (what was decided) arrives as
     `event`, and `stream.jsonl` (the model's raw thinking and response as they
@@ -330,16 +454,16 @@ def _event_stream(manager: RunManager) -> Generator[str, None, None]:
     `run` frame. The client rules off there; the session's own totals -- the
     spend the budget bounds -- carry across.
     """
-    yield sse(manager.state(), "state")
-    state = manager.state()
+    yield sse(child.state(), "state")
+    state = child.state()
     if not state["running"] and not state["run_id"]:
         yield sse({"reason": "no active run"}, "end")
         return
 
-    run_dir = manager.run_dir() or manager.wait_for_run_dir()
+    run_dir = child.run_dir() or child.wait_for_run_dir()
     if run_dir is None:
         yield sse({"reason": "run directory never appeared",
-                   "output_tail": manager.state()["output_tail"]}, "end")
+                   "output_tail": child.state()["output_tail"]}, "end")
         return
 
     def tails_for(path: Path):
@@ -347,7 +471,7 @@ def _event_stream(manager: RunManager) -> Generator[str, None, None]:
                 (path / STREAM_NAME, "llm")]
 
     yield sse({"run_id": run_dir.name,
-               "iteration": manager.state()["iteration"] or 1}, "run")
+               "iteration": child.state()["iteration"] or 1}, "run")
 
     tails = tails_for(run_dir)
     offsets = [0] * len(tails)
@@ -387,7 +511,7 @@ def _event_stream(manager: RunManager) -> Generator[str, None, None]:
         # still being written -- and never before the last one has been read,
         # which is why a switch resets the drain count.
         if not flowed:
-            newest = manager.run_dir()
+            newest = child.run_dir()
             if newest is not None and newest != run_dir:
                 for i, (_, frame) in enumerate(tails):
                     if carries[i].strip():
@@ -401,10 +525,10 @@ def _event_stream(manager: RunManager) -> Generator[str, None, None]:
                 carries = [b""] * len(tails)
                 drain_passes = 0
                 yield sse({"run_id": run_dir.name,
-                           "iteration": manager.state()["iteration"]}, "run")
+                           "iteration": child.state()["iteration"]}, "run")
                 continue
 
-        if manager.state()["running"]:
+        if child.state()["running"]:
             drain_passes = 0
         else:
             drain_passes += 1
@@ -415,7 +539,7 @@ def _event_stream(manager: RunManager) -> Generator[str, None, None]:
                             yield sse(json.loads(carries[i]), frame)
                         except json.JSONDecodeError:
                             pass
-                state = manager.state()
+                state = child.state()
                 yield sse(state, "state")
                 yield sse({"reason": "finished",
                            "returncode": state["returncode"]}, "end")

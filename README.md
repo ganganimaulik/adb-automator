@@ -65,7 +65,9 @@ export FIREWORKS_API_KEY=fw_...
 adbagent models --vision --search kimi
 ```
 
-Any model in the provider's catalogue works. Pass it with `--model`, or set it in
+Any model the listing shows works — it is the provider's catalogue narrowed to
+what a chat call can be made against, so an embedding or reranking model is never
+offered as one to drive a phone with. Pass it with `--model`, or set it in
 `config.json` (copy `config.example.json`). The API key may be set in `config.json`
 (`llm.api_key`, which is gitignored) or via the `FIREWORKS_API_KEY` environment
 variable.
@@ -152,6 +154,32 @@ An assertion also removes the final LLM call from the run.
 - The agent restores your keyboard, animation scales, rotation and screen timeout
   on exit, including on Ctrl-C.
 
+## When it stops getting anywhere
+
+The way an agent loses a run is not usually by failing. It is by succeeding at
+everything and arriving nowhere — tapping into a screen, pressing back, tapping
+into it again, twenty times over, with every action verified as having worked.
+A counter of failed actions cannot see that, and for a long time nothing here
+could either.
+
+So the loop also counts **steps since it last learned something**. Six things
+reset that counter, and they are all facts rather than opinions: reaching a
+screen it had not seen, entering a new app, writing a data record, a gesture
+that moved content, changing something on the device, or a sweep reading items.
+When none of them has happened for a while, the harness escalates:
+
+| stalled for | what happens |
+|---|---|
+| 3 steps | The model is told, in the note block, exactly how long it has been going nowhere. It gets a screenshot and thinks at the harder reasoning depth. |
+| 5 steps | The harness stops asking. Any action already tried twice on this screen is **refused** before it runs, the way a reversing scroll already was. `done`, `fail` and `ask_user` are never refused — they are the exits. |
+| 8 steps | One `replan` call, on the deciding model, from *outside* the step history. It is shown the goal, what has been tried here and how often, and what has been collected, and it answers with an approach rather than an action. That approach is carried in the prompt until progress resumes. It can also answer "abandon", which ends the run. |
+| 14 steps | Stop. The collected data survives: the CLI prints it, and `--resume` picks the run up from its checkpoint. |
+
+Each tier is in `events.jsonl` (`stall_block`, `replan`, `stalled_out`), and
+every `decide` event carries the stall count it was made at, so a run that ends
+this way can be read back rather than guessed at. Set any threshold to `0` to
+switch that tier off.
+
 ## Galleries and carousels
 
 A photo viewer breaks screen identity: photo 7 and photo 8 are structurally the
@@ -206,7 +234,9 @@ adbagent report runs/<id>
 Every run writes a directory of its own: `events.jsonl` (what it decided, one
 structured line per step), `run.log` (what it did, in full detail),
 `stream.jsonl` (the raw LLM stream — every `llm_start`/chunk/`llm_end`, which
-the web UI tails to show the model thinking live), the exact messages sent
+the web UI tails to show the model thinking live; a reasoning model writes tens
+of thousands of chunks a run, so opening a *finished* run joins each run of them
+into one record before it leaves the server), the exact messages sent
 at each step, and the screenshots that were *submitted* to a model —
 `step_004_analyze_image_9f3c1a20.jpg`, named by the step, the call that was shown
 it, and a digest of the bytes, so one frame shown twice is one file. Only
@@ -326,14 +356,29 @@ lists recorded runs with their outcome, cost and duration, and opens the full
 trace, stats and scratchpad for any of them — and a failed or interrupted one
 has a **resume** button, continuing it from its checkpoint exactly like
 `run --resume`. **Devices** shows what is attached
-and grabs a screenshot on demand. **Config** edits `config.json`. **Skills**
-lists, edits and generates app skills.
+and grabs a screenshot on demand. **Config** edits `config.json` — the five
+model fields are dropdowns over the provider's own catalogue, the same list
+`adbagent models` prints, each option carrying the context window and whether
+the model can see, since the slots that are handed a screenshot cannot take a
+text-only model. A model the catalogue does not list is still reachable through
+"custom…", and a provider that cannot be reached at all (no key yet, or offline)
+leaves every field editable rather than emptying it. **Skills**
+lists, edits and generates app skills — and a generation is watched exactly like
+a run, because it is one: the tour drives the phone through the same agent and
+writes the same `events.jsonl`, so it gets the same counters, decision cards,
+thinking panels and submitted frames rather than the tail of a subprocess's
+stdout. Its own output stays under **generator output**, which is where the two
+things the tour cannot show live end up: the skill written up afterwards from
+what it saw, and the refusals that come before there is any run to stream ("no
+API key", "that app is not installed").
 
 Runs are spawned as ordinary CLI subprocesses, so Stop is a SIGINT and the
-phone's keyboard, animations and rotation are restored exactly as with Ctrl-C.
-A run started from the UI can never block on a confirmation prompt: it is
-launched with `--unattended` unless you tick "allow destructive". One run at a
-time — there is one phone.
+phone's keyboard, animations and rotation are restored exactly as with Ctrl-C —
+for a generation as much as for a run, since both change the same settings. A run
+started from the UI can never block on a confirmation prompt: it is launched with
+`--unattended` unless you tick "allow destructive". One agent at a time — there
+is one phone, so a run and a generation cannot overlap, and whichever holds it
+turns the other's start button into a 409.
 
 **repeat** takes a count or `inf`, the same as the CLI flag. Each iteration is
 a separate run in its own directory, so the live view follows the move and
@@ -565,10 +610,16 @@ adbagent report runs/<id>        # did the reasoning tokens actually drop?
 | `llm.reasoning_style` | `auto` | Which wire convention to use: `auto`, `effort`, `thinking`, `off`. |
 | `run.pager_sweep` | `true` | Page through carousels in code once the model has chosen to. See above. |
 | `run.pager_sweep_max` | `12` | Items per sweep before control returns to the model. |
+| `run.stall_nudge_at` | `3` | Steps without learning anything before the model is told so, shown a screenshot and made to think harder. `0` switches the tier off. |
+| `run.stall_block_at` | `5` | Steps before the harness starts refusing actions already tried twice on this screen. |
+| `run.stall_replan_at` | `8` | Steps before one call is spent asking for a different approach. |
+| `run.stall_give_up_at` | `14` | Steps before the run stops. The collected data survives. |
+| `run.max_consecutive_failures` | `4` | Actions that *failed* in a row before giving up. Separate from the stall ladder, which counts actions that worked and got nowhere. |
 | `llm.vision_in_decider` | `false` | Set when `llm.model` itself accepts images: the screenshot then goes straight to the deciding call instead of being described first by `llm.model_image` — one round trip per screenshot turn instead of two. Leave off for a text-only model; an image part would fail the whole call. |
 | `run.always_screenshot` | `false` | Pay for vision on every turn. |
 | `run.never_screenshot` | `false` | Never pay for vision. Disables sweeping, which needs to read items. |
-| `device.settle_budget_s` | `2.0` | How long to wait for the screen to stop changing after an action. |
+| `device.settle_budget_s` | `2.0` | How long to wait for the screen to stop changing after an action. Also caps the re-dumping of a frame that holds nothing but the status and nav bars, which is what a dump taken mid-transition returns. |
+| `device.launch_timeout_s` | `8.0` | How long `open_app` waits for the package to actually reach the foreground. `app_start` returns before the window exists, so without this the next observation describes the launch rather than the app. |
 | `safety.budget_usd` | `2.0` | Session spend ceiling. The run aborts when it is reached. |
 
 ## Development

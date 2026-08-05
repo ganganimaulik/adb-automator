@@ -112,8 +112,8 @@ $("tabs").addEventListener("click", (e) => {
   document.querySelectorAll("section.tab").forEach((s) =>
     s.classList.toggle("active", s.id === "tab-" + btn.dataset.tab));
   const name = btn.dataset.tab;
-  if (name === "run") armPageTail();  // the other tab's scroll position isn't a
-                                      // reader's decision about this feed
+  // The other tab's scroll position isn't a reader's decision about this feed.
+  if (name === "run" || name === "skills") armPageTail();
   if (!loadedTabs.has(name)) {
     loadedTabs.add(name);
     tabLoaders[name]().catch((err) => notice(err.message));
@@ -142,21 +142,14 @@ const GRADE_CLASSES = { worked: "worked", no_change: "no_change" };
 
 /* A ledger key as a person reads it: `label:today, 9:17 am#2` is the app's own
    caption plus the ledger's bookkeeping, and the prefix is the bookkeeping. */
-function itemName(key) {
-  return String(key || "").replace(/^[a-z]+:/, "");
-}
-
 /* Kinds that are a line of context rather than a card, each mapped to its text.
    A kind in neither this table nor a branch below renders as its bare name --
    which is how a sweep used to read as twenty lines saying "sweep_step" with
    everything the events carried thrown away. */
 const NOTE_LINES = {
-  sweep_step: (e) => `swept ${e.direction || ""} · ` +
-    `${e.label || itemName(e.item) || "item"} · ${e.read_count || 0} read` +
-    (e.moved === false ? " · did not move" : ""),
-  pager_item: (e) => `gallery item ${e.read_count || 0}/${e.total || "?"}` +
-    (e.label ? ` · ${e.label}` : "") + (e.read ? " · looked at" : ""),
-  pager_retry: (e) => `pager retry: ${e.action || "the same gesture, harder"}`,
+  sweep_step: (e) => `repeated \`${e.gesture || "the gesture"}\` · ` +
+    `${e.read_count || 0} read` + (e.moved === false ? " · did not move" : ""),
+  pager_retry: (e) => `retry harder: ${e.action || "the same gesture"}`,
   dismiss: (e) => `harness dismissed ${e.label} (attempt ${e.attempt})`,
   dismiss_failed: (e) =>
     `${e.label} dismisses nothing after ${e.tries} tries — handed to the model`,
@@ -165,6 +158,10 @@ const NOTE_LINES = {
     `${e.consecutive_backs} backs in a row — asking for another approach`,
   scroll_rejected: (e) => `scroll rejected: ${e.action}`,
   refused: (e) => `refused ${e.label} — needs "allow destructive"`,
+  stall_block: (e) =>
+    `refused ${e.action} — tried ${e.tries}× here, nothing new for ${e.stalled} steps`,
+  replan: (e) => `stalled ${e.stalled} steps — new approach: ${e.strategy || "?"}`,
+  replan_failed: (e) => `replan produced nothing usable (${e.error || "?"})`,
   scratchpad: (e) => `collected: ${(e.keys || []).join(", ")} (${e.total} total)`,
   dead_ends: (e) => `dead ends avoided: ${(e.remembered || []).join(", ")}`,
 };
@@ -174,6 +171,10 @@ const NOTE_LINES = {
 const HALT_BANNERS = {
   error: (e) => [`failed`, `<b>error</b> ${esc(e.error || "")}`],
   gave_up: (e) => [`failed`, `<b>gave up</b> ${esc(e.reason || "")}`],
+  stalled_out: (e) => [`failed`,
+                       `<b>stopped going anywhere</b> nothing new for ` +
+                       `${esc(String(e.stalled || "?"))} steps — last progress: ` +
+                       `${esc(e.last_progress || "?")}`],
   sensitive: (e) => [`needs_user`,
                      `<b>stopped on a sensitive screen</b> ${esc(e.reason || "")}`],
 };
@@ -248,14 +249,14 @@ function renderEvent(ev, feed) {
     div.className = "card";
     div.innerHTML =
       `<div class="head"><span class="stepno">step ${esc(ev.step)}</span>` +
-      `<span class="chip neutral">item read</span>` +
-      (ev.item ? `<span class="mono">${esc(itemName(ev.item))}</span>` : "") + `</div>` +
+      `<span class="chip neutral">read</span>` +
+      (ev.position ? `<span class="mono">#${esc(ev.position)}</span>` : "") + `</div>` +
       `<div class="obs">${esc(ev.reading || "")}</div>`;
     const thumb = llmShot(ev, feed && feed._runId);
     if (thumb) div.appendChild(thumb);
   } else if (kind === "sweep") {
     div.className = "banner";
-    div.innerHTML = `<b>swept ${esc(ev.swept)} item(s) ${esc(ev.direction)}</b>, ` +
+    div.innerHTML = `<b>repeated \`${esc(ev.gesture)}\` ${esc(ev.swept)}×</b>, ` +
       `${esc(ev.read)} read <span class="small">· steps ${esc(ev.first_step)}–` +
       `${esc(ev.last_step)}${ev.reason ? " · " + esc(ev.reason) : ""}</span>`;
   } else if (HALT_BANNERS[kind]) {
@@ -272,22 +273,22 @@ function renderEvent(ev, feed) {
   return div;
 }
 
-function updateCountersFromEvent(ev) {
+function updateCountersFromEvent(ev, v) {
   if (typeof ev.step === "number") {
-    live.step = Math.max(live.step, ev.step);
+    v.step = Math.max(v.step, ev.step);
   }
   // Which skill is in the prompt *now*, not just where it last changed: the
   // feed scrolls away and the answer to "is this run being helped by the right
   // app's skill" should not need scrolling back for.
   if (ev.kind === "active_skill" && ev.name) {
-    live.skill = ev.name;
+    v.skill = ev.name;
   }
   const llm = ev.llm;
   if (llm && typeof llm === "object") {
-    live.calls += llm.n_calls || 0;
-    live.cost += llm.usd || 0;
+    v.calls += llm.n_calls || 0;
+    v.cost += llm.usd || 0;
   }
-  paintCounters();
+  paintCounters(v);
 }
 
 /* --------------------------------------------------------- llm stream */
@@ -362,10 +363,50 @@ function llmShot(ev, runId) {
   return wrap;
 }
 
+/* ------------------------------------------------- chunks, cheaply
+
+   A thinking model streams in far smaller pieces than a browser can lay out. A
+   measured 46-call run: 56,968 chunks, one call of it 20,120 chunks carrying
+   75,920 characters. Two rules keep that affordable, and breaking either one is
+   what made the page stop answering the mouse:
+
+   Text is *appended*, never rewritten. Re-setting `textContent` to the whole of
+   what has arrived costs the length of the message on every chunk, so a call
+   ends up writing (chars x chunks / 2) characters -- 764 million for that one
+   call, 1.3 billion over the run -- to show 76 KB.
+
+   Layout is measured once a frame, not once a chunk. Chasing the tail reads
+   `scrollHeight` on the box and on the whole document, which forces the
+   pending layout of a page carrying a run's worth of cards and screenshots.
+   Chunks arriving between two frames are joined into one append, so the cost
+   follows the display's refresh rate rather than the model's token rate. */
+
+function llmFlush(p) {
+  if (p.frame) { cancelAnimationFrame(p.frame); p.frame = 0; }
+  const ready = p.secs.filter((s) => s.buf);
+  if (!ready.length) return;
+  p.chase(() => {
+    for (const s of ready) {
+      if (s.sec.style.display !== "block") s.sec.style.display = "block";
+      // Appending a text node rather than growing one keeps the write
+      // proportional to the chunk. The browser coalesces them on its own.
+      followTail(s.text, () => s.text.appendChild(document.createTextNode(s.buf)));
+      s.buf = "";
+    }
+  });
+}
+
+function llmPush(p, streamType, chunk) {
+  const s = p.secs[streamType === "thinking" ? 0 : 1];
+  s.buf += chunk;
+  if (!p.frame) p.frame = requestAnimationFrame(() => { p.frame = 0; llmFlush(p); });
+}
+
 function finalizeLlm(feed, end) {
   const p = feed._llm;
   if (!p) return;
   feed._llm = null;
+  llmFlush(p);             // whatever the last frame did not get to
   p.details.open = false;  // auto-hide: the stream is over, the verdict follows
   p.summary.textContent = llmSummary(p.start, end);
 }
@@ -384,68 +425,92 @@ function handleLlmEvent(ev, feed) {
     const shot = llmShot(ev, feed._runId);
     if (shot) card.appendChild(shot);
     feed.appendChild(card);
+    const section = (name) => ({
+      sec: card.querySelector(`.llm-sec.${name}`),
+      text: card.querySelector(`.llm-sec.${name} .llm-text`),
+      buf: "",
+    });
     feed._llm = {
       start: ev,
       details: card.querySelector("details"),
       summary: card.querySelector("summary"),
-      thinking: "", response: "",
-      thinkingSec: card.querySelector(".llm-sec.thinking"),
-      thinkingText: card.querySelector(".llm-sec.thinking .llm-text"),
-      responseSec: card.querySelector(".llm-sec.response"),
-      responseText: card.querySelector(".llm-sec.response .llm-text"),
+      secs: [section("thinking"), section("response")],
+      frame: 0,
+      // Replaying a finished run appends hundreds of panels in one go and must
+      // not drag the page down with each; a live feed chases its newest line.
+      chase: feed._live ? (grow) => followPageTail(feed, grow) : (grow) => grow(),
     };
   } else if (ev.kind === "llm_stream" && feed._llm) {
-    const p = feed._llm;
-    const thinking = ev.stream_type === "thinking";
-    const key = thinking ? "thinking" : "response";
-    p[key] += ev.text || "";
-    const sec = thinking ? p.thinkingSec : p.responseSec;
-    const text = thinking ? p.thinkingText : p.responseText;
-    if (sec.style.display !== "block") sec.style.display = "block";
-    followTail(text, () => { text.textContent = p[key]; });
+    llmPush(feed._llm, ev.stream_type, ev.text || "");
   } else if (ev.kind === "llm_end") {
     finalizeLlm(feed, ev);
   }
 }
 
-function paintCounters() {
-  $("c-step").textContent = live.step;
-  $("c-calls").textContent = live.calls;
-  $("c-cost").textContent = "$" + live.cost.toFixed(4);
-  $("c-skill").textContent = live.skill || "—";
+function paintCounters(v) {
+  v.els.step.textContent = v.step;
+  v.els.calls.textContent = v.calls;
+  v.els.cost.textContent = "$" + v.cost.toFixed(4);
+  v.els.skill.textContent = v.skill || "—";
   // Only worth the space once there is more than one: a single run has no
-  // iteration to speak of.
-  $("c-iter-wrap").style.display = live.iteration > 1 ? "" : "none";
-  $("c-iter").textContent = live.iteration;
-}
-
-/* ------------------------------------------------------------ run tab */
-
-const live = { step: 0, calls: 0, cost: 0, skill: "", source: null,
-               startedAt: 0, timer: null, iteration: 1 };
-
-function setRunningUI(running) {
-  $("btn-start").disabled = running;
-  $("btn-stop").disabled = !running;
-  $("c-state").textContent = running ? "running" : "idle";
-  $("c-state").style.color = running ? "var(--green)" : "var(--text-dim)";
-  clearInterval(live.timer);
-  if (running) {
-    live.timer = setInterval(() => {
-      $("c-elapsed").textContent = fmtDur((Date.now() / 1000) - live.startedAt);
-    }, 1000);
+  // iteration to speak of. A tour never repeats, so it has no such counter.
+  if (v.els.iterWrap) {
+    v.els.iterWrap.style.display = v.iteration > 1 ? "" : "none";
+    v.els.iter.textContent = v.iteration;
   }
 }
 
-function openStream() {
-  if (live.source) return;
-  $("live").style.display = "block";
-  const source = new EventSource("/api/runs/stream");
-  live.source = source;
+/* ------------------------------------------------- a live surface
+
+   The counters strip, the feed under it, and the SSE connection that fills
+   them. There are two: the run tab's, and the one under the skill generator --
+   because a generation is a run. It drives the phone through the same agent,
+   spends from the same budget and writes the same events, screenshots and
+   thinking stream, so it is shown with the same cards rather than as the tail
+   of a subprocess's stdout.
+
+   `prefix` names the counter ids (`c-step`, `gc-step`), `feedId` the feed. */
+
+function makeLive(prefix, boxId, feedId) {
+  const el = (name) => $(prefix + name);
+  const feed = $(feedId);
+  feed._live = true;  // chase the tail; the history feed does not
+  return {
+    step: 0, calls: 0, cost: 0, skill: "", iteration: 1,
+    source: null, startedAt: 0, timer: null,
+    url: "",           // where to stream from; a job's is known only once it starts
+    box: $(boxId), feed,
+    els: { runid: el("runid"), step: el("step"), calls: el("calls"),
+           cost: el("cost"), elapsed: el("elapsed"), state: el("state"),
+           skill: el("skill"), iterWrap: el("iter-wrap"), iter: el("iter") },
+    setRunning: () => {},   // what else on the page follows this surface
+    onEvent: () => {},
+    onEnd: () => {},
+  };
+}
+
+/* Keep a surface's clock and status telling the truth. */
+function setLiveRunning(v, running) {
+  v.els.state.textContent = running ? "running" : "idle";
+  v.els.state.style.color = running ? "var(--green)" : "var(--text-dim)";
+  clearInterval(v.timer);
+  if (running) {
+    v.timer = setInterval(() => {
+      v.els.elapsed.textContent = fmtDur((Date.now() / 1000) - v.startedAt);
+    }, 1000);
+  }
+  v.setRunning(running);
+}
+
+function openStream(v) {
+  if (v.source) return;
+  v.box.style.display = "block";
+  const source = new EventSource(v.url);
+  v.source = source;
+  const feed = v.feed;
 
   source.addEventListener("run", (e) => {
     const data = JSON.parse(e.data);
-    const feed = $("feed");
     // Sent again for every `--repeat` iteration, each of which is a separate
     // run in its own directory. Rule off rather than letting the next one's
     // step 1 land under the last one's step 40.
@@ -458,49 +523,63 @@ function openStream() {
       followPageTail(feed, () => feed.appendChild(rule));
       // Steps are per iteration; calls and spend are the session's, because
       // that is what --budget-usd bounds.
-      live.step = 0;
+      v.step = 0;
       feed._llm = null;
       feed._skill = "";
     }
-    live.iteration = data.iteration || 1;
-    $("c-runid").textContent = data.run_id;
+    v.iteration = data.iteration || 1;
+    v.els.runid.textContent = data.run_id;
     feed._runId = data.run_id;        // sent before any llm frame, so the
-    paintCounters();                  // screenshots have a run to come from
+    paintCounters(v);                 // screenshots have a run to come from
   });
   source.addEventListener("event", (e) => {
     const ev = JSON.parse(e.data);
-    const feed = $("feed");
     const el = renderEvent(ev, feed);
     if (el) followPageTail(feed, () => feed.appendChild(el));
-    updateCountersFromEvent(ev);
+    updateCountersFromEvent(ev, v);
+    v.onEvent(ev);
   });
   source.addEventListener("llm", (e) => {
-    const feed = $("feed");
-    const ev = JSON.parse(e.data);
-    followPageTail(feed, () => handleLlmEvent(ev, feed));
+    // Not wrapped in followPageTail: a stream chunk is one of tens of thousands
+    // and the panel batches its own appends and scrolling by frame.
+    handleLlmEvent(JSON.parse(e.data), feed);
   });
   source.addEventListener("state", (e) => {
     const st = JSON.parse(e.data);
-    if (st.started_at) live.startedAt = st.started_at;
-    setRunningUI(!!st.running);
+    if (st.started_at) v.startedAt = st.started_at;
+    setLiveRunning(v, !!st.running);
     if (!st.running && st.returncode != null) {
-      $("c-state").textContent = "exited (" + st.returncode + ")";
+      v.els.state.textContent = "exited (" + st.returncode + ")";
     }
   });
   source.addEventListener("end", () => {
     source.close();
-    live.source = null;
-    setRunningUI(false);
-    finalizeLlm($("feed"), null);  // a run can end mid-call
-    loadedTabs.delete("history");  // a new run may have appeared
+    v.source = null;
+    setLiveRunning(v, false);
+    finalizeLlm(feed, null);        // a run can end mid-call
+    loadedTabs.delete("history");   // a new run may have appeared
+    v.onEnd();
   });
   source.onerror = () => {
     // The server closes the connection after "end"; anything else is a drop.
-    if (live.source && source.readyState === EventSource.CLOSED) {
-      live.source = null;
-      setRunningUI(false);
+    if (v.source && source.readyState === EventSource.CLOSED) {
+      v.source = null;
+      setLiveRunning(v, false);
     }
   };
+}
+
+/* ------------------------------------------------------------ run tab */
+
+const live = makeLive("c-", "live", "feed");
+live.url = "/api/runs/stream";
+live.setRunning = (running) => {
+  $("btn-start").disabled = running;
+  $("btn-stop").disabled = !running;
+};
+
+function setRunningUI(running) {
+  setLiveRunning(live, running);
 }
 
 /* What the form's options are currently set to -- shared by a fresh run and a
@@ -520,20 +599,20 @@ function runOptions() {
   return body;
 }
 
-function beginLive() {
-  live.step = 0; live.calls = 0; live.cost = 0; live.skill = "";
-  live.iteration = 1;
-  live.startedAt = Date.now() / 1000;
-  $("feed").innerHTML = "";
+/* Clear a surface and attach it to whatever is starting now. */
+function beginLive(v) {
+  v.step = 0; v.calls = 0; v.cost = 0; v.skill = "";
+  v.iteration = 1;
+  v.startedAt = Date.now() / 1000;
+  v.feed.innerHTML = "";
   armPageTail();  // a new run is followed however the last one was left
-  $("feed")._llm = null;
-  $("feed")._runId = "";
-  $("feed")._skill = "";
-  $("c-runid").textContent = "starting…";
-  paintCounters();
-  setRunningUI(true);
-  $("run-hint").textContent = "";
-  openStream();
+  v.feed._llm = null;
+  v.feed._runId = "";
+  v.feed._skill = "";
+  v.els.runid.textContent = "starting…";
+  paintCounters(v);
+  setLiveRunning(v, true);
+  openStream(v);
 }
 
 $("run-form").addEventListener("submit", async (e) => {
@@ -547,7 +626,8 @@ $("run-form").addEventListener("submit", async (e) => {
     notice(err.message);
     return;
   }
-  beginLive();
+  $("run-hint").textContent = "";
+  beginLive(live);
 });
 
 /* Continue a failed run from its checkpoint, watched in the run tab. */
@@ -562,7 +642,7 @@ async function resumeRun(id) {
     return;
   }
   document.querySelector('button[data-tab="run"]').click();
-  beginLive();
+  beginLive(live);
   $("run-hint").textContent = `resuming ${id} from its checkpoint`;
 }
 
@@ -585,13 +665,20 @@ async function refreshStatus() {
     parts.push(st.model ? esc(st.model.split("/").pop()) : `<span class="warn">no model</span>`);
     parts.push(st.api_key_present ? `<span class="ok">api key</span>` : `<span class="warn">no api key</span>`);
     if (st.run && st.run.running) parts.push(`<span class="ok">● running: ${esc(st.run.goal)}</span>`);
+    if (st.job) parts.push(`<span class="ok">● generating a skill</span>`);
     $("status").innerHTML = parts.join(" · ");
     // Reattach to a run already in progress (e.g. page reloaded mid-run).
     if (st.run && st.run.running && !live.source) {
       live.step = 0; live.calls = 0; live.cost = 0;
       live.startedAt = st.run.started_at || Date.now() / 1000;
       setRunningUI(true);
-      openStream();
+      openStream(live);
+    }
+    // And to a generation, which outlives a reload just as long.
+    if (st.job && !genLive.source) {
+      genLive.step = 0; genLive.calls = 0; genLive.cost = 0;
+      genLive.startedAt = st.job.started_at || Date.now() / 1000;
+      watchGeneration(st.job.id, { fresh: false });
     }
   } catch {
     $("status").textContent = "server unreachable";
@@ -734,10 +821,28 @@ $("btn-dev-reload").addEventListener("click", () => loadDevices().catch((e) => n
 
 /* ------------------------------------------------------------- config */
 
+/* A model field is a dropdown over the provider's own catalogue (/api/models)
+   rather than a text box: the ids are long, exact and unguessable, and a typo in
+   one only surfaces as a failed call mid-run.
+
+   The catalogue is advice, not law. "custom…" still takes any id, a configured
+   model the catalogue does not list is kept and labelled rather than dropped,
+   and a provider that cannot be reached at all leaves every field editable --
+   a picker that can silently rewrite what is configured is worse than the text
+   box it replaced.
+
+   `unset` is what the empty option means for that field. The fallback chain
+   lives in config.py, and it is worth saying out loud here, since taking the
+   fallback is the whole reason four of these five are empty by default. */
 const CFG_SPEC = [
   ["llm", [
-    ["provider", "text"], ["model", "text"], ["model_small", "text"],
-    ["model_image", "text"], ["model_skill", "text"], ["model_skill_image", "text"],
+    ["provider", "text"],
+    ["model", "model", { unset: "a run needs one" }],
+    ["model_small", "model", { unset: "falls back to model" }],
+    ["model_image", "model", { unset: "falls back to model", vision: true }],
+    ["model_skill", "model", { unset: "falls back to model" }],
+    ["model_skill_image", "model",
+      { unset: "falls back to model_image, then model", vision: true }],
     ["temperature", "number"], ["max_tokens", "number"], ["max_tokens_image", "number"],
     ["rpm", "number"], ["base_url", "text"], ["service_tier", "text"],
     ["api_key", "password"], ["api_key_env", "text"],
@@ -764,7 +869,86 @@ const CFG_SPEC = [
   ["memory", [["db", "text"]]],
 ];
 
+/* The value of the "custom…" option, chosen so no model id can be it. Not a NUL
+   or another control character: the HTML parser rewrites U+0000 in an attribute
+   to U+FFFD, and every comparison against it would then quietly fail. */
+const MODEL_CUSTOM = "custom…";
+
 let cfgValues = {};
+let modelFields = [];  // the model dropdowns now on the form
+let catalogue = { models: [], provider: "", error: "", loaded: false };
+
+function modelOptionLabel(m) {
+  const caps = [];
+  if (m.context_length) caps.push(Math.round(m.context_length / 1024) + "k");
+  if (m.vision) caps.push("vision");
+  if (m.tools) caps.push("tools");
+  return m.id + (caps.length ? `  ·  ${caps.join(" · ")}` : "") +
+    (m.deprecated ? `  ·  deprecated ${m.deprecated}` : "");
+}
+
+/* Render one model dropdown against whatever catalogue we have: once when the
+   form is built -- usually before the fetch lands, so the field shows only its
+   own value -- and again when it arrives. */
+function fillModelSelect(field) {
+  const sel = $(field.id);
+  if (!sel) return;
+  // What is on screen wins over what is on disk: the catalogue can land after
+  // the reader has already picked something.
+  const value = sel.options.length ? sel.value : field.value;
+  const match = catalogue.models.find((m) => m.value === value || m.id === value);
+  const opts = [`<option value="">(unset — ${esc(field.unset)})</option>`];
+  if (value && value !== MODEL_CUSTOM && !match) {
+    opts.push(`<option value="${esc(value)}">${esc(value)}  ·  not in the catalogue</option>`);
+  }
+  // A slot that gets handed a screenshot cannot take a text-only model: the
+  // whole call fails, not just the image part of it. So say which is which.
+  const seeing = catalogue.models.filter((m) => m.vision);
+  const blind = catalogue.models.filter((m) => !m.vision);
+  const groups = field.vision && seeing.length && blind.length
+    ? [["can see", seeing], ["text-only — an image call to one of these fails", blind]]
+    : [["", catalogue.models]];
+  for (const [name, list] of groups) {
+    if (!list.length) continue;
+    const body = list.map((m) =>
+      `<option value="${esc(m.value)}">${esc(modelOptionLabel(m))}</option>`).join("");
+    opts.push(name ? `<optgroup label="${esc(name)}">${body}</optgroup>` : body);
+  }
+  opts.push(`<option value="${MODEL_CUSTOM}">custom…</option>`);
+  sel.innerHTML = opts.join("");
+  sel.value = match ? match.value : value;
+  $(field.id + "-custom").style.display = sel.value === MODEL_CUSTOM ? "" : "none";
+}
+
+async function loadModels(refresh = false) {
+  const status = $("cfg-models-status");
+  status.textContent = refresh ? "reloading the model catalogue…" : "loading models…";
+  try {
+    const d = await api("/api/models" + (refresh ? "?refresh=1" : ""));
+    catalogue = { models: d.models || [], provider: d.provider || "",
+                  error: d.error || "", loaded: true };
+  } catch (err) {
+    catalogue = { models: [], provider: "", error: err.message, loaded: true };
+  }
+  const n = catalogue.models.length;
+  status.textContent = catalogue.error
+    ? `No model catalogue: ${catalogue.error}. Pick “custom…” to type an id.`
+    : `${n} model${n === 1 ? "" : "s"} from ${catalogue.provider}.`;
+  modelFields.forEach(fillModelSelect);
+}
+
+/* "custom…" reveals the text box beside its dropdown. Delegated, because the
+   form is rebuilt from scratch every time it loads. */
+$("cfg-form").addEventListener("change", (e) => {
+  const field = modelFields.find((f) => f.id === e.target.id);
+  if (!field) return;
+  const box = $(field.id + "-custom");
+  const on = e.target.value === MODEL_CUSTOM;
+  box.style.display = on ? "" : "none";
+  if (on) box.focus();
+});
+
+$("btn-cfg-models").addEventListener("click", () => loadModels(true));
 
 async function loadConfig() {
   const d = await api("/api/config");
@@ -772,17 +956,25 @@ async function loadConfig() {
   $("cfg-path").textContent = d.path || "(no config file — one will be created on save)";
   const form = $("cfg-form");
   form.innerHTML = "";
+  modelFields = [];
   for (const [section, fieldsSpec] of CFG_SPEC) {
     const group = document.createElement("div");
     group.className = "cfg-group";
     group.innerHTML = `<h4>${esc(section)}</h4>`;
     const grid = document.createElement("div");
     grid.className = "cfg-grid";
-    for (const [key, type] of fieldsSpec) {
+    for (const [key, type, opts] of fieldsSpec) {
       const value = (cfgValues[section] || {})[key];
       const label = document.createElement("label");
       const inputId = `cfg-${section}-${key}`;
-      if (type === "bool") {
+      if (type === "model") {
+        label.innerHTML = `${esc(key)}<select class="mono" id="${inputId}"></select>` +
+          `<input class="mono" type="text" id="${inputId}-custom" spellcheck="false" ` +
+          `placeholder="model id" autocomplete="off" style="display:none">`;
+        modelFields.push({ id: inputId, value: value ?? "",
+                           unset: (opts && opts.unset) || "falls back to model",
+                           vision: !!(opts && opts.vision) });
+      } else if (type === "bool") {
         label.className = "check";
         label.innerHTML = `<input type="checkbox" id="${inputId}" ${value ? "checked" : ""}> ${esc(key)}`;
       } else if (Array.isArray(type)) {
@@ -803,17 +995,28 @@ async function loadConfig() {
     group.appendChild(grid);
     form.appendChild(group);
   }
+  modelFields.forEach(fillModelSelect);  // with the current values, at least
+  if (!catalogue.loaded) loadModels();   // and with the catalogue when it lands
 }
 
 $("btn-cfg-save").addEventListener("click", async () => {
   const sections = {};
   for (const [section, fieldsSpec] of CFG_SPEC) {
     for (const [key, type] of fieldsSpec) {
-      const el = $(`cfg-${section}-${key}`);
+      const inputId = `cfg-${section}-${key}`;
+      const el = $(inputId);
       const original = (cfgValues[section] || {})[key];
       let value;
       if (type === "bool") {
         value = el.checked;
+      } else if (type === "model") {
+        value = el.value;
+        if (value === MODEL_CUSTOM) {
+          value = $(`${inputId}-custom`).value.trim();
+          if (value === "") continue;  // "custom…" with nothing typed yet
+        }
+        // Unlike a plain text field, an emptied model dropdown is a decision --
+        // take the fallback -- so it is written rather than skipped.
       } else if (Array.isArray(type)) {
         value = el.value;
         if (value === "" && original !== "") continue;  // don't clobber with unset
@@ -924,20 +1127,45 @@ function clearLog(pre) {
   pre._lines = null;
 }
 
-$("btn-gen").addEventListener("click", async () => {
-  let jobId;
-  try {
-    const r = await api("/api/skills/generate", {
-      method: "POST",
-      body: JSON.stringify({ name: $("gen-name").value, tasks: $("gen-tasks").value }),
-    });
-    jobId = r.job;
-  } catch (err) {
-    notice(err.message);
-    return;
+/* The generator's own live surface. A tour is a run, so it gets the run's view:
+   the same step cards, thinking panels, submitted frames and counters, off the
+   same files. */
+const genLive = makeLive("gc-", "gen-live", "gen-feed");
+genLive.jobId = 0;
+genLive.setRunning = (running) => {
+  $("btn-gen").disabled = running;
+  $("btn-gen-stop").disabled = !running;
+};
+genLive.onEnd = () => loadSkills().catch(() => {});
+genLive.onEvent = (ev) => {
+  // The tour ending is not the job ending: the skill is written up afterwards,
+  // from what the tour saw, by one more call in the same process -- and the run
+  // directory it would have streamed into is closed by then. So the feed goes
+  // quiet here, and only the status says why.
+  if (ev.kind === "run_end") $("gen-status").textContent = "writing the skill…";
+};
+
+/* Two channels, because they carry different halves of the story. The stream is
+   the tour -- every step of it, as it happens. The poll is the child's stdout,
+   which is where the part *after* the tour lands: the skill written up from
+   what it saw, and the refusals that come before there is any run to stream
+   ("no API key", "that app is not installed"). */
+function watchGeneration(jobId, { fresh = true } = {}) {
+  genLive.jobId = jobId;
+  genLive.url = "/api/jobs/" + jobId + "/stream";
+  if (fresh) {
+    clearLog($("gen-log"));
+    $("gen-log-wrap").style.display = "block";
+    $("gen-status").textContent = "exploring…";
+    beginLive(genLive);
+  } else {
+    // Reattached after a reload: the log's earlier lines are gone with the page.
+    $("gen-log-wrap").style.display = "block";
+    $("gen-status").textContent = "generating…";
+    setLiveRunning(genLive, true);
+    openStream(genLive);
   }
-  clearLog($("gen-log"));
-  $("gen-status").textContent = "exploring…";
+
   const poll = setInterval(async () => {
     try {
       const job = await api("/api/jobs/" + jobId);
@@ -953,6 +1181,30 @@ $("btn-gen").addEventListener("click", async () => {
       $("gen-status").textContent = "lost track of the job";
     }
   }, 2000);
+}
+
+$("btn-gen-stop").addEventListener("click", async () => {
+  try {
+    await api("/api/jobs/" + genLive.jobId + "/stop", { method: "POST" });
+    $("gen-status").textContent = "stopping — the tour restores the phone first";
+  } catch (err) {
+    notice(err.message);
+  }
+});
+
+$("btn-gen").addEventListener("click", async () => {
+  let jobId;
+  try {
+    const r = await api("/api/skills/generate", {
+      method: "POST",
+      body: JSON.stringify({ name: $("gen-name").value, tasks: $("gen-tasks").value }),
+    });
+    jobId = r.job;
+  } catch (err) {
+    notice(err.message);
+    return;
+  }
+  watchGeneration(jobId);
 });
 
 /* -------------------------------------------------------------- boot */

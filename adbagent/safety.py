@@ -162,14 +162,36 @@ _SCROLL_OPPOSITES = {"up": "down", "down": "up", "left": "right", "right": "left
 
 @dataclass
 class LoopDetector:
-    """Ring buffer of recent screens, plus a per-screen ban list.
+    """Ring buffer of recent (screen, action) pairs, plus a per-screen ban list.
 
     Roughly four fifths of failures in the published baselines are navigation
     loops eating the step budget, so this is not an optional nicety.
+
+    Screens are identified here by ``skeleton_id`` -- the content-free hash --
+    and not by ``exact_id``. That was the bug this class existed to catch and
+    could not. ``exact_id`` hashes every content element *including its bounds*,
+    so a pixel of layout jitter, one new list row or an animation frame makes it
+    a different screen. In ``runs/2521862d7a23`` the agent ran a textbook
+    two-cycle -- ``tap #7``, ``back``, ``tap #7``, ``back`` -- for twenty steps
+    between two screens whose ``skeleton_id``s were rock stable, and not one
+    detector here fired, because every visit minted a fresh ``exact_id``. Every
+    step was graded ``success`` too, so nothing else noticed either; the run was
+    ended by the person watching it.
+
+    The other half of that fix is *what* is compared. Both detectors below now
+    key on the (screen, action) pair rather than on the screen alone, because
+    the screen alone cannot tell "tapping #7 ten times" from "tapping #1 through
+    #10" -- and on a stable id the latter is what walking a grid legitimately
+    looks like.
     """
 
     history: List[Tuple[str, str]] = field(default_factory=list)
     banned: Dict[str, Set[str]] = field(default_factory=dict)
+    #: Every (screen, action) pair the run has taken, and how often. Unlike
+    #: `history` this is not a ring buffer: "have I done this here before" has to
+    #: stay answerable after twenty other steps, which is exactly the span a
+    #: slow two-cycle outlives.
+    attempts: Dict[Tuple[str, str], int] = field(default_factory=dict)
     #: Element-level history per screen identity (skeleton_id): list of (step, signature, action_desc)
     element_actions: Dict[str, List[Tuple[int, str, str]]] = field(default_factory=dict)
     #: Every scroll direction across the entire run, not cleared by taps.
@@ -183,9 +205,26 @@ class LoopDetector:
     consecutive_backs: int = 0
     _BACK_LOOP_CAP: int = field(default=2, repr=False)
 
-    def record(self, exact_id: str, signature: str) -> None:
-        self.history.append((exact_id, signature))
+    def record(self, screen_id: str, signature: str) -> None:
+        self.history.append((screen_id, signature))
         del self.history[:-WINDOW]
+        key = (screen_id, signature)
+        self.attempts[key] = self.attempts.get(key, 0) + 1
+
+    def times_on(self, screen_id: str, signature: str) -> int:
+        """How often this exact action has been taken on this screen, ever.
+
+        Reads `attempts` rather than `history` on purpose: the ring buffer holds
+        twenty entries, and the question "have I already tried this here" is
+        asked precisely when the answer is further back than that.
+        """
+        return self.attempts.get((screen_id, signature), 0)
+
+    def tried_on(self, screen_id: str) -> List[Tuple[str, int]]:
+        """Distinct actions tried on this screen, most-repeated first."""
+        rows = [(sig, n) for (sid, sig), n in self.attempts.items()
+                if sid == screen_id and sig != "forced-back"]
+        return sorted(rows, key=lambda row: (-row[1], row[0]))
 
     def record_element_action(self, skeleton_id: str, step: int, signature: str, action_desc: str) -> None:
         """Record an action performed on an element for a specific screen identity."""
@@ -202,6 +241,15 @@ class LoopDetector:
         turn -- the pager of a carousel. Without it this hint tells the agent not
         to reuse the one element that advances a gallery, which pushes it into
         flinging arbitrary indices instead.
+
+        The exemption is granted only when the repetition it excuses is actually
+        the pager gesture. In ``runs/2521862d7a23`` it was not: the last five
+        actions were five ``press_key back`` presses, and this hint recited them
+        and then said "repeating it is correct. Do not substitute a different
+        index for it." The agent was in a hard two-cycle at the time, and the one
+        piece of context that should have broken it instead licensed it for
+        another 30 steps. An exemption for the pager must not cover an action
+        that never touches the pager.
         """
         actions = self.element_actions.get(skeleton_id, [])
         if not actions:
@@ -209,7 +257,12 @@ class LoopDetector:
         recent = actions[-5:]
         formatted = [f"step {step}: {desc}" for step, _, desc in recent]
         summary = "; ".join(formatted)
-        if repeatable:
+        # Split rather than substring-match: `signature` joins its parts with
+        # "/", and "#4" is a substring of "#41", so a fling at #41 would have
+        # cleared the exemption meant for the pager at #4.
+        target = f"#{repeatable}"
+        on_pager = any(target in sig.split("/") for _, sig, _ in recent)
+        if repeatable and on_pager:
             return (
                 f"PREVIOUS ACTIONS ON THIS SCREEN: {summary}. "
                 f"#{repeatable} is the pager for this screen: swiping it again "
@@ -223,37 +276,50 @@ class LoopDetector:
             f"Select the next uninspected element index or take a different action."
         )
 
-    def repeats(self, exact_id: str) -> int:
-        return sum(1 for seen, _ in self.history if seen == exact_id)
+    def repeats(self, screen_id: str) -> int:
+        return sum(1 for seen, _ in self.history if seen == screen_id)
 
-    def hint(self, exact_id: str) -> Optional[str]:
-        n = self.repeats(exact_id)
+    def hint(self, screen_id: str) -> Optional[str]:
+        n = self.repeats(screen_id)
         if n >= REPEAT_HINT_AT:
             return (f"You have now seen this exact screen {n} times. Whatever you "
                     f"have been trying is not working -- do something different, "
                     f"or go back.")
         return None
 
-    def should_force_back(self, exact_id: str) -> bool:
-        # Don't count repeated scrolls on the same screen as a navigation
-        # loop.  Scroll stalls mean end-of-list, not that the agent is stuck
-        # bouncing between screens.
-        # Also exclude "forced-back" signatures: those are our own
-        # interventions, not real agent actions.  Counting them created a
-        # positive-feedback loop where each forced back made the next one
-        # trigger sooner.
-        # Horizontal swipes are excluded for the same reason: paging a carousel
-        # is browsing, not a navigation loop, and the remedy here -- a back press
-        # -- ejects the agent from the set it was working through.
-        non_scroll = sum(
-            1 for eid, sig in self.history
-            if eid == exact_id
-            and not sig.startswith("scroll/")
-            and not (sig.startswith("swipe/")
-                     and sig.rsplit("/", 1)[-1] in ("left", "right"))
-            and sig != "forced-back"
-        )
-        return non_scroll >= FORCE_BACK_AT
+    @staticmethod
+    def _counts_as_repetition(signature: str) -> bool:
+        """Whether repeating this signature on one screen means anything.
+
+        Repeated scrolls do not: a scroll stall means end-of-list, not that the
+        agent is bouncing between screens. Horizontal swipes do not either --
+        paging a carousel is browsing, and the remedy here (a back press) ejects
+        the agent from the set it was working through. "forced-back" does not,
+        because it is this class's own intervention, and counting it created a
+        positive-feedback loop where each forced back made the next fire sooner.
+        """
+        if signature.startswith("scroll/"):
+            return False
+        if (signature.startswith("swipe/")
+                and signature.rsplit("/", 1)[-1] in ("left", "right")):
+            return False
+        return signature != "forced-back"
+
+    def should_force_back(self, screen_id: str) -> bool:
+        """True when one action has been repeated on one screen to no effect.
+
+        Counts *per signature* rather than totalling every action taken here.
+        The total cannot tell a stuck agent from a working one: opening ten grid
+        items in turn puts ten taps on the grid's ``skeleton_id``, and totalling
+        them would press back in the middle of legitimate work. Repeating the
+        *same* tap nine times is unambiguous.
+        """
+        counts: Dict[str, int] = {}
+        for sid, sig in self.history:
+            if sid != screen_id or not self._counts_as_repetition(sig):
+                continue
+            counts[sig] = counts.get(sig, 0) + 1
+        return max(counts.values(), default=0) >= FORCE_BACK_AT
 
     def in_back_loop(self) -> bool:
         """True when pressing back is itself the problem.
@@ -264,22 +330,36 @@ class LoopDetector:
         return self.consecutive_backs >= self._BACK_LOOP_CAP
 
     def oscillating(self) -> bool:
-        """A repeating 2- or 3-step cycle that has persisted for 4+ full
-        repetitions, e.g. [A,B,A,B,A,B,A,B].
+        """A repeating 2- or 3-step cycle that has persisted for 5 full
+        repetitions, e.g. [A,B,A,B,A,B,A,B,A,B].
 
-        Ignores patterns that consist entirely of forced-back entries,
-        because those are a symptom of *this* guard firing repeatedly,
-        not of the agent misbehaving.
+        Compares whole (screen, action) pairs, not screen ids alone. Screen ids
+        alone cannot separate the two things that look identical from the
+        outside: ``tap #7 -> back -> tap #7 -> back`` bounces between two
+        screens getting nowhere, while ``tap #1 -> back -> tap #2 -> back``
+        bounces between the same two screens working through a list. The action
+        is the only part that differs, so the action has to be in the key.
+
+        Ignores forced-back entries, because those are a symptom of *this* guard
+        firing repeatedly rather than of the agent misbehaving.
         """
         MIN_REPS = 5  # cycle must repeat this many times
-        # Filter out forced-back entries to check for real oscillation.
         real = [(h, s) for h, s in self.history if s != "forced-back"]
-        ids = [h for h, _ in real]
         for period in (2, 3):
             needed = period * MIN_REPS
-            if len(ids) >= needed:
-                tail = ids[-needed:]
+            if len(real) >= needed:
+                tail = real[-needed:]
                 cycle = tail[:period]
+                # A cycle has to have somewhere to go and come back from. Doing
+                # one thing over and over -- ``[A,A,A,A,...]`` -- satisfies the
+                # period-2 and period-3 patterns trivially, and used to be
+                # reported here as oscillation: paging an album is exactly that
+                # shape, and the remedy this triggers is a back press that ejects
+                # the agent from the album it was halfway through. Repetition of
+                # a single action is `should_force_back`'s question, and that one
+                # knows which gestures are browsing rather than thrashing.
+                if len(set(cycle)) < 2:
+                    continue
                 if all(tail[i * period:(i + 1) * period] == cycle
                        for i in range(1, MIN_REPS)):
                     return True

@@ -496,28 +496,29 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
         dev.press(action.key or "back")
     elif action.action in ("scroll", "swipe"):
         box = None
-        if action.direction in ("left", "right"):
-            # A pager has exactly one right answer, and its #N moves around as
-            # the app fades its overlay chrome in and out -- the same media
-            # viewer lists the image as #1, #4 or #11 depending on what else is
-            # on screen. Snap to it rather than flinging whatever index the model
-            # named last turn, which is how a "next photo" swipe ends up landing
-            # on a toolbar and silently doing nothing.
-            from .pager import pager_element
-            pager = pager_element(screen)
-            if pager is not None and (element is None or not element.is_horizontal):
-                if element is not None:
-                    log.info("horizontal %s retargeted from #%d to pager #%d",
-                             action.action, element.index, pager.index)
-                element = pager
+        # A horizontal swipe used to be silently retargeted onto "the pager" --
+        # the largest full-bleed horizontal scroller on screen. That was meant
+        # for a media viewer whose image is listed as #1, #4 or #11 depending on
+        # which overlay chrome is showing. On an app that nests tabs above a
+        # feed it picked the *tab strip*, so "next photo" became "next tab", and
+        # the model could not tell because its stated target was overridden.
+        # The model's target is now honoured; when it is the wrong one the swipe
+        # moves nothing and `verify` reports that, which is a signal the model
+        # can act on rather than one the harness hides.
         if element is not None:
             box = element.bounds
-            # Only remap vertical->horizontal if element is explicitly horizontal and direction is up/down
-            if element.is_horizontal and action.direction in ("up", "down"):
-                remapped = "left" if action.direction == "up" else "right"
-                log.warning("remapping scroll %s -> %s for horizontal scroller",
-                            action.direction, remapped)
-                action = action.model_copy(update={"direction": remapped})
+            # A "swipe up" on a container believed to be horizontal used to be
+            # rewritten as "swipe left". `Element.is_horizontal` answers from the
+            # class name when the geometry is inconclusive, and `ViewPager2` --
+            # which it treats as horizontal -- is exactly what a vertical video
+            # feed is built from. So on Reels, Shorts and TikTok every "next
+            # video" swipe was silently turned ninety degrees, did nothing, and
+            # came back as an unexplained failure the model could not diagnose
+            # because it was never told its gesture had been changed.
+            #
+            # The direction the model asked for is now the direction that goes
+            # out. A gesture aimed the wrong way moves nothing and `verify` says
+            # so, which is a fact the model can act on.
         amount = max(0.25, min(action.scroll_amount, 5.0))
         if action.action == "swipe":
             # Swipe gesture: default duration 0.3s for reliable ViewPager/gallery transitions, single gesture with scale 0.8
@@ -547,8 +548,13 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
                 target_pkg = _best_app_match(pkgs, raw_pkg)
                 log.info("resolved app %r -> %r", raw_pkg, target_pkg)
         setattr(action, "_resolved_package", target_pkg)
-        dev.open_app(target_pkg)
+        landed = dev.open_app(target_pkg)
         summary = f"opened {target_pkg}" + (f" (resolved from {raw_pkg!r})" if target_pkg != raw_pkg else "")
+        # `is False` and not `not landed`: only the device layer reports on the
+        # foreground, and saying "never arrived" about a launch nobody waited for
+        # would be worse than saying nothing.
+        if landed is False:
+            summary += "; it was still not in front when the wait ran out"
         setattr(action, "_result_summary", summary)
     elif action.action == "list_apps":
         query = (action.text or "").strip()
@@ -743,11 +749,15 @@ def _scroll_changed(before: Screen, after: Screen,
        the case where the hierarchy drifted more but the user is seeing the
        same list content.
     """
-    # Signal 0a: pager item identity. Authoritative when available.
-    from .pager import same_item
-    identical_item = same_item(before, after)
-    if identical_item is not None:
-        return not identical_item
+    # Signal 0a: the app's own content, hashed with the overlay bands cropped
+    # off. Authoritative when both frames have a screenshot. This replaced
+    # `pager.same_item`, which preferred the app's caption over the pixels and
+    # so inherited every way a caption could be wrong -- including reading the
+    # status-bar clock, which made two frames "different items" once a minute.
+    from .pager import content_moved
+    moved = content_moved(before, after)
+    if moved is not None:
+        return moved
 
     # Signal 0b: Perceptual Image Fingerprinting
     if before.dhash is not None and after.dhash is not None:
