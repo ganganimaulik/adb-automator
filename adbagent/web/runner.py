@@ -236,7 +236,8 @@ class RunManager(ChildProcess):
               budget_usd: Optional[float] = None, repeat: str = "1",
               dry_run: bool = False, allow_destructive: bool = False,
               no_learn: bool = False, serial: str = "",
-              resume: str = "") -> Dict[str, Any]:
+              assert_shell: str = "", assert_equals: str = "",
+              assert_text: str = "", resume: str = "") -> Dict[str, Any]:
         with self._lock:
             if self.running():
                 raise RuntimeError("a run is already in progress")
@@ -259,6 +260,14 @@ class RunManager(ChildProcess):
             argv.append("--allow-destructive" if allow_destructive else "--unattended")
             if no_learn:
                 argv.append("--no-learn")
+            # An assertion is per-run, not config, so this is the only way the UI
+            # can offer one at all.
+            if assert_shell:
+                argv += ["--assert-shell", assert_shell]
+            if assert_equals:
+                argv += ["--assert-equals", assert_equals]
+            if assert_text:
+                argv += ["--assert-text", assert_text]
             if serial:
                 argv += ["-d", serial]
             if self.config_path:
@@ -269,6 +278,81 @@ class RunManager(ChildProcess):
             # A repeat *after* a resume still gets fresh directories, and the
             # sweep goes on finding those.
             proc = self._spawn(argv, seed=resume)
+            return {"pid": proc.pid, "argv": argv}
+
+
+class WatchManager(ChildProcess):
+    """The one `adbagent watch` the UI is allowed to have in flight.
+
+    A watch is the same shape as a run to everything here -- a subprocess that
+    drives the phone and writes a `runs/<id>/` directory per pass -- so it
+    inherits the directory sweep and the SIGINT stop unchanged. What differs is
+    that it does not end on its own: `returncode` stays None for days, and the
+    sweep goes on finding a new directory every pass. Both are already true of a
+    `--repeat inf` run, which is why `ChildProcess` needed nothing new.
+
+    It is a separate class from `RunManager` rather than a flag on it because the
+    two must be able to *refuse* each other: one phone, and a watch that has been
+    quietly displaced by a goal run is a watch that is no longer watching.
+    """
+
+    def __init__(self, artifacts_dir: Path | str, *, config_path: str = ""):
+        super().__init__(artifacts_dir)
+        self.config_path = config_path
+        self._goal = ""
+        self._draft = False
+        self._policy = ""
+
+    def state(self) -> Dict[str, Any]:
+        state = super().state()
+        with self._lock:
+            state["goal"] = self._goal
+            state["draft"] = self._draft
+            state["policy"] = self._policy
+            # Passes, not iterations: the word the CLI and the docs both use.
+            state["passes"] = len(self._run_dirs)
+        return state
+
+    def start(self, goal: str, *, policy: str, draft: bool = False,
+              interval_s: Optional[float] = None,
+              max_steps: Optional[int] = None,
+              replies_per_hour: Optional[int] = None,
+              replies_per_conversation: Optional[int] = None,
+              cooldown_s: Optional[float] = None,
+              usd_per_hour: Optional[float] = None,
+              ledger: str = "", serial: str = "") -> Dict[str, Any]:
+        with self._lock:
+            if self.running():
+                raise RuntimeError("a watch is already running")
+
+            argv = [sys.executable, "-m", "adbagent", "watch", goal,
+                    "--policy", policy]
+            if draft:
+                argv.append("--draft")
+            if interval_s is not None:
+                argv += ["--interval", str(interval_s)]
+            if max_steps is not None:
+                argv += ["--steps-per-pass", str(max_steps)]
+            if replies_per_hour is not None:
+                argv += ["--replies-per-hour", str(replies_per_hour)]
+            if replies_per_conversation is not None:
+                argv += ["--replies-per-conversation",
+                         str(replies_per_conversation)]
+            if cooldown_s is not None:
+                argv += ["--cooldown", str(cooldown_s)]
+            if usd_per_hour is not None:
+                argv += ["--usd-per-hour", str(usd_per_hour)]
+            if ledger:
+                argv += ["--ledger", ledger]
+            if serial:
+                argv += ["-d", serial]
+            if self.config_path:
+                argv += ["-c", self.config_path]
+
+            self._goal = goal
+            self._draft = draft
+            self._policy = policy
+            proc = self._spawn(argv)
             return {"pid": proc.pid, "argv": argv}
 
 

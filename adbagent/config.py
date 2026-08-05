@@ -214,6 +214,59 @@ class RunConfig:
 
 
 @dataclass
+class WatchConfig:
+    """Settings for `adbagent watch` -- the unbounded monitor-and-reply loop.
+
+    A watch is not a long run. A run is bounded, may fail, and is over; a watch
+    is expected to outlive transient failures and to still be going tomorrow.
+    Every ceiling here is therefore per *iteration* or per *rolling hour*, never
+    per lifetime, and none of them ends the loop -- they pause it.
+    """
+
+    #: Seconds to wait after an iteration that found nothing to do. The device
+    #: is dumped once per interval (no LLM call), so this is the resolution at
+    #: which a new message is noticed, not a cost dial.
+    interval_s: float = 45.0
+    #: Steps one iteration may spend before it is abandoned and re-anchored. An
+    #: iteration is "look at the inbox, handle what is new, come back" -- if that
+    #: takes 25 steps something is wrong, and the fix is a fresh iteration rather
+    #: than more budget for a confused one.
+    max_steps: int = 25
+    #: Compose replies and record them, but never tap Send. The first thing to
+    #: run when a policy changes: the failure mode becomes a wrong draft in the
+    #: log instead of a wrong message in somebody's inbox.
+    draft: bool = False
+    #: Seconds before the same conversation may be written to again, whatever the
+    #: content digests say. The backstop for the one crash window digests cannot
+    #: close -- see `ledger`.
+    thread_cooldown_s: float = 600.0
+    #: Rolling ceilings on sends. These are circuit breakers, not budgets: a loop
+    #: that has started replying to everything is the thing they exist to stop.
+    max_replies_per_hour: int = 12
+    max_replies_per_thread_per_hour: int = 2
+    #: The reply ledger. Relative paths are relative to the working directory,
+    #: not to the artifacts dir: it must outlive any one run.
+    ledger: str = "watch-replies.jsonl"
+    #: File holding the reply instructions, injected verbatim into the prompt.
+    #: Required by `adbagent watch` -- there is no default policy, because a
+    #: default policy is one nobody wrote and everybody would be surprised by.
+    policy: str = ""
+    #: Refuse to send when the conversation on screen cannot be identified.
+    #: Leaving this on trades a missed reply for never sending blind; turning it
+    #: off is only sensible while debugging an app whose thread title the parser
+    #: cannot see.
+    fail_closed: bool = True
+    #: Rolling spend ceiling. Unlike `safety.budget_usd`, hitting this pauses the
+    #: watch until the window clears rather than ending it. 0 switches it off.
+    max_usd_per_hour: float = 0.0
+    #: Backoff after an iteration that failed. Doubles per consecutive failure up
+    #: to the cap, and resets on the first iteration that gets through -- so a
+    #: flapping device costs a slow poll rather than a dead watch.
+    backoff_initial_s: float = 30.0
+    backoff_max_s: float = 900.0
+
+
+@dataclass
 class SkillsConfig:
     enabled: bool = True
     skills_dir: str = "skills"
@@ -232,6 +285,7 @@ class Config:
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     run: RunConfig = field(default_factory=RunConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
+    watch: WatchConfig = field(default_factory=WatchConfig)
 
     # -- derived -----------------------------------------------------------
 
@@ -272,6 +326,10 @@ _ENV_MAP = {
     "ADBAGENT_PAGER_SWEEP": "run.pager_sweep",
     "ADBAGENT_VISION_IN_DECIDER": "llm.vision_in_decider",
     "ADBAGENT_SKILLS_DIR": "skills.skills_dir",
+    "ADBAGENT_WATCH_INTERVAL": "watch.interval_s",
+    "ADBAGENT_WATCH_POLICY": "watch.policy",
+    "ADBAGENT_WATCH_LEDGER": "watch.ledger",
+    "ADBAGENT_WATCH_DRAFT": "watch.draft",
     "ADBAGENT_DISABLE_AUTO_ROTATE": "device.disable_auto_rotate",
     "ANDROID_SERIAL": "device.serial",
 }

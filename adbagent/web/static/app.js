@@ -99,6 +99,7 @@ function armPageTail() {
 const loadedTabs = new Set();
 const tabLoaders = {
   run: () => {},
+  watch: loadWatch,
   history: loadRuns,
   devices: loadDevices,
   config: loadConfig,
@@ -113,7 +114,7 @@ $("tabs").addEventListener("click", (e) => {
     s.classList.toggle("active", s.id === "tab-" + btn.dataset.tab));
   const name = btn.dataset.tab;
   // The other tab's scroll position isn't a reader's decision about this feed.
-  if (name === "run" || name === "skills") armPageTail();
+  if (name === "run" || name === "skills" || name === "watch") armPageTail();
   if (!loadedTabs.has(name)) {
     loadedTabs.add(name);
     tabLoaders[name]().catch((err) => notice(err.message));
@@ -483,6 +484,7 @@ function makeLive(prefix, boxId, feedId) {
     els: { runid: el("runid"), step: el("step"), calls: el("calls"),
            cost: el("cost"), elapsed: el("elapsed"), state: el("state"),
            skill: el("skill"), iterWrap: el("iter-wrap"), iter: el("iter") },
+    passLabel: "iteration",  // a watch calls its own "pass"
     setRunning: () => {},   // what else on the page follows this surface
     onEvent: () => {},
     onEnd: () => {},
@@ -518,7 +520,10 @@ function openStream(v) {
       finalizeLlm(feed, null);        // an iteration can end mid-call
       const rule = document.createElement("div");
       rule.className = "banner";
-      rule.innerHTML = `<b>iteration ${esc(data.iteration || "?")}</b>` +
+      // "pass" for a watch, "iteration" for a --repeat run. The same mechanism
+      // underneath -- a new run directory -- but calling a watch's sweep of the
+      // inbox an "iteration" reads as though the goal were being retried.
+      rule.innerHTML = `<b>${v.passLabel} ${esc(data.iteration || "?")}</b>` +
         `<br><span class="small">${esc(data.run_id)}</span>`;
       followPageTail(feed, () => feed.appendChild(rule));
       // Steps are per iteration; calls and spend are the session's, because
@@ -591,6 +596,9 @@ function runOptions() {
     allow_destructive: $("opt-destructive").checked,
     no_learn: $("opt-no-learn").checked,
     serial: $("opt-serial").value.trim(),
+    assert_shell: $("opt-assert-shell").value.trim(),
+    assert_equals: $("opt-assert-equals").value.trim(),
+    assert_text: $("opt-assert-text").value.trim(),
   };
   const ms = parseInt($("opt-max-steps").value, 10);
   if (ms) body.max_steps = ms;
@@ -665,6 +673,14 @@ async function refreshStatus() {
     parts.push(st.model ? esc(st.model.split("/").pop()) : `<span class="warn">no model</span>`);
     parts.push(st.api_key_present ? `<span class="ok">api key</span>` : `<span class="warn">no api key</span>`);
     if (st.run && st.run.running) parts.push(`<span class="ok">● running: ${esc(st.run.goal)}</span>`);
+    if (st.watch && st.watch.running) {
+      // The mode is part of the status line, not just the tab: a watch outlives
+      // every reload, and "is it sending?" should be answerable at a glance from
+      // any tab.
+      parts.push(st.watch.draft
+        ? `<span class="ok">● watching (draft): ${esc(st.watch.goal)}</span>`
+        : `<span class="warn">● watching LIVE: ${esc(st.watch.goal)}</span>`);
+    }
     if (st.job) parts.push(`<span class="ok">● generating a skill</span>`);
     $("status").innerHTML = parts.join(" · ");
     // Reattach to a run already in progress (e.g. page reloaded mid-run).
@@ -673,6 +689,14 @@ async function refreshStatus() {
       live.startedAt = st.run.started_at || Date.now() / 1000;
       setRunningUI(true);
       openStream(live);
+    }
+    // And to a watch, which outlives a reload by days rather than minutes.
+    if (st.watch && st.watch.running && !watchLive.source) {
+      watchLive.step = 0; watchLive.calls = 0; watchLive.cost = 0;
+      watchLive.startedAt = st.watch.started_at || Date.now() / 1000;
+      $("watch-draft").checked = !!st.watch.draft;
+      setLiveRunning(watchLive, true);
+      openStream(watchLive);
     }
     // And to a generation, which outlives a reload just as long.
     if (st.job && !genLive.source) {
@@ -684,6 +708,157 @@ async function refreshStatus() {
     $("status").textContent = "server unreachable";
   }
 }
+
+/* -------------------------------------------------------------- watch */
+
+const watchLive = makeLive("w-", "watch-live", "watch-feed");
+watchLive.url = "/api/watch/stream";
+watchLive.passLabel = "pass";
+watchLive.setRunning = (running) => {
+  $("btn-watch-start").disabled = running;
+  $("btn-watch-stop").disabled = !running;
+  // The policy is read once, at startup. Editing it under a running watch would
+  // take effect at no predictable moment, so the server refuses and the form
+  // says so before you type into it.
+  $("watch-policy").readOnly = running;
+  $("btn-policy-save").disabled = running;
+  paintWatchBanner(running);
+};
+// Every pass writes a reply or it does not; either way the ledger is what
+// changed, so refresh it when one ends rather than making the reader ask.
+watchLive.onEvent = (ev) => {
+  if (ev.kind === "reply_attempt" || ev.kind === "reply_confirmed"
+      || ev.kind === "run_end") loadLedger().catch(() => {});
+};
+
+let watchDefaults = {};
+
+function paintWatchBanner(running) {
+  const draft = $("watch-draft").checked;
+  const el = $("watch-mode-banner");
+  el.className = "banner " + (draft ? "ok" : "danger");
+  el.innerHTML = draft
+    ? "<b>DRAFT</b> — replies are composed and recorded, and never sent."
+      + "<br><span class=\"small\">Read what it would have said in the run feed,"
+      + " then uncheck “draft only” when the drafts look right.</span>"
+    : "<b>LIVE</b> — replies WILL be sent to real people from this device."
+      + "<br><span class=\"small\">The harness will not answer the same message"
+      + " twice, whatever the policy says.</span>";
+  if (running) el.innerHTML += "<br><span class=\"small\">watching…</span>";
+}
+
+function watchOptions() {
+  const num = (id, int) => {
+    const raw = $(id).value.trim();
+    if (raw === "") return null;
+    const n = int ? parseInt(raw, 10) : parseFloat(raw);
+    return isNaN(n) ? null : n;
+  };
+  return {
+    goal: $("watch-goal").value.trim(),
+    draft: $("watch-draft").checked,
+    serial: $("watch-serial").value.trim(),
+    interval_s: num("watch-interval"),
+    max_steps: num("watch-steps", true),
+    replies_per_hour: num("watch-rph", true),
+    replies_per_conversation: num("watch-rpc", true),
+    cooldown_s: num("watch-cooldown"),
+    usd_per_hour: num("watch-usd"),
+  };
+}
+
+async function loadWatch() {
+  const data = await api("/api/watch");
+  watchDefaults = data.defaults || {};
+  $("watch-policy-path").textContent = data.policy_path || "(no policy path set)";
+  $("watch-ledger-path").textContent = data.ledger_path || "";
+  // Placeholders, not values: an empty field means "whatever config says", and
+  // filling them in would silently pin today's defaults into every start.
+  const ph = (id, v) => { if (v !== undefined && v !== null) $(id).placeholder = String(v); };
+  ph("watch-interval", watchDefaults.interval_s);
+  ph("watch-steps", watchDefaults.max_steps);
+  ph("watch-rph", watchDefaults.max_replies_per_hour);
+  ph("watch-rpc", watchDefaults.max_replies_per_thread_per_hour);
+  ph("watch-cooldown", watchDefaults.thread_cooldown_s);
+  const active = data.active || {};
+  if (active.goal && !$("watch-goal").value) $("watch-goal").value = active.goal;
+  if (active.running) $("watch-draft").checked = !!active.draft;
+  paintWatchBanner(!!active.running);
+  await loadPolicy();
+  await loadLedger();
+}
+
+async function loadPolicy() {
+  const data = await api("/api/watch/policy");
+  $("watch-policy").value = data.text || "";
+  $("watch-policy-path").textContent =
+    data.path ? data.path + (data.exists ? "" : " (not written yet)")
+              : "(no policy path set — set watch.policy in Config)";
+}
+
+async function loadLedger() {
+  const data = await api("/api/watch/ledger");
+  const tbody = document.querySelector("#watch-ledger-table tbody");
+  tbody.innerHTML = "";
+  const rows = data.threads || [];
+  $("watch-ledger-empty").style.display = rows.length ? "none" : "block";
+  $("watch-ledger-path").textContent = data.path || "";
+  for (const t of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td>${esc(t.preview || t.thread_key)}</td>` +
+      `<td>${t.reply_count}</td>` +
+      `<td class="small">${esc(fmtTime(t.last_attempt_at))}</td>` +
+      `<td class="small">${t.confirmed
+        ? "<span class=\"ok\">confirmed</span>"
+        : "<span class=\"warn\">unconfirmed — in doubt</span>"}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+$("watch-draft").addEventListener("change", () => paintWatchBanner(false));
+
+$("btn-policy-save").addEventListener("click", async () => {
+  try {
+    const r = await api("/api/watch/policy", {
+      method: "PUT",
+      body: JSON.stringify({ text: $("watch-policy").value }),
+    });
+    notice(`policy saved to ${r.path}`, false);
+  } catch (err) { notice(err.message); }
+});
+
+$("btn-ledger-reload").addEventListener("click", () =>
+  loadLedger().catch((err) => notice(err.message)));
+
+$("watch-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = watchOptions();
+  if (!body.goal) { notice("say what to watch"); return; }
+  if (!body.draft &&
+      !confirm("This will send real replies from this device.\n\n" +
+               "Have you read what it drafts first?")) return;
+  try {
+    await api("/api/watch", { method: "POST", body: JSON.stringify(body) });
+  } catch (err) { notice(err.message); return; }
+  $("watch-hint").textContent = "";
+  watchLive.step = 0; watchLive.calls = 0; watchLive.cost = 0;
+  watchLive.startedAt = Date.now() / 1000;
+  watchLive.feed.innerHTML = "";
+  watchLive.feed._llm = null;
+  watchLive.feed._runId = "";
+  watchLive.els.runid.textContent = "starting…";
+  paintCounters(watchLive);
+  setLiveRunning(watchLive, true);
+  openStream(watchLive);
+});
+
+$("btn-watch-stop").addEventListener("click", async () => {
+  try {
+    await api("/api/watch/stop", { method: "POST" });
+    $("watch-hint").textContent = "stopping…";
+  } catch (err) { notice(err.message); }
+});
 
 /* ------------------------------------------------------------ history */
 
@@ -819,6 +994,70 @@ async function loadDevices() {
 
 $("btn-dev-reload").addEventListener("click", () => loadDevices().catch((e) => notice(e.message)));
 
+/* The three read-only device commands the CLI has always had and the browser
+   never did. All of them open a `Device` session, which resets animation scales
+   and rotation on the way in and out, so the server refuses them while anything
+   is driving the phone -- and the button says so rather than the phone changing
+   under a run. */
+
+function deviceSerial() {
+  return $("opt-serial").value.trim() || $("watch-serial").value.trim();
+}
+
+async function withStatus(statusId, label, fn) {
+  const el = $(statusId);
+  el.textContent = label;
+  try {
+    await fn();
+    el.textContent = "";
+  } catch (err) {
+    el.textContent = err.message;
+  }
+}
+
+$("btn-apps-load").addEventListener("click", () =>
+  withStatus("apps-status", "listing…", async () => {
+    const q = new URLSearchParams({
+      search: $("apps-search").value.trim(),
+      third_party: $("apps-third-party").checked ? "true" : "false",
+      serial: deviceSerial(),
+    });
+    const d = await api("/api/apps?" + q);
+    const out = $("apps-out");
+    out.style.display = "block";
+    out.textContent = d.count
+      ? `${d.count} app(s)\n\n` + d.apps.join("\n")
+      : "no matching apps";
+  }));
+
+$("apps-search").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); $("btn-apps-load").click(); }
+});
+
+$("btn-dump").addEventListener("click", () =>
+  withStatus("dump-status", "dumping…", async () => {
+    const q = new URLSearchParams({
+      raw: $("dump-raw").checked ? "true" : "false",
+      serial: deviceSerial(),
+    });
+    const d = await api("/api/dump?" + q);
+    $("dump-meta").textContent =
+      `${d.package || "(no package)"} ${d.activity || ""} · ` +
+      `${d.width}x${d.height} · ${d.elements} of ${d.nodes} nodes shown · ` +
+      `skeleton ${d.skeleton_id}` + (d.keyboard_open ? " · keyboard open" : "");
+    const out = $("dump-out");
+    out.style.display = "block";
+    out.textContent = d.rendered + (d.xml ? "\n\n--- raw xml ---\n" + d.xml : "");
+  }));
+
+$("btn-doctor").addEventListener("click", () =>
+  withStatus("doctor-status", "checking…", async () => {
+    const d = await api("/api/doctor");
+    const out = $("doctor-out");
+    out.style.display = "block";
+    out.textContent = d.text || "(no output)";
+  }));
+
 /* ------------------------------------------------------------- config */
 
 /* A model field is a dropdown over the provider's own catalogue (/api/models)
@@ -872,6 +1111,20 @@ const CFG_SPEC = [
   ]],
   ["skills", [
     ["enabled", "bool"], ["skills_dir", "text"], ["learn_after_run", "bool"],
+  ]],
+  // The Watch tab can override most of these per start, but they belong here
+  // too: these are the ceilings, and a ceiling you have to retype on every start
+  // is one that will be forgotten once. `policy` and `ledger` especially -- those
+  // are paths, and the Watch tab reads them from here rather than asking.
+  ["watch", [
+    ["policy", "text"], ["ledger", "text"],
+    ["interval_s", "number"], ["max_steps", "number"],
+    ["draft", "bool"], ["fail_closed", "bool"],
+    ["thread_cooldown_s", "number"],
+    ["max_replies_per_hour", "number"],
+    ["max_replies_per_thread_per_hour", "number"],
+    ["max_usd_per_hour", "number"],
+    ["backoff_initial_s", "number"], ["backoff_max_s", "number"],
   ]],
   ["memory", [["db", "text"]]],
 ];

@@ -1147,6 +1147,7 @@ class LLMClient:
                width: int, height: int, package: str = "",
                screenshot: Optional[bytes] = None, note: str = "",
                scratchpad: str = "", progress: str = "", skill: str = "",
+               policy: str = "",
                step: int = 0, recorder: Optional[Any] = None,
                purpose: str = "decide", effort: str = "",
                image_analysis: Optional[str] = None,
@@ -1181,6 +1182,12 @@ class LLMClient:
              "content": prompts.device_profile(width, height)},
             {"role": "user", "content": prompts.goal_block(goal)},
         ]
+        if policy:
+            # Above the skill and the history: for a watch this is the one block
+            # that is byte-identical on every turn for days, so it belongs as
+            # early in the prefix as the goal itself. See `prompts.policy_block`.
+            messages.append({"role": "user",
+                             "content": prompts.policy_block(policy)})
         if skill:
             # Above the history on purpose -- see `prompts.skill_block`.
             messages.append({"role": "user", "content": prompts.skill_block(skill)})
