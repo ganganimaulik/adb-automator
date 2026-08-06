@@ -259,6 +259,31 @@ class NoteLedger:
                      len(changed), len(self.entries), ", ".join(changed[:8]))
         return changed
 
+    def records(self, keys: Sequence[str] = ()) -> List[Dict[str, Any]]:
+        """The entries `keys` name -- all of them when it is empty -- as JSON.
+
+        Written into the ``scratchpad`` event so a reader can show the *values* a
+        step collected rather than only the names of them: the event used to
+        carry the changed keys and a count, which says a record arrived and not
+        what it says.
+
+        The normalised key rides along as ``id``. This module owns how two
+        spellings of one key become one record, and a consumer keeping the union
+        of these deltas -- the web feed does -- would otherwise have to re-derive
+        that and drift from it.
+        """
+        wanted = list(keys) if keys else list(self.entries)
+        out: List[Dict[str, Any]] = []
+        for raw in wanted:
+            key = normalise_key(raw)
+            entry = self.entries.get(key)
+            if entry is None:
+                continue
+            out.append({"id": key, "key": entry.key, "value": entry.value,
+                        "superseded": list(entry.superseded),
+                        "step": entry.last_step})
+        return out
+
     def _lines(self, max_chars: int = 0) -> Tuple[List[str], int]:
         """The rendered records that fit, and how many did not.
 

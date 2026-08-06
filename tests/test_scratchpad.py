@@ -16,6 +16,9 @@ records, that they survive that too.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from adbagent import scratchpad as sp
@@ -222,6 +225,58 @@ def test_a_long_value_is_capped():
     assert len(entry.value) <= sp.MAX_VALUE_CHARS
 
 
+# ---------------------------------------------------------------------------
+# The records a reader is handed
+# ---------------------------------------------------------------------------
+
+def test_records_carry_the_values_not_just_the_keys():
+    """What the `scratchpad` event used to say was "a record called 9:59
+    arrived", which is the one thing a reader can already see. The live view
+    shows the ledger, so it needs the readings."""
+    ledger = sp.NoteLedger()
+    ledger.update(recs(("9:59", "potatoes 403g")), 1)
+    ledger.update(recs(("10:03", "tomatoes 120g")), 2)
+    assert ledger.records() == [
+        {"id": "9:59", "key": "9:59", "value": "potatoes 403g",
+         "superseded": [], "step": 1},
+        {"id": "10:03", "key": "10:03", "value": "tomatoes 120g",
+         "superseded": [], "step": 2},
+    ]
+
+
+def test_records_of_one_turn_are_the_ones_that_turn_changed():
+    ledger = sp.NoteLedger()
+    ledger.update(recs(("9:59", "potatoes 403g")), 1)
+    written = ledger.update(recs(("10:03", "tomatoes 120g")), 2)
+    assert [r["key"] for r in ledger.records(written)] == ["10:03"]
+
+
+def test_a_records_view_carries_the_disagreement():
+    """403g then 413g. A reader shown only the current value cannot see that the
+    run read it twice and got two answers."""
+    ledger = sp.NoteLedger()
+    ledger.update(recs(("9:59", "potatoes 403g")), 1)
+    written = ledger.update(recs(("9:59", "potatoes 413g")), 2)
+    record = ledger.records(written)[0]
+    assert record["value"] == "potatoes 413g"
+    assert record["superseded"] == ["potatoes 403g"]
+
+
+def test_records_are_keyed_on_the_id_the_ledger_matched_on():
+    """`id` is what a consumer keeping the union of these deltas keys off. It has
+    to be the normalised key, or "9:45" and "9:45:" become two records in the
+    view of a ledger that holds one."""
+    ledger = sp.NoteLedger()
+    ledger.update(recs(("9:45", "chicken 425g")), 1)
+    written = ledger.update(recs(("9:45:", "chicken 426g")), 2)
+    assert [r["id"] for r in ledger.records(written)] == ["9:45"]
+    assert ledger.records(written)[0]["key"] == "9:45"
+
+
+def test_records_ignores_a_key_the_ledger_does_not_hold():
+    assert sp.NoteLedger().records(["9:45"]) == []
+
+
 def test_replay_rebuilds_a_finished_run_from_its_deltas():
     ledger = sp.replay([
         {"kind": "run_start"},
@@ -290,6 +345,56 @@ def test_the_loop_keeps_a_reading_a_later_turn_stops_mentioning(cfg, mem):
     assert "potatoes 403g" in collected      # written on turn 1, never repeated
     assert "tomatoes 120g" in collected
     assert "rice 290g" in collected
+
+
+def run_events(cfg, run_id):
+    """The events one run wrote, which is what the web feed replays."""
+    path = Path(cfg.run.artifacts_dir) / run_id / "events.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def test_the_event_carries_the_records_a_step_collected(cfg, mem):
+    """The live view renders the ledger from these. Carrying only the keys and a
+    count -- which is what the event had -- shows that a record arrived and not
+    what it says, so the values have to be in the file."""
+    _, state, _, _ = run_collection(
+        cfg, mem, [recs(("9:59", "potatoes 403g")),
+                   recs(("10:03", "tomatoes 120g"))])
+    written = [e for e in run_events(cfg, state.run_id) if e["kind"] == "scratchpad"]
+    assert len(written) == 2
+    assert written[0]["records"] == [
+        {"id": "9:59", "key": "9:59", "value": "potatoes 403g",
+         "superseded": [], "step": 1}]
+    # The delta, not the ledger: the reader keeps the union, and re-sending
+    # everything every step is what the record contract exists to avoid.
+    assert [r["key"] for r in written[1]["records"]] == ["10:03"]
+    assert written[1]["total"] == 2
+
+
+def test_what_a_step_collected_is_recorded_under_that_step(cfg, mem):
+    """After the decision that produced it. Both the file and the live feed play
+    back in order, and a ledger that lands above its own step reads as belonging
+    to the step before."""
+    _, state, _, _ = run_collection(cfg, mem, [recs(("9:59", "potatoes 403g"))])
+    kinds = [e["kind"] for e in run_events(cfg, state.run_id)
+             if e["kind"] in ("decide", "scratchpad")]
+    assert kinds[:2] == ["decide", "scratchpad"]
+
+
+def test_a_step_that_collected_nothing_writes_no_ledger_event(cfg, mem):
+    _, state, _, _ = run_collection(cfg, mem, [None, recs(("9:59", "potatoes 403g"))])
+    written = [e for e in run_events(cfg, state.run_id) if e["kind"] == "scratchpad"]
+    assert [e["step"] for e in written] == [2]
+
+
+def test_the_run_records_the_ceilings_it_was_given(cfg, mem):
+    """`max_steps` and the budget are in a config file that changes, and
+    `--max-steps` on one invocation leaves no other trace. The live view shows
+    "step 4/6" from these -- a step count against nothing is not a position."""
+    _, state, _, _ = run_collection(cfg, mem, [recs(("9:59", "potatoes 403g"))])
+    start = next(e for e in run_events(cfg, state.run_id) if e["kind"] == "run_start")
+    assert start["max_steps"] == cfg.run.max_steps == 6
+    assert start["budget_usd"] == cfg.safety.budget_usd
 
 
 def test_the_judge_grades_on_everything_collected_not_the_last_turn(cfg, mem):

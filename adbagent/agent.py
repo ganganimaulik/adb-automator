@@ -610,15 +610,23 @@ class Agent:
         recorder = Recorder(self.cfg, run_id)
         self._log_header(goal, recorder, resumed_from=state.step if resume else 0)
         self.mem.begin_run(run_id, goal, state.intent_id)
+        # The ceilings this sitting runs under. Recorded because they are not
+        # recoverable afterwards -- they live in a config file that changes, and
+        # `--max-steps` on one invocation leaves no other trace -- and because a
+        # step count means something different against 25 than against 200. The
+        # live view reads them to show progress as "step 12/60" rather than "step
+        # 12", which is the difference between a number and a position.
+        limits = {"max_steps": self.cfg.run.max_steps,
+                  "budget_usd": self.cfg.safety.budget_usd}
         if resume:
             # One directory per run still holds: the events of this sitting are
             # appended to the failed one's, with this event where they join.
             recorder.event("run_resume", goal=goal,
                            model=getattr(self.llm, "model", ""),
-                           resumed_at_step=state.step)
+                           resumed_at_step=state.step, **limits)
         else:
             recorder.event("run_start", goal=goal,
-                           model=getattr(self.llm, "model", ""))
+                           model=getattr(self.llm, "model", ""), **limits)
 
         # Mirror the live LLM stream into the run directory as it happens, so
         # the web UI can show the model thinking rather than just its verdicts.
@@ -1186,11 +1194,10 @@ class Agent:
             # here. Nothing it stops mentioning can be lost, because nothing is
             # being replaced -- which is what the previous contract, where the
             # model rewrote the whole ledger every turn, could not promise.
+            written: List[str] = []
             if getattr(action, "notes", None):
                 written = state.scratchpad.update(action.notes, state.step)
                 if written:
-                    rec.event("scratchpad", step=state.step, keys=written,
-                              total=len(state.scratchpad))
                     # The clearest progress signal there is on a collection goal:
                     # a record the run did not have a moment ago. `update`
                     # returns only the keys that were new or corrected, so a
@@ -1233,6 +1240,16 @@ class Agent:
                       screenshot=bool(screenshot),
                       effort=effort, hard_because=hard_because,
                       wall_s=round(t_step_llm, 3), llm=step_metrics(step_calls))
+            # What this step collected, under the decision that collected it:
+            # recorded after the `decide` event because that is the order a
+            # reader wants it in -- the file and the live feed both play back in
+            # sequence, and the records came out of the answer above. `records`
+            # carries the values as well as the keys, so a reader does not have
+            # to replay every delta in the file to see what the run has got.
+            if written:
+                rec.event("scratchpad", step=state.step, keys=written,
+                          total=len(state.scratchpad),
+                          records=state.scratchpad.records(written))
             self.on_event("step", state=state, screen=screen, action=action,
                           source=source, screenshot=bool(screenshot))
 

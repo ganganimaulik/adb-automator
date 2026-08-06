@@ -72,7 +72,13 @@
         <span>elapsed <b id="c-elapsed">0s</b></span>
         <span>status <b id="c-state">running</b></span>
         <span>skill <b id="c-skill">—</b></span>
+        <!-- What the run has collected so far. The feed shows each record as it
+             arrives; this is the running total, which is the number a
+             collection goal is actually judged on. -->
+        <span>records <b id="c-records">0</b></span>
       </div>
+      <!-- The model's own note on what is done and what remains. -->
+      <div class="progress-note" id="c-progress" style="display:none"></div>
       <div class="feed" id="feed"></div>
     </div>
   </section>
@@ -130,7 +136,9 @@
         <span>elapsed <b id="w-elapsed">0s</b></span>
         <span>status <b id="w-state">running</b></span>
         <span>skill <b id="w-skill">—</b></span>
+        <span>records <b id="w-records">0</b></span>
       </div>
+      <div class="progress-note" id="w-progress" style="display:none"></div>
       <div class="feed" id="watch-feed"></div>
     </div>
 
@@ -294,7 +302,9 @@
               <span>elapsed <b id="gc-elapsed">0s</b></span>
               <span>status <b id="gc-state">running</b></span>
               <span>skill <b id="gc-skill">—</b></span>
+              <span>records <b id="gc-records">0</b></span>
             </div>
+            <div class="progress-note" id="gc-progress" style="display:none"></div>
             <div class="feed" id="gen-feed"></div>
           </div>
 

@@ -471,7 +471,20 @@ vision read, or the decision itself when the decider is the one looking. A
 sweep's per-item reads have no panel — each is prefetched on another thread, and
 streaming several of those into one view interleaves them — so each arrives as a
 card carrying the line the model read and the frame it read it from, which on a
-carousel is most of the run's vision calls. A run can also carry a **success
+carousel is most of the run's vision calls. What the run has **collected**
+arrives under the step that collected it: the whole ledger, not the delta, with
+the records that step wrote or corrected marked, and a re-read that disagreed
+with an earlier reading shown next to the value that replaced it. Only the
+newest of those panels stays open — each folds the one before it, the way the
+thinking panels fold — because fifteen steps of an album walk are fifteen copies
+of a growing list and the one worth reading is the last. Each decision card also
+carries the model's own **progress** note where it wrote one, what the step cost
+in tokens and how much of that prompt was cached, and a `stalled N` chip once
+the run has gone N steps without learning anything, which is the number the
+harness escalates on. Above the feed: the ledger's running total, the latest
+progress note (which would otherwise scroll away with the card that wrote it),
+and step and spend against the ceilings the run started under — `step 12/60`,
+`$0.31 / $2.00`. A run can also carry a **success
 assertion**, folded away under the options — the browser's only route to
 `--assert-shell`/`--assert-text`, since an assertion is per-run and not
 config. **Watch** starts and supervises a

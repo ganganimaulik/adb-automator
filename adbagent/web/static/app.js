@@ -180,6 +180,103 @@ const HALT_BANNERS = {
                      `<b>stopped on a sensitive screen</b> ${esc(e.reason || "")}`],
 };
 
+/* --------------------------------------------------- collected data
+
+   What the run has *got*: the ledger `scratchpad.py` maintains, shown under the
+   step that changed it. The harness sends only the records that were new or
+   corrected on that step -- keyed by `id`, the normalised key it matched them
+   on -- so the union is kept here per feed and re-rendered whole. A person
+   watching a collection run wants the ledger, not the delta: the delta is one
+   line and the question is always "has it got everything yet".
+
+   Only the newest panel stays open. Fifteen steps of an album walk would
+   otherwise be fifteen copies of a growing list, and the one worth reading is
+   always the last -- so each new panel folds the one before it, the way the
+   thinking panels fold when their call ends. A panel a reader opened by hand is
+   left alone: only the panel this feed opened is tracked. */
+
+function noteRow(rec, fresh) {
+  const row = document.createElement("div");
+  row.className = "rec" + (fresh ? " fresh" : "");
+  const was = rec.superseded || [];
+  row.innerHTML =
+    `<span class="k">${esc(rec.key)}</span>` +
+    (rec.value ? `<span class="v">${esc(rec.value)}</span>` : "") +
+    // A re-read that disagreed with the first reading. Kept by the harness
+    // rather than overwritten, so showing it is the whole point of keeping it.
+    (was.length ? `<span class="was">earlier: ${esc(was.join(" · "))}</span>` : "");
+  return row;
+}
+
+function finalizeNotes(feed) {
+  const card = feed && feed._notesCard;
+  if (card) {
+    card.open = false;
+    feed._notesCard = null;
+  }
+}
+
+function notesPanel(ev, feed) {
+  const ledger = feed ? (feed._notes || (feed._notes = new Map())) : new Map();
+  const fresh = new Set();
+  for (const rec of ev.records || []) {
+    const id = rec.id || rec.key;
+    // Set, not delete-then-set: a corrected record keeps the position it was
+    // first written in, which is the order the harness holds them in too.
+    ledger.set(id, rec);
+    fresh.add(id);
+  }
+  finalizeNotes(feed);  // this panel is the current ledger now; the last is not
+
+  const card = document.createElement("div");
+  card.className = "card notes";
+  const n = fresh.size;
+  card.innerHTML =
+    `<details open><summary>collected data · step ${esc(ev.step)} · ` +
+    `+${n} ${n === 1 ? "record" : "records"} · ${ledger.size} total</summary>` +
+    `<div class="notes-body"></div></details>`;
+  const body = card.querySelector(".notes-body");
+  for (const [id, rec] of ledger) body.appendChild(noteRow(rec, fresh.has(id)));
+  // The harness evicts its oldest records past a ceiling and reports the count
+  // rather than hiding it; the view has no such ceiling, so when the two
+  // disagree it is the harness that stopped carrying them -- and the prompt the
+  // model sees from here on is the shorter one.
+  const dropped = ledger.size - (ev.total || ledger.size);
+  if (dropped > 0) {
+    const note = document.createElement("div");
+    note.className = "notes-note";
+    note.textContent = `the harness has dropped the oldest ${dropped} for ` +
+      `space — still listed here, but no longer in the model's prompt`;
+    card.querySelector("details").appendChild(note);
+  }
+  if (feed) feed._notesCard = card.querySelector("details");
+  return card;
+}
+
+/* --------------------------------------------------------- step cards */
+
+/* The per-step arithmetic. Tokens as well as calls and spend, because what a
+   step cost is mostly what it was *shown* -- and the cached share is the
+   difference between a prompt that reused the run's context and one that paid
+   for the whole of it again, which is otherwise invisible until the bill. */
+function stepMeta(ev) {
+  const llm = ev.llm || {};
+  const a = ev.action || {};
+  const bits = [];
+  if (ev.wall_s) bits.push(ev.wall_s.toFixed(1) + "s");
+  bits.push(`${llm.n_calls || 0} call(s)`);
+  if (llm.prompt_tokens) {
+    let tok = `${fmtTok(llm.prompt_tokens)}→${fmtTok(llm.completion_tokens)} tok`;
+    if (llm.cached_tokens) {
+      tok += ` · ${Math.round(100 * llm.cached_tokens / llm.prompt_tokens)}% cached`;
+    }
+    bits.push(tok);
+  }
+  bits.push(`$${(llm.usd || 0).toFixed(4)}`);
+  if (a.confidence) bits.push(esc(a.confidence));
+  return bits.join(" · ");
+}
+
 /* One feed entry, or null when the event says nothing new.
    `feed` is the element it is going into, which is where the per-feed state a
    few kinds need lives -- see `active_skill`. */
@@ -198,19 +295,27 @@ function renderEvent(ev, feed) {
       `<br><span class="small">${esc(ev.model || "")}</span>`;
   } else if (kind === "decide") {
     const a = ev.action || {};
-    const llm = ev.llm || {};
     div.className = "card";
     div.innerHTML =
       `<div class="head"><span class="stepno">step ${esc(ev.step)}</span>` +
       `<span class="action">${esc(actionSummary(a))}</span>` +
-      (ev.effort ? `<span class="chip neutral">${esc(ev.effort)}</span>` : "") +
+      // Why the turn was given deep reasoning, on the chip that says it was:
+      // `hard_because` is recorded per step and had nowhere to be read.
+      (ev.effort ? `<span class="chip neutral"${ev.hard_because
+        ? ` title="${esc(ev.hard_because)}"` : ""}>${esc(ev.effort)}</span>` : "") +
       (ev.screenshot ? `<span class="chip neutral">vision</span>` : "") +
+      // The stall ladder's own counter. Every action can be succeeding while the
+      // run goes nowhere, and this is the number the harness escalates on.
+      (ev.stalled ? `<span class="chip stall" title="steps since the run last ` +
+        `learned anything — the harness starts intervening as this climbs">` +
+        `stalled ${esc(ev.stalled)}</span>` : "") +
       `</div>` +
       (a.observation ? `<div class="obs">${esc(a.observation)}</div>` : "") +
       (a.reasoning ? `<div class="why">${esc(a.reasoning)}</div>` : "") +
-      `<div class="meta">${ev.wall_s ? ev.wall_s.toFixed(1) + "s · " : ""}` +
-      `${llm.n_calls || 0} call(s) · $${(llm.usd || 0).toFixed(4)}` +
-      (a.confidence ? ` · ${esc(a.confidence)}` : "") + `</div>`;
+      // The model's own plan for the goal, which it rewrites as it goes. It has
+      // been in the prompt and in the events all along and was shown nowhere.
+      (a.progress ? `<div class="plan">${esc(a.progress)}</div>` : "") +
+      `<div class="meta">${stepMeta(ev)}</div>`;
   } else if (kind === "verify") {
     const cls = GRADE_CLASSES[ev.grade] || "failed";
     div.className = "card";
@@ -267,6 +372,10 @@ function renderEvent(ev, feed) {
     div.innerHTML = `<b>repeated \`${esc(ev.gesture)}\` ${esc(ev.swept)}×</b>, ` +
       `${esc(ev.read)} read <span class="small">· steps ${esc(ev.first_step)}–` +
       `${esc(ev.last_step)}${ev.reason ? " · " + esc(ev.reason) : ""}</span>`;
+  } else if (kind === "scratchpad" && (ev.records || []).length) {
+    // A run recorded before the event carried its records has only the keys, and
+    // falls through to the one-line form in NOTE_LINES below.
+    return notesPanel(ev, feed);
   } else if (HALT_BANNERS[kind]) {
     const [cls, html] = HALT_BANNERS[kind](ev);
     div.className = "banner " + cls;
@@ -290,6 +399,20 @@ function updateCountersFromEvent(ev, v) {
   // app's skill" should not need scrolling back for.
   if (ev.kind === "active_skill" && ev.name) {
     v.skill = ev.name;
+  }
+  // The ceilings this sitting runs under, so a step count reads as a position
+  // and the spend reads against what it is allowed to reach.
+  if (ev.kind === "run_start" || ev.kind === "run_resume") {
+    v.maxSteps = ev.max_steps || 0;
+    v.budget = ev.budget_usd || 0;
+  }
+  // How much the run has collected, and where it thinks it is. Both scroll away
+  // in the feed, and both are the answer to "is this going anywhere".
+  if (ev.kind === "scratchpad" && typeof ev.total === "number") {
+    v.records = ev.total;
+  }
+  if (ev.kind === "decide" && (ev.action || {}).progress) {
+    v.progress = ev.action.progress;
   }
   const llm = ev.llm;
   if (llm && typeof llm === "object") {
@@ -456,10 +579,19 @@ function handleLlmEvent(ev, feed) {
 }
 
 function paintCounters(v) {
-  v.els.step.textContent = v.step;
+  // Against the ceiling when the run recorded one: "step 12/60" says how much
+  // room is left, which is what somebody watching actually wants to know.
+  v.els.step.textContent = v.maxSteps ? `${v.step}/${v.maxSteps}` : v.step;
   v.els.calls.textContent = v.calls;
-  v.els.cost.textContent = "$" + v.cost.toFixed(4);
+  v.els.cost.textContent = "$" + v.cost.toFixed(4) +
+    (v.budget ? " / $" + v.budget.toFixed(2) : "");
   v.els.skill.textContent = v.skill || "—";
+  v.els.records.textContent = v.records;
+  // The model's own progress note, outside the feed on purpose: it is the one
+  // line that answers "what does it think it is doing", and the card carrying it
+  // is twenty cards back by the time the question comes up.
+  v.els.progress.textContent = v.progress;
+  v.els.progress.style.display = v.progress ? "" : "none";
   // Only worth the space once there is more than one: a single run has no
   // iteration to speak of. A tour never repeats, so it has no such counter.
   if (v.els.iterWrap) {
@@ -485,17 +617,34 @@ function makeLive(prefix, boxId, feedId) {
   feed._live = true;  // chase the tail; the history feed does not
   return {
     step: 0, calls: 0, cost: 0, skill: "", iteration: 1,
+    records: 0, progress: "", maxSteps: 0, budget: 0,
     source: null, startedAt: 0, timer: null,
     url: "",           // where to stream from; a job's is known only once it starts
     box: $(boxId), feed,
     els: { runid: el("runid"), step: el("step"), calls: el("calls"),
            cost: el("cost"), elapsed: el("elapsed"), state: el("state"),
-           skill: el("skill"), iterWrap: el("iter-wrap"), iter: el("iter") },
+           skill: el("skill"), iterWrap: el("iter-wrap"), iter: el("iter"),
+           records: el("records"), progress: el("progress") },
     passLabel: "iteration",  // a watch calls its own "pass"
     setRunning: () => {},   // what else on the page follows this surface
     onEvent: () => {},
     onEnd: () => {},
   };
+}
+
+/* A surface's counters back to nothing: for a run starting, and for one being
+   reattached to after a reload, where whatever the page last watched is not it.
+   The ceilings go too -- the stream replays from the top of the events file, so
+   `run_start` puts back the ones this run is actually under. */
+function resetCounters(v) {
+  v.step = 0;
+  v.calls = 0;
+  v.cost = 0;
+  v.skill = "";
+  v.records = 0;
+  v.progress = "";
+  v.maxSteps = 0;
+  v.budget = 0;
 }
 
 /* Keep a surface's clock and status telling the truth. */
@@ -533,11 +682,17 @@ function openStream(v) {
       rule.innerHTML = `<b>${v.passLabel} ${esc(data.iteration || "?")}</b>` +
         `<br><span class="small">${esc(data.run_id)}</span>`;
       followPageTail(feed, () => feed.appendChild(rule));
-      // Steps are per iteration; calls and spend are the session's, because
-      // that is what --budget-usd bounds.
+      // Steps are per iteration, and so are the ledger and the progress note --
+      // each iteration pursues the goal from scratch in its own run directory.
+      // Calls and spend are the session's, because that is what --budget-usd
+      // bounds.
       v.step = 0;
+      v.records = 0;
+      v.progress = "";
       feed._llm = null;
       feed._skill = "";
+      finalizeNotes(feed);   // the last pass's ledger is not this one's
+      feed._notes = null;
     }
     v.iteration = data.iteration || 1;
     v.els.runid.textContent = data.run_id;
@@ -616,7 +771,7 @@ function runOptions() {
 
 /* Clear a surface and attach it to whatever is starting now. */
 function beginLive(v) {
-  v.step = 0; v.calls = 0; v.cost = 0; v.skill = "";
+  resetCounters(v);
   v.iteration = 1;
   v.startedAt = Date.now() / 1000;
   v.feed.innerHTML = "";
@@ -624,6 +779,8 @@ function beginLive(v) {
   v.feed._llm = null;
   v.feed._runId = "";
   v.feed._skill = "";
+  v.feed._notes = null;
+  v.feed._notesCard = null;
   v.els.runid.textContent = "starting…";
   paintCounters(v);
   setLiveRunning(v, true);
@@ -692,14 +849,14 @@ async function refreshStatus() {
     $("status").innerHTML = parts.join(" · ");
     // Reattach to a run already in progress (e.g. page reloaded mid-run).
     if (st.run && st.run.running && !live.source) {
-      live.step = 0; live.calls = 0; live.cost = 0;
+      resetCounters(live);
       live.startedAt = st.run.started_at || Date.now() / 1000;
       setRunningUI(true);
       openStream(live);
     }
     // And to a watch, which outlives a reload by days rather than minutes.
     if (st.watch && st.watch.running && !watchLive.source) {
-      watchLive.step = 0; watchLive.calls = 0; watchLive.cost = 0;
+      resetCounters(watchLive);
       watchLive.startedAt = st.watch.started_at || Date.now() / 1000;
       $("watch-draft").checked = !!st.watch.draft;
       setLiveRunning(watchLive, true);
@@ -707,7 +864,7 @@ async function refreshStatus() {
     }
     // And to a generation, which outlives a reload just as long.
     if (st.job && !genLive.source) {
-      genLive.step = 0; genLive.calls = 0; genLive.cost = 0;
+      resetCounters(genLive);
       genLive.startedAt = st.job.started_at || Date.now() / 1000;
       watchGeneration(st.job.id, { fresh: false });
     }
@@ -849,15 +1006,9 @@ $("watch-form").addEventListener("submit", async (e) => {
     await api("/api/watch", { method: "POST", body: JSON.stringify(body) });
   } catch (err) { notice(err.message); return; }
   $("watch-hint").textContent = "";
-  watchLive.step = 0; watchLive.calls = 0; watchLive.cost = 0;
-  watchLive.startedAt = Date.now() / 1000;
-  watchLive.feed.innerHTML = "";
-  watchLive.feed._llm = null;
-  watchLive.feed._runId = "";
-  watchLive.els.runid.textContent = "starting…";
-  paintCounters(watchLive);
-  setLiveRunning(watchLive, true);
-  openStream(watchLive);
+  // The same clean slate a run gets, including the ledger and the notes panels:
+  // a watch starting is not a continuation of the last one.
+  beginLive(watchLive);
 });
 
 $("btn-watch-stop").addEventListener("click", async () => {
@@ -926,6 +1077,8 @@ async function openRunDetail(id) {
   feed._llm = null;
   feed._runId = id;
   feed._skill = "";
+  feed._notes = null;
+  feed._notesCard = null;
   try {
     const d = await api("/api/runs/" + encodeURIComponent(id));
     const s = d.summary, st = d.stats, chain = skillChain(d.events);
@@ -967,6 +1120,9 @@ async function openRunDetail(id) {
       }
     }
     finalizeLlm(feed, null);  // a run that died mid-call has no llm_end
+    // Every ledger panel folded, unlike a live run's last one: this page already
+    // opens with the finished ledger in full, above the feed.
+    finalizeNotes(feed);
   } catch (err) {
     notice(err.message);
     return;
