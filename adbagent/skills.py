@@ -867,10 +867,18 @@ class TraceCollector:
     """
 
     def __init__(self, dev: Any, trace: Optional[AppTrace] = None,
-                 on_event: Optional[Callable[..., None]] = None):
+                 on_event: Optional[Callable[..., None]] = None,
+                 max_actions: int = 0):
         self.dev = dev
         self.trace = trace or AppTrace()
         self.on_event = on_event or (lambda *a, **k: None)
+        #: Cap on the recorded action list, or 0 for no cap. A run is bounded by
+        #: its step budget so it needs none; a watch collects across every pass
+        #: for as long as it is up, and one entry per step for a week is both a
+        #: leak and a prompt nothing could read. Screens and frames need no such
+        #: cap -- `record` dedupes screens on the content-free `skeleton_id`, and
+        #: frames stop at `MAX_EXPLORE_SHOTS` per app.
+        self.max_actions = max_actions
         self.seen: set = set()
         #: Steps spent in each package, so a run that crosses apps can say which
         #: one it was mostly working in.
@@ -900,6 +908,15 @@ class TraceCollector:
             self.trace.actions.append(described)
             if self._last_package:
                 self.actions_in.setdefault(self._last_package, []).append(described)
+            if self.max_actions > 0:
+                # The most recent rather than the first: the screens list already
+                # carries the coverage (it is deduped and complete), so what these
+                # are for is showing what the agent actually does in the app, and
+                # the settled routine is more useful for that than the first
+                # fumbling at it.
+                del self.trace.actions[:-self.max_actions]
+                for actions in self.actions_in.values():
+                    del actions[:-self.max_actions]
 
     def record(self, screen: "Screen", step: int) -> None:
         if screen.package:

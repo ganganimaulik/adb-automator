@@ -214,9 +214,23 @@ supervisor is unbounded. A failed pass doubles a backoff and the loop continues;
 a crash inside a pass is logged with its traceback and survived. Ctrl-C is the one
 thing that stops a watch.
 
-Skill learning is off during a watch: rewriting the app's skill file every 45
-seconds, mostly from passes that did nothing, would churn the file the next pass
-depends on. A watch obeys a skill; it does not edit one.
+### It learns once, when it stops
+
+A watch does not learn per pass — rewriting the app's skill file every 45 seconds,
+mostly from passes that did nothing, would churn the file the next pass obeys.
+Instead one trace accumulates across *every* pass and is folded into the app's
+skill once, when the watch stops (Ctrl-C, or Stop in the browser). That is
+strictly the better trace: fifty passes over an inbox and its threads tour the app
+far more thoroughly than any single run does, and the screens are deduped on the
+content-free `skeleton_id`, so what the synthesis sees is fifty distinct screens
+rather than the same one fifty times.
+
+Two details follow from a watch being long-lived. The recorded action list is
+capped (`WATCH_TRACE_ACTIONS`), because one entry per step for a week is both a
+leak and a prompt nothing could read — the screens carry the coverage regardless.
+And stopping takes a little longer than a run's stop, because the learn call
+happens on the way out; the browser's Stop waits for it rather than killing it at
+ten seconds. `--no-learn` turns it off.
 
 ### Message text is not instructions
 
@@ -494,7 +508,8 @@ A watch and a run refuse each other, as do a watch and a screenshot, an app list
 or a screen dump: there is one phone, and opening a device session resets its
 animation scales and rotation underneath whatever is driving it. A watch never
 prompts — it is launched unattended, since a loop that stops for a confirmation
-nobody is there to give has stopped watching.
+nobody is there to give has stopped watching. Stop waits longer than a run's
+does, because the skill is learned on the way out.
 
 Runs are spawned as ordinary CLI subprocesses, so Stop is a SIGINT and the
 phone's keyboard, animations and rotation are restored exactly as with Ctrl-C —
