@@ -23,6 +23,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from datetime import date as _date
 from typing import Callable, List, Optional, Sequence, Tuple, TypeVar
 
 import adbutils
@@ -635,6 +636,28 @@ class Device:
         result = _guard(lambda: self.u2.adb_device.shell(command, timeout=timeout),
                         timeout + 5, f"shell({command[:40]})")
         return result if isinstance(result, str) else str(result)
+
+    def today(self) -> str:
+        """The phone's own local date as ``YYYY-MM-DD``, or "" if unreadable.
+
+        Read from the device and deliberately not from this host. Every
+        timestamp the model reads was rendered by an app in the *phone's*
+        timezone, so a host an hour the other side of midnight would answer
+        "today" with a date that appears nowhere on screen.
+
+        Empty on failure rather than falling back to the host clock: a plausible
+        wrong date is worse than none, because the prompt states it as fact and
+        the model has nothing to check it against. The caller leaves the line
+        out -- see `prompts.device_profile`.
+        """
+        raw = (self._safe(lambda: self.shell("date +%Y-%m-%d", timeout=10)) or "").strip()
+        try:
+            _date.fromisoformat(raw)
+        except ValueError:
+            if raw:
+                log.debug("device date unparseable: %r", raw)
+            return ""
+        return raw
 
     # -- observation -------------------------------------------------------
 

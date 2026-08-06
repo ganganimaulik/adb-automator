@@ -832,6 +832,67 @@ def test_the_device_profile_holds_still_when_the_app_changes():
     assert prompts.device_profile(720, 1600, package="com.whatsapp") == profile
 
 
+def test_the_device_profile_carries_the_phones_date():
+    """A goal that says "today" is unreadable without one.
+
+    In ``runs/963a4f4ae96c`` -- "check today and yesterday's messages" -- the
+    prompt held no date at all, and the run walked a recency-ordered list past
+    the window into Sunday, Saturday and 27 Jul.
+    """
+    from adbagent import prompts
+
+    profile = prompts.device_profile(720, 1600, today="2026-08-06")
+    assert "Today is Thursday 2026-08-06" in profile
+    # Yesterday too: it is the common half of the phrase, and the model should
+    # not be doing calendar arithmetic in its head to get it.
+    assert "yesterday was Wednesday 2026-08-05" in profile
+    # Still the same message it was, and still holding still across an app
+    # switch -- the date is a fact about the run, not about the foreground app.
+    assert profile.startswith("Device: 720x1600 px | ")
+    assert prompts.device_profile(720, 1600, today="2026-08-06",
+                                 package="com.whatsapp") == profile
+
+
+def test_the_clock_stays_out_of_the_cached_prefix():
+    """Date only, never the time.
+
+    This message sits above the goal, the skill, the history and the screen. At
+    minute resolution it would change on every turn and evict all four; the
+    status bar carries the time in the screen block, which is rebuilt anyway.
+    """
+    from adbagent import prompts
+
+    profile = prompts.device_profile(720, 1600, today="2026-08-06")
+    assert ":" not in profile.split("|", 1)[1]
+
+
+@pytest.mark.parametrize("today, expected", [
+    # A month boundary, and a year one. Neither is a string edit.
+    ("2026-03-01", "yesterday was Saturday 2026-02-28"),
+    ("2026-01-01", "yesterday was Wednesday 2025-12-31"),
+])
+def test_yesterday_survives_a_boundary(today, expected):
+    from adbagent import prompts
+
+    assert expected in prompts.date_facts(today)
+
+
+@pytest.mark.parametrize("today", ["", "   ", "yesterday", "06/08/2026", None])
+def test_a_date_the_phone_would_not_give_leaves_the_line_out(today):
+    """No date beats a guessed one: the prompt states this as fact and the model
+    has nothing on screen to check it against."""
+    from adbagent import prompts
+
+    assert prompts.date_facts(today) == ""
+    assert prompts.device_profile(720, 1600, today=today) == "Device: 720x1600 px"
+
+
+def test_the_date_sits_above_the_goal_that_needs_it(monkeypatch):
+    msgs = _capture_decide(monkeypatch, today="2026-08-06")
+    assert "Today is Thursday 2026-08-06" in msgs[1]["content"]
+    assert msgs[2]["content"] == "GOAL: test goal"
+
+
 def test_the_current_app_is_still_reported_somewhere():
     from adbagent.fingerprint import attach
     from adbagent.screen import parse, render
@@ -1272,7 +1333,14 @@ def test_the_system_prompt_no_longer_carries_the_situational_blocks():
     # It kept the parts that apply on every single turn.
     assert "THE ACTIONS" in prompts.SYSTEM
     assert "SECURITY" in prompts.SYSTEM
-    assert len(prompts.SYSTEM) < 7000          # was 9,722
+    # A creep guard, not a law: 9,722 before the gating, 6,935 after it, and
+    # 7,488 once the bounded-collection stop rule went in -- 553 characters, or
+    # about 140 tokens, in the one block that is byte-identical on every call
+    # and so bought once per cache lifetime rather than once per turn. What it
+    # buys: `runs/963a4f4ae96c` spent 17 decide turns walking a recency-ordered
+    # list past the window its goal asked for, which is nearer 90,000 tokens.
+    # Anything wanting the next 500 should have a comparison like that one.
+    assert len(prompts.SYSTEM) < 7600
 
 
 def test_an_ordinary_turn_gets_no_situational_advice():

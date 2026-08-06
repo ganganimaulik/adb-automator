@@ -30,6 +30,12 @@ from . import xmlgen as X
 #: caller something to pick wrongly from.
 INSTALLED = ["com.android.settings", "com.whatsapp", "com.spotify.music"]
 
+#: The date this scripted phone's clock reads. Fixed, so a test can assert the
+#: exact sentence the prompt carries. A Thursday, so "yesterday" lands on an
+#: ordinary weekday rather than across a weekend or a month boundary -- the
+#: boundaries are `prompts.date_facts`' own tests to make.
+TODAY = "2026-08-06"
+
 
 @dataclass
 class FakeScreen:
@@ -90,6 +96,12 @@ class FakeDevice:
         self.screenshots = 0
         self.shot_edges: List[int] = []
         self.dumps = 0
+        #: What this phone says the date is, and how many times it was asked.
+        #: A run reads it once and puts it in the prompt above the goal, so a
+        #: test can check both that the model was told and that the answer was
+        #: not re-bought every turn.
+        self.date = TODAY
+        self.date_reads = 0
 
     # -- observation -------------------------------------------------------
 
@@ -202,6 +214,10 @@ class FakeDevice:
         self.shell_calls.append(command)
         return self.shell_replies.get(command, "")
 
+    def today(self) -> str:
+        self.date_reads += 1
+        return self.date
+
     def recover(self, tier: int = 1) -> bool:
         self.actions.append(f"recover({tier})")
         return True
@@ -254,6 +270,9 @@ class FakeLLM:
         #: because they answer different questions: what the model was told about
         #: the screen, against what it was told to do about it.
         self.analyses_seen: List[str] = []
+        #: The phone's date each decide turn was told, one per call. A goal
+        #: bounded in time -- "today and yesterday" -- is unreadable without it.
+        self.dates_seen: List[str] = []
         #: Tier 3 of the stall ladder. Counted apart from `calls` for the same
         #: reason the sweep's reads are: a test asserting how many reasoning
         #: turns a change costs must not have a rescue call folded into it.
@@ -300,10 +319,11 @@ class FakeLLM:
         return f"reading of {label or 'an unlabelled item'}"
 
     def decide(self, *, goal: str, rendered: str, history, width: int, height: int,
-               package: str = "", screenshot: Optional[bytes] = None,
+               package: str = "", today: str = "", screenshot: Optional[bytes] = None,
                note: str = "", scratchpad: str = "",
                progress: str = "", image_analysis: Optional[str] = None, **kwargs) -> AgentAction:
         self.calls += 1
+        self.dates_seen.append(today)
         if screenshot:
             self.seen_screenshots += 1
             # `is None`, mirroring the real client: "" means a pass ran and found

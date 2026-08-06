@@ -227,8 +227,15 @@ function renderEvent(ev, feed) {
       `<div class="why" style="margin-top:6px">${esc(ev.result || "")}</div></details>`;
   } else if (kind === "run_end") {
     div.className = "banner " + esc(ev.outcome || "");
-    div.innerHTML = `<b>${esc((ev.outcome || "").toUpperCase())}</b> — ${esc(ev.steps)} steps, ` +
-      `${esc(ev.llm_calls)} LLM calls, $${(ev.usd || 0).toFixed(4)}`;
+    // The answer first, the arithmetic under it. A run that read something and
+    // reported it put that in the terminal action's text, and the feed card for
+    // that step looks like every other step card -- so the banner is the one
+    // place a person scrolling to the bottom is guaranteed to see it.
+    div.innerHTML =
+      (ev.result ? `<div class="result">${esc(ev.result)}</div>` : "") +
+      `<b>${esc((ev.outcome || "").toUpperCase())}</b> — ${esc(ev.steps)} steps, ` +
+      `${esc(ev.llm_calls)} LLM calls, $${(ev.usd || 0).toFixed(4)}` +
+      (ev.evidence ? `<div class="why">${esc(ev.evidence)}</div>` : "");
   } else if (kind === "active_skill") {
     // Recorded on every step -- it is the per-step record of what the prompt
     // actually carried -- so rendering each one buried the fact under eight
@@ -926,7 +933,14 @@ async function openRunDetail(id) {
     resumeBtn.style.display = s.resumable ? "" : "none";
     resumeBtn.onclick = () => resumeRun(id);
     $("detail-stats").innerHTML =
-      `<h3>${esc(s.goal)}</h3><div class="counters">` +
+      `<h3>${esc(s.goal)}</h3>` +
+      // Above the counters, because "what did it conclude" outranks "how many
+      // tokens did that take" for everyone who opens a finished run.
+      (s.result ? `<div class="banner ${esc(s.outcome)}">` +
+        `<div class="result">${esc(s.result)}</div>` +
+        (s.evidence ? `<div class="why">${esc(s.evidence)}</div>` : "") +
+        `</div>` : "") +
+      `<div class="counters">` +
       `<span>outcome <b>${esc(s.outcome)}</b></span>` +
       `<span>steps <b>${esc(s.steps)}</b></span>` +
       `<span>cost <b>$${(s.usd || 0).toFixed(4)}</b></span>` +
