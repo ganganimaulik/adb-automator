@@ -1115,7 +1115,15 @@ def _watch_banner(out: Out, cfg, goal: str, policy: str, ledger) -> None:
     out.say()
 
 
+#: Actions one watch keeps in its accumulated trace. A watch runs for days and
+#: repeats the same handful of gestures every pass, so the tail is representative
+#: and an uncapped list is a leak. The screens are deduped and complete
+#: regardless, and they are what carries the coverage.
+WATCH_TRACE_ACTIONS = 400
+
+
 def cmd_watch(args) -> int:
+    from . import skills as skillmod
     from .device import Device
     from .ledger import ReplyLedger
     from .llm import LLMClient
@@ -1160,21 +1168,34 @@ def cmd_watch(args) -> int:
 
     # Per-step reporting only under -v. One line per pass is what a loop meant to
     # run for days should print; the full step trace is megabytes by morning.
-    on_event = _live_reporter(out, max_steps=cfg.watch.max_steps) \
+    reporter = _live_reporter(out, max_steps=cfg.watch.max_steps) \
         if args.verbose else None
 
     with Device(cfg, args.device or "") as dev, Memory(cfg) as mem:
         # One client for the whole watch, so the rolling ceilings and the ledger
         # both see the session rather than a single pass.
         llm = LLMClient(cfg, run_id=f"watch-{int(time.time())}")
+        # One trace across every pass, folded into the app's skill once when the
+        # watch stops -- not per pass, which would rewrite the file the next pass
+        # obeys every 45 seconds, mostly from passes that did nothing. Fifty
+        # passes over an inbox and its threads is a far better tour of the app
+        # than any single pass, so the trade is all upside.
+        trace = skillmod.TraceCollector(
+            dev, skillmod.AppTrace(tasks=goal), on_event=reporter,
+            max_actions=WATCH_TRACE_ACTIONS)
         watch = Watch(dev, mem, llm, cfg, policy=policy, ledger=ledger,
-                      say=out.say, on_event=on_event)
+                      say=out.say, on_event=trace)
         try:
             watch.run(goal)
         except KeyboardInterrupt:
             out.say()
             out.say("  stopped")
         out.say(out.dim(f"  {watch.status()}"))
+        if cfg.skills.enabled and cfg.skills.learn_after_run:
+            # After the status line, because it spends a call and can take a
+            # minute: the numbers should already be on screen when it starts.
+            trace.finish("stopped", watch.last_state)
+            _learn(out, trace.app_traces(), llm, cfg, goal)
     return 0
 
 
@@ -1907,6 +1928,9 @@ def build_parser() -> argparse.ArgumentParser:
                    metavar="USD",
                    help="pause the loop when spend in the last hour reaches "
                         "this (default 0, meaning no ceiling)")
+    p.add_argument("--no-learn", dest="learn_after_run", action="store_false",
+                   default=None,
+                   help="do not update the app's skill when the watch stops")
     p.add_argument("--fail-open", dest="watch_fail_closed",
                    action="store_false", default=None,
                    help="send even when the conversation on screen cannot be "

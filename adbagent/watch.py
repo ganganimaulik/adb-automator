@@ -169,6 +169,11 @@ class Watch:
             cfg.run.max_steps = cfg.watch.max_steps
         self.stats = Stats(replies_at_start=len(ledger))
         self.anchor = Anchor()
+        #: The `RunState` of the most recent pass, for whoever closes the trace
+        #: off when the watch stops. `TraceCollector.app_traces` takes the step
+        #: counts from its own per-package tally rather than from this, so a
+        #: week's watch is not judged on the three steps its last pass took.
+        self.last_state: Optional[Any] = None
         #: (finished_at, usd) per pass, for the rolling spend ceiling.
         self._spend: List[Tuple[float, float]] = []
         self._stop = False
@@ -183,10 +188,13 @@ class Watch:
         survive between passes is exactly what the ledger holds, and that is read
         back from disk rather than kept in memory.
 
-        Note that no skill learning happens here, unlike `cmd_run`: rewriting the
+        No skill learning happens *per pass*, unlike `cmd_run`: rewriting the
         app's skill file every 45 seconds, mostly from passes that did nothing,
-        would churn the file the next pass depends on. A watch obeys a skill; it
-        does not edit one.
+        would churn the file the next pass depends on. Learning instead happens
+        once, when the watch stops, from a trace accumulated across every pass --
+        see `cli.cmd_watch`. That is strictly the better trace anyway: fifty
+        passes over an inbox and its threads tour the app far more thoroughly
+        than any one of them does.
         """
         kw = {}
         if self.on_event is not None:
@@ -287,7 +295,8 @@ class Watch:
         before = self.llm.ledger.total_usd
         agent = self._make_agent()
         try:
-            outcome, _state = agent.run(full_goal)
+            outcome, state = agent.run(full_goal)
+            self.last_state = state
         except (BudgetExceeded, LLMError) as exc:
             # The session budget is a run-level guard; for a watch it is one more
             # thing to back off from rather than a reason to stop watching.

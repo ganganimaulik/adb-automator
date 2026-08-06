@@ -53,6 +53,14 @@ class StubDevice:
         return frame
 
 
+class StubState:
+    """Just the field `TraceCollector.finish` reads off a finished pass."""
+
+    def __init__(self, step):
+        self.step = step
+        self.scratchpad = None
+
+
 class StubAgent:
     """Returns scripted outcomes; records the goals it was given."""
 
@@ -71,7 +79,7 @@ class StubAgent:
         # and testing that Ctrl-C escapes the loop depends on raising it here.
         if isinstance(outcome, BaseException):
             raise outcome
-        return outcome, None
+        return outcome, StubState(len(self.seen_goals))
 
 
 def distinct(n: int):
@@ -304,3 +312,86 @@ def test_an_empty_policy_is_fatal(tmp_path):
     p.write_text("   \n", encoding="utf-8")
     with pytest.raises(ValueError):
         load_policy(str(p))
+
+
+# -- learning on stop -------------------------------------------------------
+
+def test_the_last_pass_state_is_kept_for_the_trace(cfg, tmp_path):
+    """Whoever closes the trace off on stop needs a state to read."""
+    watch, slept, goals = build(cfg, distinct(8), ["success", "success"],
+                                tmp_path=tmp_path)
+    assert watch.last_state is None
+    watch.run("watch instagram dms", max_passes=1)
+    assert watch.last_state.step == 1
+    watch.run("watch instagram dms", max_passes=2)
+    assert watch.last_state.step == 2, "it kept the first pass's state, not the last"
+
+
+def test_a_crashing_pass_leaves_the_previous_state_alone(cfg, tmp_path):
+    """A pass that raised has no state; the last good one must survive."""
+    watch, slept, goals = build(cfg, distinct(8),
+                                ["success", RuntimeError("boom")],
+                                tmp_path=tmp_path)
+    watch.run("watch instagram dms", max_passes=2)
+    assert watch.last_state.step == 1
+
+
+def test_a_trace_accumulates_across_passes(cfg, tmp_path):
+    """One collector for the whole watch, so the skill is learned from all of it.
+
+    Not per pass: rewriting the file the next pass obeys every 45 seconds, mostly
+    from passes that did nothing, is the churn this avoids.
+    """
+    from adbagent.skills import AppTrace, TraceCollector
+
+    class Dev:
+        def screenshot(self):
+            return b""
+
+    trace = TraceCollector(Dev(), AppTrace(tasks="watch dms"))
+    # Two passes over the same two screens, as a watch really does.
+    for _pass in range(2):
+        for s in (chat(), chat(messages=["a", "b"])):
+            trace(kind="step", step=1, screen=s, action=None)
+    per_app = trace.app_traces()
+    assert per_app[0].package == "com.instagram.android"
+    # Steps counted across both passes...
+    assert per_app[0].steps == 4
+    # ...screens deduped on the content-free skeleton, so they stay bounded.
+    assert len(per_app[0].screens) < 4
+
+
+def test_the_action_list_is_capped_when_asked(cfg, tmp_path):
+    """A week of passes must not grow one list per step without bound."""
+    from adbagent.actions import AgentAction
+    from adbagent.skills import AppTrace, TraceCollector
+
+    class Dev:
+        def screenshot(self):
+            return b""
+
+    act = AgentAction(observation="x", reasoning="y", action="press_key",
+                      key="back")
+    trace = TraceCollector(Dev(), AppTrace(), max_actions=10)
+    screen = chat()
+    for i in range(50):
+        trace(kind="step", step=i, screen=screen, action=act)
+    assert len(trace.trace.actions) == 10
+    assert all(len(v) <= 10 for v in trace.actions_in.values())
+
+
+def test_no_cap_by_default_so_runs_are_unchanged():
+    from adbagent.actions import AgentAction
+    from adbagent.skills import AppTrace, TraceCollector
+
+    class Dev:
+        def screenshot(self):
+            return b""
+
+    act = AgentAction(observation="x", reasoning="y", action="press_key",
+                      key="back")
+    trace = TraceCollector(Dev(), AppTrace())
+    screen = chat()
+    for i in range(30):
+        trace(kind="step", step=i, screen=screen, action=act)
+    assert len(trace.trace.actions) == 30
