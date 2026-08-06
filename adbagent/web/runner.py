@@ -313,6 +313,17 @@ class WatchManager(ChildProcess):
             state["passes"] = len(self._run_dirs)
         return state
 
+    def stop(self, timeout_s: float = 180.0) -> bool:
+        """SIGINT, then wait long enough for the shutdown to finish.
+
+        Much longer than a run's ten seconds, because a watch does real work on
+        the way out: it folds everything it learned about the app across every
+        pass into that app's skill, which is one call on `llm.model_skill` and can
+        take a minute on a long trace. Killing at ten seconds would abandon it
+        every time, and the learning would look like it silently did not happen.
+        """
+        return super().stop(timeout_s=timeout_s)
+
     def start(self, goal: str, *, policy: str, draft: bool = False,
               interval_s: Optional[float] = None,
               max_steps: Optional[int] = None,
