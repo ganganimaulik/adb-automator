@@ -1036,6 +1036,89 @@ def _learn(out: Out, traces, llm, cfg, goal: str) -> None:
                          f"-> {registry.path_for(skill)}"))
 
 
+#: How wide the result paragraph is allowed to get before it is wrapped. Read
+#: off the terminal, clamped: a maximised window would otherwise print the
+#: answer as one 300-column line, which is the format it was already effectively
+#: in when it was buried in the step feed.
+_RESULT_WIDTH = 96
+
+
+def _wrapped(text: str, indent: str = "  ") -> List[str]:
+    """`text` as indented lines that fit the terminal, keeping its own breaks.
+
+    A collection goal answers with a list -- one line per conversation, per
+    price, per item -- so the newlines the model wrote are structure, not
+    accidents, and reflowing the whole thing into one paragraph would lose it.
+    """
+    import shutil
+    import textwrap
+
+    width = max(min(shutil.get_terminal_size((80, 24)).columns,
+                    _RESULT_WIDTH), len(indent) + 24)
+    out: List[str] = []
+    for para in text.splitlines():
+        if not para.strip():
+            out.append("")
+            continue
+        # Continuations are indented further than the line they continue, so a
+        # wrapped list item cannot be misread as the next item -- which on the
+        # list-shaped answers this exists for is most of them.
+        out.extend(textwrap.wrap(para, width=width, initial_indent=indent,
+                                 subsequent_indent=indent + "    "))
+    return out
+
+
+def _result_block(out: Out, outcome: str, result: str, evidence: str = "",
+                  *, progress: str = "", problem: str = "") -> None:
+    """What the run concluded, in its own block at the bottom.
+
+    The answer to a "read X and tell me" goal is the text of the `done` action,
+    and it used to appear in exactly one place: inside the last line of the step
+    feed, in the same shape as the forty tap lines above it. On anything longer
+    than a couple of steps that is off the top of the terminal by the time the
+    run ends, so the visible ending was the outcome word and the bill.
+
+    A run can also stop without answering -- the step budget, a lost device, an
+    abort. Rather than print an empty heading, this says so and falls back to
+    the last two things the run knew: where it had got to, and what was going
+    wrong when it stopped.
+    """
+    out.say()
+    out.say(out.bold("  ── Result ──"))
+    out.say()
+    if result:
+        # Undimmed and uncoloured, alone in that: everything around it -- the
+        # step feed above, the evidence below -- is dim, and the outcome word
+        # under it is already carrying the green or the red.
+        for line in _wrapped(result):
+            out.say(line)
+    else:
+        out.say(out.dim("  the run ended without an answer "
+                        f"({_NO_ANSWER.get(outcome, 'it stopped early')})"))
+        for label, text in (("last progress", progress), ("last problem", problem)):
+            if not text:
+                continue
+            for line in _wrapped(f"{label}: {' '.join(text.split())}",
+                                 indent="  "):
+                out.say(out.dim(line))
+    if evidence:
+        out.say()
+        for line in _wrapped(" ".join(evidence.split()), indent="  "):
+            out.say(out.dim(line))
+
+
+#: Why there is no answer, per outcome, so the empty case still explains itself.
+_NO_ANSWER = {
+    # Reachable: `--assert-text`/`--assert-shell` end a run at the top of the
+    # loop, before the model is asked for anything, so there is no summary to
+    # print and the evidence line below carries the whole ending.
+    "success": "the success check settled it before the agent reported one",
+    "failed": "it ran out of steps or gave up without saying why",
+    "aborted": "it was interrupted, or the device or the budget gave out",
+    "needs_user": "it stopped for a person",
+}
+
+
 def _resolve_resume(target: str, artifacts_dir: str) -> Optional[Path]:
     """The run directory a `--resume` value points at, or None."""
     from . import checkpoint as ckpt
@@ -1145,14 +1228,19 @@ def cmd_run(args) -> int:
                 out.yellow if outcome == "needs_user" else out.red)
             spent = llm.ledger.total_usd - spent_before
             tilde = "~" if llm.ledger.estimated else ""
-            out.say()
             if state.scratchpad:
                 out.say()
                 out.say(out.bold("  ── Collected Data ──"))
                 out.say()
                 for line in state.scratchpad.plain().splitlines():
                     out.say(f"  {line}")
-                out.say()
+            # Last, under the data it was drawn from, because this is the line
+            # the person came for -- see `_result_block`.
+            _result_block(out, outcome, state.result, state.evidence,
+                          progress=(state.progress_log or [""])[0]
+                                   or state.last_progress,
+                          problem=state.last_failure)
+            out.say()
             out.say(f"  {colour(outcome.upper())}  "
                     f"{state.step} steps, {state.llm_calls} LLM calls, "
                     f"{tilde}${spent:.4f}, {elapsed:.1f}s")
@@ -1514,11 +1602,55 @@ def cmd_report(args) -> int:
         out.say(f"  {last_notes}")
     _cost_summary(out, events)
     _log_summary(out, events_file.parent)
+    if end:
+        # Last, next to the outcome line, so the two things a person opens a
+        # report for are together at the bottom rather than either side of the
+        # token arithmetic. Runs recorded before `run_end` carried the answer
+        # fall back to the terminal action in the feed, where it always was.
+        _result_block(out, end.get("outcome", "?"),
+                      end.get("result") or _terminal_text(events),
+                      end.get("evidence", ""),
+                      progress=_last_progress(events),
+                      problem=_last_problem(events))
     out.say()
     if end:
         out.say(f"  {end.get('outcome', '?').upper()}: {end.get('steps')} steps, "
                 f"{end.get('llm_calls')} LLM calls, ${end.get('usd', 0):.4f}")
     return 0
+
+
+def _terminal_text(events: List[Dict[str, Any]]) -> str:
+    """The text of the action that ended a run, read back out of its feed."""
+    from .actions import TERMINAL_ACTIONS
+
+    for event in reversed(events):
+        action = event.get("action") or {}
+        if event.get("kind") == "decide" \
+                and action.get("action") in TERMINAL_ACTIONS:
+            return " ".join((action.get("text") or "").split())
+    return ""
+
+
+def _last_progress(events: List[Dict[str, Any]]) -> str:
+    """The last note the model wrote about where it had got to."""
+    for event in reversed(events):
+        progress = (event.get("action") or {}).get("progress")
+        if isinstance(progress, str) and progress.strip():
+            return progress
+    return ""
+
+
+def _last_problem(events: List[Dict[str, Any]]) -> str:
+    """The last thing that went wrong, for a run that stopped without saying."""
+    for event in reversed(events):
+        kind = event.get("kind")
+        if kind == "gave_up" and event.get("reason"):
+            return str(event["reason"])
+        if kind == "error" and event.get("error"):
+            return str(event["error"])
+        if kind == "judge" and not event.get("satisfied") and event.get("evidence"):
+            return f"a claim of completion was rejected: {event['evidence']}"
+    return ""
 
 
 # ---------------------------------------------------------------------------

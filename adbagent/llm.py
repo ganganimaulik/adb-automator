@@ -1221,7 +1221,7 @@ class LLMClient:
         return " ".join(raw.split())
 
     def decide(self, *, goal: str, rendered: str, history: Sequence[str],
-               width: int, height: int, package: str = "",
+               width: int, height: int, package: str = "", today: str = "",
                screenshot: Optional[bytes] = None, note: str = "",
                scratchpad: str = "", progress: str = "", skill: str = "",
                policy: str = "",
@@ -1263,7 +1263,7 @@ class LLMClient:
             {"role": "system",
              "content": prompts.system_prompt(harden_schema(AgentAction))},
             {"role": "user",
-             "content": prompts.device_profile(width, height)},
+             "content": prompts.device_profile(width, height, today=today)},
             {"role": "user", "content": prompts.goal_block(goal)},
         ]
         if policy:

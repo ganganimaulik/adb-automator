@@ -94,6 +94,12 @@ def summarise(path: Path) -> Dict[str, Any]:
         "goal": "",
         "model": "",
         "outcome": "unknown",
+        # What the run answered, and why the harness believed it. Empty for a
+        # run that was killed, and for runs recorded before `run_end` carried
+        # them -- the detail view hides the block rather than showing a heading
+        # over nothing.
+        "result": "",
+        "evidence": "",
         "steps": 0,
         "llm_calls": 0,
         "usd": 0.0,
@@ -119,6 +125,8 @@ def summarise(path: Path) -> Dict[str, Any]:
         summary["llm_calls"] = last.get("llm_calls", 0)
         summary["usd"] = last.get("usd", 0.0)
         summary["packages"] = last.get("packages", [])
+        summary["result"] = last.get("result", "")
+        summary["evidence"] = last.get("evidence", "")
     else:
         # No run_end: either still running or killed mid-flight. The step
         # count and spend are still recoverable from what was recorded.

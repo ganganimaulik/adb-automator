@@ -124,6 +124,24 @@ def test_summarise_finished_run(tmp_path):
     assert s["packages"] == ["com.android.settings"]
 
 
+def test_summarise_carries_what_the_run_answered(tmp_path):
+    """The detail view leads with this. Without it the page opens on token
+    counts and the answer is somewhere down in the step feed."""
+    events = RUN_EVENTS[:-1] + [dict(RUN_EVENTS[-1],
+                                     result="Wi-Fi is on: Home-5G.",
+                                     evidence="the SSID is on screen")]
+    s = runparse.summarise(make_run_dir(tmp_path, events=events))
+    assert s["result"] == "Wi-Fi is on: Home-5G."
+    assert s["evidence"] == "the SSID is on screen"
+
+
+def test_summarise_a_run_recorded_before_the_answer_was_kept(tmp_path):
+    """Empty, not missing: the page hides the block rather than showing a
+    heading over nothing."""
+    s = runparse.summarise(make_run_dir(tmp_path))
+    assert s["result"] == "" and s["evidence"] == ""
+
+
 def test_summarise_interrupted_run(tmp_path):
     # No run_end: killed mid-flight. Stats come from what was recorded.
     d = make_run_dir(tmp_path, events=RUN_EVENTS[:-1])

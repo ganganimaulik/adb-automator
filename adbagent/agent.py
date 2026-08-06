@@ -63,6 +63,16 @@ class Oracle:
     def defined(self) -> bool:
         return bool(self.shell or self.text)
 
+    def describe(self) -> str:
+        """The condition, in the words it was given in. A run the oracle ends
+        has no model summary to report, so this is what the ending says."""
+        parts = []
+        if self.text:
+            parts.append(f"{self.text!r} is on screen")
+        if self.shell:
+            parts.append(f"`{self.shell}` is {self.equals.strip()!r}")
+        return " or ".join(parts)
+
     def satisfied(self, dev: Device, screen: Screen) -> bool:
         if self.text:
             wanted = self.text.strip().lower()
@@ -99,6 +109,18 @@ class RunState:
     scroll_warnings: int = 0
     started_at: float = field(default_factory=time.monotonic)
     finished: Optional[Outcome] = None
+    #: What the run answered: the text of the terminal action that ended it --
+    #: `done`'s summary, `fail`'s reason, `ask_user`'s question. The one thing a
+    #: person actually asked for on a "read X and tell me" goal, and until this
+    #: it left the agent nowhere: it was written into the step feed as part of
+    #: the last line and never survived `run()`, so the caller had the outcome
+    #: word and the cost and no answer. Set only when the action really
+    #: terminates -- a rejected `done` is not an answer.
+    result: str = ""
+    #: Why the outcome is the outcome: the judge's evidence, the assertion that
+    #: settled it, or the reason a completion was rejected. Separate from
+    #: `result` because it is the harness talking, not the model.
+    evidence: str = ""
     #: Everything the run has collected. The model sends only what is new or
     #: corrected each turn (the ``notes`` field) and this keeps the union, so a
     #: record it stops mentioning cannot go missing -- see `scratchpad.py`.
@@ -579,6 +601,12 @@ class Agent:
         if resume:
             checkpoint.restore(state, resume)
         self._goal_apps: Optional[List[str]] = None
+        # Read once per run, not per turn: the string is identical for the whole
+        # run, and it sits in the prompt above the goal where a value that
+        # changed would evict everything after it from the cache. A run that
+        # crosses midnight keeps the date it started on -- which is also how the
+        # person who typed "today" meant it. "" if the phone would not say.
+        self._today: str = self.dev.today()
         recorder = Recorder(self.cfg, run_id)
         self._log_header(goal, recorder, resumed_from=state.step if resume else 0)
         self.mem.begin_run(run_id, goal, state.intent_id)
@@ -642,6 +670,11 @@ class Agent:
             recorder.event("run_end", outcome=outcome, steps=state.step,
                            llm_calls=state.llm_calls,
                            usd=round(usd, 6),
+                           # The answer, in the one event a reader of this file
+                           # is guaranteed to look at. `report` and the web UI
+                           # both reconstruct the run from here, and neither
+                           # could show what it concluded without it.
+                           result=state.result, evidence=state.evidence,
                            # Which apps this run was in and how long it spent in
                            # each, so a later run can find the recorded runs for
                            # *its* app. Nothing else in the file says, and the
@@ -680,6 +713,11 @@ class Agent:
             adbagent=f"{__version__} (python {sys.version.split()[0]} on "
                      f"{platform.platform()})",
             device=getattr(self.dev, "serial", "") or "(only attached device)",
+            # What the run thinks "today" means, which is the phone's date and
+            # not this host's. Empty if the phone would not say -- and a goal
+            # bounded in time behaves very differently then, so the file has to
+            # record which of the two runs this was.
+            clock=self._today or "(the phone did not say)",
             model=cfg.llm.model,
             model_image=cfg.llm.image(),
             model_small=cfg.llm.small(),
@@ -758,6 +796,11 @@ class Agent:
             # know we are done, so it is checked before anything else happens.
             if self.oracle.defined and self.oracle.satisfied(self.dev, screen):
                 log.info("assertion satisfied -- goal reached")
+                # It ends the run before the model is asked anything, so there
+                # is no `done` text and never will be. Saying which check passed
+                # is the whole answer this path has, and without it the summary
+                # would report a success with nothing at all to show for it.
+                state.evidence = f"the success check passed: {self.oracle.describe()}"
                 state.finished = "success"
                 return
 
@@ -1064,6 +1107,7 @@ class Agent:
             action = self.llm.decide(                      ### LLM ###
                 goal=state.goal, rendered=render(screen), history=state.history,
                 width=screen.width, height=screen.height, package=screen.package,
+                today=self._today,
                 screenshot=screenshot, note=notes,
                 scratchpad=state.scratchpad.render(cfg.run.scratchpad_max_chars),
                 progress="\n".join(state.progress_log), skill=skill_note,
@@ -1752,19 +1796,29 @@ class Agent:
 
     def _terminal(self, state: RunState, screen: Screen, action: AgentAction,
                   rec: Recorder) -> Optional[Outcome]:
+        # What the model is answering with, held aside until the run really
+        # ends. A `done` that gets rejected below is not an answer, and letting
+        # it stand would have the run report a summary it was told was wrong.
+        answer = " ".join((action.text or "").split())
+
         if action.action == "ask_user":
-            self._hand_over(state, action.text or "the agent needs your help")
+            state.result = answer or "the agent needs your help"
+            self._hand_over(state, state.result)
             return "needs_user"
 
         if action.action == "fail":
             log.warning("the agent gave up: %s", action.text)
             rec.event("gave_up", reason=action.text)
+            state.result = answer
             return "failed"
 
         # `done` is the weakest evidence there is. Published agents claim
         # completion prematurely often enough that it must never stand alone.
         if self.oracle.defined:
             if self.oracle.satisfied(self.dev, screen):
+                state.result = answer
+                state.evidence = (f"the success check passed: "
+                                  f"{self.oracle.describe()}")
                 return "success"
             log.warning("the agent said done but the assertion disagrees")
             state.remember(
@@ -1773,6 +1827,7 @@ class Agent:
                                             "not met")
 
         if self.llm is None:
+            state.result = answer
             return "success"
 
         shot = self._ensure_screenshot(screen)
@@ -1802,6 +1857,8 @@ class Agent:
                   llm=step_metrics(judge_calls))
         if verdict.satisfied:
             log.info("verified: %s", verdict.evidence)
+            state.result = answer
+            state.evidence = verdict.evidence
             return "success"
         log.warning("premature 'done': %s", verdict.evidence)
         state.remember(f"{state.step}. claimed done; rejected: {verdict.evidence}")
@@ -1822,6 +1879,10 @@ class Agent:
         """
         state.consecutive_failures += 1
         state.last_failure = f"your 'done' was rejected: {why}"
+        # The rejection is the closest thing to an explanation this run will
+        # have if it never recovers, so it is kept where the summary can find
+        # it -- replaced by the next rejection, or by a completion that stands.
+        state.evidence = f"the last claim of completion was rejected: {why}"
         if state.consecutive_failures >= self.cfg.run.max_consecutive_failures:
             log.error("giving up after %d rejected completion(s)",
                       state.consecutive_failures)
