@@ -524,6 +524,39 @@ def dhash_distance(h1: Optional[int], h2: Optional[int]) -> Optional[int]:
     return bin(h1 ^ h2).count("1")
 
 
+def crop_frac(image_bytes: bytes, box_frac: Sequence[float],
+              quality: int = 88) -> Optional[bytes]:
+    """Re-encode `image_bytes` keeping only the region `box_frac` names.
+
+    Fractions for the same reason `compute_dhash` takes them: the screenshot need
+    not share the accessibility tree's pixel space, and a pixel box computed in
+    the wrong one crops to nothing.
+
+    Returns None rather than raising, and never returns the uncropped frame as a
+    consolation -- a caller that cropped to exclude something must not be handed
+    it back silently. The caller decides what to do with nothing.
+    """
+    if not image_bytes or box_frac is None:
+        return None
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            left, top, right, bottom = (
+                int(box_frac[0] * img.width), int(box_frac[1] * img.height),
+                int(box_frac[2] * img.width), int(box_frac[3] * img.height))
+            left, top = max(0, left), max(0, top)
+            right, bottom = min(img.width, right), min(img.height, bottom)
+            if right - left < 2 or bottom - top < 2:
+                return None
+            out = io.BytesIO()
+            img.crop((left, top, right, bottom)).convert("RGB").save(
+                out, "JPEG", quality=quality, optimize=True)
+            return out.getvalue()
+    except Exception:  # noqa: BLE001 - a crop is an improvement, never a step
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
