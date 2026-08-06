@@ -712,6 +712,14 @@ class Device:
 
         Never send the raw PNG: a 1080x2400 `screencap -p` is 1-3 MB, and
         Fireworks caps total base64 image payload at 10 MB.
+
+        The 1280 default is the everyday budget, not a hardware limit. On a
+        1080x2400 phone it lands the frame at 576x1280 -- fine for layout, and
+        enough for the price and weight in the probe fixtures, but 47% of the
+        linear resolution the app rendered small print at. Raise it (see
+        `Agent._reread_sharper`) when the model reports a value it cannot make
+        out; the cost is roughly quadratic in the long edge, so raising it for
+        every turn is not the answer.
         """
         long_edge = max(self._size) or max_long_edge
         scale = min(1.0, max_long_edge / long_edge) if long_edge else 1.0

@@ -736,3 +736,128 @@ def test_prevent_sleep():
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# doctor: the models that get handed images
+# ---------------------------------------------------------------------------
+
+def _vision_check(monkeypatch, capsys, catalogue, **llm_cfg):
+    """Run `_check_vision` against a scripted catalogue; return (problems, text)."""
+    from adbagent.cli import Out, _check_vision
+    from adbagent.config import Config
+    from adbagent.llm import ModelInfo
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = Config()
+    cfg.llm.model = "accounts/fireworks/models/text-only"
+    cfg.llm.model_image = "accounts/fireworks/models/seeing"
+    for key, value in llm_cfg.items():
+        setattr(cfg.llm, key, value)
+
+    monkeypatch.setattr("adbagent.llm.list_models",
+                        lambda provider, key, **kw: [
+                            ModelInfo(id=name, vision=sees)
+                            for name, sees in catalogue.items()])
+    problems = _check_vision(Out(), cfg)
+    return problems, capsys.readouterr().out
+
+
+CATALOGUE = {"seeing": True, "text-only": False, "also-text-only": False}
+
+
+def test_doctor_passes_a_vision_model_that_takes_images(monkeypatch, capsys):
+    problems, text = _vision_check(monkeypatch, capsys, CATALOGUE)
+    assert problems == 0
+    assert "takes images" in text
+
+
+def test_doctor_fails_a_vision_model_that_cannot_see(monkeypatch, capsys):
+    """`analyze_image` swallows the 400, so nothing else in a run would say so:
+    every screenshot turn spends a call, gets nothing back, and carries on blind
+    on exactly the turns the element tree could not answer."""
+    problems, text = _vision_check(
+        monkeypatch, capsys, CATALOGUE,          # a blind vision model that is
+        model_image="accounts/fireworks/models/also-text-only")  # not the decider
+    assert problems == 1
+    assert "does not take images" in text
+    assert "models --vision" in text
+
+
+def test_doctor_reads_one_model_in_both_slots_as_one_problem(monkeypatch, capsys):
+    """`model` and `model_image` naming one blind model is one model to change,
+    not two problems -- and it is worse than a blind vision model alone, because
+    naming the pair is what put the frame in the deciding call."""
+    problems, text = _vision_check(
+        monkeypatch, capsys, CATALOGUE,
+        model_image="accounts/fireworks/models/text-only")   # == llm.model
+    assert problems == 1
+    assert "does not take images" in text
+    assert "deciding call" in text
+
+
+def test_doctor_says_when_a_matching_pair_dropped_the_vision_pass(monkeypatch, capsys):
+    """Nobody typed this setting, so nobody thinks to check it: a config that
+    stopped spending a call per screenshot turn should say so where the models
+    are, not leave it to be inferred from the bill."""
+    problems, text = _vision_check(monkeypatch, capsys, CATALOGUE,
+                                   model="accounts/fireworks/models/seeing",
+                                   model_image="accounts/fireworks/models/seeing")
+    assert problems == 0
+    assert "straight into the deciding call" in text
+
+
+def test_doctor_says_it_of_the_skill_pair_separately(monkeypatch, capsys):
+    """`skills generate` resolves its own pair, and matching on one pair says
+    nothing about the other -- one model for the tour and another for the run is
+    the normal shape of this config, not an odd one."""
+    problems, text = _vision_check(monkeypatch, capsys, CATALOGUE,
+                                   model_skill="accounts/fireworks/models/seeing",
+                                   model_skill_image="accounts/fireworks/models/seeing")
+    assert problems == 0
+    assert "skills generate" in text
+    # The run's own pair is two models, and says so by staying quiet.
+    assert "llm.model and llm.model_image name one model" not in text
+
+
+def test_doctor_fails_a_blind_decider_asked_to_look(monkeypatch, capsys):
+    """With `vision_in_decider` the frame rides in the deciding call, so a
+    text-only decider does not degrade -- it takes the whole turn down."""
+    problems, text = _vision_check(monkeypatch, capsys, CATALOGUE,
+                                   vision_in_decider=True)
+    assert problems == 1
+    assert "llm.model =" in text
+    assert "vision_in_decider" in text
+
+
+def test_doctor_says_nothing_about_the_decider_when_it_never_looks(monkeypatch, capsys):
+    problems, text = _vision_check(monkeypatch, capsys, CATALOGUE,
+                                   vision_in_decider=False)
+    assert problems == 0
+    assert "llm.model =" not in text
+
+
+def test_an_unlisted_model_is_a_warning_not_a_failure(monkeypatch, capsys):
+    """A fine-tune or a fresh id the catalogue has not caught up with must not
+    stop a run -- it is unconfirmed, not wrong."""
+    problems, text = _vision_check(monkeypatch, capsys, CATALOGUE,
+                                   model_image="accounts/fireworks/models/mine-v1")
+    assert problems == 0
+    assert "cannot confirm" in text
+
+
+def test_an_unreachable_catalogue_is_not_a_misconfiguration(monkeypatch, capsys):
+    """doctor runs on aeroplanes."""
+    from adbagent.cli import Out, _check_vision
+    from adbagent.config import Config
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+
+    def explode(*a, **kw):
+        raise OSError("no route to host")
+
+    monkeypatch.setattr("adbagent.llm.list_models", explode)
+    cfg = Config()
+    cfg.llm.model_image = "accounts/fireworks/models/seeing"
+    assert _check_vision(Out(), cfg) == 0
+    assert "could not check vision support" in capsys.readouterr().out

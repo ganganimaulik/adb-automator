@@ -18,6 +18,21 @@ from typing import Any, Dict, List, Optional
 
 DEFAULT_CONFIG_NAMES = ("config.json", "adbagent.json")
 
+
+def same_model(a: str, b: str) -> bool:
+    """True when two model settings name one model.
+
+    Compares on the last segment, because the same id has two accepted forms --
+    ``kimi-k3`` and ``accounts/fireworks/models/kimi-k3``, which ``llm.qualify``
+    treats as one -- and a config that mixes them is still naming one model.
+
+    Empty is never a match. An unset setting falls back to another one, and a
+    fallback is not evidence of anything: ``model_image`` left empty resolves to
+    ``model`` in every config there is, text-only ones included.
+    """
+    return bool(a) and bool(b) and a.rsplit("/", 1)[-1] == b.rsplit("/", 1)[-1]
+
+
 @dataclass
 class LLMConfig:
     provider: str = "fireworks"
@@ -66,9 +81,17 @@ class LLMConfig:
     #: True when `model` itself accepts images. The screenshot then goes straight
     #: to the deciding call and the separate `model_image` description is skipped
     #: -- one round trip per screenshot turn instead of two. Left off by default
-    #: because a text-only model given an image part fails the whole call, and
-    #: the catalogue flag that would settle it (`adbagent models --vision`) is not
-    #: consulted at run time.
+    #: because a text-only model given an image part fails the whole call, and it
+    #: is still not consulted at run time: the run would discover it as a 400 on
+    #: the first screenshot turn, which may be ninety steps in.
+    #:
+    #: Only ever *asserts* the saving. Naming one model for both `model` and
+    #: `model_image` asserts it too, without being asked -- see `decider_sees`,
+    #: which is what the run reads. Nothing reads this field directly.
+    #:
+    #: `adbagent doctor` now settles it up front, for this and for `model_image`,
+    #: against the catalogue's `supportsImageInput` -- see `cli._check_vision`.
+    #: Check it after changing any of the three model settings.
     vision_in_decider: bool = False
     #: How hard to think on a routine turn: "", "none", "low", "medium", "high".
     #: Empty leaves the model's own default alone and switches the whole feature
@@ -114,6 +137,23 @@ class LLMConfig:
 
     def skill_image(self) -> str:
         return self.model_skill_image or self.model_image or self.model
+
+    def decider_sees(self) -> bool:
+        """True when the screenshot rides in the deciding call itself.
+
+        `vision_in_decider` says so outright. Naming one model for `model` and
+        for `model_image` says the same thing without being asked: the frame was
+        going to that model either way, so describing it first spends a whole
+        round trip having a model tell itself what it is already looking at.
+        Setting the pair and then hunting for the checkbox that makes it pay off
+        is a tax on knowing the internals, and forgetting the checkbox costs a
+        call on every screenshot turn of every run, silently.
+
+        Only an explicit `model_image` counts, not `image()`: an empty one falls
+        back to `model`, which would read every text-only config as a matching
+        pair and fail its first screenshot turn outright.
+        """
+        return bool(self.vision_in_decider) or same_model(self.model, self.model_image)
 
 
 @dataclass

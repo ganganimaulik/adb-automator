@@ -434,3 +434,50 @@ def test_a_reading_is_not_rounded_away_by_a_paraphrase(cfg, mem):
     # What the image model returned is what was recorded -- not the decider's
     # description of the screen it was taken on.
     assert not any("a photo of a scale is on screen" in r for r in readings)
+
+
+def test_the_item_read_is_the_item_and_not_the_frame_around_it(cfg, mem):
+    """A sweep is most of a run's vision calls, and each one asks a question about
+    one bitmap. The status bar and the nav bar are not that bitmap:
+    `ITEM_READING_SYSTEM` spends two of its rules telling the model to ignore
+    chrome that need not be sent at all -- and the chrome has been the answer
+    before, when a clock was read as an item caption.
+
+    The full frame still goes to disk and still feeds `dhash`; only the copy the
+    model reads is cropped.
+    """
+    from adbagent.pager import content_box
+
+    dev = AlbumDevice(cfg, chrome_fades_after=999)
+    llm = fake.FakeLLM(dev, album_walker())
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert llm.item_frames_seen, "no item was read"
+    box = content_box(Screen(width=dev.size[0], height=dev.size[1]))
+    kept = box[3] - box[1]
+    for frame in llm.item_frames_seen:
+        with Image.open(io.BytesIO(frame)) as img:
+            # 32px tall fixture; the crop keeps the middle band of it.
+            assert img.height == pytest.approx(32 * kept, abs=1), img.size
+            assert img.width == 32          # nothing is cropped horizontally
+
+    # A screen *analysis* is a different question -- "what am I looking at" -- and
+    # still gets the whole frame, chrome and all.
+    for frame in llm.frames_seen:
+        with Image.open(io.BytesIO(frame)) as img:
+            assert img.size == (32, 32), img.size
+
+
+def test_a_frame_that_cannot_be_cropped_is_still_read(cfg, mem, monkeypatch):
+    """A crop is an improvement, never a precondition. When it cannot be taken --
+    a truncated capture, a format PIL will not open -- the whole frame must reach
+    the model rather than nothing reaching it."""
+    monkeypatch.setattr("adbagent.agent.crop_frac", lambda *a, **kw: None)
+    dev = AlbumDevice(cfg, chrome_fades_after=999)
+    llm = fake.FakeLLM(dev, album_walker())
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert llm.item_frames_seen, "the item was not read at all"
+    for frame in llm.item_frames_seen:
+        with Image.open(io.BytesIO(frame)) as img:
+            assert img.size == (32, 32)          # the uncropped fixture

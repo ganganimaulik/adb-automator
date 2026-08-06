@@ -28,10 +28,11 @@ from .actions import (ActionError, AgentAction, append_history, execute,
                       format_history_entry, synthesise_postcondition, verify)
 from .config import Config
 from .device import Device, DeviceTimeout, DeviceLost
+from .fingerprint import crop_frac
 from .ledger import ReplyLedger
 from .llm import (BudgetExceeded, LLMClient, LLMError, Prefetch, ScreenAnalysis)
 from .memory import Memory, intent_key
-from .pager import (SweepLog, can_repeat,
+from .pager import (SweepLog, can_repeat, content_box,
                     content_moved as pager_content_moved,
                     stop_repeating, sweep_summary)
 from .safety import Aborted, LoopDetector
@@ -152,6 +153,9 @@ class RunState:
     #: `steps_since_progress` when the last replan ran, so one stall episode
     #: buys one replan rather than one every turn it persists.
     replanned_at: int = 0
+    #: Screens already re-read at full resolution. One sharper look per screen:
+    #: see `Agent._reread_sharper` for why a second cannot help.
+    rereads: set = field(default_factory=set)
 
     @property
     def elapsed(self) -> float:
@@ -390,6 +394,30 @@ def needs_reasoning(state: RunState, cfg: Config, *, visit: int,
     return cfg.llm.effort_for("decide"), ""
 
 
+#: Long edge for the one sharper capture a screen is allowed. Chosen as the
+#: largest frame that still costs a single-digit fraction of a cent on the vision
+#: models here: a 1080x2400 phone reaches 1080x2400 untouched at 2400, so this is
+#: "the pixels the app actually drew" rather than an arbitrary bigger number.
+SHARP_LONG_EDGE = 2400
+
+#: How the prompts ask the model to report a value it can see but cannot make
+#: out. `IMAGE_ANALYSIS_SYSTEM` and `ITEM_READING_SYSTEM` both name the word, so
+#: matching on it is reading the contract rather than guessing at prose.
+_UNREADABLE_HINTS = ("unreadable", "cannot make out", "can't make out",
+                     "too blurry", "too small to read", "illegible")
+
+
+def _unreadable(text: str) -> bool:
+    """True when a vision answer says the value is there but it cannot read it.
+
+    The distinction that matters is against "not applicable": an empty `reading`
+    means the goal asked for nothing this screen holds, and re-reading that at
+    four times the pixels buys nothing. Only a model that has told us it is
+    looking at something it cannot resolve is worth a second, sharper look.
+    """
+    return any(hint in (text or "").lower() for hint in _UNREADABLE_HINTS)
+
+
 def needs_screenshot(state: RunState, screen: Screen, cfg: Config) -> Tuple[bool, str]:
     """XML-first: pay for vision only when the tree cannot answer the question."""
     if cfg.run.never_screenshot:
@@ -470,6 +498,62 @@ class Agent:
             from .fingerprint import compute_dhash
             screen.dhash = compute_dhash(screen.screenshot)
         return screen.screenshot
+
+    def _reread_sharper(self, state: RunState, screen: Screen, rec: Recorder, *,
+                        rendered: str = "") -> Optional[ScreenAnalysis]:
+        """Read the screen once more at full capture resolution.
+
+        Called only when the vision model has said, in the words the prompt asks
+        for, that a value is present but it cannot make it out. The everyday
+        capture is downscaled to a 1280 long edge, so on a 1080x2400 phone the
+        model is shown 576x1280 -- and a price in 24sp type, a timestamp, a weight
+        on a scale reach it at fewer pixels than the app drew them with.
+
+        Bounded on purpose. Once per screen: the second look is answering "is the
+        blur mine or the app's", and asking that twice of the same pixels cannot
+        change the answer. Nothing is cached back onto `screen.screenshot`, which
+        must stay the frame `dhash` was computed from -- the pager compares those
+        hashes to decide whether a swipe advanced the item, and swapping in a
+        bigger frame would make every comparison read as movement.
+        """
+        if self.llm is None or self.cfg.run.never_screenshot:
+            return None
+        key = screen.exact_id or screen.skeleton_id
+        if key and key in state.rereads:
+            return None
+        if key:
+            state.rereads.add(key)
+        try:
+            sharper = self.dev.screenshot(max_long_edge=SHARP_LONG_EDGE, quality=92)
+        except (DeviceTimeout, DeviceLost) as exc:
+            # A re-read is an improvement, never a reason to lose the step. The
+            # main loop's own device calls will hit the same fault and recover.
+            log.warning("sharper re-read could not be captured: %s", exc)
+            return None
+        log.info("step %d: value reported unreadable; re-reading at %dpx "
+                 "(%d bytes)", state.step, SHARP_LONG_EDGE, len(sharper))
+        rec.event("vision_reread", step=state.step, long_edge=SHARP_LONG_EDGE,
+                  bytes=len(sharper))
+        self.on_event("vision_reread", step=state.step, long_edge=SHARP_LONG_EDGE)
+        analysis = self.llm.analyze_image(
+            sharper, goal=state.goal, rendered=rendered, step=state.step,
+            recorder=rec, on_event=self.on_event)
+        # A second look is only worth taking if it is allowed to fail. Against a
+        # real phone the full-resolution frame came back with all four fields
+        # empty where the downscaled one had at least said what it could not read
+        # -- more pixels are not monotonically more answer. So the re-read has to
+        # clear the bar it was bought to clear: an actual value, not another
+        # "unreadable" and not silence. Anything else and the first answer stands,
+        # because "unreadable, glare on the display" tells the run more than
+        # nothing does.
+        if analysis.unavailable or not analysis.reading.strip() \
+                or _unreadable(analysis.reading):
+            rec.event("vision_reread_no_better", step=state.step,
+                      reading=analysis.reading)
+            log.info("step %d: the sharper frame read no better; keeping the "
+                     "first answer", state.step)
+            return None
+        return analysis
 
     def _skill_for_run(self, package: str, goal: str) -> Optional[Skill]:
         """The app skill for this step, picked by what the task needs.
@@ -604,7 +688,7 @@ class Agent:
             reasoning=f"effort={cfg.llm.reasoning_effort or '(model default)'} "
                       f"hard={cfg.llm.reasoning_effort_hard} "
                       f"style={cfg.llm.reasoning_style} "
-                      f"vision_in_decider={cfg.llm.vision_in_decider}",
+                      f"vision_in_decider={cfg.llm.decider_sees()}",
             limits=f"max_steps={cfg.run.max_steps} "
                    f"max_wall_clock_s={cfg.run.max_wall_clock_s:g} "
                    f"budget_usd={cfg.safety.budget_usd:g}",
@@ -840,11 +924,36 @@ class Agent:
             ledger_mark = self.llm.ledger.mark() if self.llm else 0
             t0_step_llm = time.monotonic()
             analysis: Optional[ScreenAnalysis] = None
+            vision_note = ""
             if (screenshot and self.llm is not None
                     and self.llm.needs_vision_pass):
                 analysis = self.llm.analyze_image(
                     screenshot, goal=state.goal, rendered=render(screen),
                     step=state.step, recorder=rec, on_event=self.on_event)
+                # `note` was written on the assumption the image would arrive --
+                # "rely on the screenshot", "look at the screen itself". When the
+                # vision call failed, that instruction is now a lie, and a decider
+                # told to consult evidence it does not have will describe pixels
+                # it never saw. Withdraw it in the same breath.
+                if analysis.unavailable:
+                    vision_note = (
+                        "The screenshot could NOT be read this turn -- the vision "
+                        "model did not answer. Ignore any instruction above to "
+                        "rely on the image: decide from the element list alone, "
+                        "and say your confidence is low if the list cannot "
+                        "settle it.")
+                    rec.event("vision_unavailable", step=state.step,
+                              model=self.llm.model_image)
+                elif analysis.reading and _unreadable(analysis.reading):
+                    # The prompts ask for "unreadable" by name and nothing used to
+                    # act on it, so the run carried on as if the value were simply
+                    # absent. A downscaled capture is the most likely reason: a
+                    # 1080x2400 frame reaches the model as 576x1280, which is 47%
+                    # of the linear resolution small print was rendered at.
+                    sharper = self._reread_sharper(
+                        state, screen, rec, rendered=render(screen))
+                    if sharper is not None:
+                        analysis = sharper
 
             # Whatever the last mechanical sweep read, handed back once and then
             # dropped. It is a record of what *this* run saw, in order, with no
@@ -932,9 +1041,9 @@ class Agent:
             if self.ledger is not None:
                 handled_note = prompts.handled_block(
                     [st.preview for st in self.ledger.recent() if st.preview])
-            notes = "\n\n".join(filter(None, (note, stall_text, pager_note,
-                                             hint, elem_hint, ban_note,
-                                             state.last_failure,
+            notes = "\n\n".join(filter(None, (note, vision_note, stall_text,
+                                             pager_note, hint, elem_hint,
+                                             ban_note, state.last_failure,
                                              handled_note, situational)))
             effort, hard_because = needs_reasoning(
                 state, cfg, visit=visit,
@@ -947,7 +1056,7 @@ class Agent:
             # model doing the looking. Otherwise the vision pass above is the call
             # that was shown it, and its own panel already carries the image.
             shot = rec.screenshot(state.step, screenshot, "decide") \
-                if (screenshot and cfg.llm.vision_in_decider) else ""
+                if (screenshot and cfg.llm.decider_sees()) else ""
             self.on_event("llm_start", step=state.step, purpose="decide", model=model_name,
                           screenshot=bool(screenshot), shot=shot, effort=effort,
                           hard_because=hard_because)
@@ -959,7 +1068,11 @@ class Agent:
                 scratchpad=state.scratchpad.render(cfg.run.scratchpad_max_chars),
                 progress="\n".join(state.progress_log), skill=skill_note,
                 policy=self.policy,
-                image_analysis=analysis.render() if analysis else None,
+                # `is not None`, not truthiness: a pydantic model is always truthy
+                # so this happened to be right, but the distinction it relies on
+                # is between "the pass ran" and "it did not". `decide` reads "" as
+                # the former and would buy a second look for the latter.
+                image_analysis=analysis.render() if analysis is not None else None,
                 step=state.step, recorder=rec, effort=effort,
                 on_event=self.on_event)
             t_llm = time.monotonic() - t0_llm            # the decision alone
@@ -1484,7 +1597,23 @@ class Agent:
                 # of a run's vision calls, and "what did it read off item 7" is
                 # not answerable from the reading alone.
                 shot_name = rec.screenshot(state.step, shot, "read_item")
-                reading = Prefetch(lambda s=shot: self.llm.read_item(
+                # The item, not the frame it sits in. `read_item` is asking one
+                # question about one bitmap, and the status bar and the nav bar
+                # are neither -- ITEM_READING_SYSTEM spends two of its rules
+                # telling the model to ignore chrome that need not be sent at
+                # all. It has been read as the answer before: a clock read as an
+                # item caption renamed every item once a minute (see
+                # `screen.SYSTEM_UI_PACKAGES`), which was fixed on the tree side
+                # while the pixels kept carrying it.
+                #
+                # `pager.content_box` and not a box of our own: the sweep is a
+                # pager sweep, and that function is already this module's answer
+                # to where an item lives -- the same crop `content_moved` judges
+                # movement inside. The full frame is what gets kept on disk and
+                # what `dhash` is computed from; only the copy the model reads is
+                # cropped.
+                item = crop_frac(shot, content_box(screen)) or shot
+                reading = Prefetch(lambda s=item: self.llm.read_item(
                     s, goal=state.goal, step=state.step))
 
             # -- repeat the gesture ----------------------------------------

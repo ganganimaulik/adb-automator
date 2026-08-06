@@ -933,6 +933,51 @@ def test_one_model_for_both_jobs_keeps_the_vision_setting_it_was_given():
     assert cfg.llm.vision_in_decider is True
 
 
+def test_one_model_for_both_skill_slots_explores_looking_at_the_screenshots():
+    """`model_skill` with `model_skill_image` says of a skill run exactly what
+    `model` with `model_image` says of an ordinary one: the model deciding is the
+    model that reads the picture. So the tour stops describing every screenshot
+    to the model already being handed it."""
+    cfg = Config()
+    cfg.llm.model = "main-model"
+    cfg.llm.model_image = "vision-model"
+    cfg.llm.model_skill = "kimi-k3"
+    cfg.llm.model_skill_image = "kimi-k3"
+
+    assert use_skill_model(cfg) is False
+    assert cfg.llm.model == "kimi-k3"
+    assert cfg.llm.decider_sees() is True
+
+
+def test_the_skill_vision_model_reads_the_tour_screenshots_too():
+    """`model_skill_image` is the skill job's vision model and the tour is skill
+    work. Leaving exploration on `llm.model_image` meant the pair the config
+    states for this job was never the pair that ran."""
+    cfg = Config()
+    cfg.llm.model = "main-model"
+    cfg.llm.model_image = "vision-model"
+    cfg.llm.model_skill = "skill-writer"
+    cfg.llm.model_skill_image = "skill-vision"
+
+    assert use_skill_model(cfg) is False
+    assert cfg.llm.image() == "skill-vision"
+    assert cfg.llm.decider_sees() is False   # two models: the long way round
+
+
+def test_a_seeing_main_pair_says_nothing_about_a_different_skill_model():
+    """`model` and `model_image` naming one model is a statement about that
+    model. `model_skill` is a different one, and a text-only model handed an
+    image part fails the whole call rather than the picture."""
+    cfg = Config()
+    cfg.llm.model = "kimi-k3"
+    cfg.llm.model_image = "kimi-k3"
+    cfg.llm.model_skill = "skill-writer"
+
+    assert use_skill_model(cfg) is True       # the frame stops riding along
+    assert cfg.llm.decider_sees() is False
+    assert cfg.llm.image() == "kimi-k3"       # which still reads the screenshots
+
+
 # ---------------------------------------------------------------------------
 # Learning from an ordinary run
 # ---------------------------------------------------------------------------

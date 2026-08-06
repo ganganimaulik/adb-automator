@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, TypeVar
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
 
 from .config import Config
 
@@ -489,6 +489,53 @@ def reasoning_style_for(model: str) -> str:
 #: dropping them cannot take a `prompt_cache_key` or a `service_tier` with it.
 REASONING_KEYS = ("reasoning_effort", "chat_template_kwargs")
 
+#: Generic ways a provider says "you sent a field I do not take" without naming
+#: it. Fireworks answers `chat_template_kwargs` with the first of these.
+#:
+#: Every entry has to be specific enough that it cannot also describe a rejected
+#: *image*, which is the error this whole test exists to stop misreading. A bare
+#: "not allowed" would match "image inputs are not allowed" and reintroduce the
+#: bug in a new provider's wording, so the generic half of the list is phrases,
+#: not words.
+_REJECTED_FIELD_PHRASES = (
+    "extra inputs are not permitted", "additional properties",
+    "unrecognized request argument", "unrecognised request argument",
+    "unknown field", "unknown parameter", "unexpected keyword",
+    "extra fields not permitted",
+)
+
+
+def reasoning_implicated(message: str, fields: Sequence[str] = ()) -> bool:
+    """True when a 400's text supports blaming the reasoning field for it.
+
+    Without this test every 400 was blamed on reasoning, because a reasoning
+    field was in the body and nothing checked the message. The cost was not the
+    wasted retry -- it was `_rejects_reasoning`, which is remembered for the rest
+    of the process: one unrelated 400 silently stripped the configured depth from
+    every later call to that model. A vision model pointed at a text-only id is
+    how this was found. Fireworks answers the image part with "This model does
+    not support image inputs", which was logged as "rejected reasoning_effort"
+    and then held against the model for the whole run.
+
+    Two ways to qualify: the message names a field this request actually carried
+    -- `fields` comes from the body, so this cannot be fooled by a message about
+    something we did not send -- or it reports one of the generic shapes above.
+
+    The two failure modes are not symmetric, which is why the generic list errs
+    towards matching. Declining to strip when we should ends the call with the
+    provider's own message, which a human can read and answer with
+    `llm.reasoning_style: off`. Stripping when we should not leaves a run
+    mis-configured with nothing on screen to say so.
+    """
+    text = (message or "").lower()
+    for field_name in fields or REASONING_KEYS:
+        if field_name.lower() in text:
+            return True
+        # `chat_template_kwargs` is often reported by the key inside it.
+        if field_name == "chat_template_kwargs" and "thinking" in text:
+            return True
+    return any(phrase in text for phrase in _REJECTED_FIELD_PHRASES)
+
 
 def prefix_cache_key() -> str:
     """Affinity key naming the *prompt prefix*, not the run.
@@ -621,6 +668,24 @@ class ScreenAnalysis(BaseModel):
                                                  "screen, with its buttons.")
     notable: str = Field("", description="Anything else visually important that "
                                          "the accessibility tree omits.")
+
+    #: Private, so it stays out of the JSON schema the model is held to. Set when
+    #: the call did not come back at all -- see `unavailable`.
+    _failed: bool = PrivateAttr(default=False)
+
+    @property
+    def unavailable(self) -> bool:
+        """True when the vision call failed, as against having nothing to report.
+
+        Every field here is legitimately empty on a screen the tree already
+        describes, so "all four blank" cannot distinguish a screenshot that was
+        read and held no surprises from one that was never read. The difference
+        matters because `needs_screenshot` only asks for an image when the tree
+        *cannot* answer the question, and its note tells the decider to rely on
+        the image -- so a swallowed failure hands the decider an instruction to
+        use evidence it does not have.
+        """
+        return self._failed
 
     def render(self) -> str:
         """The lines worth putting in a prompt -- named, and only if filled."""
@@ -806,8 +871,14 @@ class LLMClient:
                 # optimisation, so the field is dropped, the model is remembered,
                 # and the call is reissued exactly once. If it fails again the
                 # reasoning field was not the problem and the error stands.
-                if (exc.status_code in REJECTED_STATUS
-                        and reasoning_fields(kwargs.get("extra_body"))):
+                #
+                # Only when the message supports the accusation, though: a 400
+                # naming a different cause is that cause. See
+                # `reasoning_implicated`.
+                message = str(getattr(exc, "message", exc) or "")
+                sent = reasoning_fields(kwargs.get("extra_body"))
+                if (exc.status_code in REJECTED_STATUS and sent
+                        and reasoning_implicated(message, sent)):
                     dropped = reasoning_fields(kwargs["extra_body"])
                     log.warning("%s rejected %s (%s); continuing without it",
                                 model, ", ".join(dropped),
@@ -1052,7 +1123,7 @@ class LLMClient:
         False means the decider is looking at the image itself, and a separate
         description would be a second round trip spent on prose it does not need.
         """
-        return not self.cfg.llm.vision_in_decider
+        return not self.cfg.llm.decider_sees()
 
     def analyze_image(self, screenshot: bytes, *, goal: str = "", rendered: str = "",
                       step: int = 0, recorder: Optional[Any] = None,
@@ -1100,9 +1171,15 @@ class LLMClient:
         except LLMError as exc:
             # A vision model that cannot hold the schema is not worth failing the
             # step over: the description is an aid, and the element list the
-            # decider actually acts on is unaffected.
+            # decider actually acts on is unaffected. But the step has to *know*,
+            # or it goes on believing it looked -- so the empty analysis is
+            # flagged rather than merely logged. See `ScreenAnalysis.unavailable`.
             log.warning("image analysis produced no usable answer: %s", exc)
             analysis = ScreenAnalysis()
+            analysis._failed = True
+            if on_event:
+                on_event("vision_unavailable", step=step, model=self.model_image,
+                         error=str(exc))
         elapsed = time.monotonic() - t0
         result = analysis.render()
         last_call = self.ledger.calls[-1] if self.ledger.calls else None
@@ -1160,8 +1237,15 @@ class LLMClient:
         # per screenshot turn instead of two, on the ~22% of turns that take one.
         # Describing a screenshot in prose and then reasoning over the prose is
         # only worth a whole extra call when the decider is blind.
-        inline_image = bool(screenshot) and self.cfg.llm.vision_in_decider
-        if screenshot and not image_analysis and not inline_image:
+        inline_image = bool(screenshot) and self.cfg.llm.decider_sees()
+        # `is None` and not falsiness. An analysis that ran and found nothing
+        # worth reporting renders to "", which read as "no analysis was done" and
+        # bought a second one -- the same screenshot described twice, on every
+        # turn the vision model correctly had nothing to say. Seen in
+        # ``runs/9b205cb055b4``: two `analyze_image` calls on step 3, 1,663 prompt
+        # tokens each, both answering with four empty fields. None means nobody
+        # looked; "" means somebody looked and the screen held no surprises.
+        if screenshot and image_analysis is None and not inline_image:
             # The agent normally runs this pass itself, because it wants the
             # structured fields for its own ledgers; this covers the callers that
             # do not -- the judge, replay, a bare `decide`.
@@ -1215,12 +1299,14 @@ class LLMClient:
               on_event: Optional[Callable[..., None]] = None) -> "Verdict":
         from . import prompts
 
-        if screenshot and not image_analysis:
+        if screenshot and image_analysis is None:
             # `.render()`, as `decide` does. Without it the prompt carried the
             # model's repr -- `reading='428 g' item_label='' ...` -- and, because
             # a pydantic model is always truthy, an analysis with nothing in it
             # still injected four empty fields into the block that decides
-            # whether the run succeeded. `render()` returns "" for that case.
+            # whether the run succeeded. `render()` returns "" for that case --
+            # which is why the guard tests `is None` rather than falsiness, or
+            # that "" would buy a second look at the same frame.
             image_analysis = self.analyze_image(
                 screenshot, goal=goal, rendered=rendered, step=step,
                 recorder=recorder, on_event=on_event
@@ -1263,8 +1349,9 @@ class LLMClient:
         """
         from . import prompts
 
-        inline_image = bool(screenshot) and self.cfg.llm.vision_in_decider
-        if screenshot and not image_analysis and not inline_image:
+        inline_image = bool(screenshot) and self.cfg.llm.decider_sees()
+        # `is None`, for the reason spelled out in `decide`.
+        if screenshot and image_analysis is None and not inline_image:
             image_analysis = self.analyze_image(
                 screenshot, goal=goal, rendered=rendered, step=step,
                 recorder=recorder, on_event=on_event).render()

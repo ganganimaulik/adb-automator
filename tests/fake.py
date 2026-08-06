@@ -88,6 +88,7 @@ class FakeDevice:
         self.shell_calls: List[str] = []
         self.shell_replies: Dict[str, str] = {}
         self.screenshots = 0
+        self.shot_edges: List[int] = []
         self.dumps = 0
 
     # -- observation -------------------------------------------------------
@@ -102,9 +103,13 @@ class FakeDevice:
         return attach(parse(self._xml(), width=self.size[0], height=self.size[1],
                             activity=f".{self.state.title()}Activity"))
 
-    def screenshot(self, **kw) -> bytes:
+    def screenshot(self, max_long_edge: int = 1280, **kw) -> bytes:
         self.screenshots += 1
-        return b"\xff\xd8\xff\xdb fake jpeg"
+        # The long edge asked for, in order. A sharper re-read is only a re-read
+        # if it actually asks for more pixels than the frame it is doubting, and
+        # the bytes differ so a test can tell which frame reached the model.
+        self.shot_edges.append(max_long_edge)
+        return b"\xff\xd8\xff\xdb fake jpeg @%d" % max_long_edge
 
     # -- actions -----------------------------------------------------------
 
@@ -232,6 +237,23 @@ class FakeLLM:
         self.analyses = 0
         self.vision_reading = ""
         self.vision_label = ""
+        #: True to answer every vision pass as the real client does when the call
+        #: fails: an empty analysis flagged `unavailable`.
+        self.vision_fails = False
+        #: The frames each vision pass was handed, in order, so a test can assert
+        #: a re-read was given different pixels rather than the same ones twice.
+        self.frames_seen: List[bytes] = []
+        #: The frames each *item* read was handed. Kept apart from `frames_seen`
+        #: because the two calls are shown different pixels on purpose: a screen
+        #: analysis gets the whole frame, an item read gets the item.
+        self.item_frames_seen: List[bytes] = []
+        #: Reading for the second and later passes. A sharper capture that answers
+        #: what the downscaled one could not is the whole point of re-reading.
+        self.vision_reading_after_reread: Optional[str] = None
+        #: The rendered analysis each decide turn was handed. Apart from `notes`
+        #: because they answer different questions: what the model was told about
+        #: the screen, against what it was told to do about it.
+        self.analyses_seen: List[str] = []
         #: Tier 3 of the stall ladder. Counted apart from `calls` for the same
         #: reason the sweep's reads are: a test asserting how many reasoning
         #: turns a change costs must not have a rescue call folded into it.
@@ -251,7 +273,15 @@ class FakeLLM:
         self.ledger.record(Call(model=self.model_image, prompt_tokens=500,
                                 completion_tokens=100, purpose="analyze_image"))
         self.analyses += 1
-        return ScreenAnalysis(reading=self.vision_reading,
+        self.frames_seen.append(screenshot)
+        if self.vision_fails:
+            failed = ScreenAnalysis()
+            failed._failed = True
+            return failed
+        reading = self.vision_reading
+        if self.analyses > 1 and self.vision_reading_after_reread is not None:
+            reading = self.vision_reading_after_reread
+        return ScreenAnalysis(reading=reading,
                               item_label=self.vision_label,
                               notable="fake visual analysis")
 
@@ -264,6 +294,7 @@ class FakeLLM:
         numbers apart.
         """
         self.reads_requested.append(label)
+        self.item_frames_seen.append(screenshot)
         self.ledger.record(Call(model=self.model_image, prompt_tokens=400,
                                 completion_tokens=30, purpose="read_item"))
         return f"reading of {label or 'an unlabelled item'}"
@@ -275,9 +306,12 @@ class FakeLLM:
         self.calls += 1
         if screenshot:
             self.seen_screenshots += 1
-            if not image_analysis:
+            # `is None`, mirroring the real client: "" means a pass ran and found
+            # nothing, and treating it as "no pass ran" buys a second one.
+            if image_analysis is None:
                 image_analysis = self.analyze_image(screenshot, goal=goal, rendered=rendered)
         self.notes.append(note)
+        self.analyses_seen.append(image_analysis or "")
         self.scratchpads.append(scratchpad)
         self.ledger.record(Call(model=self.model, prompt_tokens=1000,
                                 completion_tokens=50, purpose="decide"))
@@ -308,7 +342,7 @@ class FakeLLM:
               progress: str = "", image_analysis: Optional[str] = None, **kwargs) -> Verdict:
         self.judges += 1
         self.calls += 1
-        if screenshot and not image_analysis:
+        if screenshot and image_analysis is None:     # `is None`, as `decide` does
             image_analysis = self.analyze_image(screenshot, goal=goal, rendered=rendered)
         return Verdict(satisfied=self.judge_result,
                        evidence="fake judge" if self.judge_result else "not yet")

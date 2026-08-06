@@ -1195,11 +1195,48 @@ async function loadModels(refresh = false) {
     ? `No model catalogue: ${catalogue.error}. Pick “custom…” to type an id.`
     : `${n} model${n === 1 ? "" : "s"} from ${catalogue.provider}.`;
   modelFields.forEach(fillModelSelect);
+  syncVisionHint();  // the catalogue can rewrite a short id into its long form
+}
+
+/* `vision_in_decider` is one way of saying the deciding model takes images.
+   Naming one model for both slots of a pair says it too, and `decider_sees` in
+   config.py is what the run actually reads -- so an unticked box beside a
+   matching pair reads as a setting that does nothing, when the round trip it
+   controls is already being saved. The form says which pair did it. */
+function fieldValue(dotted) {
+  const id = "cfg-" + dotted.replace(".", "-");
+  const el = $(id);
+  if (!el) return "";
+  const raw = el.value === MODEL_CUSTOM ? ($(id + "-custom") || {}).value || "" : el.value;
+  return (raw || "").trim();
+}
+
+/* `config.same_model`, in the browser: one id has two accepted forms, and empty
+   is never a match -- an unset field is a fallback, not a decision. */
+function sameModel(a, b) {
+  return !!a && !!b && a.split("/").pop() === b.split("/").pop();
+}
+
+function syncVisionHint() {
+  const note = $("cfg-llm-vision_in_decider-auto");
+  if (!note) return;
+  const model = fieldValue("llm.model"), image = fieldValue("llm.model_image");
+  const skill = fieldValue("llm.model_skill"), skillImage = fieldValue("llm.model_skill_image");
+  const on = [];
+  if (sameModel(model, image)) on.push("model and model_image");
+  // The pair a skill run resolves to (`skills.use_skill_model`), which is only
+  // worth saying when one of the two was set to something of its own.
+  if ((skill || skillImage) && sameModel(skill || model, skillImage || image)) {
+    on.push("model_skill and model_skill_image");
+  }
+  note.textContent = on.length ? `· on already: ${on.join(", ")} name one model` : "";
 }
 
 /* "custom…" reveals the text box beside its dropdown. Delegated, because the
    form is rebuilt from scratch every time it loads. */
+$("cfg-form").addEventListener("input", syncVisionHint);
 $("cfg-form").addEventListener("change", (e) => {
+  syncVisionHint();
   const field = modelFields.find((f) => f.id === e.target.id);
   if (!field) return;
   const box = $(field.id + "-custom");
@@ -1236,7 +1273,8 @@ async function loadConfig() {
                            vision: !!(opts && opts.vision) });
       } else if (type === "bool") {
         label.className = "check";
-        label.innerHTML = `<input type="checkbox" id="${inputId}" ${value ? "checked" : ""}> ${esc(key)}`;
+        label.innerHTML = `<input type="checkbox" id="${inputId}" ${value ? "checked" : ""}> ${esc(key)}` +
+          (key === "vision_in_decider" ? `<span class="cfg-auto" id="${inputId}-auto"></span>` : "");
       } else if (Array.isArray(type)) {
         label.innerHTML = `${esc(key)}<select id="${inputId}">` +
           type.map((v) => `<option value="${esc(v)}" ${v === value ? "selected" : ""}>` +
@@ -1256,6 +1294,7 @@ async function loadConfig() {
     form.appendChild(group);
   }
   modelFields.forEach(fillModelSelect);  // with the current values, at least
+  syncVisionHint();
   if (!catalogue.loaded) loadModels();   // and with the catalogue when it lands
 }
 

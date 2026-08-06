@@ -1242,3 +1242,169 @@ def test_a_scroll_that_reveals_nothing_still_stalls(cfg, mem, tmp_path):
     assert outcome == "failed"
     assert state.step < cfg.run.max_steps, f"ran {state.step} steps against a wall"
     assert "stalled_out" in [e["kind"] for e in _events(tmp_path, state.run_id)]
+
+
+# ---------------------------------------------------------------------------
+# The image the step thought it had
+# ---------------------------------------------------------------------------
+
+def test_a_failed_vision_pass_withdraws_the_instruction_to_use_the_image(cfg, mem):
+    """`needs_screenshot` only asks for an image when the tree cannot answer the
+    question, and the note it returns says so: "rely on the screenshot", "look at
+    the screen itself". When the vision call fails that note is an instruction to
+    consult evidence the decider does not have -- and a model told to read pixels
+    it never received describes pixels it never received."""
+    cfg.run.always_screenshot = True
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    llm.vision_fails = True
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert llm.notes, "no decide turn happened"
+    first = llm.notes[0]
+    assert "could NOT be read" in first
+    assert "element list" in first
+
+
+def test_a_working_vision_pass_adds_no_such_warning(cfg, mem):
+    cfg.run.always_screenshot = True
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    llm.vision_reading = "Wi-Fi is on"
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert llm.notes
+    assert not any("could NOT be read" in note for note in llm.notes)
+
+
+def test_an_unreadable_value_buys_one_sharper_look(cfg, mem):
+    """Both vision prompts ask the model to say "unreadable" by name, and nothing
+    used to act on it -- so a value the capture had thrown away read the same as a
+    value the screen never held. The everyday frame is downscaled to a 1280 long
+    edge; the app drew the digits at more than that."""
+    from adbagent.agent import SHARP_LONG_EDGE
+
+    cfg.run.always_screenshot = True
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    llm.vision_reading = "unreadable, the figure is too blurry to make out"
+    llm.vision_reading_after_reread = "Wi-Fi password: hunter2"
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert SHARP_LONG_EDGE in dev.shot_edges
+    assert SHARP_LONG_EDGE > 1280
+    # The re-read must be given different pixels, not the same frame again.
+    assert len(llm.frames_seen) >= 2
+    assert llm.frames_seen[0] != llm.frames_seen[1]
+    # And the answer it bought is the one the decider acts on -- a re-read whose
+    # result is discarded is a round trip spent on nothing.
+    assert "hunter2" in llm.analyses_seen[0]
+    assert "unreadable" not in llm.analyses_seen[0]
+
+
+def test_a_readable_value_is_never_re_read(cfg, mem):
+    """An empty or answered `reading` is not a blurry one, and re-reading it at
+    four times the pixels buys nothing."""
+    from adbagent.agent import SHARP_LONG_EDGE
+
+    cfg.run.always_screenshot = True
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    llm.vision_reading = "Wi-Fi is on, 3 networks in range"
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert SHARP_LONG_EDGE not in dev.shot_edges
+
+
+def test_one_sharper_look_per_screen_not_per_turn(cfg, mem):
+    """The second look answers "is the blur mine or the app's". Asking that twice
+    of the same pixels cannot change the answer, and a screen the run sits on for
+    twenty turns would otherwise buy twenty full-resolution captures."""
+    from adbagent.agent import SHARP_LONG_EDGE
+
+    cfg.run.always_screenshot = True
+    cfg.run.max_steps = 6
+    dev = fake.FakeDevice(cfg)
+
+    def stay(screen, llm):
+        return AgentAction(observation="still here", reasoning="waiting",
+                           action="wait", duration=0.05, confidence="high")
+
+    llm = fake.FakeLLM(dev, stay)
+    llm.vision_reading = "unreadable, glare on the display"
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert dev.shot_edges.count(SHARP_LONG_EDGE) == 1
+
+
+def test_a_failed_re_read_leaves_the_first_answer_standing(cfg, mem):
+    """A re-read is an improvement, never a way to lose what was already read."""
+    dev = fake.FakeDevice(cfg)
+    cfg.run.always_screenshot = True
+
+    class Flaky(fake.FakeLLM):
+        """Answers the everyday frame and drops every sharper one."""
+
+        def analyze_image(self, screenshot, **kw):
+            analysis = super().analyze_image(screenshot, **kw)
+            if b"2400" in screenshot:             # the re-read, and only it
+                failed = type(analysis)()
+                failed._failed = True
+                return failed
+            return analysis
+
+    llm = Flaky(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    llm.vision_reading = "unreadable, too small to read"
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    # The failed re-read must not be mistaken for "the image could not be read
+    # this turn" -- the first pass answered, and its answer is what stands.
+    assert not any("could NOT be read" in note for note in llm.notes)
+
+
+def test_a_sharper_look_that_reads_no_better_does_not_erase_the_first_answer(cfg, mem):
+    """More pixels are not monotonically more answer. Against a real phone the
+    full-resolution frame came back with all four fields empty where the
+    downscaled one had at least said what it could not read -- and
+    "unreadable, glare on the display" tells the run more than nothing does."""
+    cfg.run.always_screenshot = True
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    llm.vision_reading = "unreadable, glare on the display"
+    llm.vision_reading_after_reread = ""            # the sharper frame says nothing
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert "glare on the display" in llm.analyses_seen[0]
+
+
+def test_a_sharper_look_that_is_still_unreadable_is_not_taken_as_progress(cfg, mem):
+    cfg.run.always_screenshot = True
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    llm.vision_reading = "unreadable, the meter is behind glass"
+    llm.vision_reading_after_reread = "unreadable, still cannot make out the digits"
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert "behind glass" in llm.analyses_seen[0]
+
+
+def test_a_screenshot_turn_costs_one_vision_call_even_when_it_reads_nothing(cfg, mem):
+    """The agent runs the vision pass itself so it can keep the structured fields,
+    and hands the rendered result to `decide`. An analysis with all four fields
+    empty renders to "" -- which used to read as "no analysis was done" and buy a
+    second look at the same frame, on every turn the vision model correctly had
+    nothing to add."""
+    cfg.run.always_screenshot = True
+    cfg.run.max_steps = 3
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    llm.vision_reading = ""            # nothing to report, and nothing wrong
+    llm.vision_label = ""
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    # One pass per decide turn that was given a frame, plus the judge's own pass
+    # on the final screen -- which nobody analysed for it. Two per decide turn is
+    # the regression.
+    assert llm.analyses <= llm.seen_screenshots + llm.judges, (
+        f"{llm.analyses} vision calls for {llm.seen_screenshots} screenshot "
+        f"turn(s) and {llm.judges} judge(s)")

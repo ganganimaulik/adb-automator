@@ -509,13 +509,62 @@ def _quote(s: str) -> str:
     return f'"{s}"'
 
 
-def render_element(el: Element) -> str:
+#: Row and column names for `zone`. The middle column is unnamed so a
+#: horizontally-centred element reads "@bottom" rather than "@bottom-centre" --
+#: the common case, and the one where the extra word says nothing.
+_ZONE_ROWS = ("top", "mid", "bottom")
+_ZONE_COLS = ("left", "", "right")
+
+
+def zone(el: Element, width: int, height: int) -> str:
+    """Roughly where on the screen this element sits: "top-right", "mid", "bottom".
+
+    The element list carries no geometry at all, and its order is no substitute:
+    `prune` walks the dump in document order, which is *window* order, and which
+    window comes first varies by screen. On a real Settings search screen that
+    put the navigation bar at #1-#5 (y=1504 of 1600) and the status bar at #9-#14
+    (y=0-18) -- the list ran bottom to top. So a model asked for "the icon in the
+    top-right" or "the bottom bar" had nothing correct to reason from and no way
+    to ask.
+
+    Three bands per axis, from the element's centre. Coarse on purpose: the point
+    is to answer "which end of the screen" and "which side", which is what the
+    questions actually turn on, and a finer grid would cost tokens on every
+    element of every turn to answer questions nobody asks. It is also why this
+    reports a zone and not the bounds -- the model is told it can neither see nor
+    set pixels, and handing it four numbers per element invites exactly the
+    coordinate reasoning that rule exists to prevent.
+
+    An element covering nearly the whole frame gets "full" instead: its centre is
+    the middle of the screen, but saying "mid" of a scroller that spans the view
+    would be a claim about position where there is none to make.
+    """
+    if width <= 0 or height <= 0 or el.area <= 0:
+        return ""
+    if el.width >= width * 0.9 and el.height >= height * 0.6:
+        return "full"
+    cx, cy = el.center
+    col = min(2, max(0, int(cx * 3 // width)))
+    row = min(2, max(0, int(cy * 3 // height)))
+    return "-".join(p for p in (_ZONE_ROWS[row], _ZONE_COLS[col]) if p)
+
+
+def render_element(el: Element, width: int = 0, height: int = 0) -> str:
+    """One line of the element list.
+
+    `width`/`height` are the screen's, needed for the `@zone` tag; without them
+    the line is rendered exactly as it was before zones existed, because a zone
+    computed against an unknown frame would be a guess dressed as a fact.
+    """
     parts = [f"#{el.index}", f"[{el.kind()}]"]
     label = el.best_text
     if label:
         parts.append(_quote(label))
     if el.resource_id:
         parts.append(f"id={el.resource_id}")
+    where = zone(el, width, height)
+    if where:
+        parts.append(f"@{where}")
     flags = []
     if el.checkable:
         flags.append(f"checked={'true' if el.checked else 'false'}")
@@ -548,7 +597,7 @@ def render(screen: Screen, limit: int = 80) -> str:
     lines = [header]
     shown = screen.elements[:limit]
     for el in shown:
-        lines.append(render_element(el))
+        lines.append(render_element(el, screen.width, screen.height))
     hidden = len(screen.elements) - len(shown)
     if hidden > 0:
         lines.append(f"... {hidden} more elements not shown (scroll to reach them)")
