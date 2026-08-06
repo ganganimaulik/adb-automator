@@ -1,0 +1,33 @@
+{
+  "name": "Settings",
+  "packages": [
+    "com.android.settings"
+  ],
+  "aliases": [
+    "settings",
+    "system settings",
+    "phone settings"
+  ],
+  "description": "The Android system Settings app. This exploration only reached the profile area and the Developer options screen; the run's actual goal (reading the time from the Clock app) was never achieved because attempts to open the Clock app left the device on the Settings Developer options screen. The current time is, however, always visible in the status bar at the top of Settings screens.",
+  "workflows": [
+    {
+      "name": "read_current_time_from_status_bar",
+      "steps": "Look at the top-left of the status bar on any Settings screen; the current time is shown there (e.g. '4:00 PM') and updates as time passes. If the task only needs the current time, read it from the status bar instead of trying to open a separate Clock app."
+    },
+    {
+      "name": "navigate_developer_options",
+      "steps": "The Developer options screen (title 'Developer options') has a 'Navigate up' arrow at the top-left and a 'Search settings' magnifier at the top-right. The master 'Use Developer options' toggle is at the top. Below it are entries such as 'DSU Loader', 'System UI demo mode', 'Quick settings developer tiles', and 'Grammatical gender', followed by a DEBUGGING section containing 'USB debugging', 'Revoke USB debugging authorisations', 'Wireless debugging', and 'Disable adb authorisation timeout', each with a toggle or a chevron to a sub-screen."
+    }
+  ],
+  "nuances": [
+    "During this run, issuing open_app for 'clock' and even for the explicit package 'com.google.android.deskclock' did not leave the Settings app; the screen stayed on Developer options. Do not assume an open_app call succeeded -- verify the foreground screen after each launch attempt.",
+    "The Developer options screen is a deep screen inside Settings; the top-left control is 'Navigate up', which returns toward the previous Settings screen rather than exiting to another app.",
+    "The status bar clock is visible on Settings screens and reflects the current time, so a task asking for the current time can be satisfied without leaving Settings."
+  ],
+  "recommendations": [
+    "After every open_app action, check which app's screen is actually foreground before proceeding; if the intended app did not open, retry the launch or use an alternative route (e.g. home screen icon) instead of continuing as if it had opened.",
+    "For tasks that only need the current time, read the status bar clock directly rather than attempting to open the Clock app.",
+    "Use the 'Search settings' magnifier at the top-right of Settings screens to jump directly to a specific setting instead of scrolling through long menus like Developer options."
+  ],
+  "custom_prompt": ""
+}

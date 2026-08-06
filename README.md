@@ -80,7 +80,13 @@ Five models are configurable and each is used for one job:
 | `llm.model_image` | reading screenshots |
 | `llm.model_small` | judging whether a `done` claim is true |
 | `llm.model_skill` | `skills generate`: exploring the app and writing the skill (falls back to `llm.model`) |
-| `llm.model_skill_image` | reading the screenshots taken while writing app skills (falls back to `llm.model_image`) |
+| `llm.model_skill_image` | reading the screenshots of a `skills generate` run, the tour as well as the write-up (falls back to `llm.model_image`) |
+
+Name one model for a pair — `llm.model` with `llm.model_image`, or `llm.model_skill`
+with `llm.model_skill_image` — and the screenshot goes straight into the deciding
+call: the model reading the picture is the model deciding, so describing it first
+is a round trip spent having it tell itself what it is looking at. That is
+`llm.vision_in_decider` without the checkbox, and `adbagent doctor` says so.
 
 ## Run
 
@@ -345,8 +351,8 @@ at each step, and the screenshots that were *submitted* to a model —
 `step_004_analyze_image_9f3c1a20.jpg`, named by the step, the call that was shown
 it, and a digest of the bytes, so one frame shown twice is one file. Only
 submitted frames are kept: the screen read on the ~fifth of turns that take a
-screenshot, one per item a sweep reads, and the decision itself when
-`llm.vision_in_decider` is on. The web UI shows each beside the call that saw it.
+screenshot, one per item a sweep reads, and the decision itself when the decider
+is the model doing the looking. The web UI shows each beside the call that saw it.
 `report` replays the events as a readable trace and
 ends with where the time went:
 
@@ -451,7 +457,7 @@ record. A call that was handed a screenshot shows it, thumbnailed under the
 panel and full size on click — and the thumbnail stays after the panel folds,
 because a vision read you cannot check against the frame it read is only half
 the record. It appears on the call that was actually shown the pixels: the
-vision read, or the decision itself when `llm.vision_in_decider` is on. A
+vision read, or the decision itself when the decider is the one looking. A
 sweep's per-item reads have no panel — each is prefetched on another thread, and
 streaming several of those into one view interleaves them — so each arrives as a
 card carrying the line the model read and the frame it read it from, which on a
@@ -754,7 +760,7 @@ adbagent report runs/<id>        # did the reasoning tokens actually drop?
 | `run.stall_replan_at` | `8` | Steps before one call is spent asking for a different approach. |
 | `run.stall_give_up_at` | `14` | Steps before the run stops. The collected data survives. |
 | `run.max_consecutive_failures` | `4` | Actions that *failed* in a row before giving up. Separate from the stall ladder, which counts actions that worked and got nowhere. |
-| `llm.vision_in_decider` | `false` | Set when `llm.model` itself accepts images: the screenshot then goes straight to the deciding call instead of being described first by `llm.model_image` — one round trip per screenshot turn instead of two. Leave off for a text-only model; an image part would fail the whole call. |
+| `llm.vision_in_decider` | `false` | Set when `llm.model` itself accepts images: the screenshot then goes straight to the deciding call instead of being described first by `llm.model_image` — one round trip per screenshot turn instead of two. Leave off for a text-only model; an image part would fail the whole call. Only ever *asserts* the saving: pointing `llm.model` and `llm.model_image` at one model asserts it too, and needs no flag. |
 | `run.always_screenshot` | `false` | Pay for vision on every turn. |
 | `run.never_screenshot` | `false` | Never pay for vision. Disables sweeping, which needs to read items. |
 | `device.settle_budget_s` | `2.0` | How long to wait for the screen to stop changing after an action. Also caps the re-dumping of a frame that holds nothing but the status and nav bars, which is what a dump taken mid-transition returns. |

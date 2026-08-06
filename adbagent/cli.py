@@ -186,6 +186,95 @@ _REASONING_JOBS = (
 )
 
 
+def _check_vision(out: Out, cfg) -> int:
+    """Confirm the models that will be handed images can actually take them.
+
+    Both ways this can be wrong fail quietly, which is why it is worth a network
+    call here rather than a surprise mid-run:
+
+    * `llm.model_image` pointing at a text-only model. `analyze_image` swallows
+      the 400 so the step is not lost, so every screenshot turn spends a call,
+      gets nothing, and carries on -- blind on exactly the turns
+      `needs_screenshot` decided the element tree could not answer.
+    * A deciding model that gets the frame itself but cannot take it. There the
+      400 takes the whole turn with it, and there are two ways in: setting
+      `llm.vision_in_decider`, and naming one model for `llm.model` and
+      `llm.model_image`, which means the same thing (`llm.decider_sees`).
+
+    The catalogue answers both: `supportsImageInput` per model. `llm.model_image`
+    used to be documented as uncheckable for want of exactly this flag; it is
+    there now, so the guesswork can stop.
+
+    Returns the number of problems found. A catalogue that cannot be reached is
+    not one of them -- `doctor` runs on aeroplanes.
+    """
+    from .config import same_model
+    from .llm import PROVIDERS, list_models, qualify
+
+    # Said before the catalogue is fetched, so it is still said on the aeroplane.
+    # Nobody typed this one, and a saving nobody asked for is one nobody thinks
+    # to check for. Both pairs, because `skills generate` resolves its own
+    # (`skills.use_skill_model`) and the config can match on one and not the
+    # other -- which is the common case, one model for the tour and another for
+    # the run.
+    if cfg.llm.decider_sees() and not cfg.llm.vision_in_decider:
+        out.say(out.dim("        (llm.model and llm.model_image name one model, "
+                        "so the screenshot goes straight into the deciding call "
+                        "-- one round trip per screenshot turn, not two)"))
+    if ((cfg.llm.model_skill or cfg.llm.model_skill_image)
+            and same_model(cfg.llm.skill(),
+                           cfg.llm.model_skill_image or cfg.llm.model_image)):
+        out.say(out.dim("        (llm.model_skill and llm.model_skill_image name "
+                        "one model, so a `skills generate` tour goes straight "
+                        "into the deciding call the same way)"))
+
+    provider = PROVIDERS.get(cfg.llm.provider)
+    key = cfg.api_key()
+    if provider is None or not key or not provider.catalogue_url:
+        return 0
+
+    # (config field, the value, why it gets an image)
+    wants_vision = [("llm.model_image", cfg.llm.image(),
+                     "every screenshot turn goes to it")]
+    if cfg.llm.decider_sees():
+        if same_model(cfg.llm.model, cfg.llm.image()):
+            # One model, both jobs. Checking it twice reads as two problems.
+            wants_vision[0] = (
+                "llm.model_image", cfg.llm.image(),
+                "every screenshot turn goes to it -- and it is the deciding "
+                "model too, so the frame rides in the deciding call")
+        else:
+            wants_vision.append(
+                ("llm.model", cfg.llm.model,
+                 "llm.vision_in_decider puts the frame in the deciding call"))
+    if cfg.llm.model_skill_image:
+        wants_vision.append(("llm.model_skill_image", cfg.llm.skill_image(),
+                             "the screenshot pass of skill synthesis"))
+
+    try:
+        catalogue = {qualify(provider, m.id): m for m in list_models(provider, key)}
+    except Exception as exc:  # noqa: BLE001 - offline is not a misconfiguration
+        out.say(out.dim(f"        (could not check vision support: {exc})"))
+        return 0
+
+    problems = 0
+    for field, name, why in wants_vision:
+        if not name:
+            continue
+        info = catalogue.get(qualify(provider, name))
+        if info is None:
+            out.warn(f"{field} = {name} is not in the catalogue -- "
+                     f"cannot confirm it takes images")
+        elif not info.vision:
+            out.bad(f"{field} = {name} does not take images, and {why}")
+            problems += 1
+        else:
+            out.ok(f"{field} takes images ({name.rsplit('/', 1)[-1]})")
+    if problems:
+        out.say("        pick one from: adbagent models --vision")
+    return problems
+
+
 def _report_reasoning(out: Out, cfg) -> None:
     """Print the exact request fields the reasoning setting will send.
 
@@ -328,6 +417,7 @@ def cmd_doctor(args) -> int:
             out.ok(f"small model {cfg.llm.model_small}")
         if cfg.llm.model_image:
             out.ok(f"vision model {cfg.llm.model_image}")
+        problems += _check_vision(out, cfg)
         _report_reasoning(out, cfg)
     else:
         out.warn("no model chosen -- run: adbagent models")
@@ -819,6 +909,20 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             model = kw.get("model", "")
             m_str = f" ({model})" if model else ""
             out.say(out.dim(f"        Vision{m_str}: {result}"))
+
+        elif kind == "vision_unavailable":
+            # Loud, and yellow, because the failure is survivable but the turn is
+            # not what it looks like: the screenshot was taken, paid for, and read
+            # by nobody. `adbagent doctor` names the usual cause.
+            out.say(out.yellow(
+                f"        [Vision] {kw.get('model', '')} did not read the "
+                f"screenshot ({kw.get('error', 'no answer')}). Deciding from the "
+                f"element list alone -- check: adbagent doctor"))
+
+        elif kind == "vision_reread":
+            out.say(out.dim(
+                f"        Vision: value reported unreadable, re-reading at "
+                f"{kw.get('long_edge', 0)}px"))
 
         elif kind == "step":
             action = kw["action"]
@@ -1690,12 +1794,15 @@ def cmd_skills(args) -> int:
         out.say(out.dim(f"  tasks:     {user_tasks or skillmod.DEFAULT_EXPLORE_TASKS}"))
         out.say(out.dim(f"  budget:    up to {cfg.run.max_steps} steps, ${cfg.safety.budget_usd:.2f}"))
         out.say(out.dim(f"  model:     {cfg.llm.skill()} explores and writes the skill"))
-        out.say(out.dim(f"  screens:   {cfg.llm.image()} while exploring, "
-                        f"{cfg.llm.skill_image()} while writing"))
+        out.say(out.dim(f"  screens:   {cfg.llm.skill_image()} reads them, "
+                        "exploring and writing"))
         if blinded:
             out.say(out.dim("             (vision_in_decider off for this run: a skill "
                             "model that cannot see would fail every step it was "
                             "handed a screenshot)"))
+        elif cfg.llm.decider_sees():
+            out.say(out.dim("             (one model for both, so it explores looking "
+                            "at the screenshots itself -- no separate vision call)"))
         out.say()
 
         llm = LLMClient(cfg, run_id=f"skill-{int(time.time())}")

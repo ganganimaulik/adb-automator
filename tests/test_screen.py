@@ -207,3 +207,114 @@ def test_element_kind(cls, expected):
     if expected == "Scroller":
         el.scrollable = True
     assert el.kind() == expected
+
+
+# ---------------------------------------------------------------------------
+# Where on the screen an element is
+# ---------------------------------------------------------------------------
+#
+# The element list used to carry no geometry at all, and its order is no
+# substitute: `prune` walks the dump in *window* order, and which window comes
+# first varies by screen. Measured on a real phone (720x1600), a Settings search
+# screen listed the navigation bar at #1-#5 (y=1504) and the status bar at
+# #9-#14 (y=0-18) -- the list ran bottom to top. A model asked for "the icon in
+# the top-right" or "the bar along the bottom" had nothing correct to reason from.
+
+from adbagent.screen import render_element, zone
+
+
+def _el(left, top, right, bottom):
+    return Element(bounds=(left, top, right, bottom), cls="android.widget.Button",
+                   clickable=True)
+
+
+@pytest.mark.parametrize("bounds,expected", [
+    # Corners, using a 900x1800 frame so the thirds are 300 and 600 wide/tall.
+    ((0, 0, 100, 100), "top-left"),
+    ((800, 0, 900, 100), "top-right"),
+    ((400, 0, 500, 100), "top"),
+    ((0, 1700, 100, 1800), "bottom-left"),
+    ((800, 1700, 900, 1800), "bottom-right"),
+    ((400, 1700, 500, 1800), "bottom"),
+    ((400, 850, 500, 950), "mid"),
+    ((0, 850, 100, 950), "mid-left"),
+    ((800, 850, 900, 950), "mid-right"),
+])
+def test_the_zone_names_which_end_and_which_side(bounds, expected):
+    assert zone(_el(*bounds), 900, 1800) == expected
+
+
+def test_the_middle_column_is_unnamed():
+    """"@bottom", not "@bottom-centre" -- the common case, and the one where the
+    extra word says nothing."""
+    assert zone(_el(400, 1700, 500, 1800), 900, 1800) == "bottom"
+    assert zone(_el(400, 850, 500, 950), 900, 1800) == "mid"
+
+
+def test_an_element_filling_the_frame_is_full_not_mid():
+    """Its centre is the middle of the screen, but calling a scroller that spans
+    the view "mid" would be a claim about position where there is none."""
+    assert zone(_el(0, 0, 900, 1800), 900, 1800) == "full"
+    assert zone(_el(0, 100, 900, 1500), 900, 1800) == "full"
+    # A wide but shallow bar is a real position, not a container.
+    assert zone(_el(0, 1740, 900, 1800), 900, 1800) == "bottom"
+
+
+def test_a_zone_needs_a_frame_to_be_measured_against():
+    """Rendered without the screen size -- as `adbagent dump --detail` does -- the
+    line is exactly what it was before zones existed. A zone computed against an
+    unknown frame would be a guess dressed as a fact."""
+    el = _el(0, 0, 100, 100)
+    el.index = 3
+    assert zone(el, 0, 0) == ""
+    assert zone(el, 900, 0) == ""
+    assert "@" not in render_element(el)
+    assert "@top-left" in render_element(el, 900, 1800)
+
+
+def test_a_zero_area_element_has_no_zone():
+    assert zone(_el(50, 50, 50, 50), 900, 1800) == ""
+
+
+def test_the_render_gives_every_element_a_zone():
+    scr = s(X.settings_screen())
+    lines = render(scr).splitlines()[1:]          # past the header
+    tagged = [l for l in lines if l.startswith("#")]
+    assert tagged
+    assert all("@" in line for line in tagged), [l for l in tagged if "@" not in l]
+
+
+def test_the_zone_is_right_even_when_the_list_order_is_upside_down():
+    """The regression this exists for. Two windows in the dump: the navigation bar
+    first, the app's own content second -- which is the order the real device
+    produced. The indices run bottom to top; the zones must not."""
+    nav_first = X.dump(
+        X.N("android.widget.FrameLayout", (0, X.H - 140, X.W, X.H),
+            rid="nav_bar", package="com.android.systemui", children=[
+                X.N("android.widget.ImageButton", (60, X.H - 130, 200, X.H - 10),
+                    text="Back", rid="back", package="com.android.systemui",
+                    clickable=True)]),
+        X.N("android.widget.FrameLayout", (0, 0, X.W, 200), rid="status",
+            package="com.android.systemui", children=[
+                X.N("android.widget.TextView", (30, 20, 200, 90), text="4:16 PM",
+                    rid="clock", package="com.android.systemui")]))
+    scr = parse(nav_first, width=X.W, height=X.H)
+    by_label = {e.best_text: (e.index, zone(e, scr.width, scr.height))
+                for e in scr.elements}
+
+    back_index, back_zone = by_label["Back"]
+    clock_index, clock_zone = by_label["4:16 PM"]
+
+    assert back_index < clock_index, "fixture must reproduce the inverted order"
+    assert "bottom" in back_zone, back_zone
+    assert "top" in clock_zone, clock_zone
+
+
+def test_the_system_prompt_explains_the_zone_and_distrusts_the_order():
+    """A tag the model is never told about is tokens spent on nothing."""
+    from adbagent import prompts
+    assert "@zone" in prompts.SYSTEM
+    assert "@full" in prompts.SYSTEM
+    assert "never as a measurement" in prompts.SYSTEM
+    # And the thing that made zones necessary in the first place.
+    assert "List order is NOT screen order" in prompts.SYSTEM

@@ -347,3 +347,92 @@ def test_compute_dhash_and_distance():
 
 
 
+# ---------------------------------------------------------------------------
+# Cropping a frame to the region a caller cares about
+# ---------------------------------------------------------------------------
+
+def _banded_jpeg(width=200, height=1000):
+    """A frame with a distinct band top and bottom, like chrome over content."""
+    import io
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, 0, width, int(height * 0.1)], fill="red")       # status bar
+    draw.rectangle([0, int(height * 0.9), width, height], fill="blue")  # nav bar
+    draw.ellipse([40, 400, 160, 600], fill="green")                     # the content
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=90)
+    return buf.getvalue()
+
+
+def test_a_crop_keeps_the_named_fraction():
+    import io
+    from PIL import Image
+
+    frame = _banded_jpeg()
+    out = fp.crop_frac(frame, (0.0, 0.18, 1.0, 0.82))
+    assert out is not None
+    with Image.open(io.BytesIO(out)) as img:
+        assert img.width == 200
+        assert img.height == pytest.approx(1000 * 0.64, abs=2)
+
+
+def test_a_crop_actually_removes_the_chrome():
+    """The point is not the byte count -- it is that the bands are gone. A clock
+    read as an item caption is what this prevents."""
+    import io
+    from PIL import Image
+
+    def dominant(pixel):
+        r, g, b = pixel[:3]
+        if r > 150 and g < 100 and b < 100:
+            return "the status bar"
+        if b > 150 and r < 100 and g < 100:
+            return "the nav bar"
+        return "content"
+
+    frame = _banded_jpeg()
+    assert dominant(Image.open(io.BytesIO(frame)).getpixel((100, 2))) \
+        == "the status bar"                       # it was there to begin with
+
+    out = fp.crop_frac(frame, (0.0, 0.18, 1.0, 0.82))
+    with Image.open(io.BytesIO(out)) as img:
+        edges = [dominant(img.getpixel((100, 2))),
+                 dominant(img.getpixel((100, img.height - 3)))]
+    assert edges == ["content", "content"], edges
+
+
+def test_a_crop_costs_fewer_pixels_than_the_frame():
+    frame = _banded_jpeg()
+    out = fp.crop_frac(frame, (0.0, 0.18, 1.0, 0.82))
+    assert len(out) < len(frame)
+
+
+@pytest.mark.parametrize("bad", [b"", b"\xff\xd8\xff\xdb not a jpeg at all"])
+def test_junk_bytes_crop_to_nothing_rather_than_raising(bad):
+    assert fp.crop_frac(bad, (0.0, 0.18, 1.0, 0.82)) is None
+
+
+def test_a_missing_box_crops_to_nothing():
+    """None means "there is no content region" -- the honest answer is nothing,
+    never the uncropped frame, which the caller asked not to have."""
+    assert fp.crop_frac(_banded_jpeg(), None) is None
+
+
+def test_a_degenerate_box_crops_to_nothing():
+    for box in ((0.0, 0.5, 1.0, 0.5),        # zero height
+                (0.5, 0.0, 0.5, 1.0),        # zero width
+                (0.0, 0.9, 1.0, 0.1)):       # inverted
+        assert fp.crop_frac(_banded_jpeg(), box) is None
+
+
+def test_the_crop_a_sweep_uses_comes_from_the_pager():
+    """Not a box of the agent's own: the sweep is a pager sweep, and the same
+    crop `content_moved` judges movement inside is the one the model reads."""
+    from adbagent.pager import content_box
+    from adbagent.screen import Screen
+
+    box = content_box(Screen(width=1080, height=2400))
+    assert box is not None
+    assert fp.crop_frac(_banded_jpeg(), box) is not None

@@ -538,18 +538,33 @@ def use_skill_model(cfg: Any) -> bool:
     guess (which is made per model family), and the `model_small` / `model_image`
     fallbacks for a config that names neither.
 
-    Returns True when `llm.vision_in_decider` had to be turned off: a model that
-    writes a good skill is not always one that can see, and a text-only model
-    handed an image part fails the whole call rather than the picture -- the trap
-    `llm.model_skill_image` exists for. The screenshot goes the long way round,
-    through `llm.model_image`, instead.
+    `llm.model_skill_image` is repointed the same way, for the same reason: it is
+    the vision model of the skill job, and leaving the exploration reading its
+    screenshots on `llm.model_image` while the write-up reads them on the skill
+    one means the pair the config states for this job is never the pair that
+    runs. With both repointed, `llm.decider_sees()` answers for a skill run
+    exactly as it does for an ordinary one -- name one model for `model_skill`
+    and `model_skill_image` and the tour's screenshots go straight into the
+    deciding call.
+
+    Returns True when the frame stopped riding in the deciding call: a model that
+    writes a good skill is not always one that can see, `llm.vision_in_decider`
+    was set for the model being replaced and says nothing about this one, and a
+    text-only model handed an image part fails the whole call rather than the
+    picture. The screenshot goes the long way round, through the vision model,
+    instead.
     """
     explorer = cfg.llm.skill()
-    blinded = bool(cfg.llm.vision_in_decider) and explorer != cfg.llm.model
+    # Explicit only. `skill_image()` ends its chain at `model`, and "no vision
+    # model is configured at all" is not evidence that the explorer can see --
+    # it would read every text-only config as a matching pair.
+    seer = cfg.llm.model_skill_image or cfg.llm.model_image
+    before = cfg.llm.decider_sees()
+    kept = explorer == cfg.llm.model  # the flag was set for the model staying put
     cfg.llm.model = explorer
-    if blinded:
-        cfg.llm.vision_in_decider = False
-    return blinded
+    cfg.llm.model_image = seer
+    cfg.llm.vision_in_decider = bool(cfg.llm.vision_in_decider and kept)
+    return before and not cfg.llm.decider_sees()
 
 
 def is_app_package(package: str) -> bool:

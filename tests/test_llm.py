@@ -307,6 +307,34 @@ def test_skill_image_falls_back_through_the_vision_model():
                      model_skill_image="skill-vision").skill_image() == "skill-vision"
 
 
+def test_one_model_named_for_deciding_and_for_pictures_sees_for_itself():
+    """Naming the same model twice already says the decider takes images -- the
+    frame was going to it either way. Making that a checkbox as well means the
+    round trip is only saved by whoever knows the checkbox is there."""
+    from adbagent.config import LLMConfig
+
+    assert LLMConfig(model="kimi-k3", model_image="kimi-k3").decider_sees() is True
+    # The two accepted forms of one id (`llm.qualify` takes either).
+    assert LLMConfig(
+        model="kimi-k3",
+        model_image="accounts/fireworks/models/kimi-k3").decider_sees() is True
+
+    assert LLMConfig(model="text-only", model_image="seeing").decider_sees() is False
+    assert LLMConfig(model="text-only", model_image="seeing",
+                     vision_in_decider=True).decider_sees() is True
+
+
+def test_an_unset_vision_model_is_not_a_matching_pair():
+    """The pair is read off `model_image`, not `image()`. `image()` falls back to
+    `model`, so reading it there would call every text-only config a seeing
+    decider -- and an image part fails the whole call, not just the picture."""
+    from adbagent.config import LLMConfig
+
+    cfg = LLMConfig(model="text-only")
+    assert cfg.image() == "text-only"        # the fallback, not a decision
+    assert cfg.decider_sees() is False
+
+
 def test_judge_uses_config_max_tokens(monkeypatch):
     from adbagent.config import Config
     from adbagent.llm import LLMClient
@@ -973,6 +1001,22 @@ def test_a_seeing_decider_gets_the_image_and_skips_the_extra_call(monkeypatch):
     assert "VISUAL SCREEN ANALYSIS" not in seen["messages"][-1]["content"][0]["text"]
 
 
+def test_a_decider_that_is_its_own_vision_model_needs_no_flag(monkeypatch):
+    """`model` and `model_image` naming one model makes the same statement
+    `vision_in_decider` does, so it buys the same round trip: without this the
+    config describes the screenshot to the model that is about to be shown it."""
+    client = _client(monkeypatch, model="kimi-k3", model_image="kimi-k3")
+    seen = _stub_decide(monkeypatch, client)
+
+    client.decide(goal="g", rendered="screen", history=[], width=720,
+                  height=1600, screenshot=b"jpeg-bytes")
+
+    assert client.cfg.llm.vision_in_decider is False   # nobody set it
+    assert seen["analyses"] == 0
+    assert len(_image_parts(seen["messages"])) == 1
+    assert client.needs_vision_pass is False
+
+
 def test_no_screenshot_means_no_image_and_no_analysis(monkeypatch):
     for flag in (False, True):
         client = _client(monkeypatch, vision_in_decider=flag)
@@ -1178,10 +1222,27 @@ def test_a_filled_analysis_renders_one_short_labelled_line_each():
     assert len(rendered) < 150
 
 
-def test_the_vision_prompt_forbids_the_nav_bar_it_kept_describing():
+def test_the_vision_prompt_forbids_the_chrome_it_kept_describing():
+    """Half the old free-prose answers spent a sentence on the nav bar, which is
+    in the element list on every screen and was never what was asked."""
     from adbagent import prompts
-    assert "navigation bar" in prompts.IMAGE_ANALYSIS_SYSTEM
+    assert "navigation buttons" in prompts.IMAGE_ANALYSIS_SYSTEM
     assert "Never describe" in prompts.IMAGE_ANALYSIS_SYSTEM
+
+
+@pytest.mark.parametrize("prompt_name", ["IMAGE_ANALYSIS_SYSTEM",
+                                         "ITEM_READING_SYSTEM"])
+def test_both_vision_prompts_rule_out_the_clock_as_an_answer(prompt_name):
+    """Against a real phone the vision model returned "3:51 PM, 71%, 1" as the
+    reading and the whole tab bar as the item. Both are Android's, not the app's.
+    The tree side of this was fixed by `screen.content_elements`; the pixels kept
+    carrying it, and the earlier wording only forbade the chrome in passing,
+    after the field descriptions."""
+    from adbagent import prompts
+    text = getattr(prompts, prompt_name).lower()
+    assert "clock" in text
+    assert "battery" in text
+    assert "never the answer" in text
 
 
 def test_a_vision_model_that_cannot_hold_the_schema_does_not_fail_the_step(monkeypatch):
@@ -1681,3 +1742,203 @@ def test_the_drop_is_announced_rather_than_silent(monkeypatch):
     payload = next(kw for kind, kw in events if kind == "reasoning_unsupported")
     assert payload["fields"] == ["chat_template_kwargs"]
     assert payload["model"] == client.model
+
+
+# ---------------------------------------------------------------------------
+# A 400 is only the reasoning field's fault when it says so
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("message", [
+    "Extra inputs are not permitted, field: 'chat_template_kwargs'",
+    "Unrecognized request argument supplied: reasoning_effort",
+    "unknown field: thinking",
+    "Additional properties are not allowed",
+])
+def test_a_400_naming_a_field_implicates_reasoning(message):
+    from adbagent.llm import reasoning_implicated
+    assert reasoning_implicated(message)
+
+
+@pytest.mark.parametrize("message", [
+    "This model does not support image inputs",
+    "context length exceeded",
+    "invalid base64 in image_url",
+    "The model accounts/fireworks/models/nope does not exist",
+    # The wording that would reintroduce the bug in a new provider's phrasing.
+    # A bare "not allowed"/"not permitted" in the hint list matches this.
+    "image inputs are not allowed for this model",
+    "images are not permitted on this endpoint",
+])
+def test_a_400_naming_a_different_cause_does_not(message):
+    from adbagent.llm import reasoning_implicated
+    assert not reasoning_implicated(message)
+    assert not reasoning_implicated(message, ["reasoning_effort"])
+
+
+def test_a_field_we_did_not_send_is_not_ours_to_be_blamed_for():
+    """The body says which reasoning fields went out, so a 400 about a different
+    field cannot be pinned on one that was never in the request."""
+    from adbagent.llm import reasoning_implicated
+    # We sent `reasoning_effort`; the provider is complaining about the other one.
+    assert not reasoning_implicated("chat_template_kwargs: bad value",
+                                    ["reasoning_effort"])
+    assert reasoning_implicated("chat_template_kwargs: bad value",
+                                ["chat_template_kwargs"])
+
+
+def test_the_thinking_key_counts_as_its_container():
+    """Providers report the `chat_template_kwargs` convention by the key inside
+    it as often as by the field itself."""
+    from adbagent.llm import reasoning_implicated
+    assert reasoning_implicated('"thinking" is not a valid argument',
+                                ["chat_template_kwargs"])
+
+
+def test_an_unrelated_400_is_not_blamed_on_the_reasoning_field(monkeypatch):
+    """`model_image` pointed at a text-only model is how this was found.
+
+    Fireworks answers the image part with "This model does not support image
+    inputs". That was logged as "rejected reasoning_effort", retried once for
+    nothing, and -- the part that outlived the call -- held against the model in
+    `_rejects_reasoning`, so every later call silently lost its configured depth.
+    """
+    from adbagent.llm import LLMClient, LLMError
+    from openai import APIStatusError
+    import httpx
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = cfg_with(effort="none", hard="high")
+    cfg.llm.model = "deepseek-v4-flash"          # does take reasoning_effort
+    client = LLMClient(cfg)
+
+    sent = []
+
+    def create(**kwargs):
+        sent.append(kwargs.get("extra_body") or {})
+        raise APIStatusError(
+            "This model does not support image inputs",
+            response=httpx.Response(400, request=httpx.Request("POST", "http://x")),
+            body=None)
+
+    monkeypatch.setattr(client._client.chat.completions, "create", create)
+    with pytest.raises(LLMError, match="does not support image inputs"):
+        client._post([{"role": "user", "content": "hi"}], model=client.model,
+                     schema=None, max_tokens=100, purpose="analyze_image")
+
+    assert len(sent) == 1                        # no retry bought for nothing
+    assert "reasoning_effort" in sent[0]         # the field was never the issue
+    assert client.model not in client._rejects_reasoning
+
+
+def test_a_real_rejection_is_still_dropped_and_remembered(monkeypatch):
+    """The narrowing must not cost the behaviour it was narrowing."""
+    client, sent = _rejecting_client(monkeypatch)
+    raw, _ = client._post([{"role": "user", "content": "hi"}],
+                          model=client.model, schema=None, max_tokens=100,
+                          purpose="decide")
+    assert raw == "ok"
+    assert client.model in client._rejects_reasoning
+
+
+# ---------------------------------------------------------------------------
+# A vision pass that failed is not a vision pass that saw nothing
+# ---------------------------------------------------------------------------
+
+def test_an_analysis_is_available_by_default():
+    assert not ScreenAnalysis().unavailable
+    assert not ScreenAnalysis(reading="428 g").unavailable
+
+
+def test_the_failure_flag_stays_out_of_the_schema_the_model_is_held_to():
+    """A private attribute, so the model is never asked to fill it in."""
+    schema = harden_schema(ScreenAnalysis)
+    assert set(schema["properties"]) == {
+        "reading", "item_label", "blocking_dialog", "notable"}
+    assert "_failed" not in str(schema)
+
+
+def test_a_swallowed_vision_failure_is_flagged_not_merely_logged(monkeypatch):
+    """All four fields empty is a legitimate answer -- so it cannot be the signal.
+
+    `needs_screenshot` only asks for an image when the tree cannot answer the
+    question, and its note tells the decider to rely on the image. A failure that
+    reads as "nothing to report" hands the decider that instruction anyway.
+    """
+    client = _client(monkeypatch)
+
+    def post(*a, **kw):
+        raise LLMError("400 from fireworks: This model does not support image inputs")
+
+    monkeypatch.setattr(client, "_post", post)
+    events = []
+    analysis = client.analyze_image(b"jpeg", goal="read the weight",
+                                    on_event=lambda kind, **kw: events.append((kind, kw)))
+
+    assert analysis.unavailable
+    assert analysis.render() == ""               # still nothing to show the model
+    assert "vision_unavailable" in [kind for kind, _ in events]
+
+
+def test_a_vision_pass_that_answers_is_not_flagged(monkeypatch):
+    client = _client(monkeypatch)
+
+    def post(messages, *, model, schema, max_tokens, purpose, **kw):
+        return ('{"reading":"148.50","item_label":"","blocking_dialog":"",'
+                '"notable":""}'), Call(model=model)
+
+    monkeypatch.setattr(client, "_post", post)
+    analysis = client.analyze_image(b"jpeg", goal="read the price")
+    assert not analysis.unavailable
+    assert analysis.reading == "148.50"
+
+
+# ---------------------------------------------------------------------------
+# "Nothing to report" is an answer, and must not be paid for twice
+# ---------------------------------------------------------------------------
+
+def test_an_analysis_that_found_nothing_is_not_recomputed(monkeypatch):
+    """Seen against a real phone in ``runs/9b205cb055b4``: two `analyze_image`
+    calls on one step, 1,663 prompt tokens each, both answering with four empty
+    fields. The agent runs the vision pass itself and passes `render()` down --
+    which is "" whenever the screen held no surprises, and "" read as "nobody
+    looked". None means nobody looked; "" means somebody did."""
+    client = _client(monkeypatch)
+    seen = _stub_decide(monkeypatch, client)
+
+    client.decide(goal="g", rendered="screen", history=[], width=720,
+                  height=1600, screenshot=b"jpeg", image_analysis="")
+
+    assert seen["analyses"] == 0
+    assert "VISUAL SCREEN ANALYSIS" not in seen["messages"][-1]["content"][0]["text"]
+
+
+def test_no_analysis_at_all_still_buys_one(monkeypatch):
+    """The narrowing must not stop the callers that rely on `decide` doing the
+    pass for them -- replay, a bare `decide`."""
+    client = _client(monkeypatch)
+    seen = _stub_decide(monkeypatch, client)
+    client.decide(goal="g", rendered="screen", history=[], width=720,
+                  height=1600, screenshot=b"jpeg")
+    assert seen["analyses"] == 1
+
+
+def test_the_judge_does_not_recompute_an_empty_analysis(monkeypatch):
+    client = _client(monkeypatch)
+    analyses = {"n": 0}
+
+    def analyze_image(screenshot, **kw):
+        analyses["n"] += 1
+        return ScreenAnalysis()
+
+    def structured(messages, model_cls, **kw):
+        return model_cls(satisfied=True, evidence="ok")
+
+    monkeypatch.setattr(client, "analyze_image", analyze_image)
+    monkeypatch.setattr(client, "structured", structured)
+
+    client.judge(goal="g", rendered="screen", history=[], screenshot=b"jpeg",
+                 image_analysis="")
+    assert analyses["n"] == 0
+
+    client.judge(goal="g", rendered="screen", history=[], screenshot=b"jpeg")
+    assert analyses["n"] == 1

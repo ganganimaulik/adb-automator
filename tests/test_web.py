@@ -1221,6 +1221,12 @@ INDEX_HTML = Path(__file__).resolve().parents[1] / \
 #: pass by definition and has no iteration to count.
 DERIVED_ID_OMISSIONS = {"gc-iter", "gc-iter-wrap"}
 
+#: Ids the config form mints at load time -- `cfg-<section>-<key>` from
+#: `CFG_SPEC`, plus what hangs off one -- so the page cannot ship them and the
+#: form rebuilds them on every load. Only those a literal `$()` reaches for need
+#: declaring here; the rest are built from the spec and never spelled out.
+GENERATED_ID_OMISSIONS = {"cfg-llm-vision_in_decider-auto"}
+
 
 def html_ids() -> set:
     return set(re.findall(r'id="([^"]+)"', INDEX_HTML.read_text(encoding="utf-8")))
@@ -1234,7 +1240,7 @@ def test_every_scripted_id_exists_in_the_page():
     """
     js = APP_JS.read_text(encoding="utf-8")
     referenced = set(re.findall(r'\$\("([^"]+)"\)', js))
-    missing = sorted(referenced - html_ids())
+    missing = sorted(referenced - html_ids() - GENERATED_ID_OMISSIONS)
     assert not missing, f"app.js reaches for ids the page does not have: {missing}"
 
 
