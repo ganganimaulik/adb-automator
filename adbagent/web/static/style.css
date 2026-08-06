@@ -183,6 +183,20 @@ button.ghost:hover { background: var(--bg-hover); }
 .chip.no_change, .chip.needs_user { color: var(--yellow); border-color: var(--yellow); }
 .chip.failed, .chip.aborted, .chip.interrupted { color: var(--red); border-color: var(--red); }
 .chip.neutral { color: var(--text-dim); }
+/* Steps since the run last learned anything. Yellow like `no_change`, because
+   that is what it is a count of -- and it is the number the harness escalates
+   on, so a feed where it climbs is a feed worth stopping. */
+.chip.stall { color: var(--yellow); border-color: var(--yellow); }
+
+/* The model's own plan for the goal, on the step that wrote it. Purple, matching
+   the step numbers and the skill banner: context for what follows, not a verdict
+   on what came before. */
+.card .plan {
+  margin: 4px 0 2px;
+  padding-left: 8px;
+  border-left: 2px solid var(--purple);
+  white-space: pre-wrap;
+}
 
 .banner {
   border-radius: 8px;
@@ -250,6 +264,87 @@ button.ghost:hover { background: var(--bg-hover); }
 
 details.card summary { cursor: pointer; color: var(--text-dim); font-size: 12px; }
 details.card summary:hover { color: var(--text); }
+
+/* -- collected data --------------------------------------------------------- */
+
+/* The ledger, under the step that changed it. Green on the edge only: this is
+   the run's product, and a feed of them should read as a column of ledgers
+   rather than a row of alarms. Folded panels are one dim line each, so the
+   history of the collection stays scrollable. */
+.card.notes { border-left: 3px solid var(--green); }
+
+.card.notes summary {
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.card.notes details[open] summary { color: var(--green); margin-bottom: 6px; }
+.card.notes summary:hover { color: var(--text); }
+
+/* Scrolls on its own past a couple of dozen records, so one long ledger cannot
+   push the step that produced it off the screen. */
+.notes-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 340px;
+  overflow-y: auto;
+}
+
+.rec {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--bg);
+}
+
+/* Written or corrected on this step. The rest are what the run already had. */
+.rec.fresh { background: rgba(63, 185, 80, 0.12); }
+
+.rec .k {
+  font-family: var(--mono);
+  color: var(--accent);
+  flex: 0 0 auto;
+  max-width: 240px;
+  overflow-wrap: anywhere;
+}
+
+.rec .v { flex: 1 1 280px; overflow-wrap: anywhere; white-space: pre-wrap; }
+
+/* The value a re-read disagreed with. Kept by the harness rather than
+   overwritten, so it is shown rather than dropped. */
+.rec .was { flex: 1 1 100%; color: var(--text-dim); font-style: italic; }
+
+.notes-note { margin-top: 6px; font-size: 11px; color: var(--yellow); }
+
+/* The model's note on where it is in the goal, above the feed rather than in it:
+   the card that carried it is twenty cards back by the time anyone asks. */
+.progress-note {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--purple);
+  border-radius: 6px;
+  background: var(--bg-raise);
+  padding: 8px 12px;
+  margin: -4px 0 12px;
+  font-size: 13px;
+  white-space: pre-wrap;
+}
+
+.progress-note::before {
+  content: "progress";
+  display: block;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-bottom: 2px;
+}
 
 /* -- live LLM stream -------------------------------------------------------- */
 
