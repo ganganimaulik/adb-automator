@@ -59,6 +59,33 @@ def test_run_uses_the_llm_and_succeeds(cfg, mem):
     assert llm.calls >= 2          # at least one decide plus the completion judge
 
 
+def test_every_turn_is_told_what_day_the_phone_thinks_it_is(cfg, mem):
+    """A goal bounded in time cannot be read without it.
+
+    ``runs/963a4f4ae96c`` -- "check today and yesterday's messages" -- had no
+    date in the prompt at all, and walked a recency-ordered list of chats from
+    today's down through Sunday, Saturday and 27 Jul.
+    """
+    dev = fake.FakeDevice(cfg)
+    _, _, llm = run(dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+
+    # Every decide turn, and the same date on each -- this message sits above
+    # the goal, so a value that moved would evict everything after it.
+    assert llm.dates_seen and set(llm.dates_seen) == {fake.TODAY}
+    # Read once for the run, not once a turn: it is an adb round trip.
+    assert dev.date_reads == 1
+
+
+def test_a_phone_that_will_not_give_its_date_is_not_guessed_for(cfg, mem):
+    """The host clock is not a fallback: it can be a day out, and the prompt
+    states this as fact with nothing on screen to check it against."""
+    dev = fake.FakeDevice(cfg)
+    dev.date = ""
+    _, _, llm = run(dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+
+    assert llm.dates_seen and set(llm.dates_seen) == {""}
+
+
 # ---------------------------------------------------------------------------
 # Completion
 # ---------------------------------------------------------------------------

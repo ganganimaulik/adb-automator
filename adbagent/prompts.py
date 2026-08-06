@@ -30,6 +30,7 @@ exactly what a prefix cache can reuse.
 from __future__ import annotations
 
 import json
+from datetime import date as _date, timedelta as _timedelta
 from typing import Sequence
 
 SYSTEM = """\
@@ -88,7 +89,9 @@ ask_user. Never type credentials yourself.
 - If you cannot see what you need, scroll before concluding it is absent.
 - Set confidence to "low" when you are guessing; you will be given a screenshot \
 on the next turn.
-- Only answer `done` when the goal is genuinely satisfied by what is on screen.
+- Only answer `done` when the goal is genuinely satisfied -- by the screen, or by \
+the records under COLLECTED DATA. A goal to read or report is satisfied by the \
+data, not by the current frame.
 
 DATA COLLECTION
 When the goal asks you to read, collect, extract or report information, put each \
@@ -104,6 +107,13 @@ re-send a record to keep it alive — one record per turn is normal, and an empt
 Important: If you have been scrolling extensively and cannot find a specific \
 piece of information, report `done` with what you DID find and note what was \
 missing. Do NOT scroll indefinitely looking for something that may not exist.
+
+When the goal bounds what to collect -- a time window, a count, a cutoff -- that \
+bound is also your stop condition. In a list ordered on the same axis, the first \
+item outside the bound puts every later item outside too: stop and report what \
+you have rather than opening the rest to confirm. Resolve relative stamps \
+("Today", "Yesterday", a bare weekday name) against the phone's date above \
+before judging an item in or out.
 
 When you are done collecting, set action to "done" and \
 put your final summary in `text`.
@@ -154,7 +164,44 @@ def system_prompt(schema: dict) -> str:
     return SYSTEM + json.dumps(schema, indent=None, sort_keys=True)
 
 
-def device_profile(width: int, height: int, android: str = "", **_kw) -> str:
+#: Weekday names indexed the way `datetime.date.weekday()` counts them. A fixed
+#: table and not `calendar.day_name`, which follows *this host's* locale: the
+#: name has to match the one the app on screen prints, and that is the phone's
+#: business.
+_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+             "Saturday", "Sunday")
+
+
+def date_facts(today: str) -> str:
+    """What day it is, from the phone's ``YYYY-MM-DD``. "" if unreadable.
+
+    Nothing used to tell the model this. A goal that bounds itself in time --
+    "today and yesterday", "since Monday" -- had no anchor at all, and the only
+    date in the prompt was whatever the model had read off the screen itself. In
+    ``runs/963a4f4ae96c`` that goal walked a recency-ordered match list from
+    today's messages down through Sunday, Saturday and 27 Jul, spending 17 of
+    its 31 steps past the window it was asked for and recording nothing from
+    any of them. It had judged those threads out of window correctly; it could
+    not tell that meant it was finished.
+
+    Yesterday is spelled out rather than left as arithmetic: it is the common
+    case, and a month or year boundary makes it more than a string edit.
+
+    The weekday names are half the point. Apps label anything inside the last
+    week with a bare day name -- "Sunday", "Wednesday" -- and the screen never
+    says which week it is counting back from.
+    """
+    try:
+        d = _date.fromisoformat(str(today).strip())
+    except (TypeError, ValueError):
+        return ""
+    y = d - _timedelta(days=1)
+    return (f"Today is {_WEEKDAYS[d.weekday()]} {d.isoformat()} by the phone's "
+            f"clock; yesterday was {_WEEKDAYS[y.weekday()]} {y.isoformat()}")
+
+
+def device_profile(width: int, height: int, android: str = "",
+                   today: str = "", **_kw) -> str:
     """Facts about the phone that hold for the whole run.
 
     Deliberately *not* the foreground package: it changes whenever the goal
@@ -162,10 +209,21 @@ def device_profile(width: int, height: int, android: str = "", **_kw) -> str:
     the history, one app switch used to evict both from the prompt cache. The
     screen block names the current app in its own header, where it belongs --
     next to the elements it describes.
+
+    The date belongs here for the same reason the package does not. It has to
+    sit above the goal -- a goal saying "today" is unreadable without it -- and
+    it is byte-identical for the whole run, so it costs the cache nothing. The
+    *time* stays out for exactly that reason: at minute resolution this message
+    would change every turn and evict the goal, the skill, the history and the
+    screen behind it. The status bar carries the clock in the screen block
+    already, which is a block that changes every turn regardless.
     """
     bits = [f"Device: {width}x{height} px"]
     if android:
         bits.append(f"Android {android}")
+    facts = date_facts(today)
+    if facts:
+        bits.append(facts)
     return " | ".join(bits)
 
 

@@ -287,6 +287,53 @@ def test_device_scroll_gesture_directions_and_duration(capsys):
 
 
 # ---------------------------------------------------------------------------
+# The phone's own clock
+#
+# Read from the device because the timestamps the model reads were rendered by
+# apps in the *phone's* timezone. Whatever comes back is going into the prompt
+# as a stated fact, so it is validated rather than trusted.
+# ---------------------------------------------------------------------------
+
+def _dev_answering(reply):
+    """A `Device` whose shell answers `reply` (or raises it). No phone."""
+    from adbagent.device import Device
+
+    dev = Device.__new__(Device)
+
+    def shell(command, timeout=20.0, allow_meta=False):
+        dev.asked = command
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+    dev.shell = shell
+    dev.asked = ""
+    return dev
+
+
+def test_the_date_comes_from_the_phone():
+    dev = _dev_answering("2026-08-06\n")
+    assert dev.today() == "2026-08-06"
+    # No metacharacters, so it survives `check_shell` on the real path.
+    assert dev.asked == "date +%Y-%m-%d"
+    check_shell(dev.asked)
+
+
+@pytest.mark.parametrize("reply", [
+    "",                              # nothing came back
+    "date: bad date",                # toybox complaining
+    "Thu Aug  6 17:12:34 IST 2026",  # a different format than we asked for
+    "2026-13-45",                    # shaped right, not a date
+    DeviceTimeout("shell exceeded 10s"),
+    RuntimeError("device offline"),
+])
+def test_an_answer_that_is_not_a_date_is_no_date_at_all(reply):
+    """"" and not the host's clock. A wrong date is worse than none: the prompt
+    states it as fact and the model cannot check it against the screen."""
+    assert _dev_answering(reply).today() == ""
+
+
+# ---------------------------------------------------------------------------
 # Teardown
 #
 # `close` runs after the run has already printed its result, so a step that

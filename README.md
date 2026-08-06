@@ -7,9 +7,19 @@ phone until the goal is met.
 $ adbagent run "turn on airplane mode"
     1 tap #12 "Network & internet"
     2 tap #7 "Airplane mode"
+
+  ── Result ──
+
+  Airplane mode is on; the toggle reads Enabled and the status bar shows the
+      aeroplane icon.
+
   SUCCESS  2 steps, 3 LLM calls, $0.0091, 11.4s
   trace: runs/8f21c0a4e1b9 (events.jsonl, run.log, step prompts)
 ```
+
+Every run ends with what it concluded, under its own heading — the answer to
+"read X and tell me" goals, not just the outcome word. `adbagent report` prints
+the same block for a run recorded weeks ago.
 
 It reads the accessibility tree rather than pixels, and only pays for a
 screenshot when the tree cannot answer the question — a WebView, a gallery, a

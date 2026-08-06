@@ -266,6 +266,14 @@ class Watch:
                 sent = len(self.ledger) - self.stats.replies_at_start
                 self.say(f"  pass {self.stats.passes}: {outcome} "
                          f"({sent} repl(ies) sent so far, ${self.stats.usd:.4f})")
+                # What the pass concluded. A watch prints one line per pass by
+                # default, so without this the only thing a night of watching
+                # leaves on the terminal is a column of "success". Safe to read
+                # here: this branch is the one where `agent.run` returned, so
+                # `last_state` is this pass's, not a previous one's.
+                answer = getattr(self.last_state, "result", "")
+                if answer:
+                    self.say(f"    {answer}")
                 if outcome == "needs_user":
                     # Not a failure -- the pass did what it could and stopped for
                     # a human. Said loudly because nobody is watching the log.
