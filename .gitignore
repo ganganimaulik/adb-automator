@@ -66,3 +66,9 @@ Thumbs.db
 
 # personal reply policy -- never commit
 date.md
+
+# Learned app skills. Device- and account-specific: they are written from live
+# runs against this phone's apps and carry whatever those screens said, so they
+# are local state rather than source. `SkillRegistry.load_skills` recreates the
+# directory on a fresh clone, which then learns its own.
+skills/
