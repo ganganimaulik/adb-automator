@@ -60,6 +60,13 @@ log = logging.getLogger("adbagent.watch")
 #: The last line is what makes the cheap probe possible: a pass that ends on the
 #: conversation list leaves an anchor the next probe can compare against, so a
 #: quiet inbox costs one UI dump instead of a model call.
+#:
+#: "Do not start conversations" defers to the policy rather than overriding it.
+#: Flatly forbidding openers here contradicted any policy that wanted one -- and
+#: since `prompts.policy_block` tells the model the policy is what decides what
+#: it sends, the two together produced a coin flip rather than a refusal. The
+#: default is still no: an operator who wants openers has to write that down,
+#: and the deferral is narrow enough that no other rule in this block moves.
 ITERATION_CONTRACT = """\
 This is ONE PASS of a monitoring loop that runs continuously. Do this pass only,
 then stop:
@@ -75,7 +82,8 @@ Rules for this pass:
   - If a send is refused, do not retry it and do not rephrase it. Leave that
     conversation and move on -- the refusal is the harness preventing a duplicate,
     and it is always right.
-  - Do not start conversations with anyone who has not messaged first.
+  - Do not start conversations with anyone who has not messaged first, unless
+    the REPLY POLICY explicitly says to open one. Silence in the policy means no.
   - Finish on the conversation list. The next pass starts from wherever you leave
     the screen."""
 
