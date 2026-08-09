@@ -163,9 +163,30 @@ class DeviceConfig:
     max_depth: int = 40
     #: Drop nodes not marked important-for-accessibility. Much smaller XML.
     compressed: bool = True
-    #: Adaptive settle: re-dump until two consecutive hashes match, or this budget.
-    settle_budget_s: float = 2.0
+    #: Hard ceiling on one adaptive settle. It bounds how long the loop will keep
+    #: re-dumping; it is *not* the thing that decides a screen has settled -- see
+    #: `settle_quiet_s`.
+    #:
+    #: This was 2.0, which is smaller than a single observation over wireless adb
+    #: (~1.2s for the dump alone), so the comparison the settle loop exists to
+    #: make was reached at most once and usually not at all: 95 of ~100 settling
+    #: observations across ``runs/`` logged "screen never settled". Raising it
+    #: costs nothing on a screen that is already still, because that screen
+    #: returns on its first comparison.
+    settle_budget_s: float = 6.0
     settle_interval_s: float = 0.18
+    #: How long two dumps must agree before the screen counts as settled.
+    #:
+    #: Equality alone cannot answer the question. A screen that has drawn its
+    #: chrome and not yet its content is *stably* half-rendered, so two dumps
+    #: 0.18s apart agree on a frame that is not the frame -- which is why the
+    #: model spent 13 of 103 turns (12.6%, ~254s across ``runs/``) choosing a
+    #: `wait` action to re-read a screen the harness had already declared
+    #: settled. Agreement across a wider window is much stronger evidence, and
+    #: measuring it in wall clock makes it self-calibrating: over a slow link the
+    #: dumps themselves span the window and it costs nothing, while over a fast
+    #: one a few more cheap dumps are taken.
+    settle_quiet_s: float = 0.5
     #: How long `open_app` waits for the package to actually reach the foreground.
     #: `app_start` returns before the window exists, and a cold start on a loaded
     #: phone can take several seconds; observing before then reads the launch, not
@@ -251,6 +272,29 @@ class RunConfig:
     #: Give up. The collected data survives -- the CLI prints it, and the
     #: checkpoint keeps it for `--resume`.
     stall_give_up_at: int = 14
+
+    # -- the goal check ----------------------------------------------------
+    #
+    # The ladder above measures whether the run is getting *anywhere*. It cannot
+    # measure whether the run is already *finished*, and nothing else could
+    # either: the completion judge is reachable only through a terminal action
+    # the model volunteers, and `Oracle` needs a condition supplied at launch.
+    # A run whose every action succeeds while the goal has already been met is
+    # invisible to every guard in the file -- ``runs/963a4f4ae96c`` answered its
+    # goal at step 14, ran 24 more steps and 471s, and was killed by hand.
+    #
+    # So every `goal_check_every` steps the harness asks a model, in as many
+    # words, whether the goal is already satisfied. The call is issued while the
+    # loop is blocked on the device anyway, so it costs no wall clock.
+
+    #: Steps between goal checks. 0 switches the check off.
+    goal_check_every: int = 5
+    #: Consecutive satisfied verdicts before the run is ended. Two, not one: this
+    #: is the only guard that ends a run on a model's say-so without the model
+    #: having asked to stop, and a single sample of anything is how a run that
+    #: still had work to do gets cut off. The second opinion is free -- it lands
+    #: in the next step's device round trip.
+    goal_check_hits: int = 2
 
 
 @dataclass

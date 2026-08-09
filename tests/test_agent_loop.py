@@ -753,6 +753,9 @@ def effort(cfg, **kw):
     from adbagent.agent import needs_reasoning
 
     state = RunState(goal="g", run_id="r", intent_id="i")
+    # Mid-run unless the case says otherwise: the opening turn is hard by its own
+    # clause, and a default of step 0 would make every case here look hard.
+    state.step = 5
     for key, value in kw.items():
         if key not in ("visit", "blocked", "hint"):
             setattr(state, key, value)
@@ -777,10 +780,29 @@ def test_a_failure_buys_deeper_thinking(cfg):
     assert "did not work" in why
 
 
-def test_a_new_screen_buys_deeper_thinking(cfg):
-    chosen, why = effort(deep(cfg), visit=0)
+def test_a_new_screen_does_not_buy_deeper_thinking(cfg):
+    """Novelty is the default state of exploring, not evidence of difficulty.
+
+    This clause used to fire on 57 of 103 decide calls across ``runs/`` -- 78% of
+    every escalation, ~430s, 17.5% of all wall clock -- and it was pointed the
+    wrong way: on a run walking a set, the novel screens are the items ("read it,
+    then go back") while the screen the run keeps *returning* to is the index,
+    which is the only screen it can stop from.
+    """
+    assert effort(deep(cfg), visit=0) == ("none", "")
+
+
+def test_a_screen_the_run_keeps_returning_to_buys_deeper_thinking(cfg):
+    chosen, why = effort(deep(cfg), visit=2)
     assert chosen == "high"
-    assert "not been seen before" in why
+    assert "3 times" in why
+
+
+def test_the_opening_turn_is_hard_on_its_own_account(cfg):
+    """One turn per run, not fifty-seven."""
+    chosen, why = effort(deep(cfg), step=1)
+    assert chosen == "high"
+    assert "first step" in why
 
 
 def test_saying_it_was_unsure_buys_deeper_thinking(cfg):
@@ -823,9 +845,10 @@ def test_the_first_step_of_a_run_is_always_a_hard_one(cfg, mem, tmp_path):
 def test_a_settled_walk_runs_shallow(cfg, mem, tmp_path):
     """Revisiting a screen that has caused no trouble costs the floor.
 
-    Every step here succeeds, so the only escalations are the two first sightings
-    -- and coming back to a screen already walked is the routine case the shallow
-    default exists for.
+    Every step here succeeds, so the only escalation is the opening turn -- the
+    one that picks the approach. Walking into a screen for the first time used to
+    escalate too, which is how 73 of 103 decide calls across ``runs/`` ended up at
+    `high` on a ladder documented as "shallow by default".
     """
     deep(cfg)
     dev = fake.FakeDevice(cfg)
@@ -848,9 +871,10 @@ def test_a_settled_walk_runs_shallow(cfg, mem, tmp_path):
 
     decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
     shown = [(e["step"], e["effort"], e["hard_because"]) for e in decides]
-    assert decides[0]["effort"] == "high", shown    # the opening screen is new
-    assert decides[1]["effort"] == "high", shown    # so is the one it lands on
-    # Back on a screen already walked, with nothing amiss: the floor.
+    assert decides[0]["effort"] == "high", shown    # the turn that picks the approach
+    # Everything after it is routine, including the screen it had never seen.
+    assert decides[1]["effort"] == "none", shown
+    assert decides[1]["hard_because"] == "", shown
     assert decides[2]["effort"] == "none", shown
     assert decides[2]["hard_because"] == "", shown
 
@@ -1141,6 +1165,225 @@ def test_a_replan_that_abandons_ends_the_run_there(cfg, mem, tmp_path):
     assert replans and replans[-1]["abandon"] is True
     # It stopped on the replan rather than running on to the give-up tier.
     assert "stalled_out" not in [e["kind"] for e in _events(tmp_path, state.run_id)]
+
+
+def test_rewording_the_progress_note_does_not_buy_the_run_more_time(cfg, mem, tmp_path):
+    """The model must not hold the reset switch of the guard that bounds it.
+
+    `_loop` used to call `note_progress` whenever `action.progress` differed from
+    the previous turn's, compared as a raw string. Measured across ``runs/``: the
+    field was present on 76 of 103 turns and its text changed on 72 of them, so
+    70% of all steps reset the ladder on model prose alone -- and `stalled` never
+    once exceeded 3 against block=5, replan=8, give_up=14. In
+    ``runs/c1d57cc79d9c`` steps 18-22 the "Done:" clause is byte-identical five
+    turns running while only the "Next:" clause is reworded.
+    """
+    cfg.run.max_steps = 60
+    dev = fake.FakeDevice(cfg)
+    inner = _two_cycle_policy(dev)
+    reworded = iter(f"Done: nothing. Next: attempt number {n}" for n in range(1, 500))
+
+    def policy(screen, llm):
+        action = inner(screen, llm)
+        # Same two-cycle as ever, plus a fresh progress sentence every turn.
+        return action.model_copy(update={"progress": next(reworded)})
+
+    outcome, state = Agent(dev, mem, llm := fake.FakeLLM(dev, policy), cfg).run(GOAL)
+
+    assert outcome == "failed"
+    kinds = [e["kind"] for e in _events(tmp_path, state.run_id)]
+    assert "stalled_out" in kinds, "rewording the progress note kept the run alive"
+    assert state.step < 20, f"took {state.step} steps to notice"
+    # The note itself is still working memory and still reaches the model.
+    assert state.progress_log and "attempt number" in state.progress_log[0]
+
+
+def test_one_stall_episode_can_buy_more_than_one_replan(cfg, mem, tmp_path):
+    """`replanned_at` counts steps, not stall depth.
+
+    Holding the stall value meant that after a first fire at stalled=8 the next
+    needed stalled>=16 -- and `stall_give_up_at`=14 ends the run first, so one
+    replan per run was the structural maximum.
+    """
+    cfg.run.max_steps = 80
+    cfg.run.stall_replan_at = 3
+    cfg.run.stall_give_up_at = 40
+    cfg.run.stall_block_at = 0          # let the cycle run rather than refusing it
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
+    Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert llm.replans >= 2, (
+        f"a stall lasting {cfg.run.stall_give_up_at} steps bought only "
+        f"{llm.replans} replan(s)")
+
+
+def test_the_agreed_strategy_survives_the_run_getting_somewhere(cfg, mem):
+    """A plan outlives the turn that asked for it.
+
+    `note_progress` used to clear `strategy`, and `strategy` reached the prompt
+    only through `stall_note`, which renders only while `stalled >=
+    stall_nudge_at`. Between them the new approach was deleted by the first step
+    it succeeded on -- so it was visible exactly while it was not working.
+    """
+    from adbagent.agent import RunState
+
+    state = RunState(goal=GOAL, run_id="r", intent_id="i")
+    state.strategy = "open Bluetooth from the list instead"
+    state.steps_since_progress = 7
+
+    state.note_progress("it reached a screen it had not seen before")
+
+    assert state.steps_since_progress == 0
+    assert state.strategy == "open Bluetooth from the list instead"
+
+
+def test_the_strategy_is_its_own_block_and_not_part_of_the_stall_note(cfg, mem):
+    """The two have different lifetimes, so they cannot share a render.
+
+    The stall note describes a condition that is true right now; a strategy is a
+    decision that outlives the condition that bought it. Rendered from inside
+    `stall_note` it appeared only while `stalled >= stall_nudge_at`.
+    """
+    from adbagent import prompts
+
+    note = prompts.stall_note(9, tried=[("tap/#7", 4)], refused=["tap/#7"])
+    assert "open Bluetooth" not in note
+    assert prompts.strategy_block("") == ""
+
+    carried = prompts.strategy_block("open Bluetooth from the list instead")
+    assert "open Bluetooth from the list instead" in carried
+    assert "NO PROGRESS" not in carried
+
+    # And the loop actually renders it.
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
+    llm.replan_strategy = "open Bluetooth from the list instead"
+    Agent(dev, mem, llm, cfg).run(GOAL)
+    assert any("AGREED NEW APPROACH" in n for n in llm.notes), \
+        "the strategy never reached the prompt"
+
+
+def test_every_turn_is_told_where_it_stands_against_its_budget(cfg, mem):
+    """Nothing used to say, on any of the 105 decide prompts in ``runs/``.
+
+    SYSTEM tells the model not to search "indefinitely" while giving it no
+    measurement of how long it has been going. Over nine runs `fail` was chosen
+    zero times and `ask_user` zero times, and the run that never terminated had
+    512 steps of budget left when a human killed it.
+    """
+    cfg.run.max_steps = 25
+    dev = fake.FakeDevice(cfg)
+    _, _, llm = run(dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+
+    assert llm.budgets, "no turn was shown a budget"
+    assert all("BUDGET:" in b for b in llm.budgets), llm.budgets
+    assert "step 1 of 25" in llm.budgets[0]
+    assert "step 2 of 25" in llm.budgets[1]
+
+
+def test_the_budget_line_says_nothing_before_the_first_step():
+    from adbagent import prompts
+
+    assert prompts.budget_line(0, 60, 0.0) == ""
+    assert "step 3 of 60" in prompts.budget_line(3, 60, 0.0)
+    # No ceiling configured: still says where it is, claims no limit it lacks.
+    assert "of" not in prompts.budget_line(3, 0, 0.0).split(".")[0]
+    assert "2m 5s elapsed" in prompts.budget_line(3, 60, 125.0)
+
+
+# ---------------------------------------------------------------------------
+# The goal check
+# ---------------------------------------------------------------------------
+#
+# The ladder above measures whether the run is getting anywhere. Nothing
+# measured whether it was already finished: the completion judge is reachable
+# only through a terminal action the model volunteers, and `Oracle` needs a
+# condition supplied at launch. `runs/963a4f4ae96c` graded 26 of 27 actions
+# `success`, tripped no guard, answered its goal at step 14, and then ran 24 more
+# steps and 471s before being killed by hand.
+
+
+def _never_stops_policy(dev):
+    """A run that works perfectly and never volunteers `done`."""
+    def policy(screen, llm):
+        if dev.state == "home":
+            el = next(e for e in screen.elements
+                      if e.best_text == "Wi-Fi" and e.interactive)
+            return AgentAction(observation="the settings list",
+                               reasoning="open Wi-Fi", action="tap",
+                               target={"index": el.index},
+                               notes=[{"key": f"reading {llm.calls}",
+                                       "value": "something new"}])
+        return AgentAction(observation="the Wi-Fi screen",
+                           reasoning="go back", action="press_key", key="back")
+    return policy
+
+
+def test_a_run_that_has_already_met_its_goal_is_stopped(cfg, mem, tmp_path):
+    cfg.run.max_steps = 60
+    cfg.run.goal_check_every = 2
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, _never_stops_policy(dev))
+    llm.goal_check_result = True
+
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert outcome == "success"
+    assert state.step < 12, f"ran {state.step} steps past being finished"
+    checks = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "goal_check"]
+    assert checks and checks[-1]["satisfied"] is True
+    # The answer survives: this path has no `done` text and never will, so the
+    # collected data is what the caller is given.
+    assert state.result, "the run ended with no answer"
+    assert state.evidence
+
+
+def test_one_satisfied_verdict_is_not_enough_to_stop_a_run(cfg, mem, tmp_path):
+    """The only guard that ends a run on a model's say-so without being asked to.
+
+    A single sample of anything is how a run that still had work to do gets cut
+    off, so the verdicts have to be consecutive.
+    """
+    cfg.run.max_steps = 30
+    cfg.run.goal_check_every = 1
+    cfg.run.goal_check_hits = 2
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, _never_stops_policy(dev))
+    # Satisfied once, then it changes its mind, then never again.
+    llm.goal_check_result = lambda step: step == 2
+
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert outcome != "success" or state.step > 3, \
+        "a single satisfied verdict ended the run"
+    assert llm.goal_checks > 3
+
+
+def test_the_goal_check_is_off_by_default_for_a_run_that_is_working(cfg, mem):
+    """It must not change a run that ends on its own."""
+    cfg.run.goal_check_every = 2
+    dev = fake.FakeDevice(cfg)
+    outcome, state, llm = run(dev, mem, cfg,
+                              fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    assert outcome == "success"
+    assert llm.goal_check_result is False
+    assert state.goal_check_hits == 0
+
+
+def test_a_goal_check_that_fails_never_loses_the_run(cfg, mem):
+    """It is an optimisation on a loop that already terminates on its budgets."""
+    cfg.run.max_steps = 20
+    cfg.run.goal_check_every = 1
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+
+    def boom(**kwargs):
+        raise RuntimeError("the checker fell over")
+
+    llm.goal_check = boom
+    outcome, _ = Agent(dev, mem, llm, cfg).run(GOAL)
+    assert outcome == "success"
 
 
 def test_a_run_that_keeps_learning_is_never_nudged(cfg, mem):

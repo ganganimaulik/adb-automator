@@ -30,6 +30,7 @@ import adbutils
 import uiautomator2 as u2
 from PIL import Image
 
+from .background import Prefetch
 from .config import Config
 from .fingerprint import attach
 from .screen import Screen, parse
@@ -386,6 +387,8 @@ class _Restore:
     screen_off_timeout: Optional[str] = None
     accelerometer_rotation: Optional[str] = None
     user_rotation: Optional[str] = None
+    #: `cmd window fixed-to-user-rotation`: "default", "enabled" or "disabled".
+    fixed_to_user_rotation: Optional[str] = None
 
 
 #: Wall-clock ceiling on the whole of `Device.close`, shared across its steps.
@@ -539,6 +542,13 @@ class Device:
         self._restore.screen_off_timeout = get("system", "screen_off_timeout")
         self._restore.accelerometer_rotation = get("system", "accelerometer_rotation")
         self._restore.user_rotation = get("system", "user_rotation")
+        # Reads back as "default", "enabled" or "disabled"; anything else (an
+        # older build with no such subcommand) leaves this None and `restore`
+        # then leaves the setting alone.
+        mode = (self._safe(lambda: self.shell(
+            "cmd window fixed-to-user-rotation", timeout=10)) or "").strip()
+        if mode in ("default", "enabled", "disabled"):
+            self._restore.fixed_to_user_rotation = mode
 
     def _setting_get(self, namespace: str, key: str) -> Optional[str]:
         out = self._safe(lambda: self.shell(f"settings get {namespace} {key}", timeout=10))
@@ -563,8 +573,31 @@ class Device:
                 self.shell(f"settings put global {key} {saved}", timeout=10)
 
     def _disable_auto_rotate(self) -> None:
+        """Pin the display to portrait, including against the app's own wishes.
+
+        The two `settings put` calls set the *user's* rotation preference, and
+        that is all they set. An app that declares
+        ``android:screenOrientation="landscape"`` in its manifest, or calls
+        `setRequestedOrientation()`, overrides the preference outright -- which
+        is why the screen still turned over on video players, games and camera
+        views with auto-rotate apparently off. Observed on this phone:
+        `accelerometer_rotation=0`, `user_rotation=0` and
+        `mUserRotationMode=USER_ROTATION_LOCKED`, and alongside them
+        ``mFixedToUserRotation=false``, which is the window manager saying it
+        will still honour whatever an app asks for.
+
+        `cmd window fixed-to-user-rotation enabled` is the switch that closes
+        that door: with it set, the display keeps the user rotation and app
+        orientation requests are ignored. Verified on the device -- the flag
+        flips to ``mFixedToUserRotation=true`` and reads back as ``enabled``.
+
+        Best-effort, like everything else here: the subcommand is not on every
+        Android build, and a phone without it is no worse off than before.
+        """
         self._safe(lambda: self.shell("settings put system accelerometer_rotation 0", timeout=10))
         self._safe(lambda: self.shell("settings put system user_rotation 0", timeout=10))
+        self._safe(lambda: self.shell(
+            "cmd window fixed-to-user-rotation enabled", timeout=10))
 
     def _restore_auto_rotate(self) -> None:
         if not self.cfg.device.disable_auto_rotate:
@@ -577,6 +610,13 @@ class Device:
             self.shell(
                 f"settings put system user_rotation "
                 f"{self._restore.user_rotation}", timeout=10)
+        # Put the override back the way it was found, whatever that was --
+        # leaving a phone unable to rotate for anything is a worse trace to
+        # leave behind than any of the settings above.
+        if self._restore.fixed_to_user_rotation:
+            self._safe(lambda: self.shell(
+                f"cmd window fixed-to-user-rotation "
+                f"{self._restore.fixed_to_user_rotation}", timeout=10))
 
 
     def _restore_ime(self) -> None:
@@ -667,8 +707,37 @@ class Device:
                                            max_depth=self.cfg.device.max_depth),
             self.cfg.device.watchdog_s, "dump_hierarchy")
 
+    #: Where `dumpsys activity activities` names the app in front. Two spellings
+    #: because the field was renamed across Android releases and both are still
+    #: in the wild; whichever matches first wins.
+    _RESUMED = (
+        re.compile(r"topResumedActivity=ActivityRecord\{\S+\s+\S+\s+([^/\s]+)/(\S+?)[\s}]"),
+        re.compile(r"mResumedActivity:\s+ActivityRecord\{\S+\s+\S+\s+([^/\s]+)/(\S+?)[\s}]"),
+    )
+
     def current_app(self) -> Tuple[str, str]:
-        """(package, activity). Uses the adb path, which survives a dead server."""
+        """(package, activity) of whatever is in front.
+
+        Measured on the real phone: `u2.app_current()` takes **12-13s** here,
+        against 0.55s for a whole hierarchy dump. It routes through adbutils,
+        which runs `dumpsys window windows` and then, when its regex misses,
+        two more dumpsys calls. Run directly the same query costs 0.7-2.5s, so
+        the twelve seconds are the library path rather than the device.
+
+        It was also wrong. Asked back to back, this returned
+        ``com.google.android.gms/.update.SystemUpdateActivity`` -- which is what
+        was actually on screen -- while `u2.app_current()` answered
+        ``com.bumble.app``, an app that had been in front several minutes
+        earlier. So the cheap path is the accurate one too, and u2 is kept only
+        as the fallback for a device whose dumpsys output neither pattern
+        matches.
+        """
+        out = self._safe(lambda: self.shell("dumpsys activity activities",
+                                            timeout=15)) or ""
+        for pattern in self._RESUMED:
+            found = pattern.search(out)
+            if found:
+                return found.group(1), found.group(2)
         try:
             info = _guard(lambda: self.u2.app_current(), 15, "app_current")
             return info.get("package", ""), info.get("activity", "")
@@ -692,7 +761,14 @@ class Device:
         """
         budget = self.cfg.device.settle_budget_s
         interval = self.cfg.device.settle_interval_s
+        quiet = self.cfg.device.settle_quiet_s
         deadline = time.monotonic() + budget
+
+        # One foreground lookup for the whole observation, started now so it runs
+        # under the dumps rather than after them, and collected once at the end.
+        # It used to run per sample, which is how a settling observation came to
+        # cost 25s of which 24 were this question asked two or three times.
+        pending = Prefetch(self.current_app)
 
         screen = self._observe_once()
         while screen.chrome_only and time.monotonic() < deadline:
@@ -701,34 +777,117 @@ class Device:
         if screen.chrome_only:
             # Out of budget. Nothing better is coming, so hand it over rather
             # than block; `activity` is the only clue left about what is in front.
+            screen = self._stamp_foreground(screen, pending)
             log.debug("dump held nothing but system chrome after %.1fs (activity %s)",
                       budget, screen.activity or "?")
             return screen
         if not settle:
-            return screen
+            return self._stamp_foreground(screen, pending)
 
-        while time.monotonic() < deadline:
+        # When the screen stopped changing. Not when this settle started: the
+        # question is how long the *current* frame has held, and every time the
+        # screen changes that clock restarts.
+        stable_since = time.monotonic()
+        # The comparison runs at least once however slow the link is. The
+        # deadline used to gate entry to the first comparison as well, and over
+        # wireless adb a single observation already outlasted the whole budget --
+        # so the rule this loop exists to apply was never once evaluated, and it
+        # returned its first sample while logging that the screen never settled.
+        compared = False
+        while not compared or time.monotonic() < deadline:
             time.sleep(interval)
             nxt = self._observe_once()
+            compared = True
             # A frame of nothing is not a stable state, and it must not reset the
             # comparison either: the two real frames either side of it are what
             # this loop is here to match.
             if nxt.chrome_only:
                 continue
-            if nxt.exact_id == screen.exact_id:
-                return nxt
+            # `settle_id`, not `exact_id`. The latter carries every element's
+            # bounds verbatim, so one pixel of residual animation anywhere makes
+            # two frames of the same settled screen compare unequal, and the
+            # comparison could never succeed at all. See `fingerprint.settle_id`.
+            if nxt.settle_id == screen.settle_id:
+                # Agreement is necessary and not sufficient. A screen that has
+                # drawn its chrome and not yet its content agrees with itself
+                # 0.18s later, and handing that back is what the model was
+                # answering with a `wait` action. Requiring the agreement to span
+                # `settle_quiet_s` is what tells "finished" from "not started".
+                if time.monotonic() - stable_since >= quiet:
+                    return self._stamp_foreground(nxt, pending)
+            else:
+                stable_since = time.monotonic()
             screen = nxt
         log.debug("screen never settled within %.1fs", budget)
-        return screen
+        return self._stamp_foreground(screen, pending)
 
     def _observe_once(self) -> Screen:
-        xml = self.dump()
-        package, activity = self.current_app()
-        screen = parse(xml, width=self._size[0], height=self._size[1],
-                       activity=activity)
+        """One dump, parsed and fingerprinted. No foreground lookup.
+
+        The foreground is a property of the *observation*, not of each sample a
+        settle takes, and it used to be fetched per sample. On this phone that
+        was 12-13s of the 13s an observation cost, against 0.55s for the dump
+        itself -- so a settling observation, which takes two or more samples,
+        spent 25s almost entirely on a question it had already asked. See
+        `Device.current_app` for why the call was that slow.
+
+        Nothing here needs it. `parse` already sets `screen.package` from the
+        `package` attribute the dump puts on every node (`_dominant_package`),
+        and the only reader of the fetched package was a fallback for a dump that
+        parsed to nothing. `observe` handles that case once, at the end.
+        """
+        screen = parse(self.dump(), width=self._size[0], height=self._size[1])
+        self._reorient(screen)
+        return attach(screen)
+
+    def _reorient(self, screen: Screen) -> None:
+        """Keep the frame dimensions honest when the display has turned over.
+
+        `_size` is read once, in `open`, and every dump is parsed against it. A
+        rotation therefore used to leave the rest of the run describing a
+        portrait frame while the phone was in landscape: the screen header the
+        model reads (`screen 1080x2340 rot=1`) contradicted itself, and every
+        `@zone` tag -- which is computed from these numbers and is the only
+        positional cue the element list has -- was derived from the wrong axis,
+        so "@top" named the side of the screen.
+
+        The dump states its own rotation, so no device round trip is needed to
+        notice or to correct it: portrait and landscape differ by a swap. Done
+        before `attach`, because `element_keys` folds the zone into every key.
+
+        This is a backstop, not the fix. `_disable_auto_rotate` is what is meant
+        to stop the rotation happening at all; this is what keeps the run
+        coherent on a build where that did not take.
+        """
+        landscape = screen.rotation in (1, 3)
+        if not self._size[0] or landscape == (self._size[0] > self._size[1]):
+            return
+        self._size = (self._size[1], self._size[0])
+        screen.width, screen.height = self._size
+        log.warning("display is now %s (rot=%d); frame is %dx%d",
+                    "landscape" if landscape else "portrait",
+                    screen.rotation, *self._size)
+
+    def _stamp_foreground(self, screen: Screen, pending) -> Screen:
+        """Apply the foreground lookup to the screen an observation settled on.
+
+        `activity` is decoration -- a line in the screen header and two strings in
+        `skills` -- and no identity hash reads it (`app_key` is never called with
+        `include_activity=True`), so stamping it after `attach` changes nothing
+        that has already been computed. `package` is different: it feeds
+        `app_key` and therefore `skeleton_id`, so a screen that gains one has to
+        be fingerprinted again.
+        """
+        if pending is None:
+            return screen
+        package, activity = pending.result(default=("", ""),
+                                           timeout=self.cfg.device.watchdog_s)
+        if activity:
+            screen.activity = activity
         if package and not screen.package:
             screen.package = package
-        return attach(screen)
+            return attach(screen)
+        return screen
 
     def screenshot(self, max_long_edge: int = 1280, quality: int = 82) -> bytes:
         """A JPEG, downscaled on the device where possible.

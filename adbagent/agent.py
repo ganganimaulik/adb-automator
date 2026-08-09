@@ -148,9 +148,13 @@ class RunState:
     paging: bool = False
     #: Skeleton the `paging` evidence was gathered on; leaving it clears them.
     last_skeleton: str = ""
-    #: ``#N`` of the target the paging gesture was aimed at, so the loop detector
-    #: can tell "repeating the thing that works" from "stuck".
-    repeatable_index: int = 0
+    #: `Element.key` of the target the paging gesture was aimed at, so the loop
+    #: detector can tell "repeating the thing that works" from "stuck". The key
+    #: and not the ``#N``: the signatures it is matched against are content-keyed
+    #: now (see `actions.AgentAction.signature`), and an ordinal would silently
+    #: never match -- which would withdraw the exemption from the one element it
+    #: exists for.
+    repeatable_key: str = ""
     #: The gesture observed to page, e.g. ``("swipe", "left")``.
     paging_gesture: Tuple[str, str] = ("", "")
     #: ``exact_id/label`` of the control the harness last auto-dismissed, and how
@@ -168,16 +172,27 @@ class RunState:
     steps_since_progress: int = 0
     #: What reset it last, for the log, the events and the stall note.
     last_progress: str = "the run started"
-    #: The approach a `replan` call handed back. Carried in the prompt until
-    #: progress resumes, because a plan outlives the turn that asked for it --
-    #: which is the whole reason the replan asks for a plan and not an action.
+    #: The approach a `replan` call handed back. Carried in the prompt from the
+    #: turn it arrives until the next replan supersedes it or the run ends -- a
+    #: plan outlives the turn that asked for it, which is the whole reason the
+    #: replan asks for a plan and not an action.
+    #:
+    #: It used to be deleted by `note_progress` and rendered only while
+    #: `stalled >= stall_nudge_at`, which between them gave it a lifetime of at
+    #: most one successful step: the approach that started working erased itself
+    #: the moment it did.
     strategy: str = ""
-    #: `steps_since_progress` when the last replan ran, so one stall episode
-    #: buys one replan rather than one every turn it persists.
+    #: `step` at the last replan, so one stall episode buys one replan rather
+    #: than one every turn it persists. Counted in steps and not in stall depth:
+    #: as a stall value it made a second replan need `stalled >= 2 *
+    #: stall_replan_at`, which `stall_give_up_at` ends the run before reaching.
     replanned_at: int = 0
     #: Screens already re-read at full resolution. One sharper look per screen:
     #: see `Agent._reread_sharper` for why a second cannot help.
     rereads: set = field(default_factory=set)
+    #: Consecutive "the goal is already met" verdicts. Reset by the first verdict
+    #: that disagrees -- see `Agent._finish_goal_check`.
+    goal_check_hits: int = 0
 
     @property
     def elapsed(self) -> float:
@@ -186,15 +201,35 @@ class RunState:
     def note_progress(self, reason: str) -> None:
         """Record that the run just learned something; reset the stall ladder.
 
-        The strategy goes with it. It was bought to break a stall, and a run
-        that is moving again should not keep being told to abandon the approach
-        that started working -- if it stalls a second time the next replan sees
-        the newer situation anyway.
+        Only the harness may call this, and only about something it watched
+        happen -- a screen it had not seen, a record that entered the ledger,
+        content that moved under a gesture, a device setting that flipped. What
+        it must never be is a report the model writes about itself.
+
+        It used to be exactly that. `_loop` called it whenever `action.progress`
+        differed from the previous turn's, compared as a raw string, so any
+        rewording passed. Measured across ``runs/``: the `progress` field was
+        present on 76 of 103 turns and its text changed on 72 of them, so the
+        model was resetting the ladder on 70% of all steps -- every tier of it,
+        since all four read `steps_since_progress`. In ``runs/c1d57cc79d9c``
+        steps 18-22 the "Done:" clause is byte-identical five turns running while
+        the "Next:" clause is reworded ("return to Chats list" -> "close profile
+        card" -> "back to Chats list" -> "exit preview" -> "open Tinder"); nothing
+        was accomplished and the ladder was reset five times. Across all nine
+        runs `stalled` never once exceeded 3, against block=5, replan=8,
+        give_up=14 -- so three of the four tiers had never run at all.
+
+        The `progress` field is still in the prompt and still the model's working
+        memory. It just no longer buys time.
+
+        The strategy no longer goes with it. It was bought to break a stall and
+        it used to be deleted by the first flicker of novelty after it -- so an
+        approach that produced one new screen erased itself before the turn that
+        would have followed it. It is superseded by the next replan, or it ends
+        with the run.
         """
         self.steps_since_progress = 0
         self.last_progress = reason
-        self.strategy = ""
-        self.replanned_at = 0
 
     def remember(self, entry: str) -> None:
         """Add a history line, folding it into the previous one if it repeats it.
@@ -383,9 +418,29 @@ def needs_reasoning(state: RunState, cfg: Config, *, visit: int,
 
     But *some* turns are genuinely hard, and the cost of getting those wrong is a
     wasted run. The loop already knows which: it knows the last action failed, it
-    knows this screen is new, it knows a loop was detected, and it knows the model
-    said it was guessing. So the depth follows the evidence rather than a global
-    setting -- shallow by default, deep the moment anything is off.
+    knows a loop was detected, and it knows the model said it was guessing. So the
+    depth follows the evidence rather than a global setting -- shallow by default,
+    deep the moment anything is off.
+
+    **"Shallow by default" was not what happened.** A sixth clause used to
+    escalate on `visit == 0` -- a screen not seen before in this run -- and that
+    is not evidence of difficulty, it is the default state of exploring. Measured
+    across ``runs/``: 73 of 103 decide calls ran at `high`, and 57 of those 73
+    (78%) fired on that clause alone. Only 30 turns took the shallow default the
+    docstring describes. Re-pricing those 57 turns at each model's own measured
+    `none` latency puts the clause at ~430s across nine runs -- 17.5% of all wall
+    clock, and 37% of every second spent on the model.
+
+    It was also inverted. On a run walking a set, the novel screens are the items
+    (where the decision is "read it, then go back") and the *repeated* screen is
+    the index -- which is the only screen from which stopping is available. In
+    ``runs/963a4f4ae96c`` all six "open the next conversation" decisions, the ones
+    that could have ended a run that never terminated, were taken at effort=none
+    on a screen visited seven times, while "tap Exit chat" ran at `high`.
+
+    So novelty is out and return-visits are in: a screen the run keeps coming back
+    to while the goal is unfinished is where the branch decision lives. It is also
+    far rarer -- 7 of 27 steps in that run, against 62 of 103 for novelty.
 
     Returns ("", "") when the feature is switched off, which is the default:
     `llm.reasoning_effort` has to be set before any of this applies.
@@ -404,12 +459,21 @@ def needs_reasoning(state: RunState, cfg: Config, *, visit: int,
         reason = "the last action was rejected"
     elif state.want_screenshot:
         reason = "the model said it was unsure last turn"
-    elif visit == 0:
-        reason = "this screen has not been seen before in this run"
+    elif state.step <= 1:
+        # The opening turn picks the whole approach, and it is exactly one turn
+        # per run. `visit == 0` used to cover this as a side effect and charged
+        # for 56 other turns to do it.
+        reason = "this is the first step, which chooses the approach"
     elif blocked:
         reason = "actions here are already known to lead nowhere"
     elif hint:
         reason = "the loop detector has something to say"
+    elif visit >= 2:
+        # The screen the run keeps returning to. On a goal that walks a set this
+        # is the index, and the index is the only place the decision "open the
+        # next one, or stop" can be taken -- so it is the one screen worth
+        # thinking about. Weakest clause, so anything above it wins.
+        reason = f"this screen has been reached {visit + 1} times in this run"
 
     if reason:
         return cfg.llm.effort_for("decide", hard=True), reason
@@ -948,10 +1012,16 @@ class Agent:
                 refused = {sig for sig, n in state.loops.tried_on(screen.skeleton_id)
                            if n >= 2}
 
+            # `replanned_at` counts steps, not stall depth. It used to hold the
+            # *stall value* at the last replan, so after one fire at stalled=8 the
+            # next needed stalled>=16 -- and `stall_give_up_at`=14 is checked
+            # above, which ends the run first. One replan per run was therefore
+            # the structural maximum, and a stall that a single new approach did
+            # not break could never buy a second.
             if (limits.stall_replan_at and self.llm is not None
                     and stalled >= limits.stall_replan_at
-                    and stalled - state.replanned_at >= limits.stall_replan_at):
-                state.replanned_at = stalled
+                    and state.step - state.replanned_at >= limits.stall_replan_at):
+                state.replanned_at = state.step
                 if self._replan(state, rec, screen, stalled) is False:
                     return
 
@@ -1064,7 +1134,7 @@ class Agent:
             # the same claim without the guess.
             elem_hint = state.loops.element_history_hint(
                 screen.skeleton_id,
-                repeatable=state.repeatable_index if state.paging else 0)
+                repeatable=state.repeatable_key if state.paging else "")
             # Advice that only applies sometimes lives here rather than in the
             # system prompt: this block is rebuilt every turn anyway, so varying
             # it is free, whereas varying the system message evicts the whole
@@ -1080,7 +1150,13 @@ class Agent:
             if limits.stall_nudge_at and stalled >= limits.stall_nudge_at:
                 stall_text = prompts.stall_note(
                     stalled, tried=state.loops.tried_on(screen.skeleton_id),
-                    refused=sorted(refused), strategy=state.strategy)
+                    refused=sorted(refused))
+            # The agreed approach rides in its own block rather than inside the
+            # stall note, so it survives the stall dropping back under the nudge
+            # threshold. Inside `stall_note` it was visible only while
+            # `stalled >= stall_nudge_at`, so the turn after the new approach
+            # produced anything, the approach itself vanished from the prompt.
+            strategy_note = prompts.strategy_block(state.strategy)
             # `skill_note` is deliberately not in here: it goes to its own
             # message above the history instead, because it changes per app
             # rather than per turn. See `prompts.skill_block`.
@@ -1092,10 +1168,18 @@ class Agent:
             if self.ledger is not None:
                 handled_note = prompts.handled_block(
                     [st.preview for st in self.ledger.recent() if st.preview])
-            notes = "\n\n".join(filter(None, (note, vision_note, stall_text,
+            # Ordered least specific first, so specificity increases toward the
+            # answer. It used to run the other way: `situational` -- the two
+            # standing blocks of generic advice, 63% of all NOTE text across
+            # ``runs/`` and identical on every turn that carries them -- was last,
+            # i.e. the final thing read before answering, while `last_failure`,
+            # the one sentence about what just happened on this screen, was
+            # eighth of ten.
+            notes = "\n\n".join(filter(None, (situational, handled_note,
+                                             note, vision_note,
                                              pager_note, hint, elem_hint,
-                                             ban_note, state.last_failure,
-                                             handled_note, situational)))
+                                             ban_note, strategy_note,
+                                             stall_text, state.last_failure)))
             effort, hard_because = needs_reasoning(
                 state, cfg, visit=visit,
                 blocked=bool(banned_actions or remembered), hint=hint)
@@ -1120,6 +1204,12 @@ class Agent:
                 scratchpad=state.scratchpad.render(cfg.run.scratchpad_max_chars),
                 progress="\n".join(state.progress_log), skill=skill_note,
                 policy=self.policy,
+                # Where the run is against its ceilings. Nothing used to say --
+                # not one of the 105 decide prompts in ``runs/`` carries a step
+                # number or an elapsed time, while SYSTEM tells the model not to
+                # search "indefinitely". See `prompts.budget_line`.
+                budget=prompts.budget_line(state.step, cfg.run.max_steps,
+                                           state.elapsed),
                 # `is not None`, not truthiness: a pydantic model is always truthy
                 # so this happened to be right, but the distinction it relies on
                 # is between "the pass ran" and "it did not". `decide` reads "" as
@@ -1222,11 +1312,14 @@ class Agent:
             # observation is what there is when the decider has its own eyes and
             # there was no separate pass.
             # -- accumulate progress ----------------------------------------
+            # Kept as working memory and handed back next turn. It deliberately
+            # does NOT call `note_progress`: this is the model's report about
+            # itself, and letting a rewrite of it reset the stall ladder put the
+            # model in charge of the guard that is supposed to bound it. See
+            # `RunState.note_progress`.
             if getattr(action, "progress", None):
                 prog_text = action.progress.strip()
                 if prog_text:
-                    if state.progress_log[:1] != [prog_text]:
-                        state.note_progress("it updated its own progress note")
                     state.progress_log = [prog_text]
 
             rec.event("decide", step=state.step, source=source,
@@ -1403,6 +1496,15 @@ class Agent:
                 continue
             self.on_event("act_end", step=state.step, action=action, elapsed=time.monotonic() - t0_act)
 
+            # ---- 6b. is the run already finished? ------------------------
+            # Started here and collected after the settle below, so it runs
+            # inside a device round trip the loop was going to wait through
+            # regardless -- ~7s at the median, against a check that needs no
+            # screenshot and no device access of its own. It is the only guard
+            # that can end a run because the *goal* is met rather than because
+            # the run is failing; see `config.RunConfig.goal_check_every`.
+            checking = self._start_goal_check(state, rec, screen)
+
             # ---- 7. verify (no LLM) -------------------------------------
             self.on_event("settle_start", step=state.step, budget=cfg.device.settle_budget_s)
             t0_verify = time.monotonic()
@@ -1464,8 +1566,8 @@ class Agent:
                 state.content_moved = pager_content_moved(screen, after)
                 if state.content_moved and after.skeleton_id == screen.skeleton_id:
                     state.paging = True
-                    state.repeatable_index = (element.index if element is not None
-                                              else 0)
+                    state.repeatable_key = (element.key if element is not None
+                                            else "")
                     state.paging_gesture = (action.action, action.direction)
 
             self.on_event("verify_end", step=state.step, elapsed=t_settle, grade=outcome.grade, reason=outcome.reason)
@@ -1526,18 +1628,54 @@ class Agent:
                                  or (element is not None and element.checkable)):
                 state.note_progress("it changed something on the device")
 
-            if not outcome.ok:
+            # A wait that changed nothing is neither a success nor a failure: it
+            # did exactly what it was asked and the screen was already final. So
+            # it moves `consecutive_failures` in neither direction.
+            #
+            # It used to move it *down*. `verify` graded wait/sleep `success`
+            # unconditionally, so a wait cleared `consecutive_failures` and
+            # `last_failure` -- and a fail/wait alternation could therefore never
+            # reach `max_consecutive_failures`, nor trip the deeper-thinking and
+            # take-a-screenshot triggers, which key on the same counter. That is
+            # the one guard bypass in the loop, and 13 of 103 turns across
+            # ``runs/`` were waits. It must not swing the other way either: in a
+            # read-only goal the run can sit on one screen recording what is on
+            # it, and those turns are progress, not failures.
+            passive_noop = (action.action in ("wait", "sleep")
+                            and outcome.grade == "no_change")
+            if not outcome.ok and not passive_noop:
                 state.consecutive_failures += 1
                 state.last_failure = f"{action.describe()} failed: {outcome.reason}"
                 state.want_screenshot = True
-                self.mem.record_dead_end(screen, state.intent_id,
-                                         action.signature(), outcome.reason)
+                # Only `no_change` earns a cross-run dead end. It is the one
+                # grade that means "this control did nothing"; a `hard_fail` is a
+                # statement about a postcondition, and this ledger is read back
+                # for 24 hours as "do not repeat them" on every future run
+                # against this screen and intent.
+                #
+                # It was writing both, and half of what it had learned was wrong.
+                # Of the six rows in `memory.db`, two are provably false and both
+                # are `input_text` postconditions comparing what was typed to
+                # what the accessibility tree renders: `'Hey hottie ...'` against
+                # `'Hey hottie ..'`, because the dumper renders the emoji as two
+                # dots, and `'tugain eva price'` against
+                # `'google.com/search?q=tugain+eva+price'`, because Chrome had
+                # already accepted the text and navigated. Both actions worked.
+                # In ``runs/c1d57cc79d9c`` the false entry was then replayed into
+                # the prompt on steps 18, 20 and 22 of the same run.
+                if outcome.grade == "no_change":
+                    self.mem.record_dead_end(screen, state.intent_id,
+                                             action.signature(), outcome.reason)
 
-            if outcome.ok:
+            if outcome.ok and not passive_noop:
                 state.consecutive_failures = 0
                 state.last_failure = ""
                 state.loops.consecutive_backs = 0
             if outcome.grade == "no_change":
+                # The ban still applies to a no-op wait. Waiting once on a screen
+                # that turns out to be finished is reasonable; waiting on it a
+                # second time is the thing to refuse, and this is the machinery
+                # that already refuses it.
                 if action.action not in ("scroll", "swipe"):
                     state.loops.ban(screen.skeleton_id, action.signature())
                 if action.action in ("scroll", "swipe"):
@@ -1554,6 +1692,21 @@ class Agent:
                             f"the content, so that gesture no longer advances "
                             f"here. Try the opposite direction, or leave this "
                             f"screen.")
+                        # The evidence for `paging` has just been refuted, so the
+                        # flag goes with it. It was cleared only by leaving the
+                        # screen, and while it stood, `element_history_hint`
+                        # granted the pager exemption -- "repeating it is correct.
+                        # Do not substitute a different index for it" -- about the
+                        # very gesture the sentence above has just declared dead.
+                        # In ``runs/963a4f4ae96c`` step 31 carried that exemption,
+                        # this reversal instruction, and SCROLLING_ADVICE's "do not
+                        # reverse" in one message: three orders about one element,
+                        # two of them contradictory. The model reversed, and bought
+                        # six more steps and 133s re-reading a conversation the
+                        # sweep had already dated.
+                        state.paging = False
+                        state.repeatable_key = ""
+                        state.paging_gesture = ("", "")
                     else:
                         state.last_failure = (
                             f"{act_name} {action.direction} did not reveal new "
@@ -1575,6 +1728,12 @@ class Agent:
             self._maybe_give_up(state)
             screen = after
 
+            # ---- 8b. collect the goal check ------------------------------
+            # After `remember`, so a verdict that ends the run is reported
+            # against a history that already contains the step it was taken on.
+            if self._finish_goal_check(state, rec, checking, after):
+                return
+
             # ---- 9. keep going, if the rest is mechanical ----------------
             # The model has just chosen to page through a set and the item moved.
             # Repeating that decision in code costs a vision read per item
@@ -1588,6 +1747,89 @@ class Agent:
                                           element)
                 if swept is not None:
                     screen = swept
+
+    # -- is the goal already met? -------------------------------------------
+
+    def _start_goal_check(self, state: RunState, rec: Recorder,
+                          screen: Screen) -> Optional[Prefetch]:
+        """Ask, in the background, whether the run is already finished.
+
+        Returns the in-flight call, or None when this step is not a checking
+        step. The caller collects it after the device round trip it was started
+        in front of, so the whole thing is bought with latency already spent.
+
+        Deliberately *not* gated on the run looking stuck. The failure this
+        exists for is the opposite one -- ``runs/963a4f4ae96c`` graded 26 of 27
+        actions `success`, never repeated itself, tripped no guard, and spent 65%
+        of its 726s past the point its goal was answered. A run that is working
+        perfectly is exactly the run nothing else can stop.
+        """
+        every = self.cfg.run.goal_check_every
+        if not every or self.llm is None or state.step % every:
+            return None
+        # No screenshot: this asks about the record the run has built, not about
+        # the frame it is on, and a vision pass would put it on the critical path
+        # it is designed to stay off.
+        rendered = render(screen)
+        history = list(state.history)
+        scratchpad = state.scratchpad.plain(self.cfg.run.scratchpad_max_chars)
+        progress = "\n".join(state.progress_log)
+        step = state.step
+        return Prefetch(lambda: self.llm.goal_check(
+            goal=state.goal, history=history, rendered=rendered,
+            scratchpad=scratchpad, progress=progress, step=step, recorder=rec))
+
+    def _finish_goal_check(self, state: RunState, rec: Recorder,
+                           checking: Optional[Prefetch],
+                           screen: Screen) -> bool:
+        """Collect the verdict. True when it ended the run.
+
+        A verdict that does not arrive, or that fails, is simply dropped -- this
+        is an optimisation on top of a loop that already terminates on its own
+        budgets, and a run must never be lost to the call sent to bound it.
+        """
+        if checking is None:
+            return False
+        verdict = checking.result(default=None,
+                                  timeout=self.cfg.llm.read_timeout)
+        if verdict is None:
+            return False
+        if not verdict.satisfied:
+            # One unsatisfied verdict withdraws the whole case. The hits have to
+            # be consecutive, or a single yes early on would sit there waiting
+            # for a second one fifty steps later and end the run then.
+            state.goal_check_hits = 0
+            rec.event("goal_check", step=state.step, satisfied=False,
+                      evidence=verdict.evidence)
+            return False
+
+        state.goal_check_hits += 1
+        need = max(1, self.cfg.run.goal_check_hits)
+        rec.event("goal_check", step=state.step, satisfied=True,
+                  hits=state.goal_check_hits, need=need,
+                  evidence=verdict.evidence)
+        if state.goal_check_hits < need:
+            log.info("step %d: the goal looks met (%d/%d) -- %s",
+                     state.step, state.goal_check_hits, need, verdict.evidence)
+            return False
+
+        log.info("step %d: the goal is already met; stopping -- %s",
+                 state.step, verdict.evidence)
+        self.on_event("loop_warning",
+                      message=f"step {state.step}: the goal is already met; "
+                              f"stopping")
+        state.evidence = verdict.evidence
+        # The answer is whatever the run collected. There is no `done` text on
+        # this path and never will be -- the model did not ask to stop -- so
+        # without this a caller would get the outcome word and no answer, which
+        # is the hole `RunState.result` exists to close.
+        state.result = (state.scratchpad.plain(self.cfg.run.scratchpad_max_chars)
+                        or "\n".join(state.progress_log)
+                        or verdict.evidence)
+        state.remember(f"{state.step}. the harness stopped the run: the goal was "
+                       f"already met ({verdict.evidence})")
+        state.finished = "success"
+        return True
 
     # -- repeating a gesture that works -------------------------------------
 

@@ -29,11 +29,14 @@ Three rules do most of the work:
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import unicodedata
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .screen import Element, Screen
+from .screen import Element, Screen, zone
+
+log = logging.getLogger("adbagent.fingerprint")
 
 HASH_BYTES = 8  # 64-bit, hex-encoded
 
@@ -196,7 +199,30 @@ def normalize_verb_polarity(goal: str) -> str:
 GRID_X = 16
 GRID_Y = 16
 GRID_W = 8
-MAX_DEPTH = 12
+#: Elements nested deeper than this contribute nothing to `skeleton_id` or
+#: `simhash`. It must track `DeviceConfig.max_depth`, which is what the dumper
+#: was told to keep, and it did not: this was 12 against a dumper keeping 40, so
+#: there was a 28-level band of elements that were dumped, pruned, rendered to
+#: the model and tappable while contributing nothing to screen identity.
+#:
+#: On a tree deeper than the old limit the filter did not merely coarsen the
+#: hash, it emptied it. `skeleton_tokens` returned the empty tuple and
+#: `skeleton_id` degenerated to a digest of (package, rotation) alone -- one
+#: value for the whole app. Reproduced against this module: wrap a lone button
+#: and a six-row scroller-plus-toggle in 13 layers of `FrameLayout` and the two
+#: hash the same. Compose, React Native and Flutter all nest past 12 routinely,
+#: and in ``runs/2ca3fe0c2e62`` (Zepto) one skeleton covered a blank loading
+#: frame, the loaded home screen, the home screen under an overlay, and a
+#: 108-element search grid -- which is why step 14's prompt recited "previous
+#: actions on this screen" naming elements that were never on it.
+#:
+#: Everything keyed on `skeleton_id` inherited that: `state.visits` and the
+#: novelty signal, the per-screen ban list, `LoopDetector.tried_on`,
+#: `element_history_hint`, and the 24-hour cross-run `dead_end` rows.
+#:
+#: Depth is not what bounds the hash -- `REPEAT_CAP` is. Raising this does not
+#: make the token list unbounded.
+MAX_DEPTH = 40
 REPEAT_CAP = 3
 
 
@@ -301,6 +327,54 @@ def skeleton_tokens(screen: Screen) -> Tuple[str, ...]:
     return tuple(sorted(ordered))
 
 
+#: Characters of the element key shown to the model and stored in a signature.
+#: Four hex characters is 65,536 buckets against a screen of ~30 elements, and a
+#: collision inside one screen is broken by the ordinal folded in below -- so the
+#: length only has to make two *different* screens' keys unlikely to coincide.
+KEY_CHARS = 4
+
+
+def element_keys(screen: Screen) -> None:
+    """Stamp `Element.key`: what an element *is*, not where it landed in the list.
+
+    Everything the loop remembers about an element is keyed on
+    `AgentAction.signature()`, and that resolved to the bare ordinal -- `tap/#13`
+    -- because `Target.describe()` prefers `index` and, measured across
+    ``runs/``, all 72 targets the model ever produced were index-only. An ordinal
+    is a position in one dump's `prune` output, and `prune` walks the tree in
+    window order, which is not stable between dumps of the same screen.
+
+    Measured over the 105 decide prompts in ``runs/``: of the 405 resource-ids
+    seen more than once within a single run, 192 (47%) appeared under more than
+    one `#N`. `id=back` -- the Android back button, which never moves -- took 13
+    different ordinals in ``runs/c1d57cc79d9c``, and `id=navigationView` was #1
+    at step 7 and #4 at every step after it in ``runs/963a4f4ae96c``.
+
+    So a ban earned by `tap/#4` was not applied when the same control was next
+    listed as #1, and *was* applied to whatever else landed on #4. The same key
+    backs `LoopDetector.attempts`, the per-screen ban list, the stall-tier refusal
+    set, the pager exemption, and the 24-hour cross-run `dead_end` rows.
+
+    The key is built from four things that already exist and none of which is app
+    or language specific: the element's kind, its normalised resource-id, its
+    masked text, and its `@zone`. Elements that agree on all four -- the rows of a
+    list, a strip of unlabelled icons -- are then separated by their ordinal
+    *among that group*, which is stable as long as the group is, and is the best
+    that can be done for elements the harness genuinely cannot tell apart.
+    """
+    groups: Dict[str, int] = {}
+    for el in screen.elements:
+        base = "|".join((
+            el.kind(),
+            rid_norm(el.resource_id),
+            mask_text(el.best_text),
+            zone(el, screen.width, screen.height),
+        ))
+        n = groups.get(base, 0)
+        groups[base] = n + 1
+        el.key = _digest(base, str(n))[:KEY_CHARS]
+
+
 def _digest(*parts: str) -> str:
     h = hashlib.blake2b(digest_size=HASH_BYTES)
     for p in parts:
@@ -317,6 +391,16 @@ def app_key(screen: Screen, include_activity: bool = False) -> str:
 
 def skeleton_id(screen: Screen, tokens: Optional[Sequence[str]] = None) -> str:
     toks = tokens if tokens is not None else skeleton_tokens(screen)
+    if not toks and screen.content_elements:
+        # A skeleton with no tokens is not a screen identity -- it is a digest of
+        # the package name, and every screen of that app collides on it. It must
+        # never pass silently: everything keyed on `skeleton_id` (visits, bans,
+        # `tried_on`, `dead_end` rows) would then be pooling unrelated screens.
+        # `MAX_DEPTH` tracking the dumper's own depth is what makes this
+        # unreachable in practice; this says so out loud if it ever is not.
+        log.warning("screen identity is degenerate: %d content element(s) and no "
+                    "skeleton tokens (deeper than MAX_DEPTH=%d?)",
+                    len(screen.content_elements), MAX_DEPTH)
     # Rotation belongs in identity: a landscape layout is a different layout, and
     # an anchor learned in portrait would resolve to the wrong place.
     return _digest(app_key(screen), str(screen.rotation), "\x1f".join(toks))
@@ -344,8 +428,56 @@ def exact_id(screen: Screen) -> str:
     hash carrying every element's bounds differs on nearly every visit to a
     live screen; see `safety.LoopDetector`.
     """
+    return _exact_parts(screen, grid=0)
+
+
+#: How far a bound may drift between two dumps and still count as the same
+#: frame, in pixels. Chosen against what the two things being told apart
+#: actually do. Residual layout jitter -- a ripple finishing, a row settling, an
+#: image swapping in at a rounded height -- moves an element by one or two
+#: pixels. A list still under the finger moves by hundreds between samples taken
+#: `settle_interval_s` (0.18s) apart, and even a slow fling covers far more than
+#: this. So the gap between "noise" and "still moving" is two orders of
+#: magnitude wide, and any threshold inside it works; 16 sits in the middle and
+#: is smaller than the smallest tappable target Android allows (48dp).
+SETTLE_GRID = 16
+
+
+def settle_id(screen: Screen) -> str:
+    """`exact_id` with the bounds quantised. The "has the screen stopped moving" hash.
+
+    `exact_id` hashes `str(el.bounds)` verbatim, which is right for its own job --
+    change detection wants to notice everything -- and fatal for this one. A
+    single pixel of drift anywhere on the screen mints a fresh `exact_id`, and
+    `Device.observe(settle=True)` returns only when two consecutive dumps agree,
+    so on any screen with residual animation the comparison could never succeed.
+
+    Measured across the nine runs in ``runs/``: 95 of roughly 100 settling
+    observations logged ``screen never settled``, i.e. the loop essentially never
+    converged. It exhausted its whole budget on every step, spent an extra dump
+    per step doing it -- a dump is ~1.2s over wireless adb -- and then handed
+    back whatever the last sample happened to be, which on a moving screen is a
+    frame whose element bounds the next tap is aimed at.
+
+    Quantising fixes both halves. Two frames that differ only by jitter now hash
+    the same, so a settled screen is recognised on the second sample; two frames
+    of a list still in motion still differ, because a scroll moves content by far
+    more than `SETTLE_GRID`.
+    """
+    return _exact_parts(screen, grid=SETTLE_GRID)
+
+
+def _exact_parts(screen: Screen, grid: int) -> str:
+    """The element-by-element hash behind `exact_id` and `settle_id`.
+
+    One function, because the two hashes must agree on *what* they look at.
+    They differ only in how precisely a bound is read, and a copy of this loop
+    that drifted from the other would make a screen settle that had not.
+    """
     parts: List[str] = [app_key(screen), str(screen.rotation)]
     for el in screen.content_elements:
+        bounds = (tuple(v // grid for v in el.bounds) if grid > 0
+                  else el.bounds)
         parts.append("|".join((
             class_eq(el.cls),
             el.resource_id,
@@ -355,7 +487,7 @@ def exact_id(screen: Screen) -> str:
             "1" if el.checked else "0",
             "1" if el.selected else "0",
             "1" if el.enabled else "0",
-            str(el.bounds),
+            str(bounds),
         )))
     return _digest(*parts)
 
@@ -563,11 +695,13 @@ def crop_frac(image_bytes: bytes, box_frac: Sequence[float],
 
 def attach(screen: Screen) -> Screen:
     """Compute and attach every fingerprint level. Mutates and returns."""
+    element_keys(screen)
     tokens = skeleton_tokens(screen)
     screen.tokens = tokens
     screen.skeleton_id = skeleton_id(screen, tokens)
     screen.simhash = simhash(screen)
     screen.exact_id = exact_id(screen)
+    screen.settle_id = settle_id(screen)
     if screen.screenshot and screen.dhash is None:
         screen.dhash = compute_dhash(screen.screenshot)
     # `pager.attach_item` used to run here, stamping a per-item identity onto the

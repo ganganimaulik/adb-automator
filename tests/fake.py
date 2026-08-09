@@ -239,6 +239,13 @@ class FakeLLM:
         self.calls = 0
         self.judges = 0
         self.judge_result = judge_result
+        #: How often the harness asked "is the goal already met?", and with what.
+        self.goal_checks = 0
+        self.goal_checks_seen: List[tuple] = []
+        #: What that check answers. False by default, so a test that is not about
+        #: this feature runs exactly as it did. May be a callable taking the step
+        #: number, for a run that becomes finished part-way through.
+        self.goal_check_result = False
         self.model = "fake/model"
         self.model_small = "fake/model-small"
         self.model_image = "fake/model-image"
@@ -247,6 +254,9 @@ class FakeLLM:
         self.notes: List[str] = []
         #: The rendered collected-data ledger as each turn saw it.
         self.scratchpads: List[str] = []
+        #: The budget line each turn was shown -- where the run stood against its
+        #: ceilings. Nothing carried this before; see `prompts.budget_line`.
+        self.budgets: List[str] = []
         #: Item labels the sweep asked to have read, in order.
         self.reads_requested: List[str] = []
         #: How many separate vision passes were made, and what they return.
@@ -321,9 +331,11 @@ class FakeLLM:
     def decide(self, *, goal: str, rendered: str, history, width: int, height: int,
                package: str = "", today: str = "", screenshot: Optional[bytes] = None,
                note: str = "", scratchpad: str = "",
-               progress: str = "", image_analysis: Optional[str] = None, **kwargs) -> AgentAction:
+               progress: str = "", budget: str = "",
+               image_analysis: Optional[str] = None, **kwargs) -> AgentAction:
         self.calls += 1
         self.dates_seen.append(today)
+        self.budgets.append(budget)
         if screenshot:
             self.seen_screenshots += 1
             # `is None`, mirroring the real client: "" means a pass ran and found
@@ -366,6 +378,31 @@ class FakeLLM:
             image_analysis = self.analyze_image(screenshot, goal=goal, rendered=rendered)
         return Verdict(satisfied=self.judge_result,
                        evidence="fake judge" if self.judge_result else "not yet")
+
+    def goal_check(self, *, goal: str, history=(), rendered: str = "",
+                   scratchpad: str = "", progress: str = "", step: int = 0,
+                   **kwargs) -> Verdict:
+        """"Is the run already finished?", asked mid-run by the harness.
+
+        Answers `goal_check_result`, which defaults to False -- the same default
+        the real prompt is written around, and the one that leaves every test not
+        interested in this feature behaving exactly as it did.
+
+        Counted separately from `calls`. The point of this check is that it costs
+        no wall clock because it runs inside a device round trip, and a test
+        asserting how many *reasoning turns* a goal took must not have those
+        numbers moved by it.
+        """
+        self.goal_checks += 1
+        self.goal_checks_seen.append((step, scratchpad))
+        self.ledger.record(Call(model=self.model, prompt_tokens=600,
+                                completion_tokens=30, purpose="goal_check"))
+        satisfied = self.goal_check_result
+        if callable(satisfied):
+            satisfied = satisfied(step)
+        return Verdict(satisfied=bool(satisfied),
+                       evidence=("everything the goal asked for is recorded"
+                                 if satisfied else "there is more to collect"))
 
 
 

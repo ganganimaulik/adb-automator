@@ -160,6 +160,11 @@ class Element:
         """Whatever a human would call this element."""
         return self.text or self.content_desc or self.label or self.hint
 
+    #: A short hash of what this element *is* -- its kind, resource-id, text,
+    #: rough position -- rather than where it happened to land in the list.
+    #: Stamped by `fingerprint.attach`; see `fingerprint.element_keys`.
+    key: str = ""
+
     @property
     def is_system_chrome(self) -> bool:
         """Drawn by the OS, not by the app: the status bar and the nav bar."""
@@ -220,6 +225,10 @@ class Screen:
     skeleton_id: str = ""
     simhash: int = 0
     exact_id: str = ""
+    #: Like `exact_id`, but with every bound snapped to a coarse grid. The hash
+    #: `Device.observe(settle=True)` compares two consecutive dumps on -- see
+    #: `fingerprint.settle_id` for why `exact_id` cannot do that job.
+    settle_id: str = ""
     tokens: Tuple[str, ...] = ()
     screenshot: Optional[bytes] = None
     dhash: Optional[int] = None
@@ -441,12 +450,28 @@ def _absorb_labels(nodes: Sequence[Element]) -> None:
 
 
 def _absorbed_by_ancestor(el: Element) -> bool:
-    """True when an interactive ancestor already presents this node's text."""
+    """True when an interactive ancestor already presents this node's text.
+
+    Tested against `best_text`, not `label`. `label` is only ever filled in by
+    `_absorb_labels`, which skips any interactive node that already has `text` or
+    `content_desc` -- so for the very common Compose/React-Native card that
+    carries its whole description in `content-desc` and repeats every field in
+    child ``TextView``s, the ancestor's `label` was empty, this returned False
+    for every child, and `prune` kept the card *and* all of it again.
+
+    Measured across the 105 decide screens in ``runs/``: 223 of 3,107 rendered
+    lines were text whose quote is a substring of an interactive line's quote,
+    concentrated on exactly the screens that overflowed. ``runs/2ca3fe0c2e62``
+    step 14 spent 44 of its 80 shown lines on duplicates and then truncated 28
+    elements -- and the truncated tail held the navigation bar, which is fixed
+    system chrome and cannot be scrolled to, so the "(scroll to reach them)"
+    the render appended was false. All three truncations in the corpus are this.
+    """
     piece = (el.text or el.content_desc).strip()
     if not piece:
         return False
     for anc in el.ancestors():
-        if anc.interactive and piece in anc.label:
+        if anc.interactive and piece in anc.best_text:
             return True
     return False
 
@@ -565,6 +590,13 @@ def render_element(el: Element, width: int = 0, height: int = 0) -> str:
     where = zone(el, width, height)
     if where:
         parts.append(f"@{where}")
+    if el.key:
+        # What the element *is*, as opposed to where it landed in this list. The
+        # model is asked to send it alongside the `#N` so that everything the run
+        # remembers about an element -- bans, dead ends, the pager exemption --
+        # survives the list being renumbered, which measurably happens to 47% of
+        # controls within a single run. See `fingerprint.element_keys`.
+        parts.append(f"k={el.key}")
     flags = []
     if el.checkable:
         flags.append(f"checked={'true' if el.checked else 'false'}")

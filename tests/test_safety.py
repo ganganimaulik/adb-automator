@@ -327,11 +327,11 @@ def test_element_history_tracking_and_hints():
     loops = safety.LoopDetector()
     assert loops.element_history_hint("album_screen") is None
 
-    loops.record_element_action("album_screen", 29, "tap/#6", "tap #6 [View photo 1 of 10]")
+    loops.record_element_action("album_screen", 29, "tap/k=a3f1", "tap #6 [View photo 1 of 10]")
     hint = loops.element_history_hint("album_screen")
     assert hint is not None
     assert "PREVIOUS ACTIONS ON THIS SCREEN: step 29: tap #6 [View photo 1 of 10]" in hint
-    assert "do NOT repeat an element index (#N)" in hint
+    assert "match on the k= value, not the #N" in hint
     assert loops.element_history_hint("other_screen") is None
 
 
@@ -339,22 +339,34 @@ def test_the_pager_exemption_only_excuses_the_pager_gesture():
     """Taken from ``runs/2521862d7a23``, which lost its goal to this hint.
 
     The agent was in a hard two-cycle -- tap #7, back, tap #7, back -- on a
-    screen that had a pager at #4. The hint recited five consecutive back
-    presses and then told the agent that "repeating it is correct" and not to
-    substitute a different index. Nothing in the loop touched #4.
+    screen whose pager was a different element entirely. The hint recited five
+    consecutive back presses and then told the agent that "repeating it is
+    correct" and not to substitute anything else. Nothing in the loop touched the
+    pager.
+
+    `repeatable` is an `Element.key` rather than an ordinal now, matching the
+    content-keyed form `AgentAction.signature` emits -- an ordinal would never
+    match one of those, silently withdrawing the exemption from the one element
+    it exists for.
     """
     loops = safety.LoopDetector()
     for step in (10, 12, 14, 16, 18):
         loops.record_element_action("reels", step, "press_key/back", "press_key back")
 
-    hint = loops.element_history_hint("reels", repeatable=4)
+    hint = loops.element_history_hint("reels", repeatable="9c2b")
     assert "repeating it is correct" not in hint
-    assert "do NOT repeat an element index (#N)" in hint
+    assert "match on the k= value, not the #N" in hint
 
     # But a real pager sweep still gets its exemption, which is why it exists.
-    loops.record_element_action("reels", 20, "swipe/#4/left", "swipe #4 left")
-    swept = loops.element_history_hint("reels", repeatable=4)
+    loops.record_element_action("reels", 20, "swipe/k=9c2b/left", "swipe #4 left")
+    swept = loops.element_history_hint("reels", repeatable="9c2b")
     assert "repeating it is correct" in swept
+
+    # And a swipe at a *different* element does not earn it.
+    fresh = safety.LoopDetector()
+    fresh.record_element_action("reels", 20, "swipe/k=0000/left", "swipe #7 left")
+    assert "repeating it is correct" not in fresh.element_history_hint(
+        "reels", repeatable="9c2b")
 
 
 # ---------------------------------------------------------------------------

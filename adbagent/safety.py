@@ -234,7 +234,7 @@ class LoopDetector:
             del actions[:-10]
 
     def element_history_hint(self, skeleton_id: str,
-                             repeatable: int = 0) -> Optional[str]:
+                             repeatable: str = "") -> Optional[str]:
         """Contextual hint summarizing previous element actions performed on this screen identity.
 
         ``repeatable`` names an element that is *meant* to be acted on every
@@ -258,22 +258,25 @@ class LoopDetector:
         formatted = [f"step {step}: {desc}" for step, _, desc in recent]
         summary = "; ".join(formatted)
         # Split rather than substring-match: `signature` joins its parts with
-        # "/", and "#4" is a substring of "#41", so a fling at #41 would have
-        # cleared the exemption meant for the pager at #4.
-        target = f"#{repeatable}"
+        # "/", and a prefix of one key is not another key. `repeatable` is an
+        # `Element.key`, matching the content-keyed form `signature` now emits --
+        # it used to be an ordinal, which was both what the signature carried and
+        # a thing that moves for the same control 47% of the time in ``runs/``.
+        target = f"k={repeatable}"
         on_pager = any(target in sig.split("/") for _, sig, _ in recent)
         if repeatable and on_pager:
             return (
                 f"PREVIOUS ACTIONS ON THIS SCREEN: {summary}. "
-                f"#{repeatable} is the pager for this screen: swiping it again "
-                f"is how you reach the next item, so repeating it is correct. "
-                f"Do not substitute a different index for it."
+                f"The element k={repeatable} is the pager for this screen: "
+                f"swiping it again is how you reach the next item, so repeating "
+                f"it is correct. Do not substitute a different element for it."
             )
         return (
             f"PREVIOUS ACTIONS ON THIS SCREEN: {summary}. "
             f"If you are reviewing multiple items or photos in a list or grid, "
-            f"do NOT repeat an element index (#N) you already tapped. "
-            f"Select the next uninspected element index or take a different action."
+            f"do NOT act again on an element you have already opened -- match on "
+            f"the k= value, not the #N, which is renumbered every turn. "
+            f"Choose the next uninspected element or take a different action."
         )
 
     def repeats(self, screen_id: str) -> int:

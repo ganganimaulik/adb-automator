@@ -1262,6 +1262,7 @@ const CFG_SPEC = [
   ]],
   ["device", [
     ["serial", "text"], ["settle_budget_s", "number"],
+    ["settle_quiet_s", "number"],
     ["disable_animations", "bool"], ["disable_auto_rotate", "bool"],
   ]],
   ["safety", [
@@ -1276,6 +1277,7 @@ const CFG_SPEC = [
     // file by hand. `0` switches a tier off; see `config.RunConfig`.
     ["stall_nudge_at", "number"], ["stall_block_at", "number"],
     ["stall_replan_at", "number"], ["stall_give_up_at", "number"],
+    ["goal_check_every", "number"], ["goal_check_hits", "number"],
     ["pager_sweep", "bool"], ["pager_sweep_max", "number"],
     ["always_screenshot", "bool"], ["never_screenshot", "bool"], ["dry_run", "bool"],
   ]],
