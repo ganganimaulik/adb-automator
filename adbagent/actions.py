@@ -59,6 +59,10 @@ class Target(BaseModel):
 
     index: Optional[int] = Field(
         None, description="The #N of the element from the list. Prefer this.")
+    key: Optional[str] = Field(
+        None, description="The k=XXXX printed beside that element. Always send "
+                          "it with the index: it identifies the element itself, "
+                          "so the harness can tell if the list shifted.")
     resource_id: Optional[str] = Field(
         None, description="Short resource-id, e.g. 'switch_widget'.")
     text: Optional[str] = Field(
@@ -66,14 +70,34 @@ class Target(BaseModel):
 
     @model_validator(mode="after")
     def _needs_something(self) -> "Target":
-        if self.index is None and not (self.resource_id or self.text):
-            raise ValueError("target needs index, resource_id or text")
+        if self.index is None and not (self.resource_id or self.text or self.key):
+            raise ValueError("target needs index, key, resource_id or text")
         return self
 
     def describe(self) -> str:
         if self.index is not None:
             return f"#{self.index}"
+        if self.key:
+            return f"k={self.key}"
         return self.resource_id or f"{self.text!r}"
+
+    def identity(self) -> str:
+        """The most durable name for this target, for a ban list or a ledger.
+
+        Prefers the content key over the ordinal. `describe()` still leads with
+        `#N` because that is the handle the model and the history speak in; this
+        is what anything *remembering* the target should use, because an ordinal
+        is a position in one dump and 47% of controls in ``runs/`` took more than
+        one within a single run -- so a ban earned by `tap/#4` missed the same
+        control at #1 and hit whatever else landed on #4.
+        """
+        if self.key:
+            return f"k={self.key}"
+        if self.resource_id:
+            return self.resource_id
+        if self.text:
+            return repr(self.text)
+        return f"#{self.index}"
 
 
 class Postcondition(BaseModel):
@@ -195,10 +219,18 @@ class AgentAction(BaseModel):
         return self.action in TERMINAL_ACTIONS
 
     def signature(self) -> str:
-        """Stable identity for loop detection and ban lists."""
+        """Stable identity for loop detection and ban lists.
+
+        Built from `Target.identity()` and not `Target.describe()`: this string
+        is the primary key of `LoopDetector.attempts`, the per-screen ban set,
+        the stall-tier refusal set, the pager exemption and the 24-hour cross-run
+        `dead_end` rows, and it used to resolve to the bare ordinal. Measured
+        across ``runs/``, 47% of the resource-ids seen more than once in a run
+        appeared under more than one `#N` -- `id=back` took thirteen.
+        """
         parts = [self.action]
         if self.target is not None:
-            parts.append(self.target.describe())
+            parts.append(self.target.identity())
         for extra in (self.key, self.direction):
             if extra:
                 parts.append(str(extra))
@@ -430,14 +462,29 @@ def resolve_target(target: Target, screen: Screen) -> Optional[Element]:
         el = screen.by_index(target.index)
         if el is not None:
             match = True
+            # The content key outranks the ordinal. When both are given and they
+            # disagree, the list moved between the dump the model was shown and
+            # the one being acted on -- which is exactly what an ordinal cannot
+            # survive and what this field exists to catch.
+            if target.key and el.key and el.key != target.key:
+                match = False
             if target.resource_id and el.resource_id != target.resource_id:
                 match = False
             if target.text and target.text.strip().lower() not in el.best_text.strip().lower():
                 match = False
             if match:
                 return el
-            log.warning("target index #%d mismatched (text=%r, id=%r); attempting fallback search",
-                        target.index, el.best_text, el.resource_id)
+            log.warning("target index #%d mismatched (text=%r, id=%r, key=%r); "
+                        "attempting fallback search",
+                        target.index, el.best_text, el.resource_id, el.key)
+
+    if target.key:
+        keyed = [e for e in screen.elements if e.key == target.key]
+        if len(keyed) == 1:
+            if target.index is not None:
+                log.info("target #%d moved to #%d; resolved by key %s",
+                         target.index, keyed[0].index, target.key)
+            return keyed[0]
 
     if target.resource_id:
         matches = [e for e in screen.elements if e.resource_id == target.resource_id]
@@ -811,7 +858,27 @@ def verify(action: AgentAction, before: Screen, after: Screen,
     """Grade what actually happened."""
     if action.action in ("wait", "sleep"):
         result_text = getattr(action, "_result_summary", "")
-        return VerifyOutcome(grade="success", reason=result_text or ("slept" if action.action == "sleep" else "waited"))
+        default = "slept" if action.action == "sleep" else "waited"
+        # Graded on what the wait actually produced, not on the fact that it ran.
+        #
+        # This used to be an unconditional `success`, which made a wait the one
+        # action that could never be wrong -- and `_loop` reads `outcome.ok` to
+        # zero `consecutive_failures` and clear `last_failure`, so a wait
+        # laundered the failure before it. A fail/wait alternation could never
+        # reach `max_consecutive_failures`, and it also dropped out of the
+        # deeper-thinking and take-a-screenshot triggers, both of which key on
+        # the same counter. 13 of 103 turns across ``runs/`` were waits.
+        #
+        # `no_change` rather than a failure: waiting for a screen that turned out
+        # to be already finished is a reasonable thing to have tried once. It is
+        # the *second* one on the same screen that is the problem, and
+        # `no_change` is exactly what the existing ban machinery in `_loop` acts
+        # on.
+        if after.exact_id == before.exact_id:
+            return VerifyOutcome(
+                grade="no_change",
+                reason=f"{result_text or default} and nothing on screen changed")
+        return VerifyOutcome(grade="success", reason=result_text or default)
     if action.action in ("get_clipboard", "set_clipboard"):
         result_text = getattr(action, "_result_summary", "")
         return VerifyOutcome(grade="success", reason=result_text)

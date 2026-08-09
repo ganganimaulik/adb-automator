@@ -68,6 +68,43 @@ def test_unknown_key_is_rejected():
         act(action="press_key", key="escape")
 
 
+def test_a_signature_prefers_the_content_key_to_the_ordinal():
+    """The signature is the primary key of everything the run remembers.
+
+    `LoopDetector.attempts`, the per-screen ban list, the stall-tier refusal set,
+    the pager exemption and the 24-hour cross-run `dead_end` rows all key on it,
+    and it used to resolve to the bare `#N`. Of the 405 resource-ids seen more
+    than once within a single run in ``runs/``, 192 (47%) appeared under more
+    than one ordinal -- so a ban earned by `tap/#4` missed the same control when
+    it was next listed as #1, and hit whatever else had landed on #4.
+    """
+    moved = act(action="tap", target=Target(index=1, key="a3f1"))
+    same = act(action="tap", target=Target(index=9, key="a3f1"))
+    other = act(action="tap", target=Target(index=1, key="b7c2"))
+
+    assert moved.signature() == same.signature(), "the ordinal still decides"
+    assert moved.signature() != other.signature(), "two controls share a key"
+    # The model and the history still speak in #N -- only what is *remembered*
+    # changed.
+    assert moved.target.describe() == "#1"
+
+
+def test_a_target_with_only_a_key_is_valid():
+    t = Target(key="a3f1")
+    assert t.describe() == "k=a3f1" and t.identity() == "k=a3f1"
+
+
+def test_a_key_that_contradicts_the_index_re_resolves_to_the_key():
+    """The list moved between the dump the model saw and the one being acted on."""
+    wanted = BASE.elements[4]
+    stale = Target(index=1, key=wanted.key)
+    assert resolve_target(stale, BASE) is wanted
+
+
+def test_a_key_that_is_gone_falls_through_rather_than_tapping_a_stranger():
+    assert resolve_target(Target(index=None, key="ffff"), BASE) is None
+
+
 def test_signature_is_stable_and_distinguishing():
     a = act(action="tap", target=Target(index=3))
     b = act(action="tap", target=Target(index=3), observation="different words")
@@ -223,8 +260,21 @@ def test_failed_postcondition_is_hard_failure():
     assert outcome.grade == "hard_fail" and not outcome.ok
 
 
-def test_wait_always_succeeds():
-    assert verify(act(action="wait"), BASE, BASE).grade == "success"
+def test_a_wait_is_graded_on_what_it_produced():
+    """A wait used to be the one action that could never be wrong.
+
+    `_loop` reads `outcome.ok` to zero `consecutive_failures` and clear
+    `last_failure`, so an unconditional `success` let a wait launder the failure
+    before it -- a fail/wait alternation could never reach
+    `max_consecutive_failures`, nor trip the deeper-thinking and
+    take-a-screenshot triggers, which key on the same counter. 13 of 103 turns
+    across ``runs/`` were waits.
+    """
+    assert verify(act(action="wait"), BASE, BASE).grade == "no_change"
+    assert verify(act(action="sleep"), BASE, BASE).grade == "no_change"
+    # It really waited for something and the screen moved on: that is a success.
+    moved = s(X.detail_screen())
+    assert verify(act(action="wait"), BASE, moved).grade == "success"
 
 
 def test_describe_untruncated_text():
@@ -574,7 +624,8 @@ def test_condition_based_wait():
     execute(dev, action, screen)
 
     assert "found" in getattr(action, "_result_summary")
-    assert verify(action, screen, screen).grade == "success"
+    # The text was already there, so nothing changed while it waited.
+    assert verify(action, screen, screen).grade == "no_change"
 
 
 def test_sleep_action():
@@ -590,7 +641,7 @@ def test_sleep_action():
         mock_sleep.assert_called_once_with(2.0)
 
     assert getattr(action, "_result_summary") == "slept for 2.0s"
-    assert verify(action, screen, screen).grade == "success"
+    assert verify(action, screen, screen).grade == "no_change"
     assert synthesise_postcondition(action, None).kind == "noop_ok"
 
 
@@ -606,7 +657,8 @@ def test_condition_based_sleep():
     execute(dev, action, screen)
 
     assert "found" in getattr(action, "_result_summary")
-    assert verify(action, screen, screen).grade == "success"
+    # The text was already there, so nothing changed while it waited.
+    assert verify(action, screen, screen).grade == "no_change"
 
 
 def test_target_resolution_fallback():

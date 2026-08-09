@@ -13,6 +13,13 @@ def s(xml: str):
     return parse(xml, width=X.W, height=X.H)
 
 
+def sa(xml: str):
+    """Parsed *and* fingerprinted. `Element.key` is an attach-populated field,
+    the same as `skeleton_id` and `exact_id`; `s()` deliberately stops at parse."""
+    from adbagent.fingerprint import attach
+    return attach(s(xml))
+
+
 def test_parses_geometry_and_flags():
     scr = s(X.settings_screen())
     assert scr.width == X.W and scr.height == X.H
@@ -64,6 +71,99 @@ def test_label_absorption_gives_tappable_rows_their_text():
     titles = [e for e in scr.elements
               if e.resource_id == "title" and e.text == "Wi-Fi"]
     assert titles == []
+
+
+def test_a_card_described_by_content_desc_does_not_relist_its_children():
+    """The other half of absorption, and the one that was broken.
+
+    `_absorb_labels` skips any interactive node that already has `text` or
+    `content_desc`, so such a node's `label` stays empty -- and
+    `_absorbed_by_ancestor` used to test `piece in anc.label`, which is always
+    False against an empty string. For the very common Compose/React-Native card
+    that carries its description in `content-desc` and repeats every field in
+    child TextViews, `prune` kept the card and all of it again.
+
+    Measured across the 105 decide screens in ``runs/``: 223 of 3,107 rendered
+    lines were duplicates of this shape, and they are the whole reason the three
+    truncated screens in the corpus overflowed the render cap.
+    """
+    fields = ["Yu Coconut Water 200ml", "45 rupees", "8 minutes"]
+    kids = [X.N("android.widget.TextView", (10, 620 + i * 40, 700, 655 + i * 40),
+                rid=f"field{i}", text=piece)
+            for i, piece in enumerate(fields)]
+    scr = s(X.settings_screen(extra_roots=[
+        X.N("android.widget.Button", (0, 600, X.W, 760), rid="card",
+            desc=", ".join(fields), clickable=True, children=kids)]))
+
+    card = [e for e in scr.elements if e.resource_id == "card"]
+    assert card, "the tappable card should survive pruning"
+    assert card[0].best_text == ", ".join(fields)
+    for i in range(len(fields)):
+        assert not [e for e in scr.elements if e.resource_id == f"field{i}"], \
+            f"field{i} was listed again under a card that already says it"
+
+
+# ---------------------------------------------------------------------------
+# Element keys
+#
+# `AgentAction.signature()` is the primary key of the loop detector, the
+# per-screen ban list, the stall-tier refusal set, the pager exemption and the
+# 24-hour cross-run `dead_end` rows -- and it resolved to the bare ordinal,
+# because all 72 targets the model produced across ``runs/`` were index-only.
+# An ordinal is a position in one dump. Of the 405 resource-ids seen more than
+# once within a single run, 192 (47%) appeared under more than one `#N`;
+# `id=back` took thirteen.
+# ---------------------------------------------------------------------------
+
+def _list_screen(with_banner: bool) -> str:
+    """A list of rows, optionally with a banner that arrives above them."""
+    kids = []
+    if with_banner:
+        kids.append(X.N("android.widget.TextView", (0, 100, X.W, 180),
+                        rid="banner", text="New match!"))
+    kids += [X.N("android.widget.Button", (0, 200 + i * 120, X.W, 310 + i * 120),
+                 rid="row", text=f"Chat {i}", clickable=True) for i in range(4)]
+    return X.dump(X.N("android.widget.FrameLayout", (0, 0, X.W, X.H), rid="root",
+                      children=kids))
+
+
+def test_an_element_key_survives_the_list_being_renumbered():
+    before, after = sa(_list_screen(False)), sa(_list_screen(True))
+    b = next(e for e in before.elements if e.best_text == "Chat 2")
+    a = next(e for e in after.elements if e.best_text == "Chat 2")
+
+    assert b.index != a.index, "the fixture did not actually shift the ordinals"
+    assert b.key == a.key, "the key moved with the ordinal it exists to outlive"
+
+
+def test_look_alike_rows_still_get_different_keys():
+    """Two elements the harness genuinely cannot tell apart must not collide.
+
+    Otherwise a ban earned on one row of a list would silently ban every row.
+    """
+    scr = sa(_list_screen(False))
+    rows = [e for e in scr.elements if e.resource_id == "row"]
+    assert len(rows) == 4
+    assert len({e.key for e in rows}) == 4
+
+
+def test_unlabelled_repeats_are_separated_by_their_ordinal_in_the_group():
+    """Nothing distinguishes them but position in the group, so that is the key."""
+    icons = [X.N("android.widget.ImageView", (100 + i * 80, 620, 160 + i * 80, 680),
+                 rid="icon", clickable=True) for i in range(4)]
+    scr = sa(X.settings_screen(extra_roots=[
+        X.N("android.widget.LinearLayout", (0, 600, X.W, 700), rid="strip",
+            children=icons)]))
+    keys = [e.key for e in scr.elements if e.resource_id == "icon"]
+    assert len(keys) == len(set(keys)) and keys, keys
+
+
+def test_the_key_is_printed_beside_every_element():
+    scr = sa(_list_screen(False))
+    line = render(scr)
+    assert "k=" in line
+    for el in scr.elements:
+        assert f"k={el.key}" in line
 
 
 def test_decorative_repeats_collapse():

@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, T
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
 
+from .background import Prefetch  # re-exported: callers import it from here
 from .config import Config
 
 log = logging.getLogger("adbagent.llm")
@@ -699,50 +700,6 @@ class ScreenAnalysis(BaseModel):
         return "\n".join(lines)
 
 
-class Prefetch:
-    """A call started now and collected later, so it overlaps device work.
-
-    The agent's expensive waits are strictly alternating: it talks to the model,
-    then it talks to the phone. A per-item vision read is the one call whose
-    input is already complete before the next gesture is sent, so it can run
-    while the swipe and the settle happen -- roughly 1.5-2.5s of device time that
-    was previously spent idle.
-
-    A failure is swallowed and reported through `result`'s default: a prefetched
-    read is an optimisation, and losing one must degrade the reading rather than
-    abort the walk that was collecting it. Streaming callbacks are deliberately
-    not plumbed through -- two threads writing to the same live terminal panel
-    interleave into nonsense.
-    """
-
-    def __init__(self, fn: Callable[[], Any]):
-        self._value: Any = None
-        self._error: Optional[BaseException] = None
-        self._thread = threading.Thread(target=self._run, args=(fn,),
-                                        daemon=True, name="adbagent-prefetch")
-        self._thread.start()
-
-    def _run(self, fn: Callable[[], Any]) -> None:
-        try:
-            self._value = fn()
-        except BaseException as exc:  # noqa: BLE001 - surfaced via result()
-            self._error = exc
-
-    @property
-    def failed(self) -> bool:
-        return self._error is not None
-
-    def result(self, default: Any = "", timeout: Optional[float] = None) -> Any:
-        self._thread.join(timeout)
-        if self._thread.is_alive():
-            log.warning("prefetched call did not finish within %.1fs", timeout)
-            return default
-        if self._error is not None:
-            log.warning("prefetched call failed: %s", self._error)
-            return default
-        return default if self._value is None else self._value
-
-
 class LLMClient:
     """OpenAI-protocol client, pointed at whichever provider is configured."""
 
@@ -1224,7 +1181,7 @@ class LLMClient:
                width: int, height: int, package: str = "", today: str = "",
                screenshot: Optional[bytes] = None, note: str = "",
                scratchpad: str = "", progress: str = "", skill: str = "",
-               policy: str = "",
+               policy: str = "", budget: str = "",
                step: int = 0, recorder: Optional[Any] = None,
                purpose: str = "decide", effort: str = "",
                image_analysis: Optional[str] = None,
@@ -1258,7 +1215,7 @@ class LLMClient:
         if inline_image:
             content.append(image_part(screenshot))  # type: ignore[arg-type]
 
-        state_text = prompts.state_block(scratchpad, progress)
+        state_text = prompts.state_block(scratchpad, progress, budget=budget)
         messages = [
             {"role": "system",
              "content": prompts.system_prompt(harden_schema(AgentAction))},
@@ -1329,6 +1286,41 @@ class LLMClient:
         return self.structured(messages, Verdict, model=target,
                                max_tokens=max_tokens, purpose="judge",
                                effort=self.cfg.llm.effort_for("judge", hard=True),
+                               **kw)
+
+    def goal_check(self, *, goal: str, history: Sequence[str] = (),
+                   rendered: str = "", scratchpad: str = "", progress: str = "",
+                   step: int = 0, recorder: Optional[Any] = None,
+                   on_event: Optional[Callable[..., None]] = None) -> "Verdict":
+        """Is the goal already satisfied? Asked mid-run, of a model that has not said so.
+
+        Runs on the deciding model rather than `model_small`: this verdict can end
+        the run, and the cheap model is already the weakest link in the one other
+        place a verdict does that (`judge`). Cost is not the constraint here --
+        `Agent` issues this inside the device round trip it was going to wait
+        through anyway, so it is bought with latency that was already spent.
+
+        No screenshot. The question is about the record the run has built, not
+        about the frame it happens to be on, and a vision pass would put this call
+        on the critical path it is specifically designed to stay off.
+        """
+        from . import prompts
+
+        messages = [
+            {"role": "system", "content": prompts.GOAL_CHECK_SYSTEM},
+            {"role": "user",
+             "content": prompts.goal_check_user(
+                 goal, history=history, rendered=rendered,
+                 scratchpad=scratchpad, progress=progress, step=step)},
+        ]
+        if recorder is not None:
+            recorder.dump_messages(step, messages, purpose="goal_check")
+        kw = {}
+        if on_event is not None:
+            kw["on_event"] = on_event
+        return self.structured(messages, Verdict, model=self.model,
+                               purpose="goal_check",
+                               effort=self.cfg.llm.effort_for("goal_check"),
                                **kw)
 
     def replan(self, *, goal: str, rendered: str,

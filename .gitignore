@@ -63,3 +63,6 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# personal reply policy -- never commit
+date.md
