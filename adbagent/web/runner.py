@@ -265,7 +265,16 @@ class ChildProcess:
             else:
                 proc.send_signal(signal.SIGINT)
         except (ProcessLookupError, OSError):
-            return True
+            # Two different things wear this exception. The child exiting between
+            # the poll above and the signal is over already, and there is nothing
+            # left to escalate to. A signal that simply did not land -- which is
+            # what Windows reports here -- is the opposite: the child is still
+            # running and still holding the phone, so it needs the kill below
+            # more than a healthy one does. Returning early on both left it
+            # running forever behind a UI stuck on "stopping", and `_stopping`
+            # latched, so asking again did nothing either.
+            if proc.poll() is not None:
+                return True
         threading.Thread(target=self._reap, args=(proc, timeout_s),
                          daemon=True).start()
         return True

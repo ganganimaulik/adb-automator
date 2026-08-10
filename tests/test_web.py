@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 
 from adbagent.web import runparse
 from adbagent.web.runner import RunManager
-from adbagent.web.server import create_app
+from adbagent.web.server import _event_stream, create_app
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1139,6 +1139,46 @@ def test_stopping_a_watch_answers_before_the_shutdown_is_over(
     procs[0].wait()
 
 
+def test_a_signal_that_never_landed_still_gets_the_child_killed(tmp_path,
+                                                                monkeypatch):
+    """Windows reports an undelivered signal as an OSError, which is also what a
+    child exiting a moment before the signal looks like. They need telling
+    apart: one is over, the other is still running and still holding the phone.
+    Treating both as over skipped the escalation, so the child ran on behind a
+    UI stuck on "stopping" -- and the stop was latched, so clicking again did
+    nothing either."""
+    killed = threading.Event()
+
+    class DeafProc(FakeProc):
+        def send_signal(self, sig):
+            raise OSError(22, "the signal could not be delivered")
+
+        def wait(self, timeout=None):
+            # Deaf to the signal, so the escalation is the only way out. Waits
+            # the timeout out first, as Popen does -- raising instantly would
+            # let the kill land before there was a phase to observe.
+            if timeout is None:
+                self._done.wait()
+            elif not self._done.wait(timeout):
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+            return self._returncode
+
+        def kill(self):
+            killed.set()
+            self._returncode = 137
+            self._done.set()
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: DeafProc(argv, stay_running=True, **kw))
+    manager = RunManager(tmp_path / "runs")
+    manager.start("turn on wifi")
+    assert manager.stop(timeout_s=0.5) is True
+    # Still running, and saying so: the phase is not over just because the
+    # signal bounced.
+    assert manager.state()["stopping"] is True
+    assert killed.wait(timeout=5)
+
+
 def test_a_second_stop_does_not_signal_into_the_write_up(web, tmp_path,
                                                          monkeypatch):
     """Clicking stop twice used to send a second SIGINT. The first is caught by
@@ -1172,6 +1212,66 @@ def test_the_stream_carries_the_shutdown_that_no_run_file_records(
     assert not any("pass 1: success" in line for line in shutdown)
     assert frames[-1][0] == "end"
     procs[0].wait()
+
+
+def test_the_server_takes_a_watch_down_with_it(tmp_path, monkeypatch):
+    """Ctrl+C in the console does not reach the children on Windows: each one is
+    spawned into its own process group -- it has to be, or signalling one would
+    take the server down too -- and a new group has the console's Ctrl+C
+    disabled. Without this the server exits and the watch keeps going: still
+    driving the phone, still replying to people, with the only thing that could
+    stop it now gone."""
+    # Its own app rather than the `web` fixture's, because the lifespan only runs
+    # when the client is used as a context manager.
+    (tmp_path / "skills").mkdir()
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    procs = []
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: procs.append(
+                            FakeProc(argv, stay_running=True, **kw)) or procs[-1])
+    app = create_app(artifacts_dir=str(tmp_path / "runs"),
+                     skills_dir=str(tmp_path / "skills"),
+                     config_path=str(tmp_path / "config.json"))
+    # As a context manager, so startup and shutdown actually run.
+    with TestClient(app) as client:
+        assert client.post("/api/watch",
+                           json={"goal": "watch dms"}).status_code == 200
+        assert client.get("/api/watch").json()["active"]["running"] is True
+    assert signal.SIGINT in procs[0].signals   # asked, so the phone is restored
+
+
+def test_shutting_down_ends_the_live_streams(tmp_path, monkeypatch):
+    """The stream is a plain generator on a thread, so nothing can cancel it. It
+    has to notice the server leaving and end, or the shutdown tears the response
+    down underneath it -- a CancelledError out of the middle of a
+    StreamingResponse, which is what a Ctrl+C used to print to the console."""
+    runs = tmp_path / "runs"
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: FakeProc(
+                            argv, stay_running=True,
+                            on_spawn=lambda _a: make_run_dir(runs, "live9"),
+                            **kw))
+    manager = RunManager(runs)
+    manager.start("turn on wifi")
+    leaving = threading.Event()
+    frames = []
+
+    def drain():
+        for frame in _event_stream(manager, leaving):
+            frames.append(frame)
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    for _ in range(100):                       # let it get going
+        if any("run_start" in f for f in frames):
+            break
+        time.sleep(0.02)
+    leaving.set()
+    reader.join(timeout=5)
+    assert not reader.is_alive()               # ended itself, was not cancelled
+    assert "the server is shutting down" in frames[-1]
+    manager.stop()
 
 
 def test_a_child_is_spawned_unbuffered(web, monkeypatch):
