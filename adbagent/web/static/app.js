@@ -791,6 +791,7 @@ $("run-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const body = { goal: $("goal").value.trim(), ...runOptions() };
   if (!body.goal) { notice("a goal is required"); return; }
+  saveGoal("adbagent.goal", body.goal);
 
   try {
     await api("/api/runs", { method: "POST", body: JSON.stringify(body) });
@@ -945,7 +946,9 @@ async function loadWatch() {
   ph("watch-rpc", watchDefaults.max_replies_per_thread_per_hour);
   ph("watch-cooldown", watchDefaults.thread_cooldown_s);
   const active = data.active || {};
-  if (active.goal && !$("watch-goal").value) $("watch-goal").value = active.goal;
+  // An active watch's goal is the last prompt that actually ran; show it over
+  // the remembered one. With no active watch, the remembered goal stays.
+  if (active.goal) $("watch-goal").value = active.goal;
   if (active.running) $("watch-draft").checked = !!active.draft;
   paintWatchBanner(!!active.running);
   await loadPolicy();
@@ -999,6 +1002,7 @@ $("watch-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const body = watchOptions();
   if (!body.goal) { notice("say what to watch"); return; }
+  saveGoal("adbagent.watch-goal", body.goal);
   if (!body.draft &&
       !confirm("This will send real replies from this device.\n\n" +
                "Have you read what it drafts first?")) return;
@@ -1678,8 +1682,23 @@ $("btn-gen").addEventListener("click", async () => {
   watchGeneration(jobId);
 });
 
+/* -------------------------------------------------------- persistence
+
+   The prompt a run or watch was last started with, recalled on the next load
+   so a prompt that was right once does not have to be retyped. localStorage
+   rather than the server: it is a convenience of the browser, not a setting. */
+
+function saveGoal(key, value) {
+  try { localStorage.setItem(key, value); } catch {}
+}
+function loadGoal(key) {
+  try { return localStorage.getItem(key) || ""; } catch { return ""; }
+}
+
 /* -------------------------------------------------------------- boot */
 
+$("goal").value = loadGoal("adbagent.goal");
+$("watch-goal").value = loadGoal("adbagent.watch-goal");
 refreshStatus();
 setInterval(refreshStatus, 5000);
 loadRuns().catch(() => {});  // warm the history cache for later

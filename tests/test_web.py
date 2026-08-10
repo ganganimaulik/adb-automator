@@ -10,6 +10,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -976,6 +977,54 @@ def test_watch_rejects_a_policy_path_that_is_not_there(web, tmp_path):
 
 def test_stopping_a_watch_that_is_not_running_is_a_conflict(web):
     assert web.post("/api/watch/stop").status_code == 409
+
+
+def test_stopping_a_watch_that_exited_mid_signal_is_not_a_500(web, tmp_path,
+                                                              monkeypatch):
+    """The child can exit between poll() and send_signal(); the reaper in the
+    _watch thread may have already collected it by then. On Python 3.10
+    Popen.send_signal does not check returncode, so os.kill on the dead PID
+    raises ProcessLookupError. That used to surface as a 500."""
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+
+    class VanishedProc(FakeProc):
+        # poll() says "still running" but send_signal says "gone" -- the race.
+        def send_signal(self, sig):
+            raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: VanishedProc(
+                            argv, stay_running=True, **kw))
+    web.post("/api/watch", json={"goal": "watch dms"})
+    assert web.post("/api/watch/stop").status_code == 200
+
+
+def test_stopping_a_watch_that_vanishes_after_timeout_is_not_a_500(
+        web, tmp_path, monkeypatch):
+    """The same race can hit proc.kill() after wait() times out: the child
+    exits between the TimeoutExpired and the kill, and kill on the dead PID
+    raises ProcessLookupError."""
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+
+    class HungThenVanishedProc(FakeProc):
+        # accept the SIGINT, but never exit -- so wait() times out -- and then
+        # kill() raises because the PID was reaped between the two calls.
+        def send_signal(self, sig):
+            self.signals.append(sig)
+
+        def wait(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+            return 0
+
+        def kill(self):
+            raise ProcessLookupError(3, "No such process")
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: HungThenVanishedProc(
+                            argv, stay_running=True, **kw))
+    web.post("/api/watch", json={"goal": "watch dms"})
+    assert web.post("/api/watch/stop").status_code == 200
 
 
 def test_watch_lifecycle_and_argv(web, tmp_path, monkeypatch):
