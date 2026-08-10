@@ -777,6 +777,14 @@ def locate_user(description: str, goal: str = "",
     return "\n\n".join(parts)
 
 
+#: Appended to the locate prompt only when the frame actually went out under
+#: the overlay (`llm._grid_overlay`); otherwise it would describe markings the
+#: model cannot see.
+LOCATE_GRID_NOTE = ("\n\nThe image carries a labeled grid: lines every tenth "
+                    "of the width and height, each labeled with its fraction "
+                    "at the edge. Read the point off the grid.")
+
+
 JUDGE_SYSTEM = """\
 You are checking whether an Android automation run actually achieved its goal.
 

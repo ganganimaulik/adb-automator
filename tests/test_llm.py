@@ -343,6 +343,84 @@ def test_point_fractions_propagates_not_visible():
     assert point_fractions(0.5, None, 576, 1280) is None
 
 
+def test_grid_overlay_keeps_the_geometry():
+    """The ruler must not move anything: a point read off the gridded frame
+    lands on the same device pixel as one read off the bare frame."""
+    import io
+
+    from PIL import Image
+
+    from adbagent.llm import _grid_overlay
+
+    buf = io.BytesIO()
+    Image.new("RGB", (72, 128), (240, 240, 240)).save(buf, "JPEG")
+
+    out = _grid_overlay(buf.getvalue())
+
+    assert out is not None and out != buf.getvalue()
+    assert Image.open(io.BytesIO(out)).size == (72, 128)
+
+
+def test_grid_overlay_declines_a_frame_it_cannot_read():
+    from adbagent.llm import _grid_overlay
+
+    assert _grid_overlay(b"not an image") is None
+
+
+def test_a_locate_sends_the_gridded_frame_and_says_so(monkeypatch):
+    """The model gets the ruler and is told to read the point off it."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    from adbagent.llm import Location
+
+    client = _client(monkeypatch)
+    seen = {}
+
+    def structured(messages, model_cls, **kw):
+        seen["messages"] = messages
+        return Location(x=0.5, y=0.5)
+
+    monkeypatch.setattr(client, "structured", structured)
+
+    buf = io.BytesIO()
+    Image.new("RGB", (72, 128), (240, 240, 240)).save(buf, "JPEG")
+    jpeg = buf.getvalue()
+
+    assert client.locate(jpeg, "the Save button", goal="save") == (0.5, 0.5)
+    parts = _image_parts(seen["messages"])
+    assert len(parts) == 1
+    sent = base64.b64decode(parts[0]["image_url"]["url"].split(",", 1)[1])
+    assert sent != jpeg                                     # the grid went in
+    assert Image.open(io.BytesIO(sent)).size == (72, 128)   # unmoved geometry
+    text = seen["messages"][1]["content"][0]["text"]
+    assert "labeled grid" in text
+
+
+def test_a_locate_without_a_grid_says_nothing_about_one(monkeypatch):
+    """When the overlay cannot be drawn the prompt must not describe markings
+    the model cannot see."""
+    from adbagent import llm
+    from adbagent.llm import Location
+
+    client = _client(monkeypatch)
+    seen = {}
+
+    def structured(messages, model_cls, **kw):
+        seen["messages"] = messages
+        return Location(x=0.5, y=0.5)
+
+    monkeypatch.setattr(client, "structured", structured)
+    monkeypatch.setattr(llm, "_grid_overlay", lambda jpeg: None)
+
+    client.locate(b"jpeg-bytes", "the Save button")
+
+    text = seen["messages"][1]["content"][0]["text"]
+    assert "labeled grid" not in text
+
+
 def test_llm_config_model_fallbacks():
     from adbagent.config import LLMConfig
 
