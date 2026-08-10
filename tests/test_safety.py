@@ -316,6 +316,18 @@ def test_bans_are_per_screen():
     assert loops.bans_for("screen-b") == set()
 
 
+def test_a_dead_scroll_rearms_when_the_screen_changes():
+    loops = safety.LoopDetector()
+    loops.mark_scroll_dead("feed", "down", "exact-1")
+    assert loops.scroll_dead("feed", "down", "exact-1")
+    # The opposite direction and other screens are unaffected.
+    assert not loops.scroll_dead("feed", "up", "exact-1")
+    assert not loops.scroll_dead("other", "down", "exact-1")
+    # A changed screen re-arms the gesture: end-of-list is a property of the
+    # content, and content that has changed since may be scrollable now.
+    assert not loops.scroll_dead("feed", "down", "exact-2")
+
+
 def test_history_window_is_bounded():
     loops = safety.LoopDetector()
     for i in range(50):

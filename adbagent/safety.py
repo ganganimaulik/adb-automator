@@ -199,6 +199,13 @@ class LoopDetector:
     #: consecutive-scroll counter.
     scroll_dir_log: List[str] = field(default_factory=list)
     total_scroll_count: int = 0
+    #: Scroll gestures that revealed nothing, "{skeleton_id}/{direction}" ->
+    #: the ``exact_id`` of the frame they failed on. Valued by ``exact_id``
+    #: rather than flagged forever because end-of-list is a property of the
+    #: content, not of the layout: a screen whose content has since changed --
+    #: new items loaded, a refresh, a navigation away and back -- re-arms the
+    #: gesture with no bookkeeping here.
+    dead_scrolls: Dict[str, str] = field(default_factory=dict)
     #: Consecutive forced-back presses without an intervening real action.
     #: When this reaches the cap the agent stops pressing back and lets the
     #: LLM try a different approach.
@@ -568,6 +575,23 @@ class LoopDetector:
 
     def bans_for(self, skeleton_id: str) -> Set[str]:
         return self.banned.get(skeleton_id, set())
+
+    def mark_scroll_dead(self, skeleton_id: str, direction: str,
+                         exact_id: str) -> None:
+        """Remember that this gesture revealed no new content on this frame."""
+        log.info("scroll %s revealed nothing on this screen; refusing it "
+                 "while the screen stays identical", direction)
+        self.dead_scrolls[f"{skeleton_id}/{direction}"] = exact_id
+
+    def scroll_dead(self, skeleton_id: str, direction: str,
+                    exact_id: str) -> bool:
+        """True when this gesture already revealed nothing on this exact frame.
+
+        Compared against the ``exact_id`` recorded at the failure, so a screen
+        whose content has changed since -- new items loaded, a pull-to-refresh,
+        a navigation away and back -- re-arms the gesture on its own.
+        """
+        return self.dead_scrolls.get(f"{skeleton_id}/{direction}") == exact_id
 
 
 # ---------------------------------------------------------------------------

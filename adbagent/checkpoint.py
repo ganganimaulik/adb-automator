@@ -80,6 +80,7 @@ def save(cfg: Any, state: Any) -> None:
             },
             "scroll_dir_log": state.loops.scroll_dir_log,
             "total_scroll_count": state.loops.total_scroll_count,
+            "dead_scrolls": state.loops.dead_scrolls,
             "consecutive_backs": state.loops.consecutive_backs,
         },
         "want_screenshot": state.want_screenshot,
@@ -203,6 +204,8 @@ def restore(state: Any, data: Dict[str, Any]) -> None:
     }
     state.loops.scroll_dir_log = [str(d) for d in loops.get("scroll_dir_log") or []]
     state.loops.total_scroll_count = int(loops.get("total_scroll_count") or 0)
+    state.loops.dead_scrolls = {str(k): str(v)
+                                for k, v in (loops.get("dead_scrolls") or {}).items()}
     state.loops.consecutive_backs = int(loops.get("consecutive_backs") or 0)
 
     scratch = data.get("scratchpad") or {}
