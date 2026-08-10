@@ -704,6 +704,8 @@ def test_live_reporter_keeps_drawing_a_long_stream_on_a_terminal(monkeypatch):
     from adbagent.cli import _STREAM_FPS, Out, _live_reporter
 
     class FakeTTY(io.StringIO):
+        encoding = "utf-8"
+
         def isatty(self):
             return True
 
@@ -716,7 +718,7 @@ def test_live_reporter_keeps_drawing_a_long_stream_on_a_terminal(monkeypatch):
             reporter("llm_stream", stream_type="thinking",
                      text=f"chunk {i} at [/data/app] node [foo] ... ")
         time.sleep(1.5 / _STREAM_FPS)  # let the frame throttle open
-        reporter("llm_stream", stream_type="thinking", text="the newest thought")
+        reporter("llm_stream", stream_type="thinking", text="\nthe newest thought")
         reporter("llm_stream", stream_type="content", text='{"action": "tap"}')
         reporter("llm_end", purpose="decide", elapsed=2.5)
     finally:
