@@ -56,9 +56,22 @@ class ChildProcess:
         self._started_at = 0.0
         self._returncode: Optional[int] = None
         self._output: List[str] = []  # ring buffer of the child's stdout
+        #: Lines ever printed, which the ring buffer alone cannot say. A reader
+        #: following the output needs a mark that survives lines falling off the
+        #: front, so it can tell "nothing new" from "you missed some".
+        self._output_seq = 0
         #: One entry per iteration, oldest first. `--repeat 1` leaves one.
         self._run_dirs: List[Path] = []
         self._dirs_before: set = set()
+        #: A stop has been asked for and the child is on its way out -- still
+        #: running, still holding the phone, but doing shutdown work rather than
+        #: the job. Its own phase, because it is neither "running" nor "over" and
+        #: showing it as either is what makes a stop look like it did nothing.
+        self._stopping = False
+        #: `_output_seq` when the signal went out, so a reader can replay the
+        #: shutdown from its first line rather than from wherever it happened to
+        #: look next.
+        self._stop_seq = 0
 
     # -- state -------------------------------------------------------------
 
@@ -73,6 +86,7 @@ class ChildProcess:
             running = self._proc is not None and self._proc.poll() is None
             return {
                 "running": running,
+                "stopping": running and self._stopping,
                 "run_id": self._run_dirs[-1].name if self._run_dirs else "",
                 "iteration": len(self._run_dirs),
                 "pid": self._proc.pid if self._proc and running else None,
@@ -80,6 +94,28 @@ class ChildProcess:
                 "returncode": None if running else self._returncode,
                 "output_tail": list(self._output[-50:]),
             }
+
+    def stop_mark(self) -> int:
+        """The output position the stop was asked for at."""
+        with self._lock:
+            return self._stop_seq
+
+    def output_since(self, seq: int) -> tuple[int, List[str]]:
+        """Lines printed since `seq`, and the mark to ask from next time.
+
+        Clamped to what the ring buffer still holds: a reader that fell behind
+        gets the newest of it rather than an exception, and one holding a mark
+        from a previous child -- the counter restarts per spawn -- is simply
+        moved to the current position instead of being handed the whole buffer
+        as though it were new.
+        """
+        with self._lock:
+            if seq >= self._output_seq:
+                return self._output_seq, []
+            missed = self._output_seq - seq
+            lines = list(self._output[-missed:]) if missed <= len(self._output) \
+                else list(self._output)
+            return self._output_seq, lines
 
     def run_dir(self) -> Optional[Path]:
         """The iteration being written now -- the newest directory seen."""
@@ -106,8 +142,18 @@ class ChildProcess:
             self._run_dirs = [self.artifacts_dir / seed] if seed else []
             self._returncode = None
             self._output = []
+            self._output_seq = 0
+            self._stopping = False
+            self._stop_seq = 0
             self._started_at = time.time()
-            env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+            # Unbuffered because stdout is a pipe: Python block-buffers those, so
+            # a child's lines would otherwise sit in an 8KB buffer until it
+            # exited. Everything the child says outside its run files -- the
+            # skill written up after the loop, a refusal before there is a run at
+            # all -- is exactly the part nothing else reports, and holding it
+            # back until the process is gone makes it arrive too late to be news.
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
+                   "PYTHONUNBUFFERED": "1"}
             # On Windows, put the child in its own process group so we can
             # send it CTRL_BREAK_EVENT without killing the server too.
             flags = 0
@@ -142,6 +188,7 @@ class ChildProcess:
                     return  # superseded: this is no longer the output on show
                 self._output.append(line.rstrip("\n"))
                 self._output = self._output[-200:]
+                self._output_seq += 1
         code = proc.wait()
         with self._lock:
             if self._proc is proc:
@@ -184,11 +231,32 @@ class ChildProcess:
         the CLI catches it and puts back the keyboard, the animations, the
         rotation and the screen timeout it changed. A tour changes the same
         things, so it is stopped the same way.
+
+        Returns as soon as the signal is away; the waiting and the escalation
+        happen on a thread behind it. Blocking here blocked the caller for as
+        long as the child took to wind down -- up to `timeout_s`, and a watch
+        gives that a full three minutes because it writes the app's skill on the
+        way out. The browser's stop button sends this request and says "stopping"
+        when it answers, so a blocking stop said nothing at all for the whole
+        minute it was working: the button stayed live, the status line still read
+        "watching", and the only honest reading of that screen was that the click
+        had done nothing.
+
+        Asked twice, it signals once. The second SIGINT would land in the
+        shutdown -- during the skill write-up, which is not inside the loop's
+        `KeyboardInterrupt` handler -- and take down the very work the long
+        timeout exists to protect.
         """
         with self._lock:
             proc = self._proc
-        if proc is None or proc.poll() is not None:
-            return False
+            # Order matters: a child that has already exited is a 409 for the
+            # caller, whether or not a stop was ever asked for.
+            if proc is None or proc.poll() is not None:
+                return False
+            if self._stopping:
+                return True  # already on its way out
+            self._stopping = True
+            self._stop_seq = self._output_seq
         try:
             if sys.platform == "win32":
                 # CTRL_BREAK_EVENT targets the child's own process group
@@ -198,14 +266,19 @@ class ChildProcess:
                 proc.send_signal(signal.SIGINT)
         except (ProcessLookupError, OSError):
             return True
+        threading.Thread(target=self._reap, args=(proc, timeout_s),
+                         daemon=True).start()
+        return True
+
+    def _reap(self, proc: subprocess.Popen, timeout_s: float) -> None:
+        """Give the child `timeout_s` to shut itself down, then insist."""
         try:
             proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
             try:
                 proc.kill()
             except ProcessLookupError:
-                pass
-        return True
+                pass  # it went on its own between the timeout and the kill
 
     def wait_for_run_dir(self, timeout_s: float = 60.0) -> Optional[Path]:
         """The current iteration's artifact directory, once it exists.
@@ -335,13 +408,16 @@ class WatchManager(ChildProcess):
         return state
 
     def stop(self, timeout_s: float = 180.0) -> bool:
-        """SIGINT, then wait long enough for the shutdown to finish.
+        """SIGINT, and allow a long shutdown before insisting.
 
         Much longer than a run's ten seconds, because a watch does real work on
         the way out: it folds everything it learned about the app across every
         pass into that app's skill, which is one call on `llm.model_skill` and can
         take a minute on a long trace. Killing at ten seconds would abandon it
         every time, and the learning would look like it silently did not happen.
+
+        That minute is also why nobody may wait on this: the caller is an HTTP
+        request from a browser that has a stop button to update.
         """
         return super().stop(timeout_s=timeout_s)
 

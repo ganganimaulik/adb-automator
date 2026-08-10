@@ -1003,8 +1003,11 @@ def test_stopping_a_watch_that_vanishes_after_timeout_is_not_a_500(
         web, tmp_path, monkeypatch):
     """The same race can hit proc.kill() after wait() times out: the child
     exits between the TimeoutExpired and the kill, and kill on the dead PID
-    raises ProcessLookupError."""
+    raises ProcessLookupError. The escalation happens on a thread now, so the
+    request cannot see it either way -- what this holds is that a child which
+    ignores the signal is still killed, and that the race is still swallowed."""
     _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    killed = threading.Event()
 
     class HungThenVanishedProc(FakeProc):
         # accept the SIGINT, but never exit -- so wait() times out -- and then
@@ -1018,6 +1021,7 @@ def test_stopping_a_watch_that_vanishes_after_timeout_is_not_a_500(
             return 0
 
         def kill(self):
+            killed.set()
             raise ProcessLookupError(3, "No such process")
 
     monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
@@ -1025,6 +1029,164 @@ def test_stopping_a_watch_that_vanishes_after_timeout_is_not_a_500(
                             argv, stay_running=True, **kw))
     web.post("/api/watch", json={"goal": "watch dms"})
     assert web.post("/api/watch/stop").status_code == 200
+    assert killed.wait(timeout=5)
+
+
+# -- stopping, which is its own phase ---------------------------------------
+#
+# A watch does not stop the moment it is asked to. It leaves the loop, restores
+# the phone, and folds everything every pass learned about the app into that
+# app's skill -- one model call, up to a minute, and none of it written to a run
+# directory. The tests below hold the two halves of showing that: the request
+# answers straight away, and what happens after it is streamed rather than
+# silent.
+
+def _sse_frames(body: str):
+    """[(event name, payload)] from a finished SSE response."""
+    frames = []
+    for block in body.split("\n\n"):
+        name, data = "message", None
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                name = line[7:]
+            elif line.startswith("data: "):
+                data = json.loads(line[6:])
+        if data is not None:
+            frames.append((name, data))
+    return frames
+
+
+class WindingDownProc(FakeProc):
+    """A child that answers a SIGINT by leaving its loop and working on."""
+
+    LEARN_S = 0.4
+
+    def __init__(self, argv, **kw):
+        self._exit_at = None
+        super().__init__(argv, stay_running=True, **kw)
+        self.stdout = self._lines()
+
+    def _lines(self):
+        yield "  pass 1: success (0 repl(ies) sent so far, $0.0100)\n"
+        while self._exit_at is None:
+            time.sleep(0.02)
+        yield "  stopped\n"                      # the loop is over here
+        while time.time() < self._exit_at:       # ... and the skill is written
+            time.sleep(0.02)
+        yield "  skill 'instagram' updated from this run (3 workflows, 2 nuances)\n"
+
+    def poll(self):
+        return None if self._exit_at is None or time.time() < self._exit_at else 130
+
+    def wait(self, timeout=None):
+        deadline = time.time() + (timeout if timeout is not None else 60.0)
+        while time.time() < deadline:
+            if self.poll() is not None:
+                return 130
+            time.sleep(0.02)
+        raise subprocess.TimeoutExpired(self.argv, timeout)
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+        self._exit_at = time.time() + self.LEARN_S
+
+
+def _winding_down_watch(web, tmp_path, monkeypatch, runs=None):
+    """A started watch whose child takes `LEARN_S` to shut down."""
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    procs = []
+
+    def fake_popen(argv, **kw):
+        on_spawn = (lambda _argv: make_run_dir(runs, run_id="pass1")) \
+            if runs is not None else None
+        procs.append(WindingDownProc(argv, on_spawn=on_spawn, **kw))
+        return procs[-1]
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", fake_popen)
+    assert web.post("/api/watch", json={"goal": "watch dms"}).status_code == 200
+    # Let the pass line land, so the mark the shutdown is replayed from is a
+    # real position in the output rather than the top of it.
+    for _ in range(200):
+        if web.get("/api/watch").json()["active"]["output_tail"]:
+            break
+        time.sleep(0.02)
+    return procs
+
+
+def test_stopping_a_watch_answers_before_the_shutdown_is_over(
+        web, tmp_path, monkeypatch):
+    """The browser says "stopping" when this request answers. Waiting here for
+    the child meant waiting for its skill write-up -- three minutes are allowed
+    for it -- and for all of that the page showed nothing at all: the button
+    stayed live, the status line still read "watching", and a click that has no
+    effect for a minute is a click that did nothing."""
+    procs = _winding_down_watch(web, tmp_path, monkeypatch)
+
+    t0 = time.monotonic()
+    assert web.post("/api/watch/stop").status_code == 200
+    assert time.monotonic() - t0 < WindingDownProc.LEARN_S / 2
+    assert signal.SIGINT in procs[0].signals    # sent, not merely scheduled
+
+    # Still the phone's, and now saying which of the two states it is in.
+    active = web.get("/api/watch").json()["active"]
+    assert active["running"] is True
+    assert active["stopping"] is True
+    # Still the phone's, and the refusal says which of the two it is: "already
+    # running" would read as though the stop had not been heard.
+    res = web.post("/api/runs", json={"goal": "turn on wifi"})
+    assert res.status_code == 409
+    assert "stopping" in res.json()["detail"]
+    procs[0].wait()
+
+
+def test_a_second_stop_does_not_signal_into_the_write_up(web, tmp_path,
+                                                         monkeypatch):
+    """Clicking stop twice used to send a second SIGINT. The first is caught by
+    the loop's handler; the second lands after it, in the write-up -- so an
+    impatient double click threw away everything the watch had learned."""
+    procs = _winding_down_watch(web, tmp_path, monkeypatch)
+    assert web.post("/api/watch/stop").status_code == 200
+    assert web.post("/api/watch/stop").status_code == 200
+    assert procs[0].signals == [signal.SIGINT]
+    procs[0].wait()
+
+
+def test_the_stream_carries_the_shutdown_that_no_run_file_records(
+        web, tmp_path, monkeypatch):
+    """Between the stop and the exit, `events.jsonl` has nothing to say and the
+    child is doing the learning. The feed sat still through all of it."""
+    procs = _winding_down_watch(web, tmp_path, monkeypatch,
+                                runs=tmp_path / "runs")
+    assert web.post("/api/watch/stop").status_code == 200
+
+    frames = _sse_frames(web.get("/api/watch/stream").text)
+    assert any(name == "state" and data["stopping"] for name, data in frames)
+    shutdown = [data["line"] for name, data in frames if name == "output"]
+    assert "  stopped" in shutdown
+    # The one line that says whether the learning happened is the last thing the
+    # child prints, after the stream has seen it stop running.
+    assert any("skill 'instagram' updated" in line for line in shutdown)
+    # Replayed from the signal, not from the top: the pass above it already has
+    # its own cards, and repeating the session's output under "stopping" would
+    # bury the shutdown in it.
+    assert not any("pass 1: success" in line for line in shutdown)
+    assert frames[-1][0] == "end"
+    procs[0].wait()
+
+
+def test_a_child_is_spawned_unbuffered(web, monkeypatch):
+    """Python block-buffers stdout when it is a pipe. Everything a child says
+    outside its run files -- the skill written after the loop, a refusal before
+    there is a run at all -- would otherwise sit in that buffer until it exited,
+    which is exactly too late for any of it to be news."""
+    seen = {}
+    monkeypatch.setattr(
+        "adbagent.web.runner.subprocess.Popen",
+        lambda argv, **kw: seen.update(kw) or FakeProc(argv, stay_running=True,
+                                                       **kw))
+    assert web.post("/api/runs", json={"goal": "turn on wifi"}).status_code == 200
+    assert seen["env"]["PYTHONUNBUFFERED"] == "1"
+    web.post("/api/runs/stop")
 
 
 def test_watch_lifecycle_and_argv(web, tmp_path, monkeypatch):

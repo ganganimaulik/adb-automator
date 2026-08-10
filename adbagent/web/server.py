@@ -108,10 +108,21 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         One phone, one agent. A tour and a goal run reading each other's taps
         as their own is the failure this prevents; that both are started from
         different corners of the page is what makes it easy to ask for.
+
+        A child that has been asked to stop still holds the phone -- it is
+        restoring the keyboard, the animations and the rotation, and writing up
+        what it learned -- and the answer says that rather than "already in
+        progress", which reads as though the stop had not been heard.
         """
-        if manager.state()["running"]:
+        run = manager.state()
+        if run["stopping"]:
+            return "the run is stopping; the phone is free once it has"
+        if run["running"]:
             return "a run is already in progress"
-        if watcher.state()["running"]:
+        watch = watcher.state()
+        if watch["stopping"]:
+            return "the watch is stopping; it is writing up what it learned"
+        if watch["running"]:
             # Said with the remedy in it: a watch does not end on its own, so
             # "busy, try later" would be advice to wait forever.
             return ("a watch is running; stop it from the Watch tab before "
@@ -695,6 +706,13 @@ def _event_stream(child: ChildProcess) -> Generator[str, None, None]:
     happen) arrives as `llm`. A run recorded before the stream file existed
     just yields the first.
 
+    A third arrives only while the child is stopping: `output`, one frame per
+    line of its stdout. Both files go quiet the moment the loop ends, and for a
+    watch that is where the work starts -- every pass it made is folded into the
+    app's skill by one model call that can take a minute. None of that is written
+    to a run directory, so without this the feed simply freezes between the stop
+    and the exit, which reads as a stop that hung or did nothing.
+
     Under `--repeat` one subprocess writes several runs, each in its own
     directory, so the tail follows the move and announces it with a fresh
     `run` frame. The client rules off there; the session's own totals -- the
@@ -724,6 +742,7 @@ def _event_stream(child: ChildProcess) -> Generator[str, None, None]:
     carries = [b""] * len(tails)  # an appended-to file's last line may be torn
     drain_passes = 0  # once the child exits, read twice more to catch the tail
     last_heartbeat = time.monotonic()
+    output_seq: Optional[int] = None  # set when the stop is first seen
     while True:
         flowed = False
         for i, (path, frame) in enumerate(tails):
@@ -774,7 +793,24 @@ def _event_stream(child: ChildProcess) -> Generator[str, None, None]:
                            "iteration": child.state()["iteration"]}, "run")
                 continue
 
-        if child.state()["running"]:
+        state = child.state()
+
+        # The shutdown, as the child tells it. Read from the mark the signal was
+        # sent at rather than from wherever this loop happens to look first, so
+        # the account starts at its own first line -- the child answers a SIGINT
+        # in milliseconds and this poll is half a second wide.
+        # Kept up once started, because `stopping` is only true while the child
+        # is alive: the line that says whether the skill was written is the last
+        # thing it prints, and the drain passes below are where it arrives.
+        if state["stopping"] or output_seq is not None:
+            if output_seq is None:
+                output_seq = child.stop_mark()
+                yield sse(state, "state")  # the button has a phase to show
+            output_seq, lines = child.output_since(output_seq)
+            for line in lines:
+                yield sse({"line": line}, "output")
+
+        if state["running"]:
             drain_passes = 0
         else:
             drain_passes += 1
