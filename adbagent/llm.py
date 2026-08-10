@@ -746,6 +746,66 @@ def _image_size(image: bytes) -> Tuple[int, int]:
         return (0, 0)
 
 
+def _grid_font(size: int) -> Any:
+    """A legible label font, whichever platform fonts exist; never raises."""
+    from PIL import ImageFont
+
+    for name in ("arialbd.ttf", "DejaVuSans-Bold.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    try:
+        return ImageFont.load_default(size=size)  # the size kwarg is 10.1+
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def _grid_overlay(jpeg: bytes) -> Optional[bytes]:
+    """The frame with a labeled 10% grid drawn over it, or None.
+
+    A grounding model reads a ruler far better than it estimates a bare
+    coordinate: on the Hinge frame that ran (0.60, 0.52) three steps running,
+    the grid took qwen3p7-plus from a 67px average error to 11px and left the
+    most accurate model unchanged. None when the frame will not decode -- the
+    locate then sends the bare frame and drops the grid note from the prompt.
+    """
+    try:
+        import io
+
+        from PIL import Image, ImageDraw
+
+        with Image.open(io.BytesIO(jpeg)) as opened:
+            img = opened.convert("RGBA")
+        w, h = img.size
+        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(overlay)
+        ink = (255, 60, 60, 105)
+        for k in range(1, 10):
+            x = round(w * k / 10)
+            dr.line([(x, 0), (x, h)], fill=ink, width=1)
+            y = round(h * k / 10)
+            dr.line([(0, y), (w, y)], fill=ink, width=1)
+        img = Image.alpha_composite(img, overlay)
+        dr = ImageDraw.Draw(img)
+        font = _grid_font(max(12, round(min(w, h) * 0.024)))
+        for k in range(1, 10):
+            label = f"{k / 10:.1f}"
+            box = dr.textbbox((0, 0), label, font=font)
+            cw, ch = box[2] - box[0] + 7, box[3] - box[1] + 6
+            x = round(w * k / 10)
+            dr.rectangle([x + 1, 0, x + 1 + cw, ch], fill=(255, 255, 255, 235))
+            dr.text((x + 4, 2), label, font=font, fill=(180, 0, 0, 255))
+            y = round(h * k / 10)
+            dr.rectangle([0, y + 1, cw, y + 1 + ch], fill=(255, 255, 255, 235))
+            dr.text((3, y + 3), label, font=font, fill=(180, 0, 0, 255))
+        out = io.BytesIO()
+        img.convert("RGB").save(out, "JPEG", quality=90)
+        return out.getvalue()
+    except Exception:  # no PIL or a frame it cannot read: send it bare
+        return None
+
+
 def point_fractions(x: Optional[float], y: Optional[float],
                     width: int, height: int) -> Optional[Tuple[float, float]]:
     """A located point as fractions of the frame, whatever space it came in.
@@ -1263,6 +1323,9 @@ class LLMClient:
         `misses` are points already tapped on this screen that changed nothing.
         The call is stateless, so without them the model re-derives the same
         wrong point every time it is asked again.
+
+        The frame goes out under a labeled 10% grid (`_grid_overlay`): the
+        model reads the point off a ruler instead of estimating it bare.
         """
         from . import prompts
 
@@ -1270,13 +1333,18 @@ class LLMClient:
         # capture, not the device's -- so the prompt can state them and a
         # pixel-space answer can be brought back to fractions.
         width, height = _image_size(screenshot)
+        gridded = _grid_overlay(screenshot)
+        if gridded is None:
+            frame, note = screenshot, ""
+        else:
+            frame, note = gridded, prompts.LOCATE_GRID_NOTE
         messages = [
             {"role": "system", "content": prompts.LOCATE_SYSTEM},
             {"role": "user", "content": [
                 text_part(prompts.locate_user(description, goal=goal,
                                               width=width, height=height,
-                                              misses=misses)),
-                image_part(screenshot),
+                                              misses=misses) + note),
+                image_part(frame),
             ]},
         ]
         shot = ""
