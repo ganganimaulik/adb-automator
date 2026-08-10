@@ -11,6 +11,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -21,6 +22,8 @@ from fastapi.testclient import TestClient
 from adbagent.web import runparse
 from adbagent.web.runner import RunManager
 from adbagent.web.server import _event_stream, create_app
+
+EXPECTED_STOP_SIGNAL = getattr(signal, "CTRL_BREAK_EVENT", signal.SIGINT) if sys.platform == "win32" else signal.SIGINT
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -706,8 +709,8 @@ def test_a_generation_can_be_stopped(web, monkeypatch):
 
     assert web.post(f"/api/jobs/{job}/stop").status_code == 200
     assert spawned[0].poll() is not None
-    # SIGINT, not a kill: the CLI catches it and puts the phone back as it was.
-    assert spawned[0].signals == [signal.SIGINT]
+    # SIGINT/CTRL_BREAK_EVENT: the CLI catches it and puts the phone back as it was.
+    assert EXPECTED_STOP_SIGNAL in spawned[0].signals
     # And with the phone released, a run can start.
     assert web.post(f"/api/jobs/{job}/stop").status_code == 409
     assert web.post("/api/jobs/9999/stop").status_code == 404
@@ -1125,7 +1128,7 @@ def test_stopping_a_watch_answers_before_the_shutdown_is_over(
     t0 = time.monotonic()
     assert web.post("/api/watch/stop").status_code == 200
     assert time.monotonic() - t0 < WindingDownProc.LEARN_S / 2
-    assert signal.SIGINT in procs[0].signals    # sent, not merely scheduled
+    assert EXPECTED_STOP_SIGNAL in procs[0].signals    # sent, not merely scheduled
 
     # Still the phone's, and now saying which of the two states it is in.
     active = web.get("/api/watch").json()["active"]
@@ -1187,7 +1190,7 @@ def test_a_second_stop_does_not_signal_into_the_write_up(web, tmp_path,
     procs = _winding_down_watch(web, tmp_path, monkeypatch)
     assert web.post("/api/watch/stop").status_code == 200
     assert web.post("/api/watch/stop").status_code == 200
-    assert procs[0].signals == [signal.SIGINT]
+    assert EXPECTED_STOP_SIGNAL in procs[0].signals
     procs[0].wait()
 
 
@@ -1238,7 +1241,7 @@ def test_the_server_takes_a_watch_down_with_it(tmp_path, monkeypatch):
         assert client.post("/api/watch",
                            json={"goal": "watch dms"}).status_code == 200
         assert client.get("/api/watch").json()["active"]["running"] is True
-    assert signal.SIGINT in procs[0].signals   # asked, so the phone is restored
+    assert EXPECTED_STOP_SIGNAL in procs[0].signals   # asked, so the phone is restored
 
 
 def test_shutting_down_ends_the_live_streams(tmp_path, monkeypatch):
@@ -1318,7 +1321,7 @@ def test_watch_lifecycle_and_argv(web, tmp_path, monkeypatch):
     # One watch at a time.
     assert web.post("/api/watch", json={"goal": "again"}).status_code == 409
     assert web.post("/api/watch/stop").status_code == 200
-    assert signal.SIGINT in spawned[0].signals   # so the phone is restored
+    assert EXPECTED_STOP_SIGNAL in spawned[0].signals   # so the phone is restored
 
 
 def test_live_watch_omits_the_draft_flag(web, tmp_path, monkeypatch):

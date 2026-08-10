@@ -1805,3 +1805,20 @@ def test_a_screenshot_turn_costs_one_vision_call_even_when_it_reads_nothing(cfg,
     assert llm.analyses <= llm.seen_screenshots + llm.judges, (
         f"{llm.analyses} vision calls for {llm.seen_screenshots} screenshot "
         f"turn(s) and {llm.judges} judge(s)")
+
+
+def test_keyboard_interrupt_raises(cfg, mem, monkeypatch):
+    """KeyboardInterrupt inside agent.run loop must be re-raised so callers
+    and watch loops know the run was stopped by user request."""
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    agent = Agent(dev, mem, llm, cfg)
+
+    def raise_interrupt(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(dev, "observe", raise_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        agent.run(GOAL)
+

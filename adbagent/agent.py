@@ -719,6 +719,7 @@ class Agent:
         except KeyboardInterrupt:
             log.warning("interrupted")
             state.finished = "aborted"
+            raise
         except Exception as exc:  # noqa: BLE001 -- re-raised immediately
             # Not handling it, only recording it. `finally` closes the run log
             # below, so a crash that reached the top of the loop has this one
