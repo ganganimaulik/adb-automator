@@ -1335,6 +1335,19 @@ def test_live_watch_omits_the_draft_flag(web, tmp_path, monkeypatch):
     assert "--draft" not in spawned[0].argv
 
 
+def test_watch_no_learn_reaches_the_argv(web, tmp_path, monkeypatch):
+    """The 'don't learn' checkbox: the watch's skill write-up on stop is
+    opt-out, the same as a run's."""
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    spawned = []
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: spawned.append(
+                            FakeProc(argv, stay_running=True, **kw))
+                        or spawned[-1])
+    web.post("/api/watch", json={"goal": "watch dms", "no_learn": True})
+    assert "--no-learn" in spawned[0].argv
+
+
 def test_a_watch_and_a_run_refuse_each_other(web, tmp_path, monkeypatch):
     """One phone. A watch quietly displaced by a run is no longer watching."""
     _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
