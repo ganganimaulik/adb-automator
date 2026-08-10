@@ -6,80 +6,195 @@
 <title>adbagent</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-density="story">
 
 <header>
   <h1>adbagent</h1>
+  <!-- Device, model, key: the three facts that decide whether Start run can
+       work at all, and the activity of anything already holding the phone. -->
   <div class="status" id="status">connecting…</div>
 </header>
 
+<!-- Three tabs. Work is compose, watch it happen, and read what happened —
+     starting a run and reviewing one were never two different jobs. -->
 <nav id="tabs">
-  <button data-tab="run" class="active">Run</button>
+  <button data-tab="work" class="active">Work</button>
   <button data-tab="watch">Watch</button>
-  <button data-tab="history">History</button>
-  <button data-tab="devices">Devices</button>
-  <button data-tab="config">Config</button>
-  <button data-tab="skills">Skills</button>
+  <button data-tab="setup">Setup</button>
 </nav>
 
 <main>
   <div class="notice" id="notice"></div>
 
-  <!-- ----------------------------------------------------------- Run -->
-  <section class="tab active" id="tab-run">
-    <form class="run-form" id="run-form">
-      <textarea id="goal" rows="2" placeholder="What should the phone do? e.g. turn on airplane mode"></textarea>
-      <div class="opts">
-        <label>max steps <input type="number" id="opt-max-steps" min="1" placeholder="60"></label>
-        <label>budget $ <input type="number" id="opt-budget" min="0" step="0.1" placeholder="2.0"></label>
-        <label>repeat <input type="text" id="opt-repeat" value="1" size="4"
-          title="How many times to pursue the goal. 'inf' repeats until you stop it or the budget runs out — each iteration is its own run, and the budget bounds the whole session."></label>
-        <label>device <input type="text" id="opt-serial" placeholder="default serial"></label>
-        <label><input type="checkbox" id="opt-dry-run"> dry run</label>
-        <label><input type="checkbox" id="opt-destructive"> allow destructive</label>
-        <label><input type="checkbox" id="opt-no-learn"> don't learn</label>
+  <!-- ---------------------------------------------------------- Work -->
+  <section class="tab active" id="tab-work">
+
+    <!-- The goal is the most important control on the page, so it gets the
+         page's first line and the recent goals sit under it: a blank box is a
+         cold start, and most goals are a retry of one already in history. -->
+    <form class="composer" id="run-form">
+      <textarea id="goal" rows="3" aria-label="goal"
+        placeholder="What should the phone do? e.g. turn on airplane mode"></textarea>
+      <div class="recent" id="recent-goals" hidden>
+        <span class="recent-label">again:</span>
+        <span class="recent-chips" id="recent-chips"></span>
       </div>
+
+      <div class="optgroups">
+        <!-- What the run is allowed to do and spend. Separated from tuning
+             because these three are the ones that cost money or change
+             something you cannot change back. -->
+        <fieldset class="optgroup guard">
+          <legend>Guardrails</legend>
+          <label>budget $
+            <input type="number" id="opt-budget" min="0" step="0.1" placeholder="2.0"
+              title="The ceiling on the whole session, including every repeat iteration."></label>
+          <label class="check"><input type="checkbox" id="opt-destructive">
+            allow destructive</label>
+          <label class="check"><input type="checkbox" id="opt-dry-run">
+            dry run</label>
+        </fieldset>
+        <fieldset class="optgroup">
+          <legend>Tuning</legend>
+          <label>max steps <input type="number" id="opt-max-steps" min="1" placeholder="60"></label>
+          <label>repeat <input type="text" id="opt-repeat" value="1"
+            title="How many times to pursue the goal. 'inf' repeats until you stop it or the budget runs out — each iteration is its own run, and the budget bounds the whole session."></label>
+          <label>device <input type="text" id="opt-serial" placeholder="default serial"></label>
+          <label class="check"><input type="checkbox" id="opt-no-learn"> don't learn</label>
+        </fieldset>
+      </div>
+
       <!-- A machine-checkable definition of done. Free, instant, cannot be
            argued with, and it removes the completion-judge call from the run.
            Per-run rather than config, so this is the only place to set one. -->
       <details class="opts-more">
         <summary class="small">success assertion (optional)</summary>
         <div class="opts">
-          <label>shell <input type="text" id="opt-assert-shell" size="34"
+          <label>shell <input type="text" id="opt-assert-shell"
             placeholder="settings get global airplane_mode_on"></label>
-          <label>equals <input type="text" id="opt-assert-equals" size="8"
-            placeholder="1"></label>
-          <label>or text on screen <input type="text" id="opt-assert-text" size="22"
+          <label>equals <input type="text" id="opt-assert-equals" placeholder="1"></label>
+          <label>or text on screen <input type="text" id="opt-assert-text"
             placeholder="Forget network"></label>
         </div>
       </details>
-      <div class="opts">
-      </div>
-      <div class="split">
-        <button type="submit" class="primary" id="btn-start">Start run</button>
-        <button type="button" class="danger" id="btn-stop" disabled>Stop</button>
+
+      <div class="actions">
+        <button type="submit" class="primary big" id="btn-start">Start run</button>
         <span class="small" id="run-hint"></span>
       </div>
     </form>
 
-    <div id="live" style="display:none">
-      <div class="counters">
-        <span>run <b id="c-runid">—</b></span>
-        <span id="c-iter-wrap" style="display:none">iteration <b id="c-iter">1</b></span>
-        <span>step <b id="c-step">0</b></span>
-        <span>llm calls <b id="c-calls">0</b></span>
-        <span>cost <b id="c-cost">$0.0000</b></span>
-        <span>elapsed <b id="c-elapsed">0s</b></span>
-        <span>status <b id="c-state">running</b></span>
-        <span>skill <b id="c-skill">—</b></span>
-        <!-- What the run has collected so far. The feed shows each record as it
-             arrives; this is the running total, which is the number a
-             collection goal is actually judged on. -->
-        <span>records <b id="c-records">0</b></span>
+    <!-- What the run answered, in the treatment the answer deserves: above the
+         machinery that produced it, not at the bottom of it. -->
+    <div id="work-result" hidden>
+      <div class="result-box" id="result-box"></div>
+      <!-- Hidden while the session is still going: under `--repeat` an
+           iteration ends and the next begins, and a Start button that 409s is
+           worse than no button. -->
+      <div class="actions" id="run-actions">
+        <button type="button" class="primary" id="btn-new-run">New run</button>
+        <button type="button" class="ghost" id="btn-run-again">Run this goal again</button>
+        <button type="button" class="ghost" id="btn-resume-live" hidden>Resume from its checkpoint</button>
       </div>
-      <!-- The model's own note on what is done and what remains. -->
-      <div class="progress-note" id="c-progress" style="display:none"></div>
-      <div class="feed" id="feed"></div>
+    </div>
+
+    <!-- The live surface. Replaces the composer in place: watching a run and
+         starting one are the same screen. -->
+    <div id="live" hidden>
+      <div class="readouts">
+        <div class="readout wide">
+          <span class="rk">doing now</span>
+          <b id="c-now">starting…</b>
+        </div>
+        <div class="readout">
+          <span class="rk">step</span>
+          <b id="c-step">0</b>
+        </div>
+        <div class="readout">
+          <span class="rk">spent</span>
+          <b id="c-cost">$0.0000</b>
+        </div>
+        <div class="readout-rest">
+          <span>run <b class="mono" id="c-runid">—</b></span>
+          <span id="c-iter-wrap" hidden>iteration <b id="c-iter">1</b></span>
+          <span>llm calls <b id="c-calls">0</b></span>
+          <span>elapsed <b id="c-elapsed">0s</b></span>
+          <span>status <b id="c-state">running</b></span>
+          <span>skill <b id="c-skill">—</b></span>
+          <!-- What the run has collected so far. The feed shows each record as
+               it arrives; this is the running total, which is the number a
+               collection goal is actually judged on. -->
+          <span>records <b id="c-records">0</b></span>
+        </div>
+        <button type="button" class="danger" id="btn-stop" hidden>Stop</button>
+      </div>
+
+      <div class="live-body">
+        <div class="live-main">
+          <!-- The model's own note on what is done and what remains. -->
+          <div class="progress-note" id="c-progress" hidden></div>
+          <div class="ledger-pin" id="c-ledger" hidden></div>
+          <div class="feed-head">
+            <h3>Steps</h3>
+            <div class="seg" role="group" aria-label="feed density">
+              <button type="button" data-density="story">story</button>
+              <button type="button" data-density="trace">trace</button>
+            </div>
+          </div>
+          <div class="feed" id="feed"></div>
+        </div>
+        <aside class="phone" id="live-phone"></aside>
+      </div>
+    </div>
+
+    <!-- ------------------------------------------------------- history -->
+    <div id="history">
+      <div id="runs-list-view">
+        <div class="feed-head">
+          <h3>History</h3>
+          <span class="small" id="runs-count"></span>
+        </div>
+        <div class="filters">
+          <input type="search" id="runs-search" placeholder="search goals, answers, run ids">
+          <div class="seg" role="group" aria-label="outcome filter">
+            <button type="button" data-outcome="" class="on">all</button>
+            <button type="button" data-outcome="success">success</button>
+            <button type="button" data-outcome="failed">failed</button>
+            <button type="button" data-outcome="other">other</button>
+          </div>
+        </div>
+        <div class="runs" id="runs-list"></div>
+        <p class="small" id="runs-empty" hidden>No runs yet.</p>
+      </div>
+
+      <div id="run-detail-view" hidden>
+        <div class="detail-top">
+          <button class="ghost" id="btn-back-runs">← all runs</button>
+          <span class="mono small runid" id="detail-title"></span>
+          <span class="grow"></span>
+          <button class="primary" id="btn-resume-run" hidden>Resume this run</button>
+        </div>
+        <div class="goal-headline" id="detail-goal"></div>
+        <div id="detail-answer"></div>
+        <div class="readout-rest solo" id="detail-metrics"></div>
+        <details class="panel thin" id="detail-more">
+          <summary class="small">cost of thinking</summary>
+          <div class="readout-rest solo" id="detail-stats"></div>
+        </details>
+        <div class="ledger-pin" id="detail-ledger" hidden></div>
+        <div class="feed-head">
+          <h3>Steps</h3>
+          <div class="seg" role="group" aria-label="feed density">
+            <button type="button" data-density="story">story</button>
+            <button type="button" data-density="trace">trace</button>
+          </div>
+        </div>
+        <div class="feed" id="detail-feed"></div>
+        <details class="panel thin">
+          <summary class="small">run.log tail</summary>
+          <pre class="log" id="detail-log">loading…</pre>
+        </details>
+      </div>
     </div>
   </section>
 
@@ -90,34 +205,104 @@
   <section class="tab" id="tab-watch">
     <div class="banner" id="watch-mode-banner"></div>
 
-    <form class="run-form" id="watch-form">
-      <textarea id="watch-goal" rows="2"
+    <form class="composer" id="watch-form">
+      <textarea id="watch-goal" rows="2" aria-label="what to watch"
         placeholder="What should it watch? e.g. watch my instagram direct messages"></textarea>
-      <div class="opts">
-        <label><input type="checkbox" id="watch-draft" checked> draft only (never send)</label>
-        <label>every <input type="number" id="watch-interval" min="5" step="5" size="4" placeholder="45"> s</label>
-        <label>steps/pass <input type="number" id="watch-steps" min="1" size="4" placeholder="25"></label>
-        <label>device <input type="text" id="watch-serial" placeholder="default serial"></label>
-        <label><input type="checkbox" id="watch-no-learn"> don't learn</label>
+      <div class="optgroups">
+        <fieldset class="optgroup guard">
+          <legend>Mode</legend>
+          <label class="check"><input type="checkbox" id="watch-draft" checked>
+            draft only (never send)</label>
+          <label>every (seconds) <input type="number" id="watch-interval" min="5" step="5" placeholder="45"></label>
+          <label>steps/pass <input type="number" id="watch-steps" min="1" placeholder="25"></label>
+        </fieldset>
+        <fieldset class="optgroup">
+          <legend>Limits</legend>
+          <label>replies/hour <input type="number" id="watch-rph" min="0" placeholder="12"></label>
+          <label>per conversation/hour <input type="number" id="watch-rpc" min="0" placeholder="2"></label>
+          <label>cooldown (seconds) <input type="number" id="watch-cooldown" min="0" step="30" placeholder="600"></label>
+          <label>$/hour <input type="number" id="watch-usd" min="0" step="0.1" placeholder="off"></label>
+        </fieldset>
+        <fieldset class="optgroup">
+          <legend>Tuning</legend>
+          <label>device <input type="text" id="watch-serial" placeholder="default serial"></label>
+          <label class="check"><input type="checkbox" id="watch-no-learn"> don't learn</label>
+        </fieldset>
       </div>
-      <div class="opts">
-        <label>replies/hour <input type="number" id="watch-rph" min="0" size="4" placeholder="12"></label>
-        <label>per conversation/hour <input type="number" id="watch-rpc" min="0" size="4" placeholder="2"></label>
-        <label>cooldown <input type="number" id="watch-cooldown" min="0" step="30" size="5" placeholder="600"> s</label>
-        <label>$/hour <input type="number" id="watch-usd" min="0" step="0.1" size="5" placeholder="off"></label>
-      </div>
-      <div class="split">
-        <button type="submit" class="primary" id="btn-watch-start">Start watching</button>
-        <button type="button" class="danger" id="btn-watch-stop" disabled>Stop</button>
+      <div class="actions">
+        <button type="submit" class="primary big" id="btn-watch-start">Start watching</button>
         <span class="small" id="watch-hint"></span>
       </div>
     </form>
 
+    <!-- The record the never-double-reply guarantee is built on, and the only
+         place that answers "what did it say, to whom, when". The product of a
+         watch, so it comes before the machinery. -->
     <div class="panel">
-      <div class="split">
+      <div class="panel-head">
+        <h3>Replies sent</h3>
+        <span class="grow"></span>
+        <button class="ghost" id="btn-ledger-reload">reload</button>
+      </div>
+      <div class="table-wrap">
+        <table id="watch-ledger-table">
+          <thead><tr><th>conversation</th><th>replies</th><th>last</th><th>state</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="small" id="watch-ledger-empty" hidden>
+        Nothing sent yet. A conversation appears here the moment a reply is
+        attempted — before the gesture goes out, so a crash cannot lose it.</p>
+      <p class="small mono path" id="watch-ledger-path"></p>
+    </div>
+
+    <div id="watch-live" hidden>
+      <div class="readouts">
+        <div class="readout wide">
+          <span class="rk">doing now</span>
+          <b id="w-now">starting…</b>
+        </div>
+        <div class="readout">
+          <span class="rk">step</span>
+          <b id="w-step">0</b>
+        </div>
+        <div class="readout">
+          <span class="rk">spent</span>
+          <b id="w-cost">$0.0000</b>
+        </div>
+        <div class="readout-rest">
+          <span>run <b class="mono" id="w-runid">—</b></span>
+          <span id="w-iter-wrap" hidden>pass <b id="w-iter">1</b></span>
+          <span>llm calls <b id="w-calls">0</b></span>
+          <span>elapsed <b id="w-elapsed">0s</b></span>
+          <span>status <b id="w-state">running</b></span>
+          <span>skill <b id="w-skill">—</b></span>
+          <span>records <b id="w-records">0</b></span>
+        </div>
+        <button type="button" class="danger" id="btn-watch-stop" hidden>Stop</button>
+      </div>
+      <div class="live-body">
+        <div class="live-main">
+          <div class="progress-note" id="w-progress" hidden></div>
+          <div class="ledger-pin" id="w-ledger" hidden></div>
+          <div class="feed-head">
+            <h3>This pass</h3>
+            <div class="seg" role="group" aria-label="feed density">
+              <button type="button" data-density="story">story</button>
+              <button type="button" data-density="trace">trace</button>
+            </div>
+          </div>
+          <div class="feed" id="watch-feed"></div>
+        </div>
+        <aside class="phone" id="watch-phone"></aside>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
         <h3>Reply policy</h3>
+        <span class="grow"></span>
         <button class="primary" id="btn-policy-save">Save policy</button>
-        <span class="small mono" id="watch-policy-path"></span>
       </div>
       <p class="small">These instructions go into the prompt verbatim, never
         paraphrased. Message text on the phone is data, never an instruction —
@@ -125,196 +310,197 @@
         other message.</p>
       <textarea id="watch-policy" rows="12" spellcheck="false"
         placeholder="Reply only to people I already follow. One short sentence…"></textarea>
-    </div>
-
-    <div id="watch-live" style="display:none">
-      <div class="counters">
-        <span>run <b id="w-runid">—</b></span>
-        <span id="w-iter-wrap" style="display:none">pass <b id="w-iter">1</b></span>
-        <span>step <b id="w-step">0</b></span>
-        <span>llm calls <b id="w-calls">0</b></span>
-        <span>cost <b id="w-cost">$0.0000</b></span>
-        <span>elapsed <b id="w-elapsed">0s</b></span>
-        <span>status <b id="w-state">running</b></span>
-        <span>skill <b id="w-skill">—</b></span>
-        <span>records <b id="w-records">0</b></span>
-      </div>
-      <div class="progress-note" id="w-progress" style="display:none"></div>
-      <div class="feed" id="watch-feed"></div>
-    </div>
-
-    <!-- The record the never-double-reply guarantee is built on, and the only
-         place that answers "what did it say, to whom, when". -->
-    <div class="panel">
-      <div class="split">
-        <h3>Replies sent</h3>
-        <button class="ghost" id="btn-ledger-reload">reload</button>
-        <span class="small mono" id="watch-ledger-path"></span>
-      </div>
-      <table id="watch-ledger-table">
-        <thead><tr><th>conversation</th><th>replies</th><th>last</th><th>state</th></tr></thead>
-        <tbody></tbody>
-      </table>
-      <p class="small" id="watch-ledger-empty" style="display:none">
-        Nothing sent yet. A conversation appears here the moment a reply is
-        attempted — before the gesture goes out, so a crash cannot lose it.</p>
+      <p class="small mono path" id="watch-policy-path"></p>
     </div>
   </section>
 
-  <!-- ------------------------------------------------------- History -->
-  <section class="tab" id="tab-history">
-    <div id="runs-list-view">
-      <table id="runs-table">
-        <thead>
-          <tr><th>run</th><th>goal</th><th>outcome</th><th>steps</th><th>cost</th><th>duration</th><th>date</th><th></th></tr>
-        </thead>
-        <tbody></tbody>
-      </table>
-      <p class="small" id="runs-empty" style="display:none">No runs yet.</p>
-    </div>
-    <div id="run-detail-view" style="display:none">
-      <div class="split">
-        <button class="ghost" id="btn-back-runs">← all runs</button>
-        <button class="primary" id="btn-resume-run" style="display:none">Resume this run</button>
-        <span class="mono small" id="detail-title"></span>
-      </div>
-      <div class="panel" id="detail-stats"></div>
-      <div class="panel" id="detail-scratch" style="display:none">
-        <h3>Collected data</h3>
-        <pre class="log" id="detail-scratch-text"></pre>
-      </div>
-      <div class="feed" id="detail-feed"></div>
-      <details class="panel">
-        <summary>run.log tail</summary>
-        <pre class="log" id="detail-log">loading…</pre>
-      </details>
-    </div>
-  </section>
+  <!-- --------------------------------------------------------- Setup -->
+  <section class="tab" id="tab-setup">
+    <nav class="subnav" id="setup-nav">
+      <button data-pane="device" class="active">Device</button>
+      <button data-pane="config">Config</button>
+      <button data-pane="skills">Skills</button>
+    </nav>
 
-  <!-- ------------------------------------------------------- Devices -->
-  <section class="tab" id="tab-devices">
-    <div class="split">
-      <button class="ghost" id="btn-dev-reload">reload</button>
-      <span class="small" id="dev-error"></span>
-    </div>
-    <div class="panel">
-      <h3>Connected devices</h3>
-      <table id="dev-table">
-        <thead><tr><th>serial</th><th>model</th><th>android</th><th></th></tr></thead>
-        <tbody></tbody>
-      </table>
-      <p class="small" id="dev-empty" style="display:none">No devices. Connect over USB, or pair over Wi-Fi from the CLI.</p>
-      <p class="small" id="dev-candidates"></p>
-    </div>
-    <div class="panel" id="shot-panel" style="display:none">
-      <h3>Screenshot <span class="mono small" id="shot-serial"></span></h3>
-      <img class="shot" id="shot-img" alt="device screenshot">
-    </div>
-
-    <!-- Which app is this actually called? A goal naming an app the phone does
-         not have fails on step one. -->
-    <div class="panel">
-      <div class="split">
-        <h3>Installed apps</h3>
-        <input type="text" id="apps-search" placeholder="search, e.g. whatsapp" size="20">
-        <label class="small"><input type="checkbox" id="apps-third-party" checked> third-party only</label>
-        <button class="ghost" id="btn-apps-load">list apps</button>
-        <span class="small" id="apps-status"></span>
-      </div>
-      <pre class="log" id="apps-out" style="display:none"></pre>
-    </div>
-
-    <!-- Exactly what the model is shown for the current screen: the same
-         pruning, the same #indices it is told to aim at. The first thing to look
-         at when a run did something inexplicable. -->
-    <div class="panel">
-      <div class="split">
-        <h3>What the model sees</h3>
-        <label class="small"><input type="checkbox" id="dump-raw"> include raw XML</label>
-        <button class="ghost" id="btn-dump">dump screen</button>
-        <span class="small" id="dump-status"></span>
-      </div>
-      <p class="small mono" id="dump-meta"></p>
-      <pre class="log" id="dump-out" style="display:none"></pre>
-    </div>
-
-    <div class="panel">
-      <div class="split">
-        <h3>Diagnostics</h3>
-        <button class="ghost" id="btn-doctor">run doctor</button>
-        <span class="small" id="doctor-status"></span>
-      </div>
-      <pre class="log" id="doctor-out" style="display:none"></pre>
-    </div>
-  </section>
-
-  <!-- -------------------------------------------------------- Config -->
-  <section class="tab" id="tab-config">
-    <div class="split">
-      <button class="primary" id="btn-cfg-save">Save config</button>
-      <button class="ghost" id="btn-cfg-models"
-        title="Page through the provider's catalogue again — for a model released since this page loaded.">reload models</button>
-      <span class="small mono" id="cfg-path"></span>
-    </div>
-    <p class="small" id="cfg-models-status"></p>
-    <div id="cfg-form"></div>
-    <p class="small">A key typed into <span class="mono">api_key</span> is written to the config
-      file, which is gitignored. Left blank it keeps whatever is stored, falling back to the
-      environment variable named by <span class="mono">api_key_env</span>.</p>
-  </section>
-
-  <!-- -------------------------------------------------------- Skills -->
-  <section class="tab" id="tab-skills">
-    <div class="skills-layout">
-      <div>
-        <div class="split">
-          <button class="ghost" id="btn-skills-reload">reload</button>
+    <!-- ....................................................... device -->
+    <div class="pane active" id="pane-device">
+      <!-- Whether a run can start at all, said plainly. A serial in config is
+           not a phone on the end of a cable. -->
+      <div class="panel" id="dev-state-panel">
+        <div class="panel-head">
+          <h3>This phone</h3>
+          <span class="grow"></span>
+          <button class="ghost" id="btn-dev-reload">reload</button>
         </div>
-        <div class="skills-list" id="skills-list"></div>
-      </div>
-      <div>
-        <div id="skill-editor" style="display:none">
-          <div class="split">
-            <b id="skill-name"></b>
-            <button class="primary" id="btn-skill-save">Save</button>
-          </div>
-          <textarea id="skill-json" rows="22" spellcheck="false"></textarea>
+        <div id="dev-state"></div>
+        <div class="table-wrap">
+          <table id="dev-table">
+            <thead><tr><th>serial</th><th>model</th><th>android</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
         </div>
-        <div class="panel" style="margin-top:16px">
-          <h3>Generate a skill</h3>
-          <div class="opts" style="margin-bottom:10px">
-            <label>app <input type="text" id="gen-name" placeholder="whatsapp (blank = foreground app)"></label>
-            <label>tasks <input type="text" id="gen-tasks" placeholder="open a chat and read the last message" style="width:280px"></label>
-          </div>
-          <div class="split">
-            <button class="ghost" id="btn-gen">Generate</button>
-            <button type="button" class="danger" id="btn-gen-stop" disabled>Stop</button>
-            <span class="small" id="gen-status"></span>
-          </div>
+        <p class="small" id="dev-empty" hidden>No devices. Connect over USB, or pair over Wi-Fi from the CLI.</p>
+        <p class="small" id="dev-candidates"></p>
+        <p class="small" id="dev-error"></p>
+      </div>
 
-          <!-- The tour, watched as the run it is: same counters, same cards,
-               same thinking panels and submitted frames as the Run tab. -->
-          <div id="gen-live" style="display:none">
-            <div class="counters">
-              <span>run <b id="gc-runid">—</b></span>
-              <span>step <b id="gc-step">0</b></span>
-              <span>llm calls <b id="gc-calls">0</b></span>
-              <span>cost <b id="gc-cost">$0.0000</b></span>
-              <span>elapsed <b id="gc-elapsed">0s</b></span>
-              <span>status <b id="gc-state">running</b></span>
-              <span>skill <b id="gc-skill">—</b></span>
-              <span>records <b id="gc-records">0</b></span>
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Screen</h3>
+          <span class="grow"></span>
+          <span class="small" id="shot-serial"></span>
+        </div>
+        <aside class="phone standalone" id="setup-phone"></aside>
+      </div>
+
+      <!-- Which app is this actually called? A goal naming an app the phone does
+           not have fails on step one. -->
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Installed apps</h3>
+          <input type="search" id="apps-search" placeholder="search, e.g. whatsapp">
+          <label class="check small"><input type="checkbox" id="apps-third-party" checked> third-party only</label>
+          <button class="ghost" id="btn-apps-load">list apps</button>
+          <span class="small" id="apps-status"></span>
+        </div>
+        <pre class="log" id="apps-out" hidden></pre>
+      </div>
+
+      <!-- Exactly what the model is shown for the current screen: the same
+           pruning, the same #indices it is told to aim at. The first thing to look
+           at when a run did something inexplicable. -->
+      <div class="panel">
+        <div class="panel-head">
+          <h3>What the model sees</h3>
+          <label class="check small"><input type="checkbox" id="dump-raw"> include raw XML</label>
+          <button class="ghost" id="btn-dump">dump screen</button>
+          <span class="small" id="dump-status"></span>
+        </div>
+        <p class="small mono" id="dump-meta"></p>
+        <pre class="log" id="dump-out" hidden></pre>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>Diagnostics</h3>
+          <button class="ghost" id="btn-doctor">run doctor</button>
+          <span class="small" id="doctor-status"></span>
+        </div>
+        <pre class="log" id="doctor-out" hidden></pre>
+      </div>
+    </div>
+
+    <!-- ....................................................... config -->
+    <div class="pane" id="pane-config">
+      <div class="detail-top">
+        <button class="primary" id="btn-cfg-save">Save config</button>
+        <button class="ghost" id="btn-cfg-models"
+          title="Page through the provider's catalogue again — for a model released since this page loaded.">reload models</button>
+        <span class="grow"></span>
+        <span class="small mono path" id="cfg-path"></span>
+      </div>
+      <p class="small" id="cfg-models-status"></p>
+      <div id="cfg-form">
+        <div class="panel">
+          <div class="panel-head"><h3>Essentials</h3></div>
+          <div class="cfg-grid" id="cfg-essentials"></div>
+        </div>
+        <details class="panel" id="cfg-advanced-panel">
+          <summary><h3>Advanced</h3><span class="small">every other setting in <span class="mono">config.json</span></span></summary>
+          <div class="panel-head">
+            <input type="search" id="cfg-search" placeholder="search settings, e.g. stall">
+            <span class="small" id="cfg-search-status"></span>
+          </div>
+          <div id="cfg-advanced"></div>
+        </details>
+      </div>
+      <p class="small">A key typed into <span class="mono">api_key</span> is written to the config
+        file, which is gitignored. Left blank it keeps whatever is stored, falling back to the
+        environment variable named by <span class="mono">api_key_env</span>.</p>
+    </div>
+
+    <!-- ....................................................... skills -->
+    <div class="pane" id="pane-skills">
+      <div class="skills-layout">
+        <div>
+          <div class="panel-head">
+            <h3>Skills</h3>
+            <span class="grow"></span>
+            <button class="ghost" id="btn-skills-reload">reload</button>
+          </div>
+          <div class="skills-list" id="skills-list"></div>
+        </div>
+        <div>
+          <div class="panel" id="skill-editor" hidden>
+            <div class="panel-head">
+              <h3 id="skill-name"></h3>
+              <span class="grow"></span>
+              <button class="primary" id="btn-skill-save">Save</button>
             </div>
-            <div class="progress-note" id="gc-progress" style="display:none"></div>
-            <div class="feed" id="gen-feed"></div>
+            <textarea id="skill-json" rows="22" spellcheck="false"></textarea>
           </div>
+          <div class="panel">
+            <div class="panel-head"><h3>Generate a skill</h3></div>
+            <div class="opts">
+              <label>app <input type="text" id="gen-name" placeholder="whatsapp (blank = foreground app)"></label>
+              <label class="grow-field">tasks <input type="text" id="gen-tasks"
+                placeholder="open a chat and read the last message"></label>
+            </div>
+            <div class="actions">
+              <button class="ghost" id="btn-gen">Generate</button>
+              <button type="button" class="danger" id="btn-gen-stop" hidden>Stop</button>
+              <span class="small" id="gen-status"></span>
+            </div>
 
-          <!-- What the tour itself cannot show: the write-up afterwards, and
-               the refusals that come before there is a run at all. -->
-          <details id="gen-log-wrap" style="display:none;margin-top:12px">
-            <summary class="small">generator output</summary>
-            <pre class="log" id="gen-log" style="margin-top:8px"></pre>
-          </details>
+            <!-- The tour, watched as the run it is: same readouts, same step
+                 rows, same thinking panels and submitted frames as Work. -->
+            <div id="gen-live" hidden>
+              <div class="readouts">
+                <div class="readout wide">
+                  <span class="rk">doing now</span>
+                  <b id="gc-now">starting…</b>
+                </div>
+                <div class="readout">
+                  <span class="rk">step</span>
+                  <b id="gc-step">0</b>
+                </div>
+                <div class="readout">
+                  <span class="rk">spent</span>
+                  <b id="gc-cost">$0.0000</b>
+                </div>
+                <div class="readout-rest">
+                  <span>run <b class="mono" id="gc-runid">—</b></span>
+                  <span>llm calls <b id="gc-calls">0</b></span>
+                  <span>elapsed <b id="gc-elapsed">0s</b></span>
+                  <span>status <b id="gc-state">running</b></span>
+                  <span>skill <b id="gc-skill">—</b></span>
+                  <span>records <b id="gc-records">0</b></span>
+                </div>
+              </div>
+              <div class="live-body">
+                <div class="live-main">
+                  <div class="progress-note" id="gc-progress" hidden></div>
+                  <div class="ledger-pin" id="gc-ledger" hidden></div>
+                  <div class="feed-head">
+                    <h3>The tour</h3>
+                    <div class="seg" role="group" aria-label="feed density">
+                      <button type="button" data-density="story">story</button>
+                      <button type="button" data-density="trace">trace</button>
+                    </div>
+                  </div>
+                  <div class="feed" id="gen-feed"></div>
+                </div>
+                <aside class="phone" id="gen-phone"></aside>
+              </div>
+            </div>
+
+            <!-- What the tour itself cannot show: the write-up afterwards, and
+                 the refusals that come before there is a run at all. -->
+            <details id="gen-log-wrap" hidden>
+              <summary class="small">generator output</summary>
+              <pre class="log" id="gen-log"></pre>
+            </details>
+          </div>
         </div>
       </div>
     </div>
@@ -322,7 +508,7 @@
 </main>
 
 <!-- A submitted screenshot at full size. Click anywhere, or Escape, to close. -->
-<div class="lightbox" id="lightbox" style="display:none"><img id="lightbox-img" alt=""></div>
+<div class="lightbox" id="lightbox" hidden><img id="lightbox-img" alt=""></div>
 
 <script src="/static/app.js"></script>
 </body>
