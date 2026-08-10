@@ -149,6 +149,46 @@ def test_a_tap_at_naming_a_listed_element_is_refused_with_its_index(cfg, mem):
     assert "#" in (state.last_failure or "")
 
 
+def test_a_tap_at_naming_something_inside_a_container_label_is_located(cfg, mem):
+    """The text half of the refusal guard takes the point half's size rule:
+    a name that resolves only as a substring of a big container's aggregated
+    label is naming something inside it that has no element of its own, and
+    refusing it with "tap it by index" points at the container -- a dead end,
+    not guidance. runs/8213dc5e6bf3: Hinge's like-comment composer is one
+    full-screen scroller whose label mentions the "Send Priority Like" pill;
+    the named tap_at was refused twice with the scroller's #1 before the
+    watch was stopped, and no locate ever ran."""
+    # The composer as the tree reports it: one full-screen scroller whose
+    # label aggregates the composer's contents, the pill among them.
+    composer = X.dump(X.N("android.widget.ScrollView", (0, 0, X.W, X.H),
+                          desc="Edit comment Send a Rose with message "
+                               "Send priority like with message Vac's photo",
+                          scrollable=True))
+    dev = fake.FakeDevice(cfg, start="composer",
+                          app={"composer": fake.FakeScreen(xml=composer)})
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="the composer closed",
+                               reasoning="the like went out",
+                               action="done", text="like sent")
+        tried.append(True)
+        # What the vision model answers for the pill on this frame.
+        llm.location = (0.59, 0.67)
+        return AgentAction(observation="the send pill has no element of its own",
+                           reasoning="name it and have it located",
+                           action="tap_at", text="Send Priority Like")
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert llm.locates == 1 and llm.locates_seen == ["Send Priority Like"]
+    assert "tap_at refused" not in (state.last_failure or "")
+    # The located point, not the container's centre, is what was tapped.
+    assert dev.taps == [(int(0.59 * X.W), int(0.67 * X.H))]
+
+
 def test_a_tap_at_landing_on_a_listed_control_is_refused(cfg, mem):
     dev = fake.FakeDevice(cfg)
     tried = []
@@ -211,6 +251,72 @@ def test_a_locate_miss_is_a_failed_step_never_a_tapped_guess(cfg, mem):
     assert llm.locates == 1            # the locate was asked...
     assert dev.taps == []              # ...and its miss was not tapped
     assert "could not locate" in (state.last_failure or "")
+
+
+def test_a_blind_deciders_guessed_point_is_replaced_by_the_locate(cfg, mem):
+    """A blind decider never saw a frame, so the x/y it writes are guesses by
+    construction: when the control is also named, the locate answers and its
+    point -- not the guess -- is what goes out.
+
+    runs/467405879436: a split pair (deepseek deciding, inkling reading the
+    screenshots) and Hinge's "Send Priority Like" pill, which the tree folds
+    into the composer scroller's label. The decider read the image-analysis
+    block as "a screenshot is attached" and guessed (0.5, 0.55), (0.5, 0.62),
+    (0.5, 0.45), (0.5, 0.58) -- around the pill every time, on it never --
+    and the run aborted with the like unsent.
+    """
+    dev = fake.FakeDevice(cfg)
+    expected = []
+
+    def policy(screen, llm):
+        if dev.state == "wifi":
+            return AgentAction(observation="arrived", reasoning="goal reached",
+                               action="done", text="reached wifi")
+        wanted = next(e for e in screen.elements if e.best_text == "Wi-Fi")
+        # What a vision model would answer for the named control on this frame.
+        llm.location = (wanted.center[0] / screen.width,
+                        wanted.center[1] / screen.height)
+        expected.append(wanted.center)
+        # Coordinates AND a name, as the blind decider in the run sent them.
+        # (540, 468) is bare canvas, so the listed-element guard passes; the
+        # located row centre is the point that must actually be tapped.
+        return AgentAction(observation="the tree does not list it",
+                           reasoning="tap where I believe the control is",
+                           action="tap_at", x=0.5, y=0.2,
+                           text="the Wi-Fi row icon")
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert dev.state == "wifi"
+    assert llm.locates == 1 and llm.locates_seen == ["the Wi-Fi row icon"]
+    cx, cy = expected[0]
+    assert abs(dev.taps[0][0] - cx) <= 1 and abs(dev.taps[0][1] - cy) <= 1
+
+
+def test_a_seeing_deciders_named_point_is_kept(cfg, mem):
+    """The override is for blind deciders only: a model shown the frame taps
+    the point it read off it, and no locate is paid for."""
+    cfg.llm.vision_in_decider = True
+    dev = fake.FakeDevice(cfg)
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="done probing", reasoning="finished",
+                               action="done", text="probed")
+        tried.append(True)
+        # (540, 468): below the tabs, above the list -- nothing interactive.
+        return AgentAction(observation="saw the canvas on the screenshot",
+                           reasoning="press where the control is drawn",
+                           action="tap_at", x=0.5, y=0.2,
+                           text="the record button")
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert llm.locates == 0
+    assert dev.taps == [(540, 468)]
 
 
 # ---------------------------------------------------------------------------

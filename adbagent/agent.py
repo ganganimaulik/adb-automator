@@ -24,9 +24,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__, checkpoint, conversation, prompts, runlog, safety
-from .actions import (ActionError, AgentAction, Target, append_history,
-                      element_at_point, execute, format_history_entry,
-                      resolve_target, synthesise_postcondition, verify)
+from .actions import (_POINT_GUARD_MAX_AREA, ActionError, AgentAction, Target,
+                      append_history, element_at_point, execute,
+                      format_history_entry, resolve_target,
+                      synthesise_postcondition, verify)
 from .config import Config
 from .device import Device, DeviceTimeout, DeviceLost
 from .fingerprint import crop_frac
@@ -1147,7 +1148,11 @@ class Agent:
                 # tap_at is revealed only once ordinary targeting has failed
                 # somehow: a stall, or an action that did not work. On a
                 # healthy turn the model never hears the hatch exists.
-                struggle=stalled + state.consecutive_failures)
+                struggle=stalled + state.consecutive_failures,
+                # ...and its x/y form exists only for a decider that can see:
+                # a blind one's fractions are guesses, so it is told to name
+                # the control and let the locate place it.
+                decider_sees=cfg.llm.decider_sees())
             # Placed ahead of the older hints on purpose: when the run has
             # stopped getting anywhere, that is the most important thing on the
             # turn, and it is the only block that names the actions the harness
@@ -1523,6 +1528,24 @@ class Agent:
                 elif (action.text or "").strip():
                     listed = resolve_target(Target(text=action.text.strip()),
                                             screen)
+                    # The point half's size rule, applied to the text half: a
+                    # name that resolves only to a big container -- a scroller
+                    # whose aggregated label mentions the control -- is naming
+                    # something inside it that has no element of its own, and
+                    # "tap the container by index" is a dead end, not guidance.
+                    # runs/8213dc5e6bf3 refused the named tap_at of Hinge's
+                    # "Send Priority Like" pill twice this way, pointing at the
+                    # full-screen composer scroller whose label contains it.
+                    if (listed is not None and screen.width > 0
+                            and screen.height > 0
+                            and listed.area > screen.width * screen.height
+                                              * _POINT_GUARD_MAX_AREA):
+                        log.info("tap_at %r matches container #%d "
+                                 "(%.0f%% of screen); leaving it to the locate",
+                                 action.text.strip(), listed.index,
+                                 100.0 * listed.area
+                                 / (screen.width * screen.height))
+                        listed = None
                 if listed is not None:
                     label = f' "{listed.best_text}"' if listed.best_text else ""
                     state.last_failure = (
@@ -1533,16 +1556,28 @@ class Agent:
                         state.step, action, screen=screen, grade="refused",
                         reason=state.last_failure))
                     continue
-            # A tap_at that names a control instead of a point is grounded here:
-            # the decider never saw pixels, so the vision model places the
-            # control on this turn's own frame -- the pixels the tree the model
-            # reasoned over was dumped with -- and the answer rides into execute
-            # as ordinary x/y. A miss (call failed, control not found) is a
-            # failed step, never a tap at a guess.
+            # A tap_at that names a control is grounded here rather than tapped
+            # blind: the vision model places the control on this turn's own
+            # frame -- the pixels the tree the model reasoned over was dumped
+            # with -- and the answer rides into execute as ordinary x/y. A miss
+            # (call failed, control not found) is a failed step, never a tap at
+            # a guess. The grounding also fires when a blind decider sent
+            # coordinates anyway: never having seen a frame, its fractions are
+            # guesses by construction, and the named control is the only real
+            # information in the action -- runs/467405879436 spent four steps
+            # tapping around Hinge's "Send Priority Like" pill without once
+            # hitting it, on a prompt that read the image analysis as "a
+            # screenshot is attached". A seeing decider's coordinates are its
+            # own reading and are left alone.
             if (action.action == "tap_at" and self.llm is not None
-                    and (action.x is None or action.y is None)
                     and (action.text or "").strip()
-                    and not cfg.run.never_screenshot):
+                    and not cfg.run.never_screenshot
+                    and (action.x is None or action.y is None
+                         or not cfg.llm.decider_sees())):
+                if action.x is not None and action.y is not None:
+                    log.info("step %d: tap_at (%.2f, %.2f) overridden: blind "
+                             "decider; locating %r instead", state.step,
+                             action.x, action.y, action.text.strip())
                 where = self.llm.locate(self._ensure_screenshot(screen),
                                         action.text.strip(), goal=state.goal,
                                         step=state.step, recorder=rec,

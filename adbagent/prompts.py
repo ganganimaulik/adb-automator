@@ -457,6 +457,16 @@ switching — the previous screen will be gone.
 #: ordinary targeting is working. It is revealed here, once the run has actually
 #: struggled -- and the harness refuses it when a listed element would do, so
 #: seeing the block is not a licence to reach for it first.
+#:
+#: Two variants, because "give x/y when a screenshot is attached" is only true
+#: of a decider that can see. A blind one (a text-only `llm.model` with
+#: `model_image` doing the looking) is never attached to the pixels, however
+#: much of the prompt talks about them: it reads the VISUAL SCREEN ANALYSIS
+#: block as "a screenshot is attached" and invents fractions. In
+#: runs/467405879436 four such guesses landed around Hinge's "Send Priority
+#: Like" pill -- above it, below it, on the photo, never on it -- and the run
+#: died there. The blind variant does not offer coordinates at all: name the
+#: control and the locate places it.
 TAP_AT_ADVICE = """\
 TAP AT A POINT (element targeting is not working here, so this is now available):
 - `tap_at` presses a control the list does NOT name -- an image button, a \
@@ -467,8 +477,19 @@ from the top-left, 0.0 to 1.0.
 - If none is, name the control in `text` (e.g. "the red record button") and \
 it will be located on a fresh screenshot for you."""
 
+TAP_AT_ADVICE_BLIND = """\
+TAP AT A POINT (element targeting is not working here, so this is now available):
+- `tap_at` presses a control the list does NOT name -- an image button, a \
+canvas, a map. If a #N fits what you want, tap that instead: a tap_at that \
+names or lands on a listed element is refused.
+- You are never shown screenshots yourself -- the analysis above is another \
+model's reading. So NEVER invent `x` and `y`: name the control in `text` \
+(e.g. "the red record button") and it will be located on a fresh screenshot \
+for you. Coordinates sent alongside a name are ignored in favour of the \
+located point."""
+
 def situational_notes(*, scrolls: int = 0, packages_seen: int = 1,
-                      struggle: int = 0) -> str:
+                      struggle: int = 0, decider_sees: bool = True) -> str:
     """The advice that applies to *this* turn, and nothing else.
 
     Gated purely on what the run has *done*: the scrolling block once it has
@@ -495,7 +516,7 @@ def situational_notes(*, scrolls: int = 0, packages_seen: int = 1,
     if packages_seen > 1:
         parts.append(MULTI_APP_ADVICE)
     if struggle > 0:
-        parts.append(TAP_AT_ADVICE)
+        parts.append(TAP_AT_ADVICE if decider_sees else TAP_AT_ADVICE_BLIND)
     return "\n\n".join(parts)
 
 

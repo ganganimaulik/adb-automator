@@ -1430,6 +1430,21 @@ def test_tap_at_advice_arrives_only_once_the_run_has_struggled():
     assert "tap_at" in situational_notes(struggle=1)
 
 
+def test_tap_at_advice_matches_whether_the_decider_can_see():
+    """A blind decider must be told to name the control, never to invent x/y;
+    a seeing one keeps the two-branch rule. Told the generic rule, a blind
+    decider reads the image-analysis block as "a screenshot is attached" and
+    guesses fractions -- runs/467405879436 missed Hinge's send pill four times
+    that way and aborted."""
+    from adbagent.prompts import situational_notes
+    blind = situational_notes(struggle=1, decider_sees=False)
+    assert "NEVER invent `x` and `y`" in blind
+    assert "If a screenshot is attached" not in blind
+    seeing = situational_notes(struggle=1, decider_sees=True)
+    assert "If a screenshot is attached" in seeing
+    assert "NEVER invent" not in seeing
+
+
 def test_the_system_prompt_does_not_advertise_the_escape_hatch():
     """tap_at is the last resort; naming it on a healthy turn invites it."""
     from adbagent import prompts
