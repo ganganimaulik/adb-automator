@@ -267,3 +267,107 @@ def test_a_sweep_is_summarised_as_one_history_line():
 def test_a_one_step_sweep_does_not_render_a_range():
     line = pager.sweep_summary(4, 4, "swipe up", swept=1, read=1, reason="x")
     assert "step 4" in line and "4-4" not in line
+
+
+# ---------------------------------------------------------------------------
+# A playing video is not the content changing
+# ---------------------------------------------------------------------------
+
+VPKG = "com.instagram.android"
+_VTOP, _VBOT = 700, 1480          # a video over a third of a 1080x2340 frame
+
+
+def _feed(nested: bool, video: bool = True):
+    """A feed post with a video in it, drawn the two ways apps draw one.
+
+    ``nested`` is the shape a real player takes -- a container whose resource
+    id names it, the surface inside, the mute button on top -- and all three
+    match `_video_regions`. Flat is the same video with no wrapper.
+    """
+    inner = [
+        X.N("android.view.SurfaceView", (0, _VTOP, X.W, _VBOT),
+            rid="video_surface", package=VPKG),
+        X.N("android.widget.Button", (960, _VBOT - 120, 1050, _VBOT - 30),
+            desc="Unmute video", rid="mute_button", package=VPKG,
+            clickable=True),
+    ] if video else [
+        X.N("android.widget.ImageView", (0, _VTOP, X.W, _VBOT),
+            rid="photo", package=VPKG),
+    ]
+    if nested and video:
+        inner = [X.N("android.widget.FrameLayout", (0, _VTOP, X.W, _VBOT),
+                     rid="clips_player_container", package=VPKG,
+                     children=inner)]
+    root = X.N("android.widget.FrameLayout", (0, 0, X.W, X.H), package=VPKG,
+               children=[
+                   X.status_bar(),
+                   X.N("androidx.recyclerview.widget.RecyclerView",
+                       (0, 80, X.W, X.H), rid="feed_list", package=VPKG,
+                       scrollable=True, children=[
+                           X.N("android.widget.TextView", (24, 600, X.W - 24, 680),
+                               text="alice_", rid="username", package=VPKG),
+                           *inner,
+                           X.N("android.widget.TextView",
+                               (24, _VBOT + 20, X.W - 24, _VBOT + 90),
+                               text="a caption that does not change",
+                               rid="caption", package=VPKG),
+                       ]),
+               ])
+    return attach(parse(X.dump(root), width=X.W, height=X.H))
+
+
+def test_a_video_over_part_of_the_frame_vetoes_the_pixel_change():
+    before, after = _feed(nested=False), _feed(nested=False)
+    assert pager.video_only_drift(before, after)
+
+
+def test_a_nested_player_is_measured_once_not_once_per_matching_node():
+    """The container, the surface and the mute button all match, and all
+    describe the same pixels. Summed they read 0.670 of the frame -- past
+    `_VIDEO_FULL_BLEED`, so a third-of-the-screen video was taken for a
+    full-bleed one and the veto silently did not fire."""
+    before, after = _feed(nested=True), _feed(nested=True)
+    regions = pager._video_regions(before)
+    assert len(regions) == 3, "the fixture should match all three nodes"
+    frame = X.W * X.H
+    assert sum(el.area for el in regions) / frame > pager._VIDEO_FULL_BLEED
+    assert pager._union_area(regions) / frame < pager._VIDEO_FULL_BLEED
+    assert pager.video_only_drift(before, after)
+
+
+def test_a_full_bleed_video_is_the_content_and_is_not_vetoed():
+    """A reel fills the frame: paging it changes nothing the tree describes,
+    so its bitmaps are the only evidence there is."""
+    root = X.N("android.widget.FrameLayout", (0, 0, X.W, X.H), package=VPKG,
+               children=[X.status_bar(),
+                         X.N("android.view.SurfaceView", (0, 0, X.W, X.H),
+                             rid="reel_surface", package=VPKG)])
+    reel = attach(parse(X.dump(root), width=X.W, height=X.H))
+    assert not pager.video_only_drift(reel, reel)
+
+
+def test_a_screen_with_no_video_is_never_vetoed():
+    still = _feed(nested=False, video=False)
+    assert not pager.video_only_drift(still, still)
+
+
+def test_a_tree_that_changed_is_the_gesture_working_not_the_video():
+    """The veto turns on the tree standing still. A scroll that revealed new
+    content changes the tree, and its pixel movement is real."""
+    before = _feed(nested=True)
+    after = _feed(nested=True)
+    after.exact_id = before.exact_id + "-moved"
+    assert not pager.video_only_drift(before, after)
+
+
+def test_union_area_counts_overlapping_boxes_once():
+    class _Box:
+        def __init__(self, bounds):
+            self.bounds = bounds
+            l, t, r, b = bounds
+            self.area = (r - l) * (b - t)
+
+    assert pager._union_area([_Box((0, 0, 10, 10)), _Box((0, 0, 10, 10))]) == 100
+    assert pager._union_area([_Box((0, 0, 10, 10)), _Box((5, 0, 15, 10))]) == 150
+    assert pager._union_area([_Box((0, 0, 10, 10)), _Box((20, 0, 30, 10))]) == 200
+    assert pager._union_area([]) == 0
