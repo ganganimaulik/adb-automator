@@ -861,6 +861,11 @@ def _scroll_changed(before: Screen, after: Screen,
        ``mask_text`` rewrites the caption's timestamp -- so without this signal
        an advancing swipe and a dropped swipe are indistinguishable.
 
+    Both pixel signals answer "did the bitmap move", though, and a video
+    playing inside the frame moves the bitmap on its own -- no gesture needed.
+    So each is vetoed by `pager.video_only_drift`: a byte-identical tree with
+    a video on it means the motion is the video, not the scroll.
+
     1. **exact_id identity** -- the hierarchy hash is byte-identical, so nothing
        changed at all.
     2. **skeleton + simhash proximity + scroller content** -- the exact_id *did*
@@ -877,9 +882,14 @@ def _scroll_changed(before: Screen, after: Screen,
     # `pager.same_item`, which preferred the app's caption over the pixels and
     # so inherited every way a caption could be wrong -- including reading the
     # status-bar clock, which made two frames "different items" once a minute.
-    from .pager import content_moved
+    from .pager import content_moved, video_only_drift
     moved = content_moved(before, after)
     if moved is not None:
+        # A video playing inside the frame moves the bitmap whether or not the
+        # gesture did anything -- the scroll that hit the end of the list and
+        # the one that revealed a new page are pixel-identical while it plays.
+        if moved and video_only_drift(before, after):
+            return False
         return moved
 
     # Signal 0b: Perceptual Image Fingerprinting
@@ -888,6 +898,8 @@ def _scroll_changed(before: Screen, after: Screen,
         dist = dhash_distance(before.dhash, after.dhash)
         if dist is not None:
             if dist >= 4:
+                if video_only_drift(before, after):
+                    return False
                 return True
             if dist < 4 and after.exact_id == before.exact_id:
                 return False

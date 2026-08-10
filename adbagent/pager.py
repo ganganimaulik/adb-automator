@@ -50,10 +50,11 @@ for them.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from .screen import Screen
+from .screen import Element, Screen
 
 log = logging.getLogger("adbagent.pager")
 
@@ -118,6 +119,79 @@ def content_moved(before: Screen, after: Screen) -> Optional[bool]:
     if distance is None:
         return None
     return distance >= _PIXEL_DISTANCE
+
+
+# ---------------------------------------------------------------------------
+# A playing video is not the content changing
+# ---------------------------------------------------------------------------
+
+#: Surfaces that repaint themselves: video players and GL views. The dump
+#: records the surface, never the frames on it -- so a tree standing still
+#: while the pixels churn is what "a video is playing" looks like from here.
+_VIDEO_SURFACE_SUFFIXES = (
+    "SurfaceView", "TextureView", "VideoView", "GLSurfaceView", "TvView",
+    "PlayerView", "ExoPlayerView", "SimpleExoPlayerView", "StyledPlayerView",
+)
+
+#: A video *control* says the same thing when the surface itself never reaches
+#: the tree (a Compose player draws one): "Unmute video", "Play video".
+_VIDEO_CONTROL = re.compile(r"\b(?:unmute|mute|play|pause)\b[\w ]*\bvideo\b",
+                            re.I)
+
+#: Past this share of the frame the video IS the content -- a reel, the media
+#: viewer -- and its pixels are the only evidence there is, veto or no veto.
+_VIDEO_FULL_BLEED = 0.65
+
+
+def _video_regions(screen: Screen) -> List[Element]:
+    """Elements that animate on their own, read off the *full* tree (`nodes`).
+
+    The surface itself when the dump carries one, and otherwise the control
+    that names it ("Unmute video"). Resource ids naming a player or a video
+    count too -- custom players do not all extend a recognisable base class.
+    """
+    out: List[Element] = []
+    for el in screen.nodes:
+        if el.is_system_chrome:
+            continue
+        short = el.cls.rsplit("$", 1)[-1].rsplit(".", 1)[-1]
+        if short.endswith(_VIDEO_SURFACE_SUFFIXES):
+            out.append(el)
+            continue
+        rid = el.resource_id.lower()
+        if "exoplayer" in el.cls.lower() or "player" in rid or "video" in rid:
+            out.append(el)
+            continue
+        if _VIDEO_CONTROL.search(el.best_text or ""):
+            out.append(el)
+    return out
+
+
+def video_only_drift(before: Screen, after: Screen) -> bool:
+    """True when a playing video explains a pixel change the tree never felt.
+
+    `content_moved` compares bitmaps, so a video playing inside an otherwise
+    static screen reads as "the content moved" on every gesture -- including
+    the scroll that hit the end of the list and moved nothing. That kept the
+    sweep alive and the dead-scroll ledger empty for as long as the video
+    played. The tree is the tiebreak: a gesture that reveals content the tree
+    describes changes the tree, so a byte-identical tree with a video on it
+    means the motion is the video, not the gesture.
+
+    A video that fills the frame -- a reel, the media viewer -- is the content
+    itself, not noise over it: paging it changes nothing the tree describes,
+    so its bitmaps stay the only evidence and are not vetoed.
+    """
+    if not before.exact_id or after.exact_id != before.exact_id:
+        return False
+    regions = _video_regions(before)
+    if not regions or not _video_regions(after):
+        return False
+    total = before.width * before.height
+    if total <= 0:
+        return True
+    covered = min(1.0, sum(el.area for el in regions) / total)
+    return covered < _VIDEO_FULL_BLEED
 
 
 # ---------------------------------------------------------------------------

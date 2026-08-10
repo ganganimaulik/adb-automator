@@ -36,7 +36,7 @@ from .llm import (BudgetExceeded, LLMClient, LLMError, Prefetch, ScreenAnalysis)
 from .memory import Memory, intent_key
 from .pager import (SweepLog, can_repeat, content_box,
                     content_moved as pager_content_moved,
-                    stop_repeating, sweep_summary)
+                    stop_repeating, sweep_summary, video_only_drift)
 from .safety import Aborted, LoopDetector
 from .scratchpad import NoteLedger
 from .screen import Screen, render
@@ -1735,6 +1735,13 @@ class Agent:
                 # but not evidence, and `can_repeat` below turns this into the
                 # authority to act thirty more times without asking.
                 state.content_moved = pager_content_moved(screen, after)
+                if state.content_moved and video_only_drift(screen, after):
+                    # A playing video moves the bitmap whether or not the
+                    # gesture did -- `verify` graded this step `no_change`
+                    # through the same veto in `_scroll_changed`. Without this
+                    # the sweep arms itself on the video and flings at the end
+                    # of the list until the repeat cap, every time.
+                    state.content_moved = False
                 if state.content_moved and after.skeleton_id == screen.skeleton_id:
                     state.paging = True
                     state.repeatable_key = (element.key if element is not None
