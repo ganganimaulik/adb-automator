@@ -298,6 +298,18 @@ def test_config_round_trip(web):
     assert got["config"]["llm"]["model"] == "m2"
 
 
+def test_config_carries_the_shipped_defaults_too(web):
+    """Sixty-two fields showing their defaults look identical to sixty-two
+    fields somebody set on purpose; the form marks the difference off this."""
+    web.put("/api/config", json={"sections": {"safety": {"budget_usd": 9.0}}})
+    got = web.get("/api/config").json()
+    assert got["config"]["safety"]["budget_usd"] == 9.0
+    assert got["defaults"]["safety"]["budget_usd"] == 2.0
+    # Every section of the live config is in the defaults, or the form would
+    # mark a whole section as changed the moment it appeared.
+    assert set(got["defaults"]) == set(got["config"])
+
+
 def test_config_rejects_unknown_keys(web):
     res = web.put("/api/config", json={"sections": {"safety": {"nope": 1}}})
     assert res.status_code == 400
@@ -636,6 +648,162 @@ def test_screenshot_returns_jpeg(web, monkeypatch):
     res = web.get("/api/devices/screenshot")
     assert res.status_code == 200
     assert res.content == b"\xff\xd8jpeg"
+
+
+# ---------------------------------------------------------------------------
+# the live frame: the one screenshot path that may be taken under a run
+# ---------------------------------------------------------------------------
+#
+# It exists because `Device.open()` zeroes the animation scales, locks rotation
+# and selects its own IME, so `/api/devices/screenshot` cannot be used while an
+# agent holds the phone -- and a tool that drives a phone and never shows you the
+# phone was the largest hole in it. `exec-out screencap` opens no session.
+
+
+def _attach(monkeypatch, *serials):
+    """Pretend adb sees these, with no TTL in the way."""
+    monkeypatch.setattr("adbagent.web.server.ATTACHED_TTL_S", 0.0)
+    monkeypatch.setattr("adbagent.web.server.attached_serials", lambda: list(serials))
+
+
+def test_a_frame_says_when_there_is_no_phone(web, monkeypatch):
+    _attach(monkeypatch)
+    res = web.get("/api/device/frame")
+    assert res.status_code == 404
+    assert "no device" in res.json()["detail"]
+
+
+def test_a_frame_will_not_pretend_a_configured_serial_is_attached(
+        web, tmp_path, monkeypatch):
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"device": {"serial": "192.168.1.23:41207"}}),
+                   encoding="utf-8")
+    _attach(monkeypatch, "emulator-5554")
+    res = web.get("/api/device/frame")
+    assert res.status_code == 404
+    detail = res.json()["detail"]
+    assert "192.168.1.23:41207" in detail and "emulator-5554" in detail
+
+
+def test_a_frame_refuses_to_guess_between_two_phones(web, monkeypatch):
+    _attach(monkeypatch, "one", "two")
+    res = web.get("/api/device/frame")
+    assert res.status_code == 409
+    assert "no serial chosen" in res.json()["detail"]
+
+
+def test_a_frame_comes_back_as_a_jpeg(web, monkeypatch):
+    _attach(monkeypatch, "emulator-5554")
+    seen = {}
+
+    def fake(serial, max_long_edge=720):
+        seen["serial"] = serial
+        seen["edge"] = max_long_edge
+        return b"\xff\xd8frame"
+
+    monkeypatch.setattr("adbagent.web.server.screencap", fake)
+    res = web.get("/api/device/frame?max_long_edge=360")
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "image/jpeg"
+    assert res.content == b"\xff\xd8frame"
+    assert seen == {"serial": "emulator-5554", "edge": 360}
+
+
+def test_a_frame_is_still_served_while_a_run_holds_the_phone(web, monkeypatch):
+    """The whole point of the endpoint: every other device call is a 409 here."""
+    _attach(monkeypatch, "emulator-5554")
+    monkeypatch.setattr("adbagent.web.server.screencap",
+                        lambda serial, max_long_edge=720: b"\xff\xd8live")
+    monkeypatch.setattr(
+        "adbagent.web.runner.subprocess.Popen",
+        lambda argv, **kw: FakeProc(argv, stay_running=True, **kw))
+    assert web.post("/api/runs", json={"goal": "hold"}).status_code == 200
+    assert web.get("/api/devices/screenshot").status_code == 409
+    live = web.get("/api/device/frame")
+    assert live.status_code == 200
+    assert live.content == b"\xff\xd8live"
+
+
+def test_a_frame_reports_a_dead_link_rather_than_hanging_on_it(web, monkeypatch):
+    _attach(monkeypatch, "emulator-5554")
+
+    def boom(serial, max_long_edge=720):
+        raise RuntimeError("device offline")
+
+    monkeypatch.setattr("adbagent.web.server.screencap", boom)
+    res = web.get("/api/device/frame")
+    assert res.status_code == 502
+    assert "device offline" in res.json()["detail"]
+
+
+def test_screencap_downscales_a_png_into_a_jpeg(monkeypatch):
+    """The raw `screencap -p` off a 1080x2400 phone is 1-3 MB, and this is
+    polled every couple of seconds."""
+    import io
+
+    from PIL import Image
+
+    from adbagent.web import server as srv
+
+    raw = io.BytesIO()
+    Image.new("RGB", (1080, 2400), (20, 30, 40)).save(raw, "PNG")
+
+    seen = {}
+
+    class Done:
+        returncode, stdout, stderr = 0, raw.getvalue(), b""
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        return Done()
+
+    monkeypatch.setattr(srv.subprocess, "run", fake_run)
+    jpeg = srv.screencap("emulator-5554", max_long_edge=600)
+    assert seen["argv"][1:] == ["-s", "emulator-5554", "exec-out", "screencap", "-p"]
+    out = Image.open(io.BytesIO(jpeg))
+    assert out.format == "JPEG"
+    assert max(out.size) == 600
+    assert out.size == (270, 600)   # aspect ratio kept, as the model needs
+
+
+def test_screencap_reports_what_adb_said_when_it_fails(monkeypatch):
+    from adbagent.web import server as srv
+
+    class Failed:
+        returncode, stdout, stderr = 1, b"", b"error: device offline\n"
+
+    monkeypatch.setattr(srv.subprocess, "run", lambda argv, **kw: Failed())
+    with pytest.raises(RuntimeError, match="device offline"):
+        srv.screencap("emulator-5554")
+
+
+def test_status_separates_a_configured_serial_from_an_attached_one(
+        web, tmp_path, monkeypatch):
+    """The header used to print the configured serial as though it were a phone."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"device": {"serial": "192.168.1.23:41207"}}),
+                   encoding="utf-8")
+    _attach(monkeypatch)
+    st = web.get("/api/status").json()
+    assert st["device_serial"] == "192.168.1.23:41207"
+    assert st["devices_attached"] == []
+    assert st["device_attached"] is False
+
+    _attach(monkeypatch, "192.168.1.23:41207")
+    st = web.get("/api/status").json()
+    assert st["device_attached"] is True
+
+
+def test_status_calls_one_unnamed_phone_attached(web, monkeypatch):
+    """No serial configured and exactly one device is the everyday case, and it
+    is the one adb resolves on its own."""
+    _attach(monkeypatch, "emulator-5554")
+    st = web.get("/api/status").json()
+    assert st["device_serial"] == ""
+    assert st["device_attached"] is True
+
+    _attach(monkeypatch, "emulator-5554", "emulator-5556")
+    assert web.get("/api/status").json()["device_attached"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -1615,3 +1783,30 @@ def test_every_tab_button_has_a_section_and_a_loader():
     assert tabs == loaders, (
         f"every tab needs a loader (a missing one throws on first click): "
         f"{tabs ^ loaders}")
+
+
+def test_every_setup_pane_has_a_section_and_a_loader():
+    """Setup's three panes are not tabs -- they are one tab's contents -- but
+    they wire up the same way and break the same way."""
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    js = APP_JS.read_text(encoding="utf-8")
+    panes = set(re.findall(r'data-pane="([^"]+)"', html))
+    sections = {i[5:] for i in html_ids() if i.startswith("pane-")}
+    assert panes == sections, f"pane buttons and sections disagree: {panes ^ sections}"
+    body = js[js.index("const setupLoaders = {"):]
+    loaders = set(re.findall(r"(\w+):", body[:body.index("};")]))
+    assert panes == loaders, f"every pane needs a loader: {panes ^ loaders}"
+
+
+def test_the_density_toggle_only_offers_the_two_densities():
+    """`body[data-density="story"] .trace-only` is what hides the trace; a third
+    value on a button would simply show everything, silently."""
+    html = INDEX_HTML.read_text(encoding="utf-8")
+    css = (Path(__file__).resolve().parents[1]
+           / "adbagent/web/static/style.css").read_text(encoding="utf-8")
+    offered = set(re.findall(r'data-density="([^"]+)"', html))
+    assert offered == {"story", "trace"}, f"unexpected densities: {offered}"
+    assert 'body[data-density="story"] .trace-only' in css
+    # And the default the page ships in, so a reader who never touches it gets
+    # the quiet view rather than the full trace.
+    assert '<body data-density="story">' in html

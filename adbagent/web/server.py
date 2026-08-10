@@ -34,6 +34,17 @@ STATIC_DIR = Path(__file__).parent / "static"
 _MEDIA_TYPES = {".html": "text/html", ".js": "text/javascript",
                 ".css": "text/css", ".png": "image/png"}
 
+#: How long an `adb devices` answer is reused. The status line polls every few
+#: seconds from every open tab, and what is plugged in does not change between
+#: two of those; long enough to collapse the poll, short enough that unplugging
+#: a phone shows up while your hand is still on the cable.
+ATTACHED_TTL_S = 2.5
+
+#: Ceiling on one `exec-out screencap`. A healthy phone answers in well under a
+#: second over USB and a couple over wireless adb; past this the link is the
+#: problem and the panel should say so rather than hang.
+FRAME_TIMEOUT_S = 20.0
+
 #: How long the server waits, on its way out, for the agents it started to put
 #: the phone back. Deliberately far short of the three minutes a stop from the
 #: browser allows a watch: there is somebody at a prompt waiting for it.
@@ -99,6 +110,61 @@ def _static(name: str) -> Response:
         raise HTTPException(status_code=404, detail="not found")
     media = _MEDIA_TYPES.get(path.suffix, "application/octet-stream")
     return Response(content=path.read_bytes(), media_type=media)
+
+
+def attached_serials() -> List[str]:
+    """Serials adb can actually see, or [] when it cannot be asked.
+
+    Separate from `/api/devices`, which also reads a model name and an Android
+    version off every one of them: this is the cheap question -- is there a phone
+    on the end of the cable -- and it is asked on every status poll, because a
+    serial in config is not a device and only one of the two decides whether a
+    run can start.
+    """
+    from .. import device as devmod
+    try:
+        return [d.serial for d in devmod.list_devices()]
+    except Exception:  # noqa: BLE001 - adb absent or its server down
+        return []
+
+
+def screencap(serial: str = "", max_long_edge: int = 720,
+              quality: int = 72) -> bytes:
+    """A JPEG of the screen right now, without opening a device session.
+
+    This is the one screenshot path that is safe to take *while an agent is
+    driving the phone*, and that is the whole reason it exists. `Device.open()`
+    zeroes the animation scales, locks rotation, selects its own IME and takes a
+    stay-awake lock -- so `Device(...).screenshot()` cannot be used mid-run
+    without changing the phone underneath the run. `exec-out screencap` is a
+    plain read: no uiautomator server, no settings touched, nothing to restore.
+
+    Downscaled here rather than shipped raw: a 1080x2400 `screencap -p` is 1-3 MB
+    of PNG, and this is polled every couple of seconds.
+    """
+    import io
+
+    from PIL import Image
+
+    from ..device import adb_path
+
+    argv = [adb_path()]
+    if serial:
+        argv += ["-s", serial]
+    argv += ["exec-out", "screencap", "-p"]
+    proc = subprocess.run(argv, capture_output=True, timeout=FRAME_TIMEOUT_S)
+    if proc.returncode != 0 or not proc.stdout:
+        detail = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError(detail or "screencap returned nothing")
+    image = Image.open(io.BytesIO(proc.stdout))
+    w, h = image.size
+    factor = min(1.0, max_long_edge / max(w, h)) if max(w, h) else 1.0
+    if factor < 1.0:
+        image = image.resize((max(1, round(w * factor)), max(1, round(h * factor))),
+                             Image.LANCZOS)
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, "JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
 
 
 def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
@@ -213,6 +279,15 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
 
     # -- status & devices ------------------------------------------------
 
+    #: `attached_serials()` behind a short TTL. Every open tab polls the status
+    #: line, and none of them needs its own `adb devices`.
+    attached: Dict[str, Any] = {"at": 0.0, "serials": []}
+
+    def attached_now() -> List[str]:
+        if time.monotonic() - attached["at"] > ATTACHED_TTL_S:
+            attached.update(at=time.monotonic(), serials=attached_serials())
+        return list(attached["serials"])
+
     @app.get("/api/status")
     def status() -> Dict[str, Any]:
         loaded = load_config(config_path or None)
@@ -221,11 +296,19 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         # reason: a page reloaded mid-tour has to know there is something to
         # reattach to, and which job to ask for it.
         job = jobs.active()
+        # What is configured and what is plugged in are two different facts, and
+        # the header used to report the first as though it were the second: a
+        # serial left in config.json read as "device 192.168.1.23:41207" with
+        # nothing on the other end. Both travel, so the page can say which.
+        serials = attached_now()
         return {
             "config_path": str(loaded.path) if loaded.path else "",
             "model": cfg.llm.model,
             "api_key_present": bool(cfg.api_key()),
             "device_serial": cfg.device.serial,
+            "devices_attached": serials,
+            "device_attached": (cfg.device.serial in serials if cfg.device.serial
+                                else len(serials) == 1),
             "artifacts_dir": str(runs_dir),
             "run": manager.state(),
             # Reported alongside the run for the same reason a tour is: a page
@@ -254,6 +337,44 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         except Exception:  # noqa: BLE001
             candidates = []
         return {"devices": found, "candidates": candidates, "error": ""}
+
+    @app.get("/api/device/frame")
+    def device_frame(serial: str = "", max_long_edge: int = 720) -> Response:
+        """The screen as it is now — polled while a run is happening.
+
+        Deliberately not behind `phone_busy()`, unlike every other device call
+        here. The reason those are refused is that opening a `Device` session
+        resets the animation scales and the rotation on the way in and puts them
+        back on the way out, which changes the phone under whatever is driving
+        it. This path opens no session: it is one `exec-out screencap`, a read,
+        and it is the only honest way to watch a phone that something else is
+        holding.
+
+        A serial that is not attached is a 404 rather than a 502 — it is a normal
+        state, and the panel says so instead of showing the last frame it had.
+        """
+        wanted = serial or load_cfg().device.serial
+        serials = attached_now()
+        if not serials:
+            raise HTTPException(
+                status_code=404,
+                detail="nothing attached: adb sees no device")
+        if wanted and wanted not in serials:
+            raise HTTPException(
+                status_code=404,
+                detail=f"{wanted} is configured but adb does not see it; "
+                       f"attached: {', '.join(serials)}")
+        if not wanted and len(serials) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{len(serials)} devices attached and no serial chosen: "
+                       f"{', '.join(serials)}")
+        try:
+            jpeg = screencap(wanted or serials[0], max_long_edge=max_long_edge)
+        except Exception as exc:  # noqa: BLE001 - a dead link, a slow phone
+            raise HTTPException(status_code=502, detail=str(exc))
+        return Response(content=jpeg, media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
 
     @app.get("/api/devices/screenshot")
     def screenshot(serial: str = "") -> Response:
@@ -350,6 +471,11 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
     def get_config() -> Dict[str, Any]:
         loaded = load_config(config_path or None)
         return {"config": loaded.config.to_dict(),
+                # What the settings would be with nothing configured at all, so
+                # the form can mark the handful that were actually changed.
+                # Sixty-two fields showing their defaults look identical to
+                # sixty-two fields somebody set on purpose.
+                "defaults": Config().to_dict(),
                 "path": str(loaded.path) if loaded.path else "",
                 "warnings": loaded.warnings,
                 "api_key_present": bool(loaded.config.api_key())}
@@ -760,7 +886,7 @@ def _event_stream(child: ChildProcess,
                   ) -> Generator[str, None, None]:
     """Replay then follow a child's run files as SSE frames.
 
-    Any child that drives the phone: the goal run behind the Run tab, or the
+    Any child that drives the phone: the goal run behind the Work tab, or the
     tour behind a `skills generate`. Both write the same files, so both are
     watched with the same frames -- and the browser renders them with one view.
 

@@ -1,39 +1,55 @@
-/* adbagent web UI — dark, terminal-flavoured. No framework, no build. */
+/* adbagent web UI — dark, terminal-flavoured. No framework, no build.
+
+   The hierarchy the sheet is built around: an answer outranks its evidence,
+   and evidence outranks the machinery that produced it. So one type scale runs
+   from the answer down to the telemetry, and the mono face is reserved for
+   things that are literally identifiers, paths and arithmetic. */
 
 :root {
   --bg: #0d1117;
   --bg-raise: #161b22;
   --bg-hover: #1c2330;
+  --bg-sunk: #0a0e14;
   --border: #2b3442;
+  --border-soft: #21283340;
   --text: #d7dde5;
   --text-dim: #8b949e;
+  --text-faint: #6b7480;
   --accent: #58a6ff;
   --green: #3fb950;
   --yellow: #d29922;
   --red: #f85149;
   --purple: #bc8cff;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --pad: 20px;
+  --radius: 8px;
 }
 
 * { box-sizing: border-box; }
+
+/* `hidden` is how every conditional block on the page is switched, and most of
+   them are flex or grid containers whose display would otherwise win. */
+[hidden] { display: none !important; }
 
 body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font: 14px/1.55 var(--sans);
+  -webkit-text-size-adjust: 100%;
 }
+
+/* -- chrome ---------------------------------------------------------------- */
 
 header {
   display: flex;
   align-items: baseline;
-  gap: 16px;
-  padding: 12px 20px;
+  gap: 8px 16px;
+  padding: 12px var(--pad);
   border-bottom: 1px solid var(--border);
   background: var(--bg-raise);
-  position: sticky;
-  top: 0;
-  z-index: 10;
+  flex-wrap: wrap;
 }
 
 header h1 {
@@ -41,86 +57,236 @@ header h1 {
   margin: 0;
   font-family: var(--mono);
   color: var(--accent);
+  letter-spacing: -0.01em;
 }
 
 header .status {
   display: flex;
-  gap: 14px;
+  gap: 6px 10px;
   font-size: 12px;
   color: var(--text-dim);
   font-family: var(--mono);
   flex-wrap: wrap;
+  align-items: center;
+  min-width: 0;
 }
 
-header .status .ok { color: var(--green); }
-header .status .warn { color: var(--yellow); }
+/* Each fact in the status line is its own pill, so "no device" cannot be read
+   as part of the model id next to it. */
+header .status .st {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  max-width: 46vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
-nav {
+header .status .st.ok { color: var(--green); border-color: #3fb95055; }
+header .status .st.warn { color: var(--yellow); border-color: #d2992255; }
+header .status .st.bad { color: var(--red); border-color: #f8514955; }
+header .status .st.live { border-color: currentColor; }
+
+nav#tabs {
   display: flex;
-  gap: 4px;
-  padding: 8px 20px 0;
+  gap: 2px;
+  padding: 0 var(--pad);
   border-bottom: 1px solid var(--border);
   background: var(--bg-raise);
   position: sticky;
-  top: 45px;
+  top: 0;
   z-index: 9;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
 
-nav button {
+nav#tabs::-webkit-scrollbar { display: none; }
+
+nav#tabs button {
   background: none;
   border: none;
   border-bottom: 2px solid transparent;
   color: var(--text-dim);
-  padding: 8px 14px;
-  font-size: 14px;
+  padding: 11px 16px;
+  font: inherit;
   cursor: pointer;
+  white-space: nowrap;
 }
 
-nav button:hover { color: var(--text); }
-nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+nav#tabs button:hover { color: var(--text); }
+nav#tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
 
-main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+main { padding: var(--pad); max-width: 1180px; margin: 0 auto; }
 section.tab { display: none; }
 section.tab.active { display: block; }
 
-/* -- forms ---------------------------------------------------------------- */
-
-form.run-form {
-  display: grid;
-  gap: 12px;
-  margin-bottom: 20px;
+/* The Setup tab's own three panes: device, config, skills. Not `data-tab`,
+   because they are one tab's contents rather than tabs of their own. */
+nav.subnav {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: none;
 }
 
-textarea, input[type="text"], input[type="number"], select {
-  background: var(--bg);
+nav.subnav::-webkit-scrollbar { display: none; }
+
+nav.subnav button {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  padding: 8px 12px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+nav.subnav button:hover { color: var(--text); }
+nav.subnav button.active { color: var(--text); border-bottom-color: var(--text-dim); }
+
+.pane { display: none; }
+.pane.active { display: block; }
+
+/* -- forms ----------------------------------------------------------------- */
+
+textarea, input[type="text"], input[type="search"], input[type="number"],
+input[type="password"], select {
+  background: var(--bg-sunk);
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--text);
   padding: 8px 10px;
   font: inherit;
   width: 100%;
+  min-width: 0;
 }
 
 textarea:focus, input:focus, select:focus {
   outline: none;
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px #58a6ff22;
 }
 
 textarea { font-family: var(--mono); resize: vertical; }
 
+/* The goal. Biggest control on the page, because it is the one that matters.
+   `minmax(0, 1fr)` rather than the implicit `auto`: an auto column is as wide as
+   its widest item, and one recent-goal chip is a whole sentence -- which is how
+   a page with a viewport meta tag still scrolled sideways at 375px. */
+form.composer { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; margin-bottom: 24px; }
+form.composer > * { min-width: 0; }
+
+form.composer > textarea#goal,
+form.composer > textarea#watch-goal {
+  font-size: 15px;
+  line-height: 1.5;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+}
+
+/* Recent goals, as chips. The blank-box cold start is the worst part of this
+   page, and most goals are a retry of one already in history. */
+.recent { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.recent-label { font-size: 12px; color: var(--text-faint); font-family: var(--mono); flex: 0 0 auto; }
+.recent-chips { display: flex; gap: 6px; flex-wrap: wrap; flex: 1 1 0; min-width: 0; }
+
+.recent-chips button {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--bg-raise);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 11px;
+  cursor: pointer;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-chips button:hover { color: var(--text); border-color: var(--accent); }
+
+.optgroups { display: flex; gap: 10px; flex-wrap: wrap; }
+
+fieldset.optgroup {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px 12px;
+  margin: 0;
+  display: flex;
+  gap: 8px 18px;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  flex: 1 1 300px;
+  min-width: 0;
+  background: #161b2266;
+}
+
+fieldset.optgroup legend {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--text-faint);
+  padding: 0 4px;
+}
+
+/* Guardrails decide what a run may spend and what it may break. Marked, so the
+   row of seven identical inputs is two rows of different weight. */
+fieldset.optgroup.guard { border-color: #d2992255; background: #d2992208; }
+fieldset.optgroup.guard legend { color: var(--yellow); }
+
+fieldset.optgroup label,
+.opts label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+  min-width: 0;
+}
+
+fieldset.optgroup label.check,
+.opts label.check,
+label.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+  padding-bottom: 8px;
+}
+
+fieldset.optgroup input[type="number"] { width: 90px; }
+fieldset.optgroup input[type="text"] { width: 130px; }
+input[type="checkbox"] { accent-color: var(--accent); flex: 0 0 auto; }
+
 .opts {
   display: flex;
-  gap: 16px;
+  gap: 10px 18px;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: flex-end;
   font-size: 13px;
   color: var(--text-dim);
 }
 
-.opts label { display: flex; align-items: center; gap: 6px; }
-.opts input[type="number"] { width: 90px; }
-.opts input[type="text"] { width: 130px; }
-.opts input[type="checkbox"] { accent-color: var(--accent); }
+.opts label.grow-field { flex: 1 1 240px; }
+
+/* A fold for options that matter but are rarely set, so the common form stays
+   short. */
+.opts-more { margin: 0; }
+.opts-more > summary { cursor: pointer; color: var(--text-dim); }
+.opts-more[open] > summary { margin-bottom: 10px; }
+
+.actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.grow { flex: 1 1 auto; }
 
 button.primary, button.danger, button.ghost {
   border-radius: 6px;
@@ -131,24 +297,269 @@ button.primary, button.danger, button.ghost {
 }
 
 button.primary { background: var(--accent); border-color: var(--accent); color: #0d1117; font-weight: 600; }
+button.primary:hover { background: #79b8ff; }
+button.big { padding: 10px 24px; font-size: 15px; }
 /* Every kind of button, not just the primary one: a Stop that looks pressable
-   while there is nothing to stop invites the click and then ignores it. */
+   while there is nothing to stop invites the click and then ignores it. And a
+   Stop with nothing to stop is not shown at all. */
 button.primary:disabled, button.danger:disabled, button.ghost:disabled {
   opacity: 0.4;
   cursor: default;
 }
 button.danger { background: none; color: var(--red); border-color: var(--red); }
+button.danger:hover:not(:disabled) { background: #f8514915; }
 button.ghost { background: var(--bg-raise); color: var(--text); }
 button.ghost:hover { background: var(--bg-hover); }
 
-/* -- event feed ------------------------------------------------------------ */
+/* A two-state segmented control: feed density, and the history outcome filter. */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--bg-raise);
+  flex: 0 0 auto;
+}
+
+.seg button {
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  font: inherit;
+  font-size: 11px;
+  font-family: var(--mono);
+  padding: 4px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.seg button:hover { color: var(--text); }
+.seg button.on { background: var(--bg-hover); color: var(--accent); }
+
+/* -- section headings ------------------------------------------------------ */
+
+.feed-head, .panel-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.feed-head { margin-top: 22px; }
+
+.feed-head h3, .panel-head h3 {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  font-weight: 600;
+}
+
+.panel-head input[type="search"] { width: auto; flex: 1 1 160px; }
+.path { overflow-wrap: anywhere; color: var(--text-faint); margin: 8px 0 0; }
+
+.goal-headline {
+  margin: 12px 0 14px;
+  overflow-wrap: anywhere;
+}
+
+.goal-headline .gt {
+  display: block;
+  font-size: 19px;
+  line-height: 1.4;
+  font-weight: 600;
+  white-space: pre-wrap;
+}
+
+.goal-headline .goal-rest > summary { cursor: pointer; margin-top: 6px; }
+.goal-headline .goal-rest > summary:hover { color: var(--text); }
+
+/* -- live readouts --------------------------------------------------------- */
+
+/* Three primary readouts, then everything else. The nine equal mono counters
+   this replaces made "what is it doing" as loud as "how many tokens". */
+.readouts {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  gap: 10px 18px;
+  align-items: center;
+  padding: 14px 16px;
+  background: var(--bg-raise);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.readout { min-width: 0; }
+.readout.wide { grid-column: 1; min-width: 0; }
+
+.readout .rk {
+  display: block;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--text-faint);
+}
+
+.readout b {
+  display: block;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.readout.wide b { color: var(--accent); font-family: var(--mono); font-size: 15px; }
+
+/* Everything the three readouts demoted. One dim mono line, wrapping. */
+.readout-rest {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 6px 16px;
+  flex-wrap: wrap;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-faint);
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.readout-rest.solo {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raise);
+  padding: 10px 14px;
+  margin-bottom: 12px;
+}
+
+.readout-rest b { color: var(--text-dim); font-weight: 600; }
+.readout-rest b.strong { color: var(--text); }
+.readouts > button.danger { grid-row: 1; grid-column: 4; }
+
+/* -- live layout ----------------------------------------------------------- */
+
+.live-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  gap: 20px;
+  align-items: start;
+}
+
+.live-main { min-width: 0; }
+
+/* The phone, beside the feed. It automates a phone; not showing the phone was
+   the largest hole in the product. */
+aside.phone {
+  position: sticky;
+  top: 60px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raise);
+  padding: 10px;
+  margin-top: 22px;
+}
+
+aside.phone.standalone { position: static; margin-top: 0; border: none; padding: 0; background: none; max-width: 300px; }
+
+.phone-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--text-faint);
+  margin-bottom: 8px;
+}
+
+.phone-head .grow { flex: 1 1 auto; }
+
+.phone-head button {
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  font: inherit;
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.phone-head button:hover { color: var(--text); }
+
+.phone-frame {
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 120px;
+}
+
+.phone-frame img { display: block; width: 100%; height: auto; cursor: zoom-in; }
+.phone-note { font-size: 11px; color: var(--text-faint); margin-top: 8px; }
+.phone-note.warn { color: var(--yellow); }
+.phone-empty { padding: 22px 14px; font-size: 12px; color: var(--text-faint); text-align: center; }
+
+/* -- the feed -------------------------------------------------------------- */
 
 .feed { display: flex; flex-direction: column; gap: 8px; }
+
+/* One row per step by default. Everything the trace carries is still in the
+   DOM, folded away behind the density toggle rather than deleted. */
+body[data-density="story"] .trace-only { display: none; }
+
+.step {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raise);
+  overflow: hidden;
+}
+
+.step-row {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  gap: 4px 10px;
+  padding: 9px 13px;
+  align-items: baseline;
+}
+
+.step-no {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--purple);
+  text-align: right;
+}
+
+.step-main { min-width: 0; }
+.step-act { font-family: var(--mono); font-size: 13px; color: var(--accent); font-weight: 600; overflow-wrap: anywhere; }
+.step-act.unresolved { color: var(--text-faint); font-weight: 400; }
+.step-obs { font-size: 13px; margin-top: 2px; overflow-wrap: anywhere; }
+.step-verdict { font-size: 12px; color: var(--text-dim); margin-top: 3px; }
+
+.step-chips { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+
+.step-more {
+  border-top: 1px solid var(--border);
+  padding: 8px 13px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: #0d111780;
+}
+
+.step-more:empty { display: none; }
 
 .card {
   background: var(--bg-raise);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   padding: 10px 14px;
   font-size: 13px;
 }
@@ -165,10 +576,20 @@ button.ghost:hover { background: var(--bg-hover); }
 }
 
 .card .head .stepno { color: var(--purple); }
-.card .head .action { color: var(--accent); font-weight: 600; }
-.card .obs { margin: 2px 0; }
-.card .why { color: var(--text-dim); margin: 2px 0; }
-.card .meta { color: var(--text-dim); font-size: 12px; font-family: var(--mono); margin-top: 4px; }
+.card .obs { margin: 2px 0; overflow-wrap: anywhere; }
+.card .why { color: var(--text-dim); margin: 2px 0; overflow-wrap: anywhere; }
+.card .meta { color: var(--text-faint); font-size: 12px; font-family: var(--mono); }
+
+/* Telemetry: the harness talking to itself. Real value when debugging the
+   agent, noise when reading a run, so it lives in the step's own fold. */
+.tele {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.tele::before { content: "· "; }
 
 .chip {
   display: inline-block;
@@ -177,51 +598,95 @@ button.ghost:hover { background: var(--bg-hover); }
   font-size: 11px;
   font-family: var(--mono);
   border: 1px solid var(--border);
+  white-space: nowrap;
 }
 
 .chip.worked, .chip.success { color: var(--green); border-color: var(--green); }
 .chip.no_change, .chip.needs_user { color: var(--yellow); border-color: var(--yellow); }
 .chip.failed, .chip.aborted, .chip.interrupted { color: var(--red); border-color: var(--red); }
-.chip.neutral { color: var(--text-dim); }
+.chip.unknown, .chip.neutral { color: var(--text-faint); }
 /* Steps since the run last learned anything. Yellow like `no_change`, because
    that is what it is a count of -- and it is the number the harness escalates
    on, so a feed where it climbs is a feed worth stopping. */
 .chip.stall { color: var(--yellow); border-color: var(--yellow); }
+.chip.skill { color: var(--purple); border-color: var(--purple); }
 
 /* The model's own plan for the goal, on the step that wrote it. Purple, matching
    the step numbers and the skill banner: context for what follows, not a verdict
    on what came before. */
-.card .plan {
-  margin: 4px 0 2px;
+.plan {
   padding-left: 8px;
   border-left: 2px solid var(--purple);
   white-space: pre-wrap;
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
 }
 
 .banner {
-  border-radius: 8px;
+  border-radius: var(--radius);
   padding: 12px 16px;
   font-family: var(--mono);
   font-size: 13px;
   border: 1px solid var(--border);
   background: var(--bg-raise);
+  overflow-wrap: anywhere;
 }
 
 .banner.success { border-color: var(--green); }
 .banner.failed, .banner.aborted { border-color: var(--red); }
 .banner.needs_user { border-color: var(--yellow); }
-
-/* What the run answered, inside the outcome banner. Set in the body face and
-   left to wrap: it is prose the model wrote for a person to read, and the
-   banner's monospace is for the step/cost arithmetic under it. */
-.banner .result {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-  font-size: 14px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  margin-bottom: 8px;
-}
 .banner .why { color: var(--text-dim); margin-top: 6px; white-space: pre-wrap; }
+
+/* What the run answered. Set in the body face and left to wrap: it is prose the
+   model wrote for a person to read, and the monospace around it is for the
+   step/cost arithmetic under it. */
+.result-box {
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  background: var(--bg-raise);
+  padding: 16px 18px;
+  margin-bottom: 12px;
+}
+
+.result-box.success { border-color: var(--green); background: #3fb9500d; }
+.result-box.failed, .result-box.aborted, .result-box.interrupted { border-color: var(--red); background: #f851490d; }
+.result-box.needs_user { border-color: var(--yellow); background: #d299220d; }
+
+.result-box .verdict {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 8px;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+
+.result-box.success .verdict b { color: var(--green); }
+.result-box.failed .verdict b, .result-box.aborted .verdict b,
+.result-box.interrupted .verdict b { color: var(--red); }
+.result-box.needs_user .verdict b { color: var(--yellow); }
+
+/* The answer, large and first. This is the headline of the whole product. */
+.result-box .answer {
+  font-size: 18px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.result-box .why {
+  color: var(--text-dim);
+  margin-top: 10px;
+  white-space: pre-wrap;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
 
 /* The watch's mode banner. Filled rather than merely outlined, because unlike
    the outcome banners above this one is a statement about what is *about* to
@@ -235,16 +700,12 @@ button.ghost:hover { background: var(--bg-hover); }
 }
 .banner.danger .small { color: var(--text); }
 
+#watch-mode-banner { margin-bottom: 20px; }
+
 /* `.ok`/`.warn` were scoped to the header status line; the ledger table and the
    watch banner want the same two colours. */
 .ok { color: var(--green); }
 .warn { color: var(--yellow); }
-
-/* A fold for options that matter but are rarely set, so the common form stays
-   short. */
-.opts-more { margin: 6px 0 0; }
-.opts-more > summary { cursor: pointer; color: var(--text-dim); }
-.opts-more[open] > summary { margin-bottom: 6px; }
 
 /* Where the run picked up an app's guidance. Purple, matching the step numbers:
    both say "context for what follows" rather than "outcome of what came before",
@@ -255,9 +716,8 @@ button.ghost:hover { background: var(--bg-hover); }
   gap: 8px;
   padding: 8px 14px;
   border-color: var(--purple);
+  font-size: 12px;
 }
-
-.chip.skill { color: var(--purple); border-color: var(--purple); }
 
 .small { font-size: 12px; color: var(--text-dim); }
 .mono { font-family: var(--mono); }
@@ -267,8 +727,28 @@ details.card summary:hover { color: var(--text); }
 
 /* -- collected data --------------------------------------------------------- */
 
-/* The ledger, under the step that changed it. Green on the edge only: this is
-   the run's product, and a feed of them should read as a column of ledgers
+/* The ledger. Pinned above the feed rather than left to scroll away with the
+   step that last changed it: it is the run's product, and the question it
+   answers -- "has it got everything yet" -- comes up long after that step. */
+.ledger-pin {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--green);
+  border-radius: 6px;
+  background: var(--bg-raise);
+  padding: 10px 14px;
+  margin-bottom: 12px;
+}
+
+.ledger-pin > .lk {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--text-faint);
+  margin-bottom: 6px;
+}
+
+/* Green on the edge only: a feed of these should read as a column of ledgers
    rather than a row of alarms. Folded panels are one dim line each, so the
    history of the collection stays scrollable. */
 .card.notes { border-left: 3px solid var(--green); }
@@ -300,7 +780,7 @@ details.card summary:hover { color: var(--text); }
   font-size: 12px;
   padding: 3px 6px;
   border-radius: 4px;
-  background: var(--bg);
+  background: var(--bg-sunk);
 }
 
 /* Written or corrected on this step. The rest are what the run already had. */
@@ -314,7 +794,7 @@ details.card summary:hover { color: var(--text); }
   overflow-wrap: anywhere;
 }
 
-.rec .v { flex: 1 1 280px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.rec .v { flex: 1 1 240px; overflow-wrap: anywhere; white-space: pre-wrap; }
 
 /* The value a re-read disagreed with. Kept by the harness rather than
    overwritten, so it is shown rather than dropped. */
@@ -329,10 +809,11 @@ details.card summary:hover { color: var(--text); }
   border-left: 3px solid var(--purple);
   border-radius: 6px;
   background: var(--bg-raise);
-  padding: 8px 12px;
-  margin: -4px 0 12px;
+  padding: 9px 14px;
+  margin-bottom: 12px;
   font-size: 13px;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .progress-note::before {
@@ -341,8 +822,8 @@ details.card summary:hover { color: var(--text); }
   font-family: var(--mono);
   font-size: 10px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-dim);
+  letter-spacing: 0.09em;
+  color: var(--text-faint);
   margin-bottom: 2px;
 }
 
@@ -355,6 +836,7 @@ details.card summary:hover { color: var(--text); }
   font-family: var(--mono);
   font-size: 12px;
   color: var(--text-dim);
+  overflow-wrap: anywhere;
 }
 
 .card.llm-live details[open] summary { color: var(--accent); margin-bottom: 6px; }
@@ -367,7 +849,7 @@ details.card summary:hover { color: var(--text); }
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: var(--text-dim);
+  color: var(--text-faint);
   margin: 6px 0 2px;
 }
 
@@ -403,6 +885,7 @@ details.card summary:hover { color: var(--text); }
   inset: 0;
   z-index: 50;
   background: rgba(0, 0, 0, 0.82);
+  display: flex;
   align-items: center;
   justify-content: center;
   padding: 24px;
@@ -430,62 +913,189 @@ details.card summary:hover { color: var(--text); }
   50% { opacity: 0.2; }
 }
 
-/* -- run header counters ---------------------------------------------------- */
-
-.counters {
-  display: flex;
-  gap: 18px;
-  font-family: var(--mono);
-  font-size: 13px;
-  padding: 10px 14px;
-  background: var(--bg-raise);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  margin-bottom: 12px;
-  flex-wrap: wrap;
+@media (prefers-reduced-motion: reduce) {
+  .pulse { animation: none; }
 }
 
-.counters b { color: var(--accent); font-weight: 600; }
+/* -- history --------------------------------------------------------------- */
 
-/* -- tables ----------------------------------------------------------------- */
+.filters { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.filters input[type="search"] { flex: 1 1 220px; width: auto; }
 
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-th { color: var(--text-dim); font-weight: 500; font-size: 12px; }
-tbody tr { cursor: pointer; }
-tbody tr:hover { background: var(--bg-hover); }
-td.goal-cell { max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.runs { display: flex; flex-direction: column; gap: 8px; }
+
+/* One run. Outcome first because it is the strongest signal on the row; the
+   goal wraps rather than truncating to something six other runs also say; the
+   answer is on the row, so reading what a run concluded costs no click. */
+.run {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 12px;
+  padding: 11px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raise);
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  font: inherit;
+  color: inherit;
+}
+
+.run:hover { background: var(--bg-hover); border-color: #3b4757; }
+.run .oc { grid-row: 1 / span 3; padding-top: 2px; }
+.run .goal { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; white-space: pre-wrap; }
+.run .ans { font-size: 13px; color: var(--text-dim); overflow-wrap: anywhere; }
+.run .ans.none { color: var(--text-faint); font-style: italic; }
+
+.run .meta {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-faint);
+  display: flex;
+  gap: 4px 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* The run id: still there, still copyable, no longer the widest column on a
+   page about what the run did. */
+.run .meta .runid, .runid { color: var(--text-faint); opacity: 0.75; }
+.run .meta button { margin-left: auto; }
+
+.run .meta button.resume {
+  font: inherit;
+  font-size: 11px;
+  background: var(--bg-sunk);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 999px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+
+.run .meta button.resume:hover { color: var(--accent); border-color: var(--accent); }
+
+/* Six runs of one goal is the real story of a history like this, so the list
+   says so instead of showing six rows that read the same. */
+details.rungroup {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raise);
+}
+
+details.rungroup > summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 12px;
+  padding: 11px 14px;
+  cursor: pointer;
+  list-style: none;
+}
+
+details.rungroup > summary::-webkit-details-marker { display: none; }
+/* Same shape as a row: the outcome runs down the left, the goal leads. */
+details.rungroup > summary .oc { grid-row: 1 / span 3; padding-top: 2px; }
+details.rungroup > summary .goal { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+details.rungroup > summary .ans { font-size: 13px; color: var(--text-dim); overflow-wrap: anywhere; }
+details.rungroup > summary:hover { background: var(--bg-hover); }
+details.rungroup[open] > summary { border-bottom: 1px solid var(--border); }
+details.rungroup .tally { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
+details.rungroup .tally .more { color: var(--accent); }
+details.rungroup .kids { display: flex; flex-direction: column; gap: 6px; padding: 8px; }
+details.rungroup .kids .run { background: var(--bg-sunk); }
+
+.detail-top { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
 
 /* -- panels & editors ------------------------------------------------------- */
 
 .panel {
   background: var(--bg-raise);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius);
   padding: 16px;
   margin-bottom: 16px;
 }
 
-.panel h3 { margin: 0 0 10px; font-size: 13px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+.panel.thin { padding: 10px 14px; }
+details.panel > summary { cursor: pointer; list-style: none; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+details.panel > summary::-webkit-details-marker { display: none; }
+details.panel > summary h3 {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+}
+details.panel > summary::after { content: "▸"; color: var(--text-faint); font-size: 10px; }
+details.panel[open] > summary::after { content: "▾"; }
+details.panel[open] > summary { margin-bottom: 12px; }
 
-.cfg-group { margin-bottom: 18px; }
-.cfg-group h4 { margin: 0 0 8px; font-family: var(--mono); color: var(--accent); font-size: 13px; }
-.cfg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px 20px; }
-.cfg-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-dim); }
-.cfg-grid label.check { flex-direction: row; align-items: center; gap: 8px; padding-top: 18px; }
-.cfg-grid input[type="checkbox"] { accent-color: var(--accent); }
+/* -- config ---------------------------------------------------------------- */
+
+.cfg-group { margin-bottom: 20px; }
+
+.cfg-group > h4 {
+  margin: 0 0 10px;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 5px;
+}
+
+.cfg-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
+  gap: 14px 20px;
+}
+
+.cfg-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+/* Descendant, not child: a checkbox field nests these one level deeper, inside
+   `.body`. As direct-child rules they missed all 15 of them, which glued the
+   config key onto the label -- `Allow destructive actionssafety.allow_destructive`
+   -- and left their help text at the body size. */
+.cfg-field .lbl { font-size: 13px; color: var(--text); display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.cfg-field .lbl .key { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+.cfg-field .help { font-size: 11.5px; color: var(--text-faint); line-height: 1.4; }
+.cfg-field.check { flex-direction: row; align-items: flex-start; gap: 9px; }
+.cfg-field.check > input { margin-top: 3px; }
+.cfg-field.check > .body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+
+/* A value that differs from the shipped default. Marked, so "what have I
+   actually changed" is answerable without diffing the file. */
+.cfg-field .over {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--yellow);
+  border: 1px solid #d2992255;
+  border-radius: 999px;
+  padding: 0 6px;
+}
+
 .cfg-auto { color: var(--accent); font-size: 11px; }
+.cfg-field[hidden] { display: none; }
 
-.skills-layout { display: grid; grid-template-columns: 280px 1fr; gap: 16px; align-items: start; }
+.skills-layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 18px; align-items: start; }
 .skills-list { display: flex; flex-direction: column; gap: 6px; }
-.skill-item { padding: 8px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-raise); cursor: pointer; }
+.skill-item { padding: 9px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-raise); cursor: pointer; }
 .skill-item:hover { background: var(--bg-hover); }
 .skill-item.active { border-color: var(--accent); }
 .skill-item .nm { font-weight: 600; }
-.skill-item .pkg { font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+.skill-item .pkg { font-family: var(--mono); font-size: 11px; color: var(--text-faint); overflow-wrap: anywhere; }
+
+/* -- tables ----------------------------------------------------------------- */
+
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+th { color: var(--text-faint); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+#watch-ledger-table tbody tr:hover, #dev-table tbody tr:hover { background: var(--bg-hover); }
 
 pre.log {
-  background: var(--bg);
+  background: var(--bg-sunk);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 10px;
@@ -495,13 +1105,66 @@ pre.log {
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-all;
+  margin: 8px 0 0;
 }
-
-img.shot { max-width: 320px; border: 1px solid var(--border); border-radius: 8px; display: block; margin-top: 10px; }
 
 .notice { padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 12px; display: none; }
 .notice.show { display: block; }
-.notice.error { border: 1px solid var(--red); color: var(--red); }
-.notice.ok { border: 1px solid var(--green); color: var(--green); }
+.notice.error { border: 1px solid var(--red); color: var(--red); background: #f851490d; }
+.notice.ok { border: 1px solid var(--green); color: var(--green); background: #3fb9500d; }
 
-.split { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+/* -- device state ----------------------------------------------------------- */
+
+/* A configured serial is not an attached phone, and which of the two it is
+   decides whether Start run can work at all. */
+.devstate { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 12px; font-size: 13px; }
+.devstate .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-faint); flex: 0 0 auto; align-self: center; }
+.devstate.ok .dot { background: var(--green); }
+.devstate.warn .dot { background: var(--yellow); }
+.devstate.bad .dot { background: var(--red); }
+.devstate .what { font-weight: 600; }
+.devstate .why { color: var(--text-dim); flex: 1 1 260px; min-width: 0; }
+.devstate .why .mono { overflow-wrap: anywhere; }
+
+/* -- responsive ------------------------------------------------------------- */
+
+@media (max-width: 1000px) {
+  /* The phone stops being a column and becomes the block above the feed: at
+     this width a 260px sidebar leaves the feed too narrow to read, and putting
+     it after the feed instead would bury the one thing worth glancing at under
+     a run's worth of steps. Landscape-sized rather than full width -- it is a
+     glance, and clicking it still opens the frame full size. */
+  .live-body { grid-template-columns: minmax(0, 1fr); }
+  aside.phone { position: static; order: -1; margin-top: 12px; }
+  aside.phone .phone-frame { background: none; border: none; }
+  aside.phone .phone-frame img {
+    width: auto;
+    max-width: 100%;
+    max-height: 240px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+}
+
+@media (max-width: 780px) {
+  .skills-layout { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 620px) {
+  :root { --pad: 12px; }
+  header { padding: 10px 12px; }
+  header .status .st { max-width: 100%; }
+  .readouts { grid-template-columns: minmax(0, 1fr) auto; }
+  .readout.wide { grid-column: 1 / -1; }
+  .readouts > button.danger { grid-row: 1; grid-column: 2; }
+  .goal-headline { font-size: 17px; }
+  .result-box .answer { font-size: 16px; }
+  .result-box { padding: 14px; }
+  .panel { padding: 13px; }
+  .step-row { grid-template-columns: 24px minmax(0, 1fr); }
+  .step-chips { grid-column: 2; justify-content: flex-start; }
+  .run, details.rungroup > summary { grid-template-columns: minmax(0, 1fr); }
+  .run .oc, details.rungroup > summary .oc { grid-row: auto; }
+  fieldset.optgroup { flex: 1 1 100%; }
+  .rec .k { max-width: 100%; }
+}

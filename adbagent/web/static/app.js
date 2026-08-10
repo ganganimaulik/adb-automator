@@ -1,4 +1,15 @@
-/* adbagent web UI. No framework: fetch + EventSource against the FastAPI backend. */
+/* adbagent web UI. No framework: fetch + EventSource against the FastAPI backend.
+
+   Three tabs. Work is one surface -- compose a goal, watch it happen, read what
+   it answered, and browse what it answered before -- because starting a run and
+   reviewing one were never two different jobs. Watch is the other shape of work.
+   Setup is the phone, the config and the skills.
+
+   The feed has two densities. `story` is one row per step: what it did, what it
+   saw, whether it worked. `trace` restores every line the harness ever wrote,
+   which is the view worth having when the agent itself is the thing that is
+   wrong. Nothing is deleted for `story` -- it is all in the DOM behind
+   `.trace-only`, one class away. */
 
 "use strict";
 
@@ -45,6 +56,37 @@ function fmtDur(s) {
   return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
 }
 
+/* `09/08/2026, 19:29:14` does not say which number is the month, and nobody
+   reading a list of runs wants a date anyway -- they want how long ago. The
+   absolute time stays on the hover. */
+function fmtRel(epoch) {
+  if (!epoch) return "";
+  const s = Date.now() / 1000 - epoch;
+  if (s < 0) return "just now";
+  const step = (n, unit) => `${n} ${unit}${n === 1 ? "" : "s"} ago`;
+  if (s < 45) return "just now";
+  if (s < 5400) return step(Math.max(1, Math.round(s / 60)), "minute");
+  if (s < 86400) return step(Math.round(s / 3600), "hour");
+  if (s < 172800) return "yesterday";
+  if (s < 2592000) return step(Math.round(s / 86400), "day");
+  if (s < 31536000) return step(Math.max(1, Math.round(s / 2592000)), "month");
+  return step(Math.round(s / 31536000), "year");
+}
+
+/* A goal on one line. Watch prompts are a paragraph of instructions whose first
+   line is the only distinctive part; long single-line goals are left whole and
+   wrapped, because truncating six runs of one goal to 55 characters is what made
+   them all read the same row. */
+function goalTitle(goal) {
+  const lines = String(goal || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  return lines[0] || "(no goal recorded)";
+}
+
+function goalRest(goal) {
+  const lines = String(goal || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  return lines.length > 1 ? lines.length - 1 : 0;
+}
+
 /* ------------------------------------------------------- follow the tail
 
    Live surfaces -- the event feed, a streaming llm panel, the generator log --
@@ -88,40 +130,85 @@ function followPageTail(feed, grow) {
 }
 
 /* Treat wherever the page sits now as the tail, so the next live line resumes
-   the chase: a reader opening the run tab mid-run wants the newest of it. */
+   the chase: a reader opening the work tab mid-run wants the newest of it. */
 function armPageTail() {
   const page = document.scrollingElement;
   page._autoTop = page.scrollTop;
 }
 
+/* ------------------------------------------------------------- density
+
+   One switch for every feed on the page, kept on <body> so the whole
+   restructuring is a class lookup rather than a re-render -- and remembered,
+   because somebody debugging the agent is debugging it all afternoon. */
+
+const DENSITY_KEY = "adbagent.density";
+
+function setDensity(mode) {
+  const value = mode === "trace" ? "trace" : "story";
+  document.body.dataset.density = value;
+  document.querySelectorAll("[data-density]").forEach((b) =>
+    b.classList.toggle("on", b.dataset.density === value));
+  saveValue(DENSITY_KEY, value);
+}
+
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-density]");
+  if (btn) setDensity(btn.dataset.density);
+});
+
 /* ---------------------------------------------------------------- tabs */
 
 const loadedTabs = new Set();
 const tabLoaders = {
-  run: () => {},
+  work: loadRuns,
   watch: loadWatch,
-  history: loadRuns,
-  devices: loadDevices,
-  config: loadConfig,
-  skills: loadSkills,
+  setup: loadSetup,
 };
 
 $("tabs").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-tab]");
   if (!btn) return;
-  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b === btn));
+  document.querySelectorAll("nav#tabs button").forEach((b) =>
+    b.classList.toggle("active", b === btn));
   document.querySelectorAll("section.tab").forEach((s) =>
     s.classList.toggle("active", s.id === "tab-" + btn.dataset.tab));
   const name = btn.dataset.tab;
   // The other tab's scroll position isn't a reader's decision about this feed.
-  if (name === "run" || name === "skills" || name === "watch") armPageTail();
+  armPageTail();
   if (!loadedTabs.has(name)) {
     loadedTabs.add(name);
     tabLoaders[name]().catch((err) => notice(err.message));
   }
 });
 
-/* ------------------------------------------------------- event cards */
+/* Setup's own three panes. Not tabs -- they are one tab's contents -- and each
+   costs a fetch, so each is loaded the first time it is looked at. */
+
+const setupLoaders = { device: loadDevices, config: loadConfig, skills: loadSkills };
+const loadedPanes = new Set();
+
+function showPane(name) {
+  document.querySelectorAll("#setup-nav button").forEach((b) =>
+    b.classList.toggle("active", b.dataset.pane === name));
+  document.querySelectorAll("#tab-setup .pane").forEach((p) =>
+    p.classList.toggle("active", p.id === "pane-" + name));
+  if (loadedPanes.has(name)) return;
+  loadedPanes.add(name);
+  setupLoaders[name]().catch((err) => notice(err.message));
+}
+
+$("setup-nav").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-pane]");
+  if (btn) showPane(btn.dataset.pane);
+});
+
+async function loadSetup() {
+  const active = document.querySelector("#setup-nav button.active");
+  showPane(active ? active.dataset.pane : "device");
+}
+
+/* ------------------------------------------------------- event rendering */
 
 function actionSummary(a) {
   if (!a || typeof a !== "object") return "";
@@ -139,14 +226,18 @@ function actionSummary(a) {
   return `${kind}${bits.length ? " " + bits.join(" ") : ""}`;
 }
 
-const GRADE_CLASSES = { worked: "worked", no_change: "no_change" };
+/* `success` was missing here, so every `verify` the harness graded `success`
+   drew a red chip reading "success" -- the default branch is `failed`. */
+const GRADE_CLASSES = { worked: "worked", success: "worked", no_change: "no_change" };
 
-/* A ledger key as a person reads it: `label:today, 9:17 am#2` is the app's own
-   caption plus the ledger's bookkeeping, and the prefix is the bookkeeping. */
 /* Kinds that are a line of context rather than a card, each mapped to its text.
    A kind in neither this table nor a branch below renders as its bare name --
    which is how a sweep used to read as twenty lines saying "sweep_step" with
-   everything the events carried thrown away. */
+   everything the events carried thrown away.
+
+   All of it is telemetry: the harness talking to itself about what it refused,
+   remembered or retried. Real value when the agent is what is being debugged,
+   noise when reading what a run did, so it lives inside the step's own fold. */
 const NOTE_LINES = {
   sweep_step: (e) => `repeated \`${e.gesture || "the gesture"}\` · ` +
     `${e.read_count || 0} read` + (e.moved === false ? " · did not move" : ""),
@@ -165,6 +256,11 @@ const NOTE_LINES = {
   replan_failed: (e) => `replan produced nothing usable (${e.error || "?"})`,
   scratchpad: (e) => `collected: ${(e.keys || []).join(", ")} (${e.total} total)`,
   dead_ends: (e) => `dead ends avoided: ${(e.remembered || []).join(", ")}`,
+  // Was reaching the feed as the bare word `goal_check`, with the model's own
+  // account of what was still missing thrown away.
+  goal_check: (e) => e.satisfied
+    ? "goal check: already satisfied"
+    : `goal check: not yet — ${e.evidence || "no reason given"}`,
 };
 
 /* How a run stops badly. Rendered rather than dropped: an `error` event used to
@@ -182,18 +278,16 @@ const HALT_BANNERS = {
 
 /* --------------------------------------------------- collected data
 
-   What the run has *got*: the ledger `scratchpad.py` maintains, shown under the
-   step that changed it. The harness sends only the records that were new or
-   corrected on that step -- keyed by `id`, the normalised key it matched them
-   on -- so the union is kept here per feed and re-rendered whole. A person
-   watching a collection run wants the ledger, not the delta: the delta is one
-   line and the question is always "has it got everything yet".
+   What the run has *got*: the ledger `scratchpad.py` maintains. The harness
+   sends only the records that were new or corrected on a step -- keyed by `id`,
+   the normalised key it matched them on -- so the union is kept here per feed
+   and re-rendered whole. A person watching a collection run wants the ledger,
+   not the delta: the delta is one line and the question is always "has it got
+   everything yet".
 
-   Only the newest panel stays open. Fifteen steps of an album walk would
-   otherwise be fifteen copies of a growing list, and the one worth reading is
-   always the last -- so each new panel folds the one before it, the way the
-   thinking panels fold when their call ends. A panel a reader opened by hand is
-   left alone: only the panel this feed opened is tracked. */
+   The union is pinned above the feed, because that question comes up twenty
+   steps after the step that last answered it. The per-step panels stay in the
+   trace, where the delta is the point. */
 
 function noteRow(rec, fresh) {
   const row = document.createElement("div");
@@ -208,6 +302,30 @@ function noteRow(rec, fresh) {
   return row;
 }
 
+/* The pinned ledger: the whole union, with whatever the newest step touched
+   marked. `box` is the surface's own panel. */
+function paintLedger(box, ledger, fresh, dropped) {
+  if (!box) return;
+  if (!ledger || !ledger.size) { box.hidden = true; return; }
+  box.hidden = false;
+  const n = ledger.size;
+  box.innerHTML = `<div class="lk">collected data · ${n} ` +
+    `${n === 1 ? "record" : "records"}</div><div class="notes-body"></div>`;
+  const body = box.querySelector(".notes-body");
+  for (const [id, rec] of ledger) body.appendChild(noteRow(rec, fresh.has(id)));
+  // The harness evicts its oldest records past a ceiling and reports the count
+  // rather than hiding it; the view has no such ceiling, so when the two
+  // disagree it is the harness that stopped carrying them -- and the prompt the
+  // model sees from here on is the shorter one.
+  if (dropped > 0) {
+    const note = document.createElement("div");
+    note.className = "notes-note";
+    note.textContent = `the harness has dropped the oldest ${dropped} for ` +
+      `space — still listed here, but no longer in the model's prompt`;
+    box.appendChild(note);
+  }
+}
+
 function finalizeNotes(feed) {
   const card = feed && feed._notesCard;
   if (card) {
@@ -216,8 +334,16 @@ function finalizeNotes(feed) {
   }
 }
 
+/* Fold a `scratchpad` event into the feed's union, and return the per-step
+   delta panel for the trace.
+
+   Only the newest panel stays open. Fifteen steps of an album walk would
+   otherwise be fifteen copies of a growing list, and the one worth reading is
+   always the last -- so each new panel folds the one before it, the way the
+   thinking panels fold when their call ends. A panel a reader opened by hand is
+   left alone: only the panel this feed opened is tracked. */
 function notesPanel(ev, feed) {
-  const ledger = feed ? (feed._notes || (feed._notes = new Map())) : new Map();
+  const ledger = feed._notes || (feed._notes = new Map());
   const fresh = new Set();
   for (const rec of ev.records || []) {
     const id = rec.id || rec.key;
@@ -227,6 +353,7 @@ function notesPanel(ev, feed) {
     fresh.add(id);
   }
   finalizeNotes(feed);  // this panel is the current ledger now; the last is not
+  paintLedger(feed._ledgerBox, ledger, fresh, ledger.size - (ev.total || ledger.size));
 
   const card = document.createElement("div");
   card.className = "card notes";
@@ -237,23 +364,100 @@ function notesPanel(ev, feed) {
     `<div class="notes-body"></div></details>`;
   const body = card.querySelector(".notes-body");
   for (const [id, rec] of ledger) body.appendChild(noteRow(rec, fresh.has(id)));
-  // The harness evicts its oldest records past a ceiling and reports the count
-  // rather than hiding it; the view has no such ceiling, so when the two
-  // disagree it is the harness that stopped carrying them -- and the prompt the
-  // model sees from here on is the shorter one.
-  const dropped = ledger.size - (ev.total || ledger.size);
-  if (dropped > 0) {
-    const note = document.createElement("div");
-    note.className = "notes-note";
-    note.textContent = `the harness has dropped the oldest ${dropped} for ` +
-      `space — still listed here, but no longer in the model's prompt`;
-    card.querySelector("details").appendChild(note);
-  }
-  if (feed) feed._notesCard = card.querySelector("details");
+  feed._notesCard = card.querySelector("details");
   return card;
 }
 
-/* --------------------------------------------------------- step cards */
+/* --------------------------------------------------------- step rows */
+
+function feedAppend(feed, el) {
+  if (feed._live) followPageTail(feed, () => feed.appendChild(el));
+  else feed.appendChild(el);
+}
+
+/* The step's row, created on first sight of it -- which is the model starting to
+   think about it, not the decision landing, so the row appears as soon as there
+   is something to say about it. */
+function feedStep(feed, step) {
+  const steps = feed._steps || (feed._steps = new Map());
+  const key = step == null ? "" : String(step);
+  if (!key) return null;
+  const found = steps.get(key);
+  if (found) return found;
+  const el = document.createElement("div");
+  el.className = "step";
+  el.innerHTML =
+    `<div class="step-row">` +
+      `<span class="step-no">${esc(key)}</span>` +
+      `<div class="step-main">` +
+        `<div class="step-act" data-placeholder="1">thinking…</div>` +
+        `<div class="step-obs" hidden></div>` +
+        `<div class="step-verdict" hidden></div>` +
+      `</div>` +
+      `<div class="step-chips"></div>` +
+    `</div>` +
+    `<div class="step-shots"></div>` +
+    `<div class="step-reads"></div>` +
+    `<div class="step-more trace-only"></div>`;
+  const node = {
+    el,
+    act: el.querySelector(".step-act"),
+    obs: el.querySelector(".step-obs"),
+    verdict: el.querySelector(".step-verdict"),
+    chips: el.querySelector(".step-chips"),
+    shots: el.querySelector(".step-shots"),
+    reads: el.querySelector(".step-reads"),
+    more: el.querySelector(".step-more"),
+  };
+  steps.set(key, node);
+  feedAppend(feed, el);
+  return node;
+}
+
+/* Where a line about step N goes. Falls back to the last step seen, so events
+   the harness records without one (`dead_ends` is filed under the step it is
+   about to protect) still land under a step rather than loose in the feed. */
+function stepFor(feed, ev) {
+  const step = ev.step != null ? ev.step : feed._curStep;
+  if (step != null) feed._curStep = step;
+  return feedStep(feed, step);
+}
+
+function setAct(node, text) {
+  node.act.textContent = text;
+  delete node.act.dataset.placeholder;
+}
+
+/* Name a step whose decision has not landed. A sweep step never gets one -- the
+   harness repeats the gesture in code -- and a row reading "thinking…" for a
+   step that is over and did something is the placeholder outliving its purpose. */
+function nameStep(node, text) {
+  if (!node || node.act.dataset.placeholder !== "1") return;
+  setAct(node, text);
+}
+
+/* Every step still holding the live placeholder, once there is nothing more
+   coming: an interrupted run leaves its last step mid-thought, and the honest
+   reading of that row is that no decision was recorded, not that something is
+   still thinking about it. */
+function finalizeSteps(feed) {
+  for (const node of (feed._steps || new Map()).values()) {
+    if (node.act.dataset.placeholder !== "1") continue;
+    node.act.textContent = "no decision recorded";
+    node.act.classList.add("unresolved");
+    delete node.act.dataset.placeholder;
+  }
+}
+
+function chip(cls, text, title) {
+  return `<span class="chip ${esc(cls)}"${title ? ` title="${esc(title)}"` : ""}>` +
+    `${esc(text)}</span>`;
+}
+
+function setLine(el, text) {
+  el.textContent = text || "";
+  el.hidden = !text;
+}
 
 /* The per-step arithmetic. Tokens as well as calls and spend, because what a
    step cost is mostly what it was *shown* -- and the cached share is the
@@ -273,121 +477,177 @@ function stepMeta(ev) {
     bits.push(tok);
   }
   bits.push(`$${(llm.usd || 0).toFixed(4)}`);
-  if (a.confidence) bits.push(esc(a.confidence));
+  if (a.confidence) bits.push(a.confidence);
   return bits.join(" · ");
 }
 
-/* One feed entry, or null when the event says nothing new.
-   `feed` is the element it is going into, which is where the per-feed state a
-   few kinds need lives -- see `active_skill`. */
-function renderEvent(ev, feed) {
-  const kind = ev.kind || "";
+function banner(feed, cls, html, traceOnly) {
   const div = document.createElement("div");
+  div.className = "banner " + cls + (traceOnly ? " trace-only" : "");
+  div.innerHTML = html;
+  feedAppend(feed, div);
+}
 
-  if (kind === "run_start") {
-    div.className = "banner";
-    div.innerHTML = `<b>goal</b> ${esc(ev.goal)}<br><span class="small">${esc(ev.model || "")}</span>`;
-  } else if (kind === "run_resume") {
-    // Where two sittings of one run join: the events above it are the failed
-    // attempt, the ones below are the continuation.
-    div.className = "banner";
-    div.innerHTML = `<b>resumed from step ${esc(ev.resumed_at_step || 0)}</b>` +
-      `<br><span class="small">${esc(ev.model || "")}</span>`;
-  } else if (kind === "decide") {
+function tele(feed, ev, text) {
+  const node = stepFor(feed, ev);
+  const div = document.createElement("div");
+  div.className = "tele";
+  div.textContent = text;
+  if (node) node.more.appendChild(div);
+  else { div.classList.add("trace-only"); feedAppend(feed, div); }
+}
+
+/* One event, folded into the feed wherever it belongs: onto its step's row, into
+   that step's trace fold, or -- for the handful that are about the run rather
+   than a step -- as a rule between steps. */
+function appendEvent(ev, feed) {
+  const kind = ev.kind || "";
+
+  if (kind === "decide") {
     const a = ev.action || {};
-    div.className = "card";
-    div.innerHTML =
-      `<div class="head"><span class="stepno">step ${esc(ev.step)}</span>` +
-      `<span class="action">${esc(actionSummary(a))}</span>` +
+    const node = stepFor(feed, ev);
+    if (!node) return;
+    setAct(node, actionSummary(a) || "—");
+    setLine(node.obs, a.observation);
+    node.chips.innerHTML =
       // Why the turn was given deep reasoning, on the chip that says it was:
-      // `hard_because` is recorded per step and had nowhere to be read.
-      (ev.effort ? `<span class="chip neutral"${ev.hard_because
-        ? ` title="${esc(ev.hard_because)}"` : ""}>${esc(ev.effort)}</span>` : "") +
-      (ev.screenshot ? `<span class="chip neutral">vision</span>` : "") +
+      // `hard_because` is recorded per step and had nowhere to be read. Named
+      // rather than bare -- a chip reading only `none` beside one reading
+      // `success` is a value with its question missing.
+      (ev.effort ? chip("neutral", `effort ${ev.effort}`, ev.hard_because || "") : "") +
+      (ev.screenshot ? chip("neutral", "vision") : "") +
       // The stall ladder's own counter. Every action can be succeeding while the
       // run goes nowhere, and this is the number the harness escalates on.
-      (ev.stalled ? `<span class="chip stall" title="steps since the run last ` +
-        `learned anything — the harness starts intervening as this climbs">` +
-        `stalled ${esc(ev.stalled)}</span>` : "") +
-      `</div>` +
-      (a.observation ? `<div class="obs">${esc(a.observation)}</div>` : "") +
-      (a.reasoning ? `<div class="why">${esc(a.reasoning)}</div>` : "") +
-      // The model's own plan for the goal, which it rewrites as it goes. It has
-      // been in the prompt and in the events all along and was shown nowhere.
-      (a.progress ? `<div class="plan">${esc(a.progress)}</div>` : "") +
-      `<div class="meta">${stepMeta(ev)}</div>`;
+      (ev.stalled ? chip("stall", `stalled ${ev.stalled}`,
+        "steps since the run last learned anything — the harness starts " +
+        "intervening as this climbs") : "") +
+      node.chips.innerHTML;
+    if (a.reasoning) {
+      const why = document.createElement("div");
+      why.className = "why";
+      why.textContent = a.reasoning;
+      node.more.appendChild(why);
+    }
+    // The model's own plan for the goal, which it rewrites as it goes. Pinned
+    // above the feed as well, since the card carrying it is twenty steps back by
+    // the time anyone asks.
+    if (a.progress) {
+      const plan = document.createElement("div");
+      plan.className = "plan";
+      plan.textContent = a.progress;
+      node.more.appendChild(plan);
+    }
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = stepMeta(ev);
+    node.more.appendChild(meta);
+
   } else if (kind === "verify") {
-    const cls = GRADE_CLASSES[ev.grade] || "failed";
-    div.className = "card";
-    div.innerHTML = `<div class="head"><span class="stepno">step ${esc(ev.step)}</span>` +
-      `<span class="chip ${cls}">${esc(ev.grade)}</span></div><div class="why">${esc(ev.reason || "")}</div>`;
+    // Folded into the row it graded rather than trailing it as a card of its
+    // own: a 47px card reading `step 4 success` was a third of this feed.
+    const node = stepFor(feed, ev);
+    if (!node) return;
+    node.chips.insertAdjacentHTML("afterbegin",
+      chip(GRADE_CLASSES[ev.grade] || "failed", ev.grade || "?"));
+    if (ev.reason) setLine(node.verdict, ev.reason);
+
   } else if (kind === "judge") {
-    div.className = "card";
-    div.innerHTML = `<div class="head"><span class="stepno">step ${esc(ev.step)}</span>` +
-      `<span class="chip ${ev.satisfied ? "worked" : "failed"}">judge: ${ev.satisfied ? "satisfied" : "not yet"}</span></div>` +
-      `<div class="why">${esc(ev.evidence || "")}</div>`;
+    const node = stepFor(feed, ev);
+    if (!node) return;
+    node.chips.insertAdjacentHTML("afterbegin", chip(
+      ev.satisfied ? "worked" : "failed",
+      `judge: ${ev.satisfied ? "satisfied" : "not yet"}`));
+    if (ev.evidence) setLine(node.verdict, ev.evidence);
+
+  } else if (kind === "item_reading") {
+    // The sweep's own vision call. It gets no live panel -- a prefetched read
+    // runs on another thread, and streaming two of those into one view
+    // interleaves them -- so this row is the whole of it: the line the model
+    // read, and the frame it read it from. Kept out of the fold, because on a
+    // carousel walk these *are* what the run collected.
+    const node = stepFor(feed, ev);
+    const row = document.createElement("div");
+    row.className = "card";
+    row.innerHTML =
+      `<div class="head">${chip("neutral", "read")}` +
+      (ev.position ? `<span class="mono">#${esc(ev.position)}</span>` : "") + `</div>` +
+      `<div class="obs">${esc(ev.reading || "")}</div>`;
+    const thumb = llmShot(ev, feed._runId);
+    if (thumb) row.appendChild(thumb);
+    if (node) node.reads.appendChild(row);
+    else feedAppend(feed, row);
+
   } else if (kind === "image_analysis") {
-    div.className = "card";
-    div.innerHTML = `<details><summary>vision read · step ${esc(ev.step)} · ${esc(ev.model || "")}</summary>` +
+    const node = stepFor(feed, ev);
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML =
+      `<details><summary>vision read · ${esc(ev.model || "")}</summary>` +
       `<div class="why" style="margin-top:6px">${esc(ev.result || "")}</div></details>`;
-  } else if (kind === "run_end") {
-    div.className = "banner " + esc(ev.outcome || "");
-    // The answer first, the arithmetic under it. A run that read something and
-    // reported it put that in the terminal action's text, and the feed card for
-    // that step looks like every other step card -- so the banner is the one
-    // place a person scrolling to the bottom is guaranteed to see it.
-    div.innerHTML =
-      (ev.result ? `<div class="result">${esc(ev.result)}</div>` : "") +
-      `<b>${esc((ev.outcome || "").toUpperCase())}</b> — ${esc(ev.steps)} steps, ` +
-      `${esc(ev.llm_calls)} LLM calls, $${(ev.usd || 0).toFixed(4)}` +
-      (ev.evidence ? `<div class="why">${esc(ev.evidence)}</div>` : "");
+    if (node) node.more.appendChild(card);
+    else { card.classList.add("trace-only"); feedAppend(feed, card); }
+
+  } else if (kind === "scratchpad" && (ev.records || []).length) {
+    // A run recorded before the event carried its records has only the keys, and
+    // falls through to the one-line form in NOTE_LINES below.
+    const node = stepFor(feed, ev);
+    const panel = notesPanel(ev, feed);
+    if (node) node.more.appendChild(panel);
+    else { panel.classList.add("trace-only"); feedAppend(feed, panel); }
+
   } else if (kind === "active_skill") {
     // Recorded on every step -- it is the per-step record of what the prompt
     // actually carried -- so rendering each one buried the fact under eight
     // identical grey lines. A line per *change* is the information: it is where
     // the run crossed into another app's guidance, or failed to.
     const label = `${ev.name || "?"}|${ev.package || ""}`;
-    if (feed) {
-      if (feed._skill === label) return null;
-      feed._skill = label;
-    }
-    div.className = "banner skill";
-    div.innerHTML = `<span class="chip skill">skill loaded</span> <b>${esc(ev.name || "?")}</b>` +
-      (ev.package ? ` <span class="small">${esc(ev.package)}</span>` : "");
-  } else if (kind === "item_reading") {
-    // The sweep's own vision call. It gets no live panel -- a prefetched read
-    // runs on another thread, and streaming two of those into one view
-    // interleaves them -- so this card is the whole of it: the line the model
-    // read, and the frame it read it from.
-    div.className = "card";
-    div.innerHTML =
-      `<div class="head"><span class="stepno">step ${esc(ev.step)}</span>` +
-      `<span class="chip neutral">read</span>` +
-      (ev.position ? `<span class="mono">#${esc(ev.position)}</span>` : "") + `</div>` +
-      `<div class="obs">${esc(ev.reading || "")}</div>`;
-    const thumb = llmShot(ev, feed && feed._runId);
-    if (thumb) div.appendChild(thumb);
+    if (feed._skill === label) return;
+    feed._skill = label;
+    banner(feed, "skill", chip("skill", "skill loaded") +
+      ` <b>${esc(ev.name || "?")}</b>` +
+      (ev.package ? ` <span class="small">${esc(ev.package)}</span>` : ""));
+
   } else if (kind === "sweep") {
-    div.className = "banner";
-    div.innerHTML = `<b>repeated \`${esc(ev.gesture)}\` ${esc(ev.swept)}×</b>, ` +
+    banner(feed, "", `<b>repeated \`${esc(ev.gesture)}\` ${esc(ev.swept)}×</b>, ` +
       `${esc(ev.read)} read <span class="small">· steps ${esc(ev.first_step)}–` +
-      `${esc(ev.last_step)}${ev.reason ? " · " + esc(ev.reason) : ""}</span>`;
-  } else if (kind === "scratchpad" && (ev.records || []).length) {
-    // A run recorded before the event carried its records has only the keys, and
-    // falls through to the one-line form in NOTE_LINES below.
-    return notesPanel(ev, feed);
+      `${esc(ev.last_step)}${ev.reason ? " · " + esc(ev.reason) : ""}</span>`);
+
+  } else if (kind === "run_start") {
+    // The goal is the headline of the surface now, so this is a rule in the
+    // trace rather than a third copy of it.
+    banner(feed, "", `<b>goal</b> ${esc(ev.goal)}<br>` +
+      `<span class="small">${esc(ev.model || "")}</span>`, true);
+
+  } else if (kind === "run_resume") {
+    // Where two sittings of one run join: the events above it are the failed
+    // attempt, the ones below are the continuation.
+    banner(feed, "", `<b>resumed from step ${esc(ev.resumed_at_step || 0)}</b>` +
+      `<br><span class="small">${esc(ev.model || "")}</span>`);
+
+  } else if (kind === "run_end") {
+    // The answer has its own block above the feed -- large, first, and once. In
+    // the trace it stays where it always was, because the trace is the record.
+    banner(feed, esc(ev.outcome || ""),
+      `<b>${esc((ev.outcome || "").toUpperCase())}</b> — ${esc(ev.steps)} steps, ` +
+      `${esc(ev.llm_calls)} LLM calls, $${(ev.usd || 0).toFixed(4)}` +
+      (ev.result ? `<div class="why">${esc(ev.result)}</div>` : "") +
+      (ev.evidence ? `<div class="why">${esc(ev.evidence)}</div>` : ""), true);
+
   } else if (HALT_BANNERS[kind]) {
     const [cls, html] = HALT_BANNERS[kind](ev);
-    div.className = "banner " + cls;
-    div.innerHTML = html;
+    banner(feed, cls, html);
+
   } else if (NOTE_LINES[kind]) {
-    div.className = "small mono";
-    div.textContent = NOTE_LINES[kind](ev);
-  } else {
-    div.className = "small mono";
-    div.textContent = kind;
+    // A swept step has no decision to name it: the harness is repeating the
+    // gesture the model already chose, in code, without asking again.
+    if (kind === "sweep_step") {
+      nameStep(stepFor(feed, ev), `repeated \`${ev.gesture || "the gesture"}\``);
+    }
+    tele(feed, ev, NOTE_LINES[kind](ev));
+
+  } else if (kind) {
+    tele(feed, ev, kind);
   }
-  return div;
 }
 
 function updateCountersFromEvent(ev, v) {
@@ -411,8 +671,11 @@ function updateCountersFromEvent(ev, v) {
   if (ev.kind === "scratchpad" && typeof ev.total === "number") {
     v.records = ev.total;
   }
-  if (ev.kind === "decide" && (ev.action || {}).progress) {
-    v.progress = ev.action.progress;
+  if (ev.kind === "decide") {
+    if ((ev.action || {}).progress) v.progress = ev.action.progress;
+    // The first of the three primary readouts: what it is doing, in the words
+    // the action itself is written in.
+    v.now = actionSummary(ev.action) || v.now;
   }
   const llm = ev.llm;
   if (llm && typeof llm === "object") {
@@ -426,16 +689,18 @@ function updateCountersFromEvent(ev, v) {
 
 /* One collapsible panel per LLM call: it opens when the call starts, the
    model's raw thinking and response stream into it live, and it folds itself
-   away the moment the call ends -- the decide/verify cards carry the result.
-   Panels are keyed off order, not step: calls within a step are sequential
-   (a vision read, then the decision), so at most one is ever open per feed,
-   tracked as feed._llm.
+   away the moment the call ends -- the step row carries the result. Panels are
+   keyed off order, not step: calls within a step are sequential (a vision read,
+   then the decision), so at most one is ever open per feed, tracked as
+   feed._llm. They live in the step's trace fold, because the raw stream is the
+   deepest layer of the machinery.
 
    A call that was shown a screenshot carries its file name, and the thumbnail
-   stays visible after the panel folds: a vision read you cannot check against
-   the frame it read is only half the record. Which run's files to ask for is
-   feed._runId -- the live feed learns it from the stream, the history feed from
-   the run it opened. */
+   goes on the step itself rather than into the fold: a vision read you cannot
+   check against the frame it read is only half the record, and the filmstrip of
+   what a run was actually shown belongs in the story. Which run's files to ask
+   for is feed._runId -- the live feed learns it from the stream, the history
+   feed from the run it opened. */
 
 const LLM_PURPOSES = { decide: "decide", judge: "judge",
   analyze_image: "vision read", read_item: "item read" };
@@ -465,11 +730,11 @@ function llmSummary(start, end) {
 function openLightbox(src, alt) {
   $("lightbox-img").src = src;
   $("lightbox-img").alt = alt || "";
-  $("lightbox").style.display = "flex";
+  $("lightbox").hidden = false;
 }
 
 function closeLightbox() {
-  $("lightbox").style.display = "none";
+  $("lightbox").hidden = true;
   $("lightbox-img").removeAttribute("src");  // stop holding the decoded frame
 }
 
@@ -479,7 +744,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 /* The thumbnail of the frame this call was shown, or nothing when it was shown
-   none. Lives outside the <details> so folding the panel keeps it. */
+   none. */
 function llmShot(ev, runId) {
   if (!ev.shot || !runId) return null;
   const wrap = document.createElement("div");
@@ -508,7 +773,7 @@ function llmShot(ev, runId) {
 
    Layout is measured once a frame, not once a chunk. Chasing the tail reads
    `scrollHeight` on the box and on the whole document, which forces the
-   pending layout of a page carrying a run's worth of cards and screenshots.
+   pending layout of a page carrying a run's worth of rows and screenshots.
    Chunks arriving between two frames are joined into one append, so the cost
    follows the display's refresh rate rather than the model's token rate. */
 
@@ -545,6 +810,7 @@ function finalizeLlm(feed, end) {
 function handleLlmEvent(ev, feed) {
   if (ev.kind === "llm_start") {
     finalizeLlm(feed, null);  // a panel the last stream never closed
+    const node = stepFor(feed, ev);
     const card = document.createElement("div");
     card.className = "card llm-live";
     card.innerHTML =
@@ -553,9 +819,14 @@ function handleLlmEvent(ev, feed) {
       `<div class="llm-text"></div></div>` +
       `<div class="llm-sec response"><div class="llm-sec-label">response</div>` +
       `<div class="llm-text"></div></div></details>`;
+    if (node) node.more.appendChild(card);
+    else { card.classList.add("trace-only"); feedAppend(feed, card); }
+    // The frame outside the fold: it is evidence, not machinery.
     const shot = llmShot(ev, feed._runId);
-    if (shot) card.appendChild(shot);
-    feed.appendChild(card);
+    if (shot) {
+      if (node) node.shots.appendChild(shot);
+      else feedAppend(feed, shot);
+    }
     const section = (name) => ({
       sec: card.querySelector(`.llm-sec.${name}`),
       text: card.querySelector(`.llm-sec.${name} .llm-text`),
@@ -579,6 +850,7 @@ function handleLlmEvent(ev, feed) {
 }
 
 function paintCounters(v) {
+  v.els.now.textContent = v.now || "…";
   // Against the ceiling when the run recorded one: "step 12/60" says how much
   // room is left, which is what somebody watching actually wants to know.
   v.els.step.textContent = v.maxSteps ? `${v.step}/${v.maxSteps}` : v.step;
@@ -588,14 +860,14 @@ function paintCounters(v) {
   v.els.skill.textContent = v.skill || "—";
   v.els.records.textContent = v.records;
   // The model's own progress note, outside the feed on purpose: it is the one
-  // line that answers "what does it think it is doing", and the card carrying it
-  // is twenty cards back by the time the question comes up.
+  // line that answers "what does it think it is doing", and the row carrying it
+  // is twenty rows back by the time the question comes up.
   v.els.progress.textContent = v.progress;
-  v.els.progress.style.display = v.progress ? "" : "none";
+  v.els.progress.hidden = !v.progress;
   // Only worth the space once there is more than one: a single run has no
   // iteration to speak of. A tour never repeats, so it has no such counter.
   if (v.els.iterWrap) {
-    v.els.iterWrap.style.display = v.iteration > 1 ? "" : "none";
+    v.els.iterWrap.hidden = !(v.iteration > 1);
     v.els.iter.textContent = v.iteration;
   }
 }
@@ -618,7 +890,6 @@ function appendExitLine(feed, line) {
       + "into its skill — one model call, which can take a minute.</span>";
     const pre = document.createElement("pre");
     pre.className = "log";
-    pre.style.marginTop = "8px";
     card.appendChild(pre);
     feed._exitLog = pre;
     followPageTail(feed, () => feed.appendChild(card));
@@ -634,24 +905,167 @@ function appendExitLine(feed, line) {
     pre.appendChild(document.createTextNode(line + "\n"))));
 }
 
+/* ------------------------------------------------------ the phone
+
+   It automates a phone and never showed you the phone. This panel does, off
+   `/api/device/frame` -- one `exec-out screencap`, which opens no device session
+   and so cannot disturb whatever is driving it. Which is the whole reason it is
+   a new endpoint and not the Devices screenshot: that one goes through
+   `Device()`, which zeroes the animation scales and locks rotation on the way
+   in, and the server refuses it while an agent holds the phone.
+
+   Every state says which it is. A frame is stamped with how old it is, a phone
+   that cannot be read says why, and nothing is ever shown unlabelled. */
+
+const FRAME_POLL_MS = 2000;
+//: A phone that cannot be read will not start being readable in two seconds, so
+//: back right off rather than asking sixteen hundred times an hour. Still a
+//: poll and not a stop: plugging a phone in mid-run should heal on its own.
+const FRAME_RETRY_MS = 15000;
+
+function phoneView(box, { live = false, edge = 720 } = {}) {
+  box.innerHTML =
+    `<div class="phone-head"><span class="lbl">the phone</span>` +
+    `<span class="grow"></span>` +
+    `<button type="button" class="pause" hidden>pause</button>` +
+    `<button type="button" class="shot">refresh</button></div>` +
+    `<div class="phone-frame"><div class="phone-empty">—</div></div>` +
+    `<div class="phone-note"></div>`;
+  const frame = box.querySelector(".phone-frame");
+  const note = box.querySelector(".phone-note");
+  const lbl = box.querySelector(".lbl");
+  const pause = box.querySelector(".pause");
+  const v = {
+    timer: null, url: "", busy: false, paused: false, at: 0, ticker: null,
+    running: false, every: FRAME_POLL_MS,
+  };
+
+  function say(text, warn) {
+    note.textContent = text || "";
+    note.className = "phone-note" + (warn ? " warn" : "");
+  }
+
+  function empty(text) {
+    if (v.url) { URL.revokeObjectURL(v.url); v.url = ""; }
+    frame.innerHTML = `<div class="phone-empty">${esc(text)}</div>`;
+  }
+
+  function stamp() {
+    if (!v.at) return;
+    const age = Math.round(Date.now() / 1000 - v.at);
+    lbl.textContent = v.running
+      ? (age < 4 ? "the phone · live" : `the phone · ${age}s old`)
+      : `the phone · ${age < 4 ? "just now" : fmtRel(v.at)}`;
+  }
+
+  async function grab() {
+    if (v.busy) return;
+    v.busy = true;
+    const slow = (ms) => { if (v.every !== ms) { v.every = ms; schedule(); } };
+    try {
+      const res = await fetch(
+        `/api/device/frame?max_long_edge=${edge}&t=${Date.now()}`);
+      if (!res.ok) {
+        let detail = res.statusText;
+        try { detail = (await res.json()).detail || detail; } catch { /* text */ }
+        empty("no picture");
+        say(String(detail), true);
+        v.at = 0;
+        lbl.textContent = "the phone";
+        slow(FRAME_RETRY_MS);
+        return;
+      }
+      slow(FRAME_POLL_MS);
+      const blob = await res.blob();
+      const next = URL.createObjectURL(blob);
+      let img = frame.querySelector("img");
+      if (!img) {
+        frame.innerHTML = "";
+        img = document.createElement("img");
+        img.alt = "the phone's screen right now";
+        img.title = "click to enlarge";
+        img.addEventListener("click", () => openLightbox(img.src, img.alt));
+        frame.appendChild(img);
+      }
+      const old = v.url;
+      img.src = next;
+      v.url = next;
+      if (old) URL.revokeObjectURL(old);
+      v.at = Date.now() / 1000;
+      stamp();
+      say(v.running
+        ? "a read-only screencap taken beside the run — it opens no device "
+          + "session, so it cannot disturb what the agent set"
+        : "");
+    } catch (err) {
+      say(err.message, true);
+      slow(FRAME_RETRY_MS);
+    } finally {
+      v.busy = false;
+    }
+  }
+
+  function schedule() {
+    clearInterval(v.timer);
+    if (v.paused || !live || !v.running) return;
+    v.timer = setInterval(() => {
+      // Nothing to see on a hidden tab, and screencap is not free on the phone.
+      if (!document.hidden && box.offsetParent) grab();
+    }, v.every);
+  }
+
+  pause.addEventListener("click", () => {
+    v.paused = !v.paused;
+    pause.textContent = v.paused ? "resume" : "pause";
+    schedule();
+  });
+  box.querySelector(".shot").addEventListener("click", grab);
+
+  clearInterval(v.ticker);
+  v.ticker = setInterval(stamp, 1000);
+
+  return {
+    /* A run is on: poll, and label the frames live. */
+    start() {
+      v.running = true;
+      v.every = FRAME_POLL_MS;   // a new run gets a fresh benefit of the doubt
+      pause.hidden = !live;
+      grab();
+      schedule();
+    },
+    /* Over: stop polling, keep the last frame, and stop calling it live. */
+    stop() {
+      v.running = false;
+      pause.hidden = true;
+      clearInterval(v.timer);
+      stamp();
+      say("");
+    },
+    /* One frame, now. */
+    refresh: grab,
+    idle(text) { empty(text); say(""); lbl.textContent = "the phone"; v.at = 0; },
+  };
+}
+
 /* ------------------------------------------------- a live surface
 
-   The counters strip, the feed under it, and the SSE connection that fills
-   them. There are two: the run tab's, and the one under the skill generator --
+   The readouts, the feed under them, and the SSE connection that fills them.
+   There are three: Work's, Watch's, and the one under the skill generator --
    because a generation is a run. It drives the phone through the same agent,
    spends from the same budget and writes the same events, screenshots and
-   thinking stream, so it is shown with the same cards rather than as the tail
-   of a subprocess's stdout.
+   thinking stream, so it is shown with the same rows rather than as the tail of
+   a subprocess's stdout.
 
-   `prefix` names the counter ids (`c-step`, `gc-step`), `feedId` the feed. */
+   `prefix` names the readout ids (`c-step`, `gc-step`), `feedId` the feed. */
 
 function makeLive(prefix, boxId, feedId) {
   const el = (name) => $(prefix + name);
   const feed = $(feedId);
   feed._live = true;  // chase the tail; the history feed does not
+  feed._ledgerBox = el("ledger");
   return {
     step: 0, calls: 0, cost: 0, skill: "", iteration: 1,
-    records: 0, progress: "", maxSteps: 0, budget: 0,
+    records: 0, progress: "", maxSteps: 0, budget: 0, now: "",
     source: null, startedAt: 0, timer: null,
     // Stopped, but not over: the child still holds the phone while it restores
     // it and writes up what it learned. Its own state, because showing it as
@@ -659,10 +1073,12 @@ function makeLive(prefix, boxId, feedId) {
     stopping: false,
     url: "",           // where to stream from; a job's is known only once it starts
     box: $(boxId), feed,
-    els: { runid: el("runid"), step: el("step"), calls: el("calls"),
-           cost: el("cost"), elapsed: el("elapsed"), state: el("state"),
-           skill: el("skill"), iterWrap: el("iter-wrap"), iter: el("iter"),
-           records: el("records"), progress: el("progress") },
+    els: { runid: el("runid"), now: el("now"), step: el("step"),
+           calls: el("calls"), cost: el("cost"), elapsed: el("elapsed"),
+           state: el("state"), skill: el("skill"), iterWrap: el("iter-wrap"),
+           iter: el("iter"), records: el("records"), progress: el("progress"),
+           ledger: el("ledger") },
+    phone: null,             // the live device panel, when the surface has one
     passLabel: "iteration",  // a watch calls its own "pass"
     setRunning: () => {},   // what else on the page follows this surface
     onEvent: () => {},
@@ -670,7 +1086,7 @@ function makeLive(prefix, boxId, feedId) {
   };
 }
 
-/* A surface's counters back to nothing: for a run starting, and for one being
+/* A surface's readouts back to nothing: for a run starting, and for one being
    reattached to after a reload, where whatever the page last watched is not it.
    The ceilings go too -- the stream replays from the top of the events file, so
    `run_start` puts back the ones this run is actually under. */
@@ -683,6 +1099,8 @@ function resetCounters(v) {
   v.progress = "";
   v.maxSteps = 0;
   v.budget = 0;
+  v.now = "";
+  if (v.els.ledger) v.els.ledger.hidden = true;
 }
 
 /* Keep a surface's clock and status telling the truth.
@@ -703,6 +1121,7 @@ function setLiveRunning(v, running) {
       v.els.elapsed.textContent = fmtDur((Date.now() / 1000) - v.startedAt);
     }, 1000);
   }
+  if (v.phone) running ? v.phone.start() : v.phone.stop();
   v.setRunning(running, stopping);
 }
 
@@ -718,7 +1137,7 @@ function setStopping(v) {
 
 function openStream(v) {
   if (v.source) return;
-  v.box.style.display = "block";
+  v.box.hidden = false;
   const source = new EventSource(v.url);
   v.source = source;
   const feed = v.feed;
@@ -736,7 +1155,7 @@ function openStream(v) {
       // underneath -- a new run directory -- but calling a watch's sweep of the
       // inbox an "iteration" reads as though the goal were being retried.
       rule.innerHTML = `<b>${v.passLabel} ${esc(data.iteration || "?")}</b>` +
-        `<br><span class="small">${esc(data.run_id)}</span>`;
+        `<br><span class="small runid">${esc(data.run_id)}</span>`;
       followPageTail(feed, () => feed.appendChild(rule));
       // Steps are per iteration, and so are the ledger and the progress note --
       // each iteration pursues the goal from scratch in its own run directory.
@@ -747,8 +1166,11 @@ function openStream(v) {
       v.progress = "";
       feed._llm = null;
       feed._skill = "";
+      feed._steps = null;
+      feed._curStep = null;
       finalizeNotes(feed);   // the last pass's ledger is not this one's
       feed._notes = null;
+      if (v.els.ledger) v.els.ledger.hidden = true;
     }
     v.iteration = data.iteration || 1;
     v.els.runid.textContent = data.run_id;
@@ -757,8 +1179,7 @@ function openStream(v) {
   });
   source.addEventListener("event", (e) => {
     const ev = JSON.parse(e.data);
-    const el = renderEvent(ev, feed);
-    if (el) followPageTail(feed, () => feed.appendChild(el));
+    appendEvent(ev, feed);
     updateCountersFromEvent(ev, v);
     v.onEvent(ev);
   });
@@ -786,8 +1207,13 @@ function openStream(v) {
     v.source = null;
     setLiveRunning(v, false);
     finalizeLlm(feed, null);        // a run can end mid-call
-    loadedTabs.delete("history");   // a new run may have appeared
+    finalizeSteps(feed);            // and mid-step
     v.onEnd();
+    // Every child here leaves a run directory behind it -- a goal run, a watch
+    // pass, a generation's tour -- so history has something new in it, and
+    // whether the one just finished can be resumed is a fact only that
+    // directory has.
+    loadRuns().then(syncResumeButton).catch(() => {});
   });
   source.onerror = () => {
     // The server closes the connection after "end"; anything else is a drop.
@@ -798,15 +1224,24 @@ function openStream(v) {
   };
 }
 
-/* ------------------------------------------------------------ run tab */
+/* ----------------------------------------------------------- work tab */
 
 const live = makeLive("c-", "live", "feed");
 live.url = "/api/runs/stream";
+live.phone = phoneView($("live-phone"), { live: true });
 live.setRunning = (running, stopping) => {
   $("btn-start").disabled = running;
-  // One SIGINT is all it takes. A second lands in the shutdown -- outside the
-  // handler that catches the first -- and takes down the work it is doing there.
-  $("btn-stop").disabled = !running || stopping;
+  // Shown only while there is something to stop. One SIGINT is all it takes: a
+  // second lands in the shutdown -- outside the handler that catches the first
+  // -- and takes down the work it is doing there.
+  $("btn-stop").hidden = !running;
+  $("btn-stop").disabled = stopping;
+  // What to do next is only offered once there is no next iteration coming.
+  $("run-actions").hidden = running;
+};
+live.onEvent = (ev) => {
+  // The answer, the moment it exists, in the block that leads the surface.
+  if (ev.kind === "run_end") showResult(ev, live.feed._runId);
 };
 // The hint is about something in progress -- stopping, resuming -- and none of
 // it is still true once the run is over.
@@ -814,6 +1249,46 @@ live.onEnd = () => { $("run-hint").textContent = ""; };
 
 function setRunningUI(running) {
   setLiveRunning(live, running);
+}
+
+/* Compose, watch, read: phases of one surface. The result is not one of them --
+   it appears the moment there is an answer, which under `--repeat` is while the
+   session is still going. */
+function workPhase(phase) {
+  $("run-form").hidden = phase !== "compose";
+  $("live").hidden = phase === "compose";
+  if (phase !== "done") $("work-result").hidden = true;
+}
+
+function showResult(ev, runId) {
+  const box = $("result-box");
+  const outcome = ev.outcome || "unknown";
+  box.className = "result-box " + esc(outcome);
+  const arith = [`${ev.steps ?? "?"} steps`, `${ev.llm_calls ?? 0} LLM calls`,
+                 `$${(ev.usd || 0).toFixed(4)}`].join(" · ");
+  box.innerHTML =
+    `<div class="verdict"><b>${esc(outcome.toUpperCase())}</b>` +
+    `<span>${esc(arith)}</span>` +
+    (runId ? `<span class="runid">${esc(runId)}</span>` : "") + `</div>` +
+    (ev.result
+      ? `<div class="answer">${esc(ev.result)}</div>`
+      : `<div class="answer none">Nothing was reported — the run did not reach ` +
+        `an answer of its own.</div>`) +
+    (ev.evidence ? `<div class="why">${esc(ev.evidence)}</div>` : "");
+  box.dataset.runId = runId || "";
+  $("work-result").hidden = false;
+  $("btn-resume-live").hidden = true;   // until the run list says otherwise
+}
+
+/* Whether the run just finished left a checkpoint. Read off the history list
+   rather than guessed from the outcome: a failed run without a checkpoint has
+   nothing to resume, and a button that 409s is worse than no button. */
+function syncResumeButton() {
+  const id = $("result-box").dataset.runId;
+  const found = RUNS.find((r) => r.id === id);
+  const btn = $("btn-resume-live");
+  btn.hidden = !(found && found.resumable);
+  btn.onclick = () => resumeRun(id);
 }
 
 /* What the form's options are currently set to -- shared by a fresh run and a
@@ -847,6 +1322,8 @@ function beginLive(v) {
   v.feed._llm = null;
   v.feed._runId = "";
   v.feed._skill = "";
+  v.feed._steps = null;
+  v.feed._curStep = null;
   v.feed._notes = null;
   v.feed._notesCard = null;
   v.feed._exitLog = null;   // cleared with the feed it hung off
@@ -856,23 +1333,39 @@ function beginLive(v) {
   openStream(v);
 }
 
+async function startRun(body) {
+  try {
+    await api("/api/runs", { method: "POST", body: JSON.stringify(body) });
+  } catch (err) {
+    notice(err.message);
+    return false;
+  }
+  $("run-hint").textContent = "";
+  workPhase("live");
+  beginLive(live);
+  return true;
+}
+
 $("run-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const body = { goal: $("goal").value.trim(), ...runOptions() };
   if (!body.goal) { notice("a goal is required"); return; }
   saveGoal("adbagent.goal", body.goal);
-
-  try {
-    await api("/api/runs", { method: "POST", body: JSON.stringify(body) });
-  } catch (err) {
-    notice(err.message);
-    return;
-  }
-  $("run-hint").textContent = "";
-  beginLive(live);
+  await startRun(body);
 });
 
-/* Continue a failed run from its checkpoint, watched in the run tab. */
+$("btn-new-run").addEventListener("click", () => {
+  workPhase("compose");
+  $("goal").focus();
+});
+
+$("btn-run-again").addEventListener("click", () => {
+  const goal = $("goal").value.trim();
+  if (!goal) { workPhase("compose"); $("goal").focus(); return; }
+  startRun({ goal, ...runOptions() });
+});
+
+/* Continue a failed run from its checkpoint, watched on the work surface. */
 async function resumeRun(id) {
   try {
     await api("/api/runs", {
@@ -883,7 +1376,10 @@ async function resumeRun(id) {
     notice(err.message);
     return;
   }
-  document.querySelector('button[data-tab="run"]').click();
+  document.querySelector('button[data-tab="work"]').click();
+  $("runs-list-view").hidden = false;
+  $("run-detail-view").hidden = true;
+  workPhase("live");
   beginLive(live);
   $("run-hint").textContent = `resuming ${id} from its checkpoint`;
 }
@@ -898,19 +1394,48 @@ $("btn-stop").addEventListener("click", async () => {
   }
 });
 
-/* -------------------------------------------------------------- status */
+/* -------------------------------------------------------------- status
+
+   Three facts and whatever is holding the phone. The device one used to lie:
+   it printed the serial out of config.json whether or not anything was on the
+   other end of it, which is the one fact that decides whether Start run can
+   work at all. */
+
+function deviceStatus(st) {
+  const serials = st.devices_attached || [];
+  const serial = st.device_serial || "";
+  if (serial && st.device_attached) return ["ok", `device ${serial}`, ""];
+  if (serial) {
+    return ["warn", `${serial} · not attached`,
+      "the serial in config.json is set, but adb does not see it — a run " +
+      "cannot start until it is connected"];
+  }
+  if (serials.length === 1) return ["ok", `device ${serials[0]}`, ""];
+  if (serials.length > 1) {
+    return ["warn", `${serials.length} devices · none chosen`,
+      "set device.serial in Config, or name one per run"];
+  }
+  return ["warn", "no device", "nothing is attached"];
+}
 
 async function refreshStatus() {
   try {
     const st = await api("/api/status");
+    LAST_STATUS = st;
     const parts = [];
-    parts.push(st.device_serial ? `device ${esc(st.device_serial)}` : `<span class="warn">no device serial</span>`);
-    parts.push(st.model ? esc(st.model.split("/").pop()) : `<span class="warn">no model</span>`);
-    parts.push(st.api_key_present ? `<span class="ok">api key</span>` : `<span class="warn">no api key</span>`);
+    const [cls, text, why] = deviceStatus(st);
+    parts.push(`<span class="st ${cls}"${why ? ` title="${esc(why)}"` : ""}>` +
+      `${esc(text)}</span>`);
+    parts.push(st.model
+      ? `<span class="st">${esc(st.model.split("/").pop())}</span>`
+      : `<span class="st warn">no model</span>`);
+    parts.push(st.api_key_present
+      ? `<span class="st ok">api key</span>`
+      : `<span class="st warn">no api key</span>`);
     if (st.run && st.run.running) {
       parts.push(st.run.stopping
-        ? `<span class="warn">● stopping the run</span>`
-        : `<span class="ok">● running: ${esc(st.run.goal)}</span>`);
+        ? `<span class="st warn live">● stopping the run</span>`
+        : `<span class="st ok live">● running: ${esc(goalTitle(st.run.goal))}</span>`);
     }
     if (st.watch && st.watch.running) {
       // The mode is part of the status line, not just the tab: a watch outlives
@@ -918,18 +1443,19 @@ async function refreshStatus() {
       // any tab. A watch on its way out is neither mode -- it is no longer
       // replying to anything -- so it says that instead.
       parts.push(st.watch.stopping
-        ? `<span class="warn">● stopping the watch — writing up what it learned</span>`
+        ? `<span class="st warn live">● stopping the watch — writing up what it learned</span>`
         : st.watch.draft
-        ? `<span class="ok">● watching (draft): ${esc(st.watch.goal)}</span>`
-        : `<span class="warn">● watching LIVE: ${esc(st.watch.goal)}</span>`);
+        ? `<span class="st ok live">● watching (draft): ${esc(goalTitle(st.watch.goal))}</span>`
+        : `<span class="st bad live">● watching LIVE: ${esc(goalTitle(st.watch.goal))}</span>`);
     }
-    if (st.job) parts.push(`<span class="ok">● generating a skill</span>`);
-    $("status").innerHTML = parts.join(" · ");
+    if (st.job) parts.push(`<span class="st ok live">● generating a skill</span>`);
+    $("status").innerHTML = parts.join("");
     // Reattach to a run already in progress (e.g. page reloaded mid-run).
     if (st.run && st.run.running && !live.source) {
       resetCounters(live);
       live.startedAt = st.run.started_at || Date.now() / 1000;
       live.stopping = !!st.run.stopping;
+      workPhase("live");
       setRunningUI(true);
       openStream(live);
     }
@@ -950,21 +1476,25 @@ async function refreshStatus() {
       watchGeneration(st.job.id, { fresh: false });
     }
   } catch {
-    $("status").textContent = "server unreachable";
+    $("status").innerHTML = `<span class="st bad">server unreachable</span>`;
   }
 }
+
+let LAST_STATUS = {};
 
 /* -------------------------------------------------------------- watch */
 
 const watchLive = makeLive("w-", "watch-live", "watch-feed");
 watchLive.url = "/api/watch/stream";
 watchLive.passLabel = "pass";
+watchLive.phone = phoneView($("watch-phone"), { live: true });
 watchLive.setRunning = (running, stopping) => {
   $("btn-watch-start").disabled = running;
   // Not clickable twice. The second SIGINT arrives while the first is being
   // acted on -- during the skill write-up, which is not inside the loop's
   // interrupt handler -- and losing that is losing everything the watch learned.
-  $("btn-watch-stop").disabled = !running || stopping;
+  $("btn-watch-stop").hidden = !running;
+  $("btn-watch-stop").disabled = stopping;
   // The policy is read once, at startup. Editing it under a running watch would
   // take effect at no predictable moment, so the server refuses and the form
   // says so before you type into it.
@@ -1058,14 +1588,16 @@ async function loadLedger() {
   const tbody = document.querySelector("#watch-ledger-table tbody");
   tbody.innerHTML = "";
   const rows = data.threads || [];
-  $("watch-ledger-empty").style.display = rows.length ? "none" : "block";
+  $("watch-ledger-empty").hidden = rows.length > 0;
+  $("watch-ledger-table").hidden = rows.length === 0;
   $("watch-ledger-path").textContent = data.path || "";
   for (const t of rows) {
     const tr = document.createElement("tr");
     tr.innerHTML =
       `<td>${esc(t.preview || t.thread_key)}</td>` +
       `<td>${t.reply_count}</td>` +
-      `<td class="small">${esc(fmtTime(t.last_attempt_at))}</td>` +
+      `<td class="small" title="${esc(fmtTime(t.last_attempt_at))}">` +
+      `${esc(fmtRel(t.last_attempt_at))}</td>` +
       `<td class="small">${t.confirmed
         ? "<span class=\"ok\">confirmed</span>"
         : "<span class=\"warn\">unconfirmed — in doubt</span>"}</td>`;
@@ -1117,39 +1649,191 @@ $("btn-watch-stop").addEventListener("click", async () => {
   } catch (err) { notice(err.message); }
 });
 
-/* ------------------------------------------------------------ history */
+/* ------------------------------------------------------------ history
+
+   On the work surface rather than a tab of its own: you start a run and read
+   what it did, and those were never two places.
+
+   Every row carries the answer. A list that shows outcome, steps, cost and
+   duration and *not* what the run concluded makes the one interesting field the
+   one you have to click for. */
+
+let RUNS = [];
+let RUNS_ACTIVE = false;
+let RUN_FILTER = { q: "", outcome: "" };
 
 async function loadRuns() {
   const data = await api("/api/runs");
-  const tbody = document.querySelector("#runs-table tbody");
-  tbody.innerHTML = "";
-  $("runs-empty").style.display = data.runs.length ? "none" : "block";
-  for (const r of data.runs) {
-    const tr = document.createElement("tr");
-    tr.innerHTML =
-      `<td class="mono">${esc(r.id)}</td>` +
-      `<td class="goal-cell" title="${esc(r.goal)}">${esc(r.goal)}</td>` +
-      `<td><span class="chip ${esc(r.outcome)}">${esc(r.outcome)}</span></td>` +
-      `<td>${esc(r.steps)}</td><td>$${(r.usd || 0).toFixed(3)}</td>` +
-      `<td>${fmtDur(r.duration_s)}</td>` +
-      `<td class="small">${fmtTime(r.started)}</td>` +
-      `<td></td>`;
-    if (r.resumable && !(data.active && data.active.running)) {
-      const btn = document.createElement("button");
-      btn.className = "ghost";
-      btn.textContent = "resume";
-      btn.title = `continue from step ${r.steps}`;
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();          // the row itself opens the detail view
-        resumeRun(r.id);
-      });
-      tr.lastElementChild.appendChild(btn);
-    }
-    tr.addEventListener("click", () => openRunDetail(r.id));
-    tbody.appendChild(tr);
+  RUNS = data.runs || [];
+  RUNS_ACTIVE = !!(data.active && data.active.running);
+  paintRuns();
+  paintRecentGoals();
+}
+
+/* Which outcomes the filter buttons stand for. `other` is everything a run can
+   end as that is neither of the two anybody filters for. */
+function outcomeBucket(outcome) {
+  if (outcome === "success") return "success";
+  if (outcome === "failed") return "failed";
+  return "other";
+}
+
+function runMatches(r) {
+  if (RUN_FILTER.outcome && outcomeBucket(r.outcome) !== RUN_FILTER.outcome) return false;
+  if (!RUN_FILTER.q) return true;
+  const hay = `${r.goal} ${r.result} ${r.evidence} ${r.id} ${r.outcome}`.toLowerCase();
+  return RUN_FILTER.q.split(/\s+/).every((word) => hay.includes(word));
+}
+
+/* One run's row. A button, so it is reachable from the keyboard -- these were
+   `<tr>`s with a click listener. */
+function runRow(r, { showGoal = true } = {}) {
+  const el = document.createElement("button");
+  el.type = "button";
+  el.className = "run";
+  const rest = goalRest(r.goal);
+  el.innerHTML =
+    `<span class="oc">${chip(r.outcome, r.outcome)}</span>` +
+    (showGoal
+      ? `<div class="goal" title="${esc(r.goal)}">${esc(goalTitle(r.goal))}` +
+        (rest ? ` <span class="small">+${rest} more lines</span>` : "") + `</div>`
+      : "") +
+    (r.result
+      ? `<div class="ans">${esc(r.result)}</div>`
+      : `<div class="ans none">${esc(r.evidence
+          || "no answer recorded")}</div>`) +
+    `<div class="meta">` +
+      `<span title="${esc(fmtTime(r.started))}">${esc(fmtRel(r.started))}</span>` +
+      `<span>${esc(r.steps)} steps</span>` +
+      `<span>$${(r.usd || 0).toFixed(3)}</span>` +
+      `<span>${esc(fmtDur(r.duration_s))}</span>` +
+      `<span class="runid">${esc(r.id)}</span>` +
+    `</div>`;
+  // A failed or interrupted run with a checkpoint can be continued rather than
+  // started over -- exactly like `run --resume`.
+  if (r.resumable && !RUNS_ACTIVE) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "resume";
+    btn.textContent = "resume";
+    btn.title = `continue from step ${r.steps}`;
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();          // the row itself opens the detail view
+      resumeRun(r.id);
+    });
+    el.querySelector(".meta").appendChild(btn);
   }
-  $("runs-list-view").style.display = "block";
-  $("run-detail-view").style.display = "none";
+  el.addEventListener("click", () => openRunDetail(r.id));
+  return el;
+}
+
+/* Runs of the same goal, folded together. The real story of a history like this
+   is one person retrying one goal six times, and fourteen rows that read the
+   same is the list refusing to say so. The newest attempt is the summary, so
+   folding hides nothing that was not already older news. */
+function groupRuns(runs) {
+  const groups = [];
+  const byGoal = new Map();
+  for (const r of runs) {
+    const key = String(r.goal || "").trim().toLowerCase().replace(/\s+/g, " ");
+    let g = byGoal.get(key);
+    if (!g) {
+      g = { key, goal: r.goal, runs: [] };
+      byGoal.set(key, g);
+      groups.push(g);
+    }
+    g.runs.push(r);
+  }
+  return groups;
+}
+
+function paintRuns() {
+  const list = $("runs-list");
+  list.innerHTML = "";
+  const shown = RUNS.filter(runMatches);
+  $("runs-empty").hidden = RUNS.length > 0;
+  const groups = groupRuns(shown);
+  $("runs-count").textContent = RUNS.length
+    ? `${shown.length} of ${RUNS.length} run${RUNS.length === 1 ? "" : "s"}` +
+      (groups.length !== shown.length ? ` · ${groups.length} goals` : "")
+    : "";
+  if (RUNS.length && !shown.length) {
+    const p = document.createElement("p");
+    p.className = "small";
+    p.textContent = "Nothing matches that.";
+    list.appendChild(p);
+  }
+  for (const g of groups) {
+    if (g.runs.length === 1) {
+      list.appendChild(runRow(g.runs[0]));
+      continue;
+    }
+    const newest = g.runs[0];
+    const ok = g.runs.filter((r) => r.outcome === "success").length;
+    const spend = g.runs.reduce((a, r) => a + (r.usd || 0), 0);
+    const det = document.createElement("details");
+    det.className = "rungroup";
+    const rest = goalRest(g.goal);
+    det.innerHTML =
+      `<summary>` +
+        `<span class="oc">${chip(newest.outcome, newest.outcome)}</span>` +
+        `<div class="goal" title="${esc(g.goal)}">${esc(goalTitle(g.goal))}` +
+        (rest ? ` <span class="small">+${rest} more lines</span>` : "") + `</div>` +
+        (newest.result ? `<div class="ans">${esc(newest.result)}</div>` : "") +
+        `<div class="tally">${g.runs.length} attempts · ${ok} succeeded · ` +
+        `$${spend.toFixed(3)} · last ` +
+        `<span title="${esc(fmtTime(newest.started))}">${esc(fmtRel(newest.started))}</span>` +
+        ` <span class="more">show each</span></div>` +
+      `</summary><div class="kids"></div>`;
+    const kids = det.querySelector(".kids");
+    for (const r of g.runs) kids.appendChild(runRow(r, { showGoal: false }));
+    list.appendChild(det);
+  }
+}
+
+$("runs-search").addEventListener("input", () => {
+  RUN_FILTER.q = $("runs-search").value.trim().toLowerCase();
+  paintRuns();
+});
+
+document.querySelector("#runs-list-view .seg").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-outcome]");
+  if (!btn) return;
+  RUN_FILTER.outcome = btn.dataset.outcome;
+  btn.parentElement.querySelectorAll("button").forEach((b) =>
+    b.classList.toggle("on", b === btn));
+  paintRuns();
+});
+
+/* The five most recent distinct goals, as chips that fill the box. The blank
+   textarea was a cold start on a page whose whole history is retries. */
+function paintRecentGoals() {
+  const wrap = $("recent-goals");
+  const box = $("recent-chips");
+  box.innerHTML = "";
+  const seen = new Set();
+  const picks = [];
+  for (const r of RUNS) {
+    const goal = (r.goal || "").trim();
+    const key = goal.toLowerCase().replace(/\s+/g, " ");
+    if (!goal || seen.has(key)) continue;
+    seen.add(key);
+    picks.push(goal);
+    if (picks.length === 5) break;
+  }
+  wrap.hidden = !picks.length;
+  for (const goal of picks) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = goalTitle(goal);
+    btn.title = goal;
+    btn.addEventListener("click", () => {
+      $("goal").value = goal;
+      saveValue("adbagent.goal", goal);
+      $("goal").focus();
+    });
+    box.appendChild(btn);
+  }
 }
 
 /* Every skill a run had in its prompt, in the order it picked them up.
@@ -1168,60 +1852,94 @@ function skillChain(events) {
 }
 
 async function openRunDetail(id) {
-  $("runs-list-view").style.display = "none";
-  $("run-detail-view").style.display = "block";
+  $("runs-list-view").hidden = true;
+  $("run-detail-view").hidden = false;
   $("detail-title").textContent = id;
   const feed = $("detail-feed");
   feed.innerHTML = "";
   feed._llm = null;
   feed._runId = id;
   feed._skill = "";
+  feed._steps = null;
+  feed._curStep = null;
   feed._notes = null;
   feed._notesCard = null;
+  feed._ledgerBox = $("detail-ledger");
+  $("detail-ledger").hidden = true;
+  $("run-detail-view").scrollIntoView({ block: "start" });
   try {
     const d = await api("/api/runs/" + encodeURIComponent(id));
     const s = d.summary, st = d.stats, chain = skillChain(d.events);
     const resumeBtn = $("btn-resume-run");
-    resumeBtn.style.display = s.resumable ? "" : "none";
+    resumeBtn.hidden = !s.resumable;
     resumeBtn.onclick = () => resumeRun(id);
+    // The goal once, as the headline. It used to be here, in the run_start
+    // banner in the feed, and on the row that opened this page.
+    //
+    // A watch pass's goal is twenty lines of standing instructions whose first
+    // line is the whole of what distinguishes it; setting all twenty as the
+    // headline pushes the answer off the screen. So: the first line, and the
+    // rest one click away -- folded, not truncated.
+    const rest = goalRest(s.goal);
+    $("detail-goal").innerHTML =
+      `<span class="gt">${esc(goalTitle(s.goal))}</span>` +
+      (rest ? `<details class="goal-rest"><summary class="small">` +
+        `+${rest} more line${rest === 1 ? "" : "s"} of instructions</summary>` +
+        `<pre class="log">${esc(s.goal)}</pre></details>` : "");
+    // The answer above the arithmetic, because "what did it conclude" outranks
+    // "how many tokens did that take" for everyone who opens a finished run.
+    const box = $("detail-answer");
+    box.className = "result-box " + esc(s.outcome || "");
+    box.innerHTML =
+      `<div class="verdict"><b>${esc((s.outcome || "").toUpperCase())}</b>` +
+      `<span title="${esc(fmtTime(s.started))}">${esc(fmtRel(s.started))}</span></div>` +
+      (s.result
+        ? `<div class="answer">${esc(s.result)}</div>`
+        : `<div class="answer none">Nothing was reported — this run did not ` +
+          `reach an answer of its own.</div>`) +
+      (s.evidence ? `<div class="why">${esc(s.evidence)}</div>` : "");
+    // Four numbers anybody wants, and the cost of thinking behind a fold: a flat
+    // mono row gave `latency p90` the same weight as `outcome`.
+    $("detail-metrics").innerHTML =
+      `<span>steps <b class="strong">${esc(s.steps)}</b></span>` +
+      `<span>cost <b class="strong">$${(s.usd || 0).toFixed(4)}</b></span>` +
+      `<span>took <b class="strong">${esc(fmtDur(s.duration_s))}</b></span>` +
+      `<span>model <b>${esc((s.model || "").split("/").pop() || "—")}</b></span>` +
+      (chain.length ? `<span>skills <b>${esc(chain.join(" → "))}</b></span>` : "");
     $("detail-stats").innerHTML =
-      `<h3>${esc(s.goal)}</h3>` +
-      // Above the counters, because "what did it conclude" outranks "how many
-      // tokens did that take" for everyone who opens a finished run.
-      (s.result ? `<div class="banner ${esc(s.outcome)}">` +
-        `<div class="result">${esc(s.result)}</div>` +
-        (s.evidence ? `<div class="why">${esc(s.evidence)}</div>` : "") +
-        `</div>` : "") +
-      `<div class="counters">` +
-      `<span>outcome <b>${esc(s.outcome)}</b></span>` +
-      `<span>steps <b>${esc(s.steps)}</b></span>` +
-      `<span>cost <b>$${(s.usd || 0).toFixed(4)}</b></span>` +
       `<span>decisions <b>${st.decisions}</b></span>` +
+      `<span>llm calls <b>${st.llm_calls}</b></span>` +
       `<span>latency/step <b>${st.latency_median_s}s med · ${st.latency_p90_s}s p90</b></span>` +
       `<span>prompt tok <b>${st.prompt_tokens.toLocaleString()}</b></span>` +
+      `<span>cached tok <b>${st.cached_tokens.toLocaleString()}</b></span>` +
       `<span>completion tok <b>${st.completion_tokens.toLocaleString()}</b></span>` +
-      (st.sweep_reads ? `<span>sweep reads <b>${st.sweep_reads}</b></span>` : "") +
-      (chain.length ? `<span>skills <b>${esc(chain.join(" → "))}</b></span>` : "") +
-      `</div>`;
-    if (d.scratchpad) {
-      $("detail-scratch").style.display = "block";
-      $("detail-scratch-text").textContent = d.scratchpad;
-    } else {
-      $("detail-scratch").style.display = "none";
-    }
+      (st.reasoning_tokens
+        ? `<span>thinking tok <b>${st.reasoning_tokens.toLocaleString()}</b></span>` : "") +
+      (st.sweep_reads ? `<span>sweep reads <b>${st.sweep_reads}</b></span>` : "");
     for (const ev of d.events) {
       // Stream records render as the same live panels, long since collapsed.
       if (typeof ev.kind === "string" && ev.kind.startsWith("llm_")) {
         handleLlmEvent(ev, feed);
       } else {
-        const el = renderEvent(ev, feed);
-        if (el) feed.appendChild(el);
+        appendEvent(ev, feed);
       }
     }
     finalizeLlm(feed, null);  // a run that died mid-call has no llm_end
-    // Every ledger panel folded, unlike a live run's last one: this page already
-    // opens with the finished ledger in full, above the feed.
+    finalizeSteps(feed);      // nothing is still thinking in a finished run
+    // Every per-step ledger panel folded, unlike a live run's last one: this
+    // page already opens with the finished ledger in full, above the feed.
     finalizeNotes(feed);
+    // A run recorded before the events carried their records still has the
+    // server's replay of the ledger, which is better than nothing at all.
+    if ((!feed._notes || !feed._notes.size) && d.scratchpad) {
+      const pin = $("detail-ledger");
+      pin.hidden = false;
+      pin.innerHTML = `<div class="lk">collected data</div>`;
+      const pre = document.createElement("pre");
+      pre.className = "log";
+      pre.textContent = d.scratchpad;
+      pin.appendChild(pre);
+    }
   } catch (err) {
     notice(err.message);
     return;
@@ -1231,16 +1949,26 @@ async function openRunDetail(id) {
     .catch(() => { $("detail-log").textContent = "(unavailable)"; });
 }
 
-$("btn-back-runs").addEventListener("click", () => loadRuns().catch((e) => notice(e.message)));
+$("btn-back-runs").addEventListener("click", () => {
+  $("runs-list-view").hidden = false;
+  $("run-detail-view").hidden = true;
+  loadRuns().catch((e) => notice(e.message));
+});
 
 /* ------------------------------------------------------------ devices */
+
+/* Setup's own frame. Not polled -- it is grabbed when you ask for it -- so it
+   can afford a sharper one than the panels that take a picture every two
+   seconds while a run is going. */
+const setupPhone = phoneView($("setup-phone"), { edge: 1080 });
 
 async function loadDevices() {
   const d = await api("/api/devices");
   $("dev-error").textContent = d.error ? `adb: ${d.error}` : "";
   const tbody = document.querySelector("#dev-table tbody");
   tbody.innerHTML = "";
-  $("dev-empty").style.display = d.devices.length ? "none" : "block";
+  $("dev-empty").hidden = d.devices.length > 0;
+  $("dev-table").hidden = d.devices.length === 0;
   $("dev-candidates").textContent =
     d.candidates.length ? `wireless debugging advertised at: ${d.candidates.join(", ")}` : "";
   for (const dev of d.devices) {
@@ -1251,17 +1979,61 @@ async function loadDevices() {
     btn.className = "ghost";
     btn.textContent = "screenshot";
     btn.addEventListener("click", () => {
-      $("shot-panel").style.display = "block";
       $("shot-serial").textContent = dev.serial;
-      $("shot-img").src = "/api/devices/screenshot?serial=" +
-        encodeURIComponent(dev.serial) + "&t=" + Date.now();
+      setupPhone.refresh();
     });
     tr.lastElementChild.appendChild(btn);
     tbody.appendChild(tr);
   }
+  paintDeviceState(d.devices);
+  // No point asking for a frame there is no phone to give.
+  if (d.devices.length) setupPhone.refresh();
+  else setupPhone.idle("nothing attached");
 }
 
-$("btn-dev-reload").addEventListener("click", () => loadDevices().catch((e) => notice(e.message)));
+/* Configured, attached, or neither — said in words, because it is the fact that
+   decides whether a run can start and the header used to report the first as
+   though it were the second. */
+function paintDeviceState(devices) {
+  const serial = (LAST_STATUS.device_serial || "").trim();
+  const serials = devices.map((d) => d.serial);
+  let cls = "warn", what = "", why = "";
+  if (serial && serials.includes(serial)) {
+    cls = "ok";
+    what = "attached";
+    why = `<span class="mono">${esc(serial)}</span> is configured and adb sees it. Runs will use it.`;
+  } else if (serial) {
+    cls = "warn";
+    what = "configured, not attached";
+    why = `<span class="mono">${esc(serial)}</span> is set as ` +
+      `<span class="mono">device.serial</span> but adb does not see it. ` +
+      (serials.length
+        ? `What is attached: <span class="mono">${esc(serials.join(", "))}</span>. ` +
+          `Clear or change the serial in Config, or name one per run.`
+        : `Nothing is attached at all — a run cannot start until it is connected.`);
+  } else if (serials.length === 1) {
+    cls = "ok";
+    what = "attached";
+    why = `<span class="mono">${esc(serials[0])}</span>, and no serial is ` +
+      `configured, so it is the one that gets used.`;
+  } else if (serials.length > 1) {
+    cls = "warn";
+    what = `${serials.length} attached, none chosen`;
+    why = `Set <span class="mono">device.serial</span> in Config, or name one ` +
+      `per run — otherwise adb picks and it may not be the one you meant.`;
+  } else {
+    cls = "bad";
+    what = "nothing attached";
+    why = "No phone and no serial configured. Nothing can run until one is connected.";
+  }
+  $("dev-state").innerHTML =
+    `<div class="devstate ${cls}"><span class="dot"></span>` +
+    `<span class="what">${esc(what)}</span>` +
+    `<span class="why">${why}</span></div>`;
+}
+
+$("btn-dev-reload").addEventListener("click", () =>
+  loadDevices().catch((e) => notice(e.message)));
 
 /* The three read-only device commands the CLI has always had and the browser
    never did. All of them open a `Device` session, which resets animation scales
@@ -1293,7 +2065,7 @@ $("btn-apps-load").addEventListener("click", () =>
     });
     const d = await api("/api/apps?" + q);
     const out = $("apps-out");
-    out.style.display = "block";
+    out.hidden = false;
     out.textContent = d.count
       ? `${d.count} app(s)\n\n` + d.apps.join("\n")
       : "no matching apps";
@@ -1315,7 +2087,7 @@ $("btn-dump").addEventListener("click", () =>
       `${d.width}x${d.height} · ${d.elements} of ${d.nodes} nodes shown · ` +
       `skeleton ${d.skeleton_id}` + (d.keyboard_open ? " · keyboard open" : "");
     const out = $("dump-out");
-    out.style.display = "block";
+    out.hidden = false;
     out.textContent = d.rendered + (d.xml ? "\n\n--- raw xml ---\n" + d.xml : "");
   }));
 
@@ -1323,7 +2095,7 @@ $("btn-doctor").addEventListener("click", () =>
   withStatus("doctor-status", "checking…", async () => {
     const d = await api("/api/doctor");
     const out = $("doctor-out");
-    out.style.display = "block";
+    out.hidden = false;
     out.textContent = d.text || "(no output)";
   }));
 
@@ -1341,64 +2113,156 @@ $("btn-doctor").addEventListener("click", () =>
 
    `unset` is what the empty option means for that field. The fallback chain
    lives in config.py, and it is worth saying out loud here, since taking the
-   fallback is the whole reason four of these five are empty by default. */
+   fallback is the whole reason four of these five are empty by default.
+
+   `label` and `help` are the human reading of a key. Sixty-two raw Python
+   attribute names in one flat form is a reference manual, not a settings screen:
+   `stall_replan_at` and `settle_quiet_s` mean nothing until somebody tells you,
+   and the README already did. */
 const CFG_SPEC = [
   ["llm", [
-    ["provider", "text"],
-    ["model", "model", { unset: "a run needs one" }],
-    ["model_small", "model", { unset: "falls back to model" }],
-    ["model_image", "model", { unset: "falls back to model", vision: true }],
-    ["model_skill", "model", { unset: "falls back to model" }],
+    ["provider", "text", { label: "Provider", help: "Which API to talk to." }],
+    ["model", "model", { unset: "a run needs one", label: "Model",
+      help: "The model that decides what to do next. Everything else falls back to it." }],
+    ["model_small", "model", { unset: "falls back to model", label: "Small model",
+      help: "For the cheap side calls — verifying, judging, summarising." }],
+    ["model_image", "model", { unset: "falls back to model", vision: true,
+      label: "Vision model",
+      help: "Describes a screenshot when the deciding model cannot see." }],
+    ["model_skill", "model", { unset: "falls back to model", label: "Skill model",
+      help: "Writes an app's skill from what a run learned." }],
     ["model_skill_image", "model",
-      { unset: "falls back to model_image, then model", vision: true }],
-    ["temperature", "number"], ["max_tokens", "number"], ["max_tokens_image", "number"],
-    ["rpm", "number"], ["base_url", "text"], ["service_tier", "text"],
-    ["api_key", "password"], ["api_key_env", "text"],
-    ["reasoning_effort", ["", "none", "low", "medium", "high"]],
-    ["reasoning_effort_hard", ["", "none", "low", "medium", "high"]],
-    ["reasoning_style", ["auto", "effort", "thinking", "off"]],
-    ["vision_in_decider", "bool"],
+      { unset: "falls back to model_image, then model", vision: true,
+        label: "Skill vision model",
+        help: "Looks at screens while a skill is being written." }],
+    ["temperature", "number", { label: "Temperature" }],
+    ["max_tokens", "number", { label: "Max output tokens" }],
+    ["max_tokens_image", "number", { label: "Max output tokens (vision)" }],
+    ["rpm", "number", { label: "Requests per minute",
+      help: "Client-side rate limit. 0 is no limit." }],
+    ["base_url", "text", { label: "Base URL",
+      help: "Override the provider's endpoint." }],
+    ["service_tier", "text", { label: "Service tier" }],
+    ["api_key", "password", { label: "API key",
+      help: "Written to config.json, which is gitignored. Blank keeps what is stored." }],
+    ["api_key_env", "text", { label: "API key env var",
+      help: "Read from the environment when no key is stored." }],
+    ["reasoning_effort", ["", "none", "low", "medium", "high"],
+      { label: "Reasoning effort",
+        help: "Depth for a routine turn. Empty switches the whole feature off — and it is the single largest lever on latency." }],
+    ["reasoning_effort_hard", ["", "none", "low", "medium", "high"],
+      { label: "Reasoning effort — hard turns",
+        help: "Depth for a turn the loop can see is hard." }],
+    ["reasoning_style", ["auto", "effort", "thinking", "off"],
+      { label: "Reasoning wire convention",
+        help: "How to ask for it. Two incompatible conventions are in use; auto guesses from the model name." }],
+    ["vision_in_decider", "bool", { label: "Deciding model can see",
+      help: "Set when llm.model itself accepts images: the screenshot then goes straight to the deciding call instead of being described first — one round trip per screenshot turn instead of two." }],
   ]],
   ["device", [
-    ["serial", "text"], ["settle_budget_s", "number"],
-    ["settle_quiet_s", "number"],
-    ["disable_animations", "bool"], ["disable_auto_rotate", "bool"],
+    ["serial", "text", { label: "Device serial",
+      help: "Which phone. Blank means whichever single device adb sees." }],
+    ["settle_budget_s", "number", { label: "Settle budget (s)",
+      help: "Hard ceiling on waiting for one screen to stop moving." }],
+    ["settle_quiet_s", "number", { label: "Settle quiet time (s)",
+      help: "How long two dumps must agree before the screen counts as settled." }],
+    ["disable_animations", "bool", { label: "Turn animations off during a run",
+      help: "Restored when the run ends." }],
+    ["disable_auto_rotate", "bool", { label: "Lock rotation during a run",
+      help: "Restored when the run ends." }],
   ]],
   ["safety", [
-    ["budget_usd", "number"], ["allow_destructive", "bool"], ["unattended", "bool"],
+    ["budget_usd", "number", { label: "Budget ceiling ($)",
+      help: "Session spend ceiling. The run aborts when it is reached." }],
+    ["allow_destructive", "bool", { label: "Allow destructive actions",
+      help: "Deleting, sending, paying, uninstalling. Off, they are refused." }],
+    ["unattended", "bool", { label: "Never prompt",
+      help: "Refuse anything that would need a person rather than asking." }],
   ]],
   ["run", [
-    ["max_steps", "number"], ["max_wall_clock_s", "number"], ["artifacts_dir", "text"],
-    ["max_consecutive_failures", "number"],
+    ["max_steps", "number", { label: "Max steps",
+      help: "How many actions one run may take before it stops." }],
+    ["max_wall_clock_s", "number", { label: "Max wall clock (s)" }],
+    ["artifacts_dir", "text", { label: "Runs directory",
+      help: "Where each run's events, frames and log are written." }],
+    ["max_consecutive_failures", "number", { label: "Consecutive failures before giving up",
+      help: "Actions that failed in a row. Separate from the stall ladder, which counts actions that worked and got nowhere." }],
     // The stall ladder. A run started from here already obeys these -- the UI
     // spawns the CLI, which reads config.json -- so leaving them off the form
     // meant the only way to see why a run stopped at 14 steps was to open the
     // file by hand. `0` switches a tier off; see `config.RunConfig`.
-    ["stall_nudge_at", "number"], ["stall_block_at", "number"],
-    ["stall_replan_at", "number"], ["stall_give_up_at", "number"],
-    ["goal_check_every", "number"], ["goal_check_hits", "number"],
-    ["pager_sweep", "bool"], ["pager_sweep_max", "number"],
-    ["always_screenshot", "bool"], ["never_screenshot", "bool"], ["dry_run", "bool"],
+    ["stall_nudge_at", "number", { label: "Stall: nudge at",
+      help: "Steps without learning anything before the model is told so, shown a screenshot and made to think harder. 0 switches the tier off." }],
+    ["stall_block_at", "number", { label: "Stall: block at",
+      help: "Steps before the harness starts refusing actions already tried twice on this screen." }],
+    ["stall_replan_at", "number", { label: "Stall: replan at",
+      help: "Steps before one call is spent asking for a different approach." }],
+    ["stall_give_up_at", "number", { label: "Stall: give up at",
+      help: "Steps before the run stops. The collected data survives." }],
+    ["goal_check_every", "number", { label: "Ask if it is already done, every",
+      help: "Steps between asking a model whether the goal is already satisfied. 0 switches it off." }],
+    ["goal_check_hits", "number", { label: "Satisfied verdicts needed",
+      help: "Consecutive satisfied verdicts before the run ends. One sample is how a run that still had work gets cut off." }],
+    ["pager_sweep", "bool", { label: "Sweep carousels in code",
+      help: "Page through a carousel without a model call per item, once the model has chosen to." }],
+    ["pager_sweep_max", "number", { label: "Items per sweep",
+      help: "Before control returns to the model." }],
+    ["always_screenshot", "bool", { label: "Always pay for vision" }],
+    ["never_screenshot", "bool", { label: "Never pay for vision",
+      help: "Disables sweeping, which needs to read items." }],
+    ["dry_run", "bool", { label: "Dry run",
+      help: "Decide everything, touch nothing." }],
   ]],
   ["skills", [
-    ["enabled", "bool"], ["skills_dir", "text"], ["learn_after_run", "bool"],
+    ["enabled", "bool", { label: "Use app skills",
+      help: "Inject per-app guidance into the prompt for the apps the goal is about." }],
+    ["skills_dir", "text", { label: "Skills directory" }],
+    ["learn_after_run", "bool", { label: "Learn after every run",
+      help: "One model call at the end, folding what the run saw into the app's skill." }],
   ]],
   // The Watch tab can override most of these per start, but they belong here
   // too: these are the ceilings, and a ceiling you have to retype on every start
   // is one that will be forgotten once. `policy` and `ledger` especially -- those
   // are paths, and the Watch tab reads them from here rather than asking.
   ["watch", [
-    ["policy", "text"], ["ledger", "text"],
-    ["interval_s", "number"], ["max_steps", "number"],
-    ["draft", "bool"], ["fail_closed", "bool"],
-    ["thread_cooldown_s", "number"],
-    ["max_replies_per_hour", "number"],
-    ["max_replies_per_thread_per_hour", "number"],
-    ["max_usd_per_hour", "number"],
-    ["backoff_initial_s", "number"], ["backoff_max_s", "number"],
+    ["policy", "text", { label: "Reply policy file",
+      help: "The instructions that decide what gets replied to and what it says. A watch will not start without one." }],
+    ["ledger", "text", { label: "Reply ledger file",
+      help: "The record the never-double-reply guarantee is built on." }],
+    ["interval_s", "number", { label: "Seconds between passes" }],
+    ["max_steps", "number", { label: "Steps per pass" }],
+    ["draft", "bool", { label: "Draft only",
+      help: "Compose and record replies, and never send them." }],
+    ["fail_closed", "bool", { label: "Fail closed",
+      help: "If the ledger cannot be written, do not send." }],
+    ["thread_cooldown_s", "number", { label: "Cooldown per conversation (s)" }],
+    ["max_replies_per_hour", "number", { label: "Replies per hour" }],
+    ["max_replies_per_thread_per_hour", "number",
+      { label: "Replies per conversation per hour" }],
+    ["max_usd_per_hour", "number", { label: "Spend per hour ($)",
+      help: "0 is off." }],
+    ["backoff_initial_s", "number", { label: "Backoff, first wait (s)",
+      help: "After a pass that changed nothing." }],
+    ["backoff_max_s", "number", { label: "Backoff, longest wait (s)" }],
   ]],
-  ["memory", [["db", "text"]]],
+  ["memory", [["db", "text", { label: "Memory database",
+    help: "What it remembers about screens between runs." }]]],
 ];
+
+/* The handful anyone actually sets, in the order they get set in. Everything
+   else is real and reachable, one fold down, with a search box -- but a form
+   that opens on sixty-two fields is a form nobody reads the top of. */
+const CFG_TIER1 = [
+  "llm.model", "llm.reasoning_effort", "safety.budget_usd", "run.max_steps",
+  "device.serial", "safety.allow_destructive", "watch.draft",
+  "skills.learn_after_run",
+];
+
+/* Section names as a person would say them. */
+const CFG_SECTIONS = {
+  llm: "Model & API", device: "Phone", safety: "Safety", run: "Run behaviour",
+  skills: "App skills", watch: "Watch", memory: "Memory",
+};
 
 /* The value of the "custom…" option, chosen so no model id can be it. Not a NUL
    or another control character: the HTML parser rewrites U+0000 in an attribute
@@ -1406,6 +2270,7 @@ const CFG_SPEC = [
 const MODEL_CUSTOM = "custom…";
 
 let cfgValues = {};
+let cfgDefaults = {};
 let modelFields = [];  // the model dropdowns now on the form
 let catalogue = { models: [], provider: "", error: "", loaded: false };
 
@@ -1518,56 +2383,118 @@ $("cfg-form").addEventListener("change", (e) => {
 
 $("btn-cfg-models").addEventListener("click", () => loadModels(true));
 
+/* One field. Returns the element, so the two tiers can place it themselves. */
+function cfgField(section, key, type, opts) {
+  const value = (cfgValues[section] || {})[key];
+  const shipped = (cfgDefaults[section] || {})[key];
+  const label = (opts && opts.label) || key.replace(/_/g, " ");
+  const help = (opts && opts.help) || "";
+  const inputId = `cfg-${section}-${key}`;
+  const wrap = document.createElement("div");
+  wrap.className = "cfg-field";
+  // Marked when it differs from what ships. Nothing to compare a secret to.
+  const changed = type !== "password" && shipped !== undefined
+    && JSON.stringify(value) !== JSON.stringify(shipped);
+  const over = changed ? `<span class="over" title="default: ${esc(
+    shipped === "" ? "(unset)" : String(shipped))}">changed</span>` : "";
+  const head = `<span class="lbl">${esc(label)}` +
+    `<span class="key">${esc(section)}.${esc(key)}</span>${over}</span>` +
+    (help ? `<span class="help">${esc(help)}</span>` : "");
+
+  if (type === "model") {
+    wrap.innerHTML = head +
+      `<select class="mono" id="${inputId}"></select>` +
+      `<input class="mono" type="text" id="${inputId}-custom" spellcheck="false" ` +
+      `placeholder="model id" autocomplete="off" style="display:none">`;
+    modelFields.push({ id: inputId, value: value ?? "",
+                       unset: (opts && opts.unset) || "falls back to model",
+                       vision: !!(opts && opts.vision) });
+  } else if (type === "bool") {
+    wrap.className = "cfg-field check";
+    wrap.innerHTML = `<input type="checkbox" id="${inputId}" ${value ? "checked" : ""}>` +
+      `<span class="body">${head}` +
+      (key === "vision_in_decider"
+        ? `<span class="cfg-auto" id="${inputId}-auto"></span>` : "") + `</span>`;
+  } else if (Array.isArray(type)) {
+    wrap.innerHTML = head + `<select id="${inputId}">` +
+      type.map((v) => `<option value="${esc(v)}" ${v === value ? "selected" : ""}>` +
+        `${v === "" ? "(unset)" : esc(v)}</option>`).join("") + `</select>`;
+  } else if (type === "password") {
+    const set = value && value !== "";
+    wrap.innerHTML = head + `<input type="password" id="${inputId}" ` +
+      `placeholder="${set ? "(set, hidden)" : "(unset)"}" autocomplete="off">`;
+  } else {
+    const step = Number.isInteger(value) ? "1" : "any";
+    wrap.innerHTML = head + `<input type="${type}" id="${inputId}" ` +
+      `value="${esc(value ?? "")}" ${type === "number" ? `step="${step}"` : ""}>`;
+  }
+  wrap.dataset.hay = `${label} ${section}.${key} ${help}`.toLowerCase();
+  return wrap;
+}
+
 async function loadConfig() {
   const d = await api("/api/config");
   cfgValues = d.config;
+  cfgDefaults = d.defaults || {};
   $("cfg-path").textContent = d.path || "(no config file — one will be created on save)";
-  const form = $("cfg-form");
-  form.innerHTML = "";
+  const tier1 = $("cfg-essentials");
+  const rest = $("cfg-advanced");
+  tier1.innerHTML = "";
+  rest.innerHTML = "";
   modelFields = [];
+  const first = new Map();  // dotted -> element, so tier 1 keeps its own order
   for (const [section, fieldsSpec] of CFG_SPEC) {
     const group = document.createElement("div");
     group.className = "cfg-group";
-    group.innerHTML = `<h4>${esc(section)}</h4>`;
+    group.innerHTML = `<h4>${esc(CFG_SECTIONS[section] || section)} ` +
+      `<span class="mono">${esc(section)}</span></h4>`;
     const grid = document.createElement("div");
     grid.className = "cfg-grid";
+    let placed = 0;
     for (const [key, type, opts] of fieldsSpec) {
-      const value = (cfgValues[section] || {})[key];
-      const label = document.createElement("label");
-      const inputId = `cfg-${section}-${key}`;
-      if (type === "model") {
-        label.innerHTML = `${esc(key)}<select class="mono" id="${inputId}"></select>` +
-          `<input class="mono" type="text" id="${inputId}-custom" spellcheck="false" ` +
-          `placeholder="model id" autocomplete="off" style="display:none">`;
-        modelFields.push({ id: inputId, value: value ?? "",
-                           unset: (opts && opts.unset) || "falls back to model",
-                           vision: !!(opts && opts.vision) });
-      } else if (type === "bool") {
-        label.className = "check";
-        label.innerHTML = `<input type="checkbox" id="${inputId}" ${value ? "checked" : ""}> ${esc(key)}` +
-          (key === "vision_in_decider" ? `<span class="cfg-auto" id="${inputId}-auto"></span>` : "");
-      } else if (Array.isArray(type)) {
-        label.innerHTML = `${esc(key)}<select id="${inputId}">` +
-          type.map((v) => `<option value="${esc(v)}" ${v === value ? "selected" : ""}>` +
-            `${v === "" ? "(unset)" : esc(v)}</option>`).join("") + `</select>`;
-      } else if (type === "password") {
-        const set = value && value !== "";
-        label.innerHTML = `${esc(key)}<input type="password" id="${inputId}" ` +
-          `placeholder="${set ? "(set, hidden)" : "(unset)"}" autocomplete="off">`;
+      const el = cfgField(section, key, type, opts);
+      if (CFG_TIER1.includes(`${section}.${key}`)) {
+        first.set(`${section}.${key}`, el);
       } else {
-        const step = Number.isInteger(value) ? "1" : "any";
-        label.innerHTML = `${esc(key)}<input type="${type}" id="${inputId}" ` +
-          `value="${esc(value ?? "")}" ${type === "number" ? `step="${step}"` : ""}>`;
+        grid.appendChild(el);
+        placed += 1;
       }
-      grid.appendChild(label);
     }
-    group.appendChild(grid);
-    form.appendChild(group);
+    if (placed) {
+      group.appendChild(grid);
+      rest.appendChild(group);
+    }
+  }
+  for (const dotted of CFG_TIER1) {
+    const el = first.get(dotted);
+    if (el) tier1.appendChild(el);
   }
   modelFields.forEach(fillModelSelect);  // with the current values, at least
   syncVisionHint();
+  filterConfig();
   if (!catalogue.loaded) loadModels();   // and with the catalogue when it lands
 }
+
+/* Search over both tiers. Sixty-two settings need a way in that is not
+   scrolling, and the names you would search for are the Python ones. */
+function filterConfig() {
+  const q = $("cfg-search").value.trim().toLowerCase();
+  let hits = 0;
+  document.querySelectorAll("#cfg-form .cfg-field").forEach((el) => {
+    const on = !q || (el.dataset.hay || "").includes(q);
+    el.hidden = !on;
+    if (on) hits += 1;
+  });
+  document.querySelectorAll("#cfg-advanced .cfg-group").forEach((g) => {
+    g.hidden = !g.querySelector(".cfg-field:not([hidden])");
+  });
+  $("cfg-search-status").textContent = q
+    ? `${hits} setting${hits === 1 ? "" : "s"} match`
+    : "";
+  if (q) $("cfg-advanced-panel").open = true;
+}
+
+$("cfg-search").addEventListener("input", filterConfig);
 
 $("btn-cfg-save").addEventListener("click", async () => {
   const sections = {};
@@ -1608,6 +2535,7 @@ $("btn-cfg-save").addEventListener("click", async () => {
     const r = await api("/api/config", { method: "PUT", body: JSON.stringify({ sections }) });
     notice("saved to " + r.path, false);
     refreshStatus();
+    loadConfig().catch(() => {});   // the "changed" marks move with the save
   } catch (err) {
     notice(err.message);
   }
@@ -1633,7 +2561,7 @@ async function loadSkills() {
       item.classList.add("active");
       try {
         const full = await api("/api/skills/" + encodeURIComponent(s.name));
-        $("skill-editor").style.display = "block";
+        $("skill-editor").hidden = false;
         $("skill-name").textContent = full.name;
         $("skill-json").value = JSON.stringify(full, null, 2);
       } catch (err) { notice(err.message); }
@@ -1692,19 +2620,21 @@ function growLog(pre, tail) {
 }
 
 function clearLog(pre) {
-  pre.style.display = "block";
+  pre.hidden = false;
   pre.textContent = "";
   pre._lines = null;
 }
 
 /* The generator's own live surface. A tour is a run, so it gets the run's view:
-   the same step cards, thinking panels, submitted frames and counters, off the
+   the same step rows, thinking panels, submitted frames and readouts, off the
    same files. */
 const genLive = makeLive("gc-", "gen-live", "gen-feed");
 genLive.jobId = 0;
+genLive.phone = phoneView($("gen-phone"), { live: true });
 genLive.setRunning = (running, stopping) => {
   $("btn-gen").disabled = running;
-  $("btn-gen-stop").disabled = !running || stopping;
+  $("btn-gen-stop").hidden = !running;
+  $("btn-gen-stop").disabled = stopping;
 };
 genLive.onEnd = () => loadSkills().catch(() => {});
 genLive.onEvent = (ev) => {
@@ -1725,12 +2655,12 @@ function watchGeneration(jobId, { fresh = true } = {}) {
   genLive.url = "/api/jobs/" + jobId + "/stream";
   if (fresh) {
     clearLog($("gen-log"));
-    $("gen-log-wrap").style.display = "block";
+    $("gen-log-wrap").hidden = false;
     $("gen-status").textContent = "exploring…";
     beginLive(genLive);
   } else {
     // Reattached after a reload: the log's earlier lines are gone with the page.
-    $("gen-log-wrap").style.display = "block";
+    $("gen-log-wrap").hidden = false;
     $("gen-status").textContent = "generating…";
     setLiveRunning(genLive, true);
     openStream(genLive);
@@ -1784,7 +2714,7 @@ $("btn-gen").addEventListener("click", async () => {
    do not have to be retyped across page reloads or browser sessions. */
 
 const PERSIST_FIELDS = [
-  // Run page fields
+  // Work surface fields
   { id: "goal", key: "adbagent.goal", type: "text" },
   { id: "opt-max-steps", key: "adbagent.opt-max-steps", type: "text" },
   { id: "opt-budget", key: "adbagent.opt-budget", type: "text" },
@@ -1797,7 +2727,7 @@ const PERSIST_FIELDS = [
   { id: "opt-assert-equals", key: "adbagent.opt-assert-equals", type: "text" },
   { id: "opt-assert-text", key: "adbagent.opt-assert-text", type: "text" },
 
-  // Watch page fields
+  // Watch fields
   { id: "watch-goal", key: "adbagent.watch-goal", type: "text" },
   { id: "watch-draft", key: "adbagent.watch-draft", type: "checkbox" },
   { id: "watch-no-learn", key: "adbagent.watch-no-learn", type: "checkbox" },
@@ -1848,9 +2778,11 @@ function loadGoal(key) { return loadValue(key) || ""; }
 
 /* -------------------------------------------------------------- boot */
 
+setDensity(loadValue(DENSITY_KEY) || "story");
 bindPersistence();
+workPhase("compose");
+paintWatchBanner(false, false);
 refreshStatus();
 setInterval(refreshStatus, 5000);
-loadRuns().catch(() => {});  // warm the history cache for later
-loadedTabs.add("run");
-
+loadRuns().catch(() => {});   // history is on this surface, so it loads with it
+loadedTabs.add("work");

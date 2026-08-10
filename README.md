@@ -473,61 +473,119 @@ adbagent ui                 # http://127.0.0.1:8765
 adbagent ui --port 9000
 ```
 
-Six tabs. **Run** takes a goal and streams the run live — every decision,
-verification, vision read and the running cost — over the same `events.jsonl`
-the CLI writes, so what you see is exactly what `report` would replay. While a
-call is in flight its raw stream is shown too: the model's thinking and
-response arrive live in a panel per call (from `stream.jsonl`, below), which
-folds itself away the moment the call ends and leaves the decision card as the
-record. A call that was handed a screenshot shows it, thumbnailed under the
-panel and full size on click — and the thumbnail stays after the panel folds,
-because a vision read you cannot check against the frame it read is only half
-the record. It appears on the call that was actually shown the pixels: the
+**Three tabs: Work, Watch, Setup.**
+
+**Work** is one surface — compose a goal, watch it happen, read what happened,
+and browse what it answered before. Starting a run and reviewing one were never
+two different jobs.
+
+*Composing.* The goal box is the largest control on the page, and the goals
+already in your history sit under it as chips that fill it, because most goals
+are a retry of one that is already there. The options are two groups rather than
+one undifferentiated row of seven: the **guardrails** that decide what a run may
+spend and what it may break (budget, allow destructive, dry run), and the
+**tuning** that does neither (max steps, repeat, device, don't learn). A run can
+also carry a **success assertion**, folded away under them — the browser's only
+route to `--assert-shell`/`--assert-text`, since an assertion is per-run and not
+config.
+
+*Live.* Starting a run replaces the composer in place; there is no tab to
+change. Three readouts lead: what it is doing right now, `step 12/60`, and
+`$0.31 / $2.00` — position and spend against the ceilings the run started under.
+Everything else — calls, elapsed, skill, records, run id — is one dim line under
+them. Pinned above the feed are the model's own **progress** note and the
+**collected data** ledger, both of which used to scroll away with the step that
+last changed them. The ledger is the whole of it rather than the delta, with the
+records that the newest step wrote or corrected marked, and a re-read that
+disagreed with an earlier reading shown next to the value that replaced it.
+
+*The phone.* A panel beside the feed showing the screen as it is, polled every
+couple of seconds while a run is going. It is a read-only `exec-out screencap`
+taken alongside the agent rather than through it: opening a device session zeroes
+the animation scales, locks rotation and selects the agent's own IME, which is
+why every other device call here is refused while something is driving the phone.
+Each frame is stamped with how old it is, and a phone that cannot be read says
+why rather than leaving the last frame up unlabelled.
+
+*Story and trace.* The feed defaults to **story**: one row per step — the action,
+what the model observed, the outcome chip, and a `stalled N` chip once the run
+has gone N steps without learning anything, which is the number the harness
+escalates on. The verification is folded into the row it graded rather than
+trailing it as a card of its own. Under the row go the frames that step was
+shown and whatever a sweep read there. **Trace** puts back everything else, in
+place: the model's reasoning and its plan, what the step cost in tokens and how
+much of that prompt was cached, the raw thinking-and-response stream per call,
+the delta ledger, and every line the harness wrote to itself — the dead ends it
+remembered, the actions it refused, the gestures it retried. Nothing is deleted
+for story; it is one class away, and the toggle is remembered.
+
+While a call is in flight its raw stream is shown live in a panel per call (from
+`stream.jsonl`, below), which folds itself away the moment the call ends and
+leaves the step row as the record. A call that was handed a screenshot shows it,
+thumbnailed on the step and full size on click — and the thumbnail stays at story
+density, because a vision read you cannot check against the frame it read is only
+half the record. It appears on the call that was actually shown the pixels: the
 vision read, or the decision itself when the decider is the one looking. A
 sweep's per-item reads have no panel — each is prefetched on another thread, and
 streaming several of those into one view interleaves them — so each arrives as a
-card carrying the line the model read and the frame it read it from, which on a
-carousel is most of the run's vision calls. What the run has **collected**
-arrives under the step that collected it: the whole ledger, not the delta, with
-the records that step wrote or corrected marked, and a re-read that disagreed
-with an earlier reading shown next to the value that replaced it. Only the
-newest of those panels stays open — each folds the one before it, the way the
-thinking panels fold — because fifteen steps of an album walk are fifteen copies
-of a growing list and the one worth reading is the last. Each decision card also
-carries the model's own **progress** note where it wrote one, what the step cost
-in tokens and how much of that prompt was cached, and a `stalled N` chip once
-the run has gone N steps without learning anything, which is the number the
-harness escalates on. Above the feed: the ledger's running total, the latest
-progress note (which would otherwise scroll away with the card that wrote it),
-and step and spend against the ceilings the run started under — `step 12/60`,
-`$0.31 / $2.00`. A run can also carry a **success
-assertion**, folded away under the options — the browser's only route to
-`--assert-shell`/`--assert-text`, since an assertion is per-run and not
-config. **Watch** starts and supervises a
-watch, and is described below. **History**
-lists recorded runs with their outcome, cost and duration, and opens the full
-trace, stats and scratchpad for any of them — and a failed or interrupted one
-has a **resume** button, continuing it from its checkpoint exactly like
-`run --resume`. **Devices** shows what is attached, grabs a screenshot on
-demand, lists **installed apps** (which answers the question that comes up while
-writing a goal: what is this app actually called?), dumps **what the model sees**
-for the current screen — the same pruning and the same `#indices` it is told to
-aim at, which is the first thing to look at when a run did something
-inexplicable — and runs **doctor**. **Config** edits `config.json` — the five
-model fields are dropdowns over the provider's own catalogue, the same list
-`adbagent models` prints, each option carrying the context window and whether
-the model can see, since the slots that are handed a screenshot cannot take a
-text-only model. A model the catalogue does not list is still reachable through
-"custom…", and a provider that cannot be reached at all (no key yet, or offline)
-leaves every field editable rather than emptying it. **Skills**
-lists, edits and generates app skills — and a generation is watched exactly like
-a run, because it is one: the tour drives the phone through the same agent and
-writes the same `events.jsonl`, so it gets the same counters, decision cards,
-thinking panels and submitted frames rather than the tail of a subprocess's
-stdout. Its own output stays under **generator output**, which is where the two
-things the tour cannot show live end up: the skill written up afterwards from
-what it saw, and the refusals that come before there is any run to stream ("no
-API key", "that app is not installed").
+row carrying the line the model read and the frame it read it from, which on a
+carousel is most of the run's vision calls.
+
+*Result.* The answer, large and first, in its own block above the machinery that
+produced it — then a new run, the same goal again, or a resume from the
+checkpoint if there is one.
+
+*History*, on the same surface, below. Every row carries **the answer**, not just
+the outcome, steps, cost and duration: a list that makes the one interesting
+field the one you have to click for is a list nobody reads. Goals wrap rather
+than truncate to something six other runs also say, dates are relative with the
+absolute time on hover, and the run id is a small mono field at the end of the
+row instead of the first and widest column. Runs of the same goal fold into one
+entry that says so — *5 attempts · 3 succeeded · $0.767* — with the newest as the
+summary and the rest one click away, because the real story of most histories is
+one goal retried. There is a search over goals, answers and ids, and a filter
+over outcomes. Opening a run gives the goal once, the answer, four numbers, the
+cost of thinking behind a fold, the finished ledger, and the whole trace at
+whichever density is set. A failed or interrupted run has a **resume** button,
+continuing it from its checkpoint exactly like `run --resume`.
+
+**Setup** holds the phone, the config and the skills.
+
+**Device** says plainly whether a phone is attached and whether it is the one
+`device.serial` names — those are two different facts, and only one of them
+decides whether a run can start at all. It grabs a screenshot, lists **installed
+apps** (which answers the question that comes up while writing a goal: what is
+this app actually called?), dumps **what the model sees** for the current screen —
+the same pruning and the same `#indices` it is told to aim at, which is the first
+thing to look at when a run did something inexplicable — and runs **doctor**.
+
+**Config** edits `config.json` in two tiers. The first is the handful anyone
+actually sets — model, reasoning effort, budget, max steps, device, allow
+destructive, draft, learn-after-run — with human labels and a line of explanation
+each. Everything else is under **Advanced**: grouped, searchable, and with the
+settings that differ from the shipped defaults marked, so "what have I actually
+changed" is answerable without diffing the file. The five model fields are
+dropdowns over the provider's own catalogue, the same list `adbagent models`
+prints, each option carrying the context window and whether the model can see,
+since the slots that are handed a screenshot cannot take a text-only model. A
+model the catalogue does not list is still reachable through "custom…", and a
+provider that cannot be reached at all (no key yet, or offline) leaves every
+field editable rather than emptying it.
+
+**Skills** lists, edits and generates app skills — and a generation is watched
+exactly like a run, because it is one: the tour drives the phone through the same
+agent and writes the same `events.jsonl`, so it gets the same readouts, step
+rows, thinking panels and submitted frames rather than the tail of a
+subprocess's stdout. Its own output stays under **generator output**, which is
+where the two things the tour cannot show live end up: the skill written up
+afterwards from what it saw, and the refusals that come before there is any run
+to stream ("no API key", "that app is not installed").
+
+The header carries the three facts a run needs — device, model, key — and never
+claims a device that is not attached: a serial configured with nothing on the
+other end reads as *not attached*, in yellow, because that is what it is. Nothing
+on the page scrolls sideways on a phone, and Stop appears only when there is
+something to stop.
 
 ### Watching from the browser
 
@@ -546,12 +604,22 @@ Three things about it are deliberate:
 **Replies sent** is the ledger, and it is the interesting panel: one row per
 conversation, how many replies it has had, and whether the last one was
 *confirmed* or is still *in doubt*. A row appears the moment a reply is
-attempted — before the gesture goes out — so a crash cannot lose it. Each pass
-appears in the live feed as its own run, because it is one.
+attempted — before the gesture goes out — so a crash cannot lose it. It sits
+above the policy editor and the live feed rather than at the bottom of the tab,
+because it is the product of a watch and not an appendix to it. Each pass appears
+in the live feed as its own run, at the same story/trace densities as Work,
+because it is one.
+
+The four rate limits — replies per hour, replies per conversation per hour, the
+per-conversation cooldown and the hourly spend — are one **limits** cluster on
+the form, since they are one decision about how loud this thing is allowed to be.
 
 A watch and a run refuse each other, as do a watch and a screenshot, an app list
 or a screen dump: there is one phone, and opening a device session resets its
-animation scales and rotation underneath whatever is driving it. A watch never
+animation scales and rotation underneath whatever is driving it. The live phone
+panel is the one exception, and only because it opens no session — it is a bare
+`screencap`, and it is the only thing on the page that may look at a phone
+something else is holding. A watch never
 prompts — it is launched unattended, since a loop that stops for a confirmation
 nobody is there to give has stopped watching. Stop waits longer than a run's
 does, because the skill is learned on the way out.
