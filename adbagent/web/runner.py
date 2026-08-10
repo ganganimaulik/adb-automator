@@ -108,6 +108,11 @@ class ChildProcess:
             self._output = []
             self._started_at = time.time()
             env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+            # On Windows, put the child in its own process group so we can
+            # send it CTRL_BREAK_EVENT without killing the server too.
+            flags = 0
+            if sys.platform == "win32":
+                flags = subprocess.CREATE_NEW_PROCESS_GROUP
             self._proc = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
@@ -117,6 +122,7 @@ class ChildProcess:
                 encoding="utf-8",
                 errors="replace",
                 env=env,
+                creationflags=flags,
             )
             proc = self._proc
         # The threads are handed the process rather than reading it back off
@@ -184,8 +190,13 @@ class ChildProcess:
         if proc is None or proc.poll() is not None:
             return False
         try:
-            proc.send_signal(signal.SIGINT)
-        except ProcessLookupError:
+            if sys.platform == "win32":
+                # CTRL_BREAK_EVENT targets the child's own process group
+                # (created with CREATE_NEW_PROCESS_GROUP in _spawn).
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                proc.send_signal(signal.SIGINT)
+        except (ProcessLookupError, OSError):
             return True
         try:
             proc.wait(timeout=timeout_s)
