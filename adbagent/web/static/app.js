@@ -1011,6 +1011,7 @@ function watchOptions() {
   return {
     goal: $("watch-goal").value.trim(),
     draft: $("watch-draft").checked,
+    no_learn: $("watch-no-learn").checked,
     serial: $("watch-serial").value.trim(),
     interval_s: num("watch-interval"),
     max_steps: num("watch-steps", true),
@@ -1799,6 +1800,7 @@ const PERSIST_FIELDS = [
   // Watch page fields
   { id: "watch-goal", key: "adbagent.watch-goal", type: "text" },
   { id: "watch-draft", key: "adbagent.watch-draft", type: "checkbox" },
+  { id: "watch-no-learn", key: "adbagent.watch-no-learn", type: "checkbox" },
   { id: "watch-interval", key: "adbagent.watch-interval", type: "text" },
   { id: "watch-steps", key: "adbagent.watch-steps", type: "text" },
   { id: "watch-serial", key: "adbagent.watch-serial", type: "text" },

@@ -65,6 +65,7 @@ class WatchRequest(BaseModel):
     #: same reason the CLI has none.
     policy: str = ""
     draft: bool = False
+    no_learn: bool = False
     interval_s: Optional[float] = None
     max_steps: Optional[int] = None
     replies_per_hour: Optional[int] = None
@@ -649,7 +650,7 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             raise HTTPException(status_code=409, detail=busy)
         try:
             return watcher.start(
-                goal, policy=policy, draft=req.draft,
+                goal, policy=policy, draft=req.draft, no_learn=req.no_learn,
                 interval_s=req.interval_s, max_steps=req.max_steps,
                 replies_per_hour=req.replies_per_hour,
                 replies_per_conversation=req.replies_per_conversation,

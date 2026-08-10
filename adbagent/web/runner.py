@@ -431,6 +431,7 @@ class WatchManager(ChildProcess):
         return super().stop(timeout_s=timeout_s)
 
     def start(self, goal: str, *, policy: str, draft: bool = False,
+              no_learn: bool = False,
               interval_s: Optional[float] = None,
               max_steps: Optional[int] = None,
               replies_per_hour: Optional[int] = None,
@@ -446,6 +447,8 @@ class WatchManager(ChildProcess):
                     "--policy", policy]
             if draft:
                 argv.append("--draft")
+            if no_learn:
+                argv.append("--no-learn")
             if interval_s is not None:
                 argv += ["--interval", str(interval_s)]
             if max_steps is not None:
