@@ -1250,7 +1250,8 @@ class LLMClient:
 
     def locate(self, screenshot: bytes, description: str, *, goal: str = "",
                step: int = 0, recorder: Optional[Any] = None,
-               on_event: Optional[Callable[..., None]] = None
+               on_event: Optional[Callable[..., None]] = None,
+               misses: Sequence[Tuple[float, float]] = ()
                ) -> Optional[Tuple[float, float]]:
         """The (x, y) fractions of the control `description` names, or None.
 
@@ -1258,6 +1259,10 @@ class LLMClient:
         the tree does not list, the vision model places it on the screenshot.
         None when the call fails or the model says the control is not there --
         either way the caller reports a miss rather than tapping a guess.
+
+        `misses` are points already tapped on this screen that changed nothing.
+        The call is stateless, so without them the model re-derives the same
+        wrong point every time it is asked again.
         """
         from . import prompts
 
@@ -1269,7 +1274,8 @@ class LLMClient:
             {"role": "system", "content": prompts.LOCATE_SYSTEM},
             {"role": "user", "content": [
                 text_part(prompts.locate_user(description, goal=goal,
-                                              width=width, height=height)),
+                                              width=width, height=height,
+                                              misses=misses)),
                 image_part(screenshot),
             ]},
         ]

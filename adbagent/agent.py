@@ -545,6 +545,30 @@ def needs_screenshot(state: RunState, screen: Screen, cfg: Config) -> Tuple[bool
 # The loop
 # ---------------------------------------------------------------------------
 
+
+def _banned_tap_points(state: RunState, screen: Screen
+                       ) -> List[Tuple[float, float]]:
+    """The tap_at points already tapped on this screen that changed nothing.
+
+    Read out of the per-screen ban list, whose entries for a grounded tap are
+    the quantized ``tap_at/x.xx,y.yy`` signatures written by
+    `AgentAction.signature`. These are what a locate call needs to know: it is
+    stateless, so without them it re-derives the same wrong point every time
+    it is asked again -- runs/6fc2c7bbddeb paid for four locates of Hinge's
+    "Send Priority Like" pill and got (0.60, 0.52) back three times.
+    """
+    points = []
+    for sig in state.loops.bans_for(screen.skeleton_id):
+        if not sig.startswith("tap_at/"):
+            continue
+        try:
+            x, y = sig[len("tap_at/"):].split(",")
+            points.append((float(x), float(y)))
+        except ValueError:
+            continue  # a named tap_at's signature is text, not a point
+    return sorted(points)
+
+
 class Agent:
     def __init__(self, dev: Device, mem: Memory, llm: Optional[LLMClient],
                  cfg: Config, *, oracle: Optional[Oracle] = None,
@@ -1581,7 +1605,8 @@ class Agent:
                 where = self.llm.locate(self._ensure_screenshot(screen),
                                         action.text.strip(), goal=state.goal,
                                         step=state.step, recorder=rec,
-                                        on_event=self.on_event)
+                                        on_event=self.on_event,
+                                        misses=_banned_tap_points(state, screen))
                 if where is None:
                     state.last_failure = (
                         f"could not locate {action.text.strip()!r} on the "
@@ -1593,6 +1618,28 @@ class Agent:
                     self._maybe_give_up(state)
                     continue
                 action.x, action.y = where
+                if action.signature() in state.loops.bans_for(screen.skeleton_id):
+                    # The locate landed on a point this screen has already
+                    # tapped with no effect -- it was told the ruled-out points
+                    # and answered one anyway. Tapping it again repeats a dead
+                    # action the ban list exists to prevent, so this is the
+                    # same miss as "not found on screen".
+                    log.info("step %d: locate %r landed on ruled-out point "
+                             "(%.2f, %.2f); treating as a miss", state.step,
+                             action.text.strip(), action.x, action.y)
+                    state.last_failure = (
+                        f"the vision model keeps placing "
+                        f"{action.text.strip()!r} at ({action.x:.2f}, "
+                        f"{action.y:.2f}), where a tap already changed "
+                        f"nothing; it cannot be placed there. Name it "
+                        f"differently, or find another control for the same "
+                        f"job.")
+                    state.consecutive_failures += 1
+                    state.remember(format_history_entry(
+                        state.step, action, screen=screen, grade="failed",
+                        reason=state.last_failure))
+                    self._maybe_give_up(state)
+                    continue
             try:
                 element = execute(self.dev, action, screen)
             except (ActionError, ValueError) as exc:

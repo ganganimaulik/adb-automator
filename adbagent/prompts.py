@@ -756,12 +756,23 @@ force it into a range, and use one space for both numbers.
 
 
 def locate_user(description: str, goal: str = "",
-                width: int = 0, height: int = 0) -> str:
+                width: int = 0, height: int = 0,
+                misses: Sequence[tuple] = ()) -> str:
     parts = [f'Locate this control: "{description}".']
     if goal:
         parts.append(f"It is wanted for this goal: {goal}")
     if width > 0 and height > 0:
         parts.append(f"The image is {width}x{height} pixels.")
+    if misses:
+        # A locate call is stateless, so without this list the model re-derives
+        # the same wrong point every time it is asked -- runs/6fc2c7bbddeb got
+        # (0.60, 0.52) three steps running for Hinge's "Send Priority Like"
+        # pill, each tap landing dead on the photo above it.
+        ruled = "; ".join(f"({x:.2f}, {y:.2f})" for x, y in misses)
+        parts.append(f"Already ruled out on this screen: a tap at each of "
+                     f"these points changed nothing: {ruled}. The control is "
+                     f"not at any of them, nor right beside them -- measure "
+                     f"the layout again instead of repeating one.")
     parts.append("Reply with its centre as described above.")
     return "\n\n".join(parts)
 

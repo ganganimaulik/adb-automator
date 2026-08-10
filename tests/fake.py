@@ -291,6 +291,8 @@ class FakeLLM:
         self.locates = 0
         #: The control descriptions each locate was asked to find, in order.
         self.locates_seen: List[str] = []
+        #: The ruled-out points each locate was told about, in order.
+        self.locate_misses_seen: List[tuple] = []
         #: Tier 3 of the stall ladder. Counted apart from `calls` for the same
         #: reason the sweep's reads are: a test asserting how many reasoning
         #: turns a change costs must not have a rescue call folded into it.
@@ -337,7 +339,7 @@ class FakeLLM:
         return f"reading of {label or 'an unlabelled item'}"
 
     def locate(self, screenshot: bytes, description: str, *, goal: str = "",
-               step: int = 0, **kwargs) -> Optional[Tuple[float, float]]:
+               step: int = 0, misses=(), **kwargs) -> Optional[Tuple[float, float]]:
         """Grounds a named control, as the real client does with the vision model.
 
         Counted apart from `calls`: a locate is a vision read, not a reasoning
@@ -345,6 +347,7 @@ class FakeLLM:
         """
         self.locates += 1
         self.locates_seen.append(description)
+        self.locate_misses_seen.append(tuple(misses))
         self.ledger.record(Call(model=self.model_image, prompt_tokens=400,
                                 completion_tokens=20, purpose="locate"))
         return self.location

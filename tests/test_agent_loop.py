@@ -189,6 +189,43 @@ def test_a_tap_at_naming_something_inside_a_container_label_is_located(cfg, mem)
     assert dev.taps == [(int(0.59 * X.W), int(0.67 * X.H))]
 
 
+def test_a_locate_is_told_ruled_out_points_and_a_repeat_is_not_tapped(cfg, mem):
+    """A locate call is stateless: asked again for the same control on an
+    unchanged screen, the model re-derives the same wrong point. The harness
+    knows that point is dead -- the tap landed and nothing changed -- so the
+    next locate is told the ruled-out points, and one answered anyway is the
+    same miss as "not found", not another tap. runs/6fc2c7bbddeb paid for
+    four locates of Hinge's "Send Priority Like" pill, got (0.60, 0.52) three
+    times, and tapped the dead photo there twice."""
+    composer = X.dump(X.N("android.widget.ScrollView", (0, 0, X.W, X.H),
+                          desc="Edit comment Send a Rose with message "
+                               "Send priority like with message Vac's photo",
+                          scrollable=True))
+    dev = fake.FakeDevice(cfg, start="composer",
+                          app={"composer": fake.FakeScreen(xml=composer)})
+
+    def policy(screen, llm):
+        if llm.locates >= 2:
+            return AgentAction(observation="the pill cannot be placed",
+                               reasoning="stop poking the same dead spot",
+                               action="done", text="could not send")
+        # The vision model's wrong answer, repeated verbatim, as in the run.
+        llm.location = (0.60, 0.52)
+        return AgentAction(observation="the send pill has no element",
+                           reasoning="name it and have it located",
+                           action="tap_at", text="Send Priority Like")
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert llm.locates == 2
+    # The second locate was told what the first one's tap ruled out.
+    assert llm.locate_misses_seen == [(), ((0.60, 0.52),)]
+    # The repeated dead point was not tapped again.
+    assert dev.taps == [(int(0.60 * X.W), int(0.52 * X.H))]
+    assert "keeps placing" in (state.last_failure or "")
+
+
 def test_a_tap_at_landing_on_a_listed_control_is_refused(cfg, mem):
     dev = fake.FakeDevice(cfg)
     tried = []
