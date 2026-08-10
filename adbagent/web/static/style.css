@@ -24,6 +24,10 @@
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   --pad: 20px;
   --radius: 8px;
+  /* One text input's outer height: 14px/1.55 of content, 8px of padding either
+     side, 1px of border. Anything that has to share a row with an input and be
+     read as sitting on it -- a bare checkbox -- claims the same band. */
+  --field-h: 36px;
 }
 
 * { box-sizing: border-box; }
@@ -200,14 +204,16 @@ form.composer > textarea#watch-goal {
 
 .recent-chips button {
   font: inherit;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-dim);
   background: var(--bg-raise);
   border: 1px solid var(--border);
   border-radius: 999px;
-  padding: 3px 11px;
+  padding: 3px 10px;
   cursor: pointer;
-  max-width: 100%;
+  /* A whole sentence per chip, five of them: capped, they stay a row of
+     shortcuts rather than the paragraph they became at full length. */
+  max-width: min(100%, 320px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -215,17 +221,24 @@ form.composer > textarea#watch-goal {
 
 .recent-chips button:hover { color: var(--text); border-color: var(--accent); }
 
-.optgroups { display: flex; gap: 10px; flex-wrap: wrap; }
+.optgroups { display: flex; gap: 12px; flex-wrap: wrap; }
 
+/* Three rules do the work here. `stretch` gives every field the height of the
+   tallest in its row, so a one-line checkbox occupies the same band as a
+   label-over-input and wrapped rows stay even. `flex-start` packs those rows to
+   the top -- bottom-glued, a box whose neighbour held more fields opened with a
+   void above its own. And a shared flex basis stops each input guessing its own
+   width, which is what made a row of them look like a ransom note. */
 fieldset.optgroup {
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 10px 14px 12px;
+  padding: 12px 14px 14px;
   margin: 0;
   display: flex;
-  gap: 8px 18px;
   flex-wrap: wrap;
-  align-items: flex-end;
+  gap: 12px 16px;
+  align-items: stretch;
+  align-content: flex-start;
   flex: 1 1 300px;
   min-width: 0;
   background: #161b2266;
@@ -249,8 +262,8 @@ fieldset.optgroup label,
 .opts label {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
+  gap: 5px;
+  font-size: 11.5px;
   color: var(--text-dim);
   min-width: 0;
 }
@@ -261,29 +274,81 @@ label.check {
   flex-direction: row;
   align-items: center;
   gap: 7px;
-  padding-bottom: 8px;
+  font-size: 12.5px;
 }
 
-fieldset.optgroup input[type="number"] { width: 90px; }
-fieldset.optgroup input[type="text"] { width: 130px; }
+/* Every field shares a basis and a ceiling, and pins its input to the bottom of
+   whatever height the row settles at -- so the inputs across a row sit on one
+   line even when the label above one of them wraps. Checkboxes size to their
+   own words instead, and centre in the same band. */
+fieldset.optgroup > label { flex: 1 1 118px; max-width: 210px; justify-content: flex-end; }
+
+/* An input's own band is the bottom of the row -- the caption above it is not
+   part of it. Centred on the whole row instead, a checkbox rode a caption's
+   height above the boxes it is meant to line up with. */
+fieldset.optgroup > label.check {
+  flex: 0 1 auto;
+  max-width: none;
+  align-self: flex-end;
+  min-height: var(--field-h);
+}
+.opts label.check { min-height: var(--field-h); }
+
+fieldset.optgroup input[type="number"],
+fieldset.optgroup input[type="text"] { width: 100%; }
 input[type="checkbox"] { accent-color: var(--accent); flex: 0 0 auto; }
 
 .opts {
   display: flex;
-  gap: 10px 18px;
+  gap: 12px 18px;
   flex-wrap: wrap;
   align-items: flex-end;
   font-size: 13px;
   color: var(--text-dim);
 }
 
-.opts label.grow-field { flex: 1 1 240px; }
+.opts label { flex: 1 1 200px; }
+.opts label.grow-field { flex: 2 1 320px; }
 
 /* A fold for options that matter but are rarely set, so the common form stays
    short. */
 .opts-more { margin: 0; }
 .opts-more > summary { cursor: pointer; color: var(--text-dim); }
+.opts-more > summary:hover { color: var(--text); }
 .opts-more[open] > summary { margin-bottom: 10px; }
+
+/* One disclosure idiom for the whole page. There were three: the browser's own
+   marker here, a caret appended *after* the words on the panels -- which a
+   flex-wrapped summary left stranded a gap away from them -- and nothing at all
+   on the run groups. A caret leads, and turns. */
+.opts-more > summary,
+details.panel > summary {
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.opts-more > summary::-webkit-details-marker,
+details.panel > summary::-webkit-details-marker { display: none; }
+
+.opts-more > summary::before,
+details.panel > summary::before {
+  content: "▸";
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1;
+  transition: transform 0.12s ease;
+}
+
+.opts-more[open] > summary::before,
+details.panel[open] > summary::before { transform: rotate(90deg); }
+
+@media (prefers-reduced-motion: reduce) {
+  .opts-more > summary::before, details.panel > summary::before { transition: none; }
+}
 
 .actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .grow { flex: 1 1 auto; }
@@ -310,6 +375,14 @@ button.danger { background: none; color: var(--red); border-color: var(--red); }
 button.danger:hover:not(:disabled) { background: #f8514915; }
 button.ghost { background: var(--bg-raise); color: var(--text); }
 button.ghost:hover { background: var(--bg-hover); }
+
+/* Keyboard focus was the one state nothing on the page drew: inputs had a ring,
+   every button and row had none. */
+button:focus-visible, summary:focus-visible, .run:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
 
 /* A two-state segmented control: feed density, and the history outcome filter. */
 .seg {
@@ -357,6 +430,21 @@ button.ghost:hover { background: var(--bg-hover); }
   font-weight: 600;
 }
 
+/* The title owns the left edge and the controls the right, always. Butted up
+   against a search box the way they were, a panel's name read as that box's
+   label -- "installed apps" looked like it was asking for one. */
+.panel-head > h3 { margin-right: auto; }
+.feed-head > .seg { margin-left: auto; }
+
+/* Secondary controls in a heading are secondary: full-size buttons beside an
+   11px title made "reload" the loudest thing in the panel. */
+.panel-head > button {
+  padding: 5px 12px;
+  font-size: 12.5px;
+}
+
+.panel-head button.ghost { background: var(--bg-sunk); }
+.panel-head button.ghost:hover { background: var(--bg-hover); }
 .panel-head input[type="search"] { width: auto; flex: 1 1 160px; }
 .path { overflow-wrap: anywhere; color: var(--text-faint); margin: 8px 0 0; }
 
@@ -419,13 +507,21 @@ button.ghost:hover { background: var(--bg-hover); }
 .readout-rest {
   grid-column: 1 / -1;
   display: flex;
-  gap: 6px 16px;
+  gap: 6px 12px;
   flex-wrap: wrap;
   font-family: var(--mono);
   font-size: 12px;
   color: var(--text-faint);
   border-top: 1px solid var(--border);
   padding-top: 10px;
+}
+
+/* Same punctuation as the history rows. Each item here is a label and a value,
+   so without a divider `elapsed 20s status running` runs together. */
+.readout-rest > span + span::before {
+  content: "·";
+  margin-right: 12px;
+  color: #3b4757;
 }
 
 .readout-rest.solo {
@@ -463,7 +559,13 @@ aside.phone {
   margin-top: 22px;
 }
 
-aside.phone.standalone { position: static; margin-top: 0; border: none; padding: 0; background: none; max-width: 300px; }
+aside.phone.standalone { position: static; margin-top: 0; border: none; padding: 0; background: none; max-width: 100%; }
+
+/* The Setup screenshot is phone-shaped, so its panel is too. Full width, the
+   card was four fifths empty and its own "the phone" heading sat directly under
+   the panel's "screen" one saying the same thing twice. */
+.panel:has(> .phone.standalone) { max-width: 360px; }
+.phone.standalone .phone-head .lbl { display: none; }
 
 .phone-head {
   display: flex;
@@ -604,7 +706,14 @@ body[data-density="story"] .trace-only { display: none; }
 .chip.worked, .chip.success { color: var(--green); border-color: var(--green); }
 .chip.no_change, .chip.needs_user { color: var(--yellow); border-color: var(--yellow); }
 .chip.failed, .chip.aborted, .chip.interrupted { color: var(--red); border-color: var(--red); }
-.chip.unknown, .chip.neutral { color: var(--text-faint); }
+/* Telemetry chips -- `effort high`, `vision` -- sit beside the outcome chip
+   that says whether the step worked. Same border, they carried the same weight
+   as the verdict; recessed, they read as the footnotes they are. */
+.chip.unknown, .chip.neutral {
+  color: var(--text-faint);
+  border-color: #2b344288;
+  background: #ffffff05;
+}
 /* Steps since the run last learned anything. Yellow like `no_change`, because
    that is what it is a count of -- and it is the number the harness escalates
    on, so a feed where it climbs is a feed worth stopping. */
@@ -721,6 +830,11 @@ body[data-density="story"] .trace-only { display: none; }
 
 .small { font-size: 12px; color: var(--text-dim); }
 .mono { font-family: var(--mono); }
+
+/* Status lines are filled in by script and are empty until something happens.
+   A paragraph still claims its margins when it has nothing in it, which is what
+   left the Device panels padded by differing, unexplained amounts. */
+p:empty { display: none; }
 
 details.card summary { cursor: pointer; color: var(--text-dim); font-size: 12px; }
 details.card summary:hover { color: var(--text); }
@@ -919,6 +1033,22 @@ details.card summary:hover { color: var(--text); }
 
 /* -- history --------------------------------------------------------------- */
 
+/* History is a second surface under the composer, not more of it. Both were
+   plain blocks 24px apart, which is the same gap the composer puts between its
+   own rows, so the page read as one long column of unrelated controls. */
+#history { margin-top: 30px; border-top: 1px solid var(--border); padding-top: 6px; }
+#history .feed-head:first-child { margin-top: 16px; }
+
+/* Reading a run is not composing one. The composer stayed above the detail --
+   textarea, chips, both option boxes and a Start button -- so opening a run
+   from history buried it under the form it was not part of. */
+body:has(#run-detail-view:not([hidden])) #run-form,
+body:has(#run-detail-view:not([hidden])) #work-result { display: none !important; }
+
+/* With the composer gone the rule divides the detail from nothing, and reads as
+   a second tab bar directly under the first. */
+body:has(#run-detail-view:not([hidden])) #history { border-top: none; margin-top: 0; }
+
 .filters { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
 .filters input[type="search"] { flex: 1 1 220px; width: auto; }
 
@@ -953,9 +1083,18 @@ details.card summary:hover { color: var(--text); }
   font-size: 11.5px;
   color: var(--text-faint);
   display: flex;
-  gap: 4px 12px;
+  gap: 4px 9px;
   flex-wrap: wrap;
   align-items: center;
+}
+
+/* The same middot the folded group's tally uses. Four facts separated by a
+   space alone read as one phrase -- `4 days ago 11 steps $0.015` -- while the
+   row directly above them, being a tally, was punctuated. */
+.run .meta > span + span::before {
+  content: "·";
+  margin-right: 9px;
+  color: #3b4757;
 }
 
 /* The run id: still there, still copyable, no longer the widest column on a
@@ -1018,8 +1157,8 @@ details.rungroup .kids .run { background: var(--bg-sunk); }
 }
 
 .panel.thin { padding: 10px 14px; }
-details.panel > summary { cursor: pointer; list-style: none; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
-details.panel > summary::-webkit-details-marker { display: none; }
+details.panel > summary { cursor: pointer; }
+
 details.panel > summary h3 {
   margin: 0;
   font-size: 11px;
@@ -1027,8 +1166,12 @@ details.panel > summary h3 {
   text-transform: uppercase;
   letter-spacing: 0.09em;
 }
-details.panel > summary::after { content: "▸"; color: var(--text-faint); font-size: 10px; }
-details.panel[open] > summary::after { content: "▾"; }
+
+/* Closed, a panel is a fold and not a card: the card's own air around a single
+   line of summary read as an empty container someone forgot to fill. */
+details.panel:not([open]) { padding-top: 11px; padding-bottom: 11px; }
+details.panel > summary:hover, details.panel > summary:hover h3 { color: var(--text-dim); }
+details.panel > summary:hover::before { color: var(--text-dim); }
 details.panel[open] > summary { margin-bottom: 12px; }
 
 /* -- config ---------------------------------------------------------------- */
@@ -1059,7 +1202,16 @@ details.panel[open] > summary { margin-bottom: 12px; }
    -- and left their help text at the body size. */
 .cfg-field .lbl { font-size: 13px; color: var(--text); display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
 .cfg-field .lbl .key { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
-.cfg-field .help { font-size: 11.5px; color: var(--text-faint); line-height: 1.4; }
+
+/* Two lines' worth reserved whether the help needs one or two. Sized to its
+   own text, a one-line description lifted its input a line above the ones
+   either side of it, so no row of the grid shared a baseline. */
+.cfg-field .help {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  line-height: 1.4;
+  min-height: 2.8em;
+}
 .cfg-field.check { flex-direction: row; align-items: flex-start; gap: 9px; }
 .cfg-field.check > input { margin-top: 3px; }
 .cfg-field.check > .body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
