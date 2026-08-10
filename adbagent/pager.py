@@ -167,6 +167,34 @@ def _video_regions(screen: Screen) -> List[Element]:
     return out
 
 
+def _union_area(elements: List[Element]) -> int:
+    """Area covered by these boxes counted once, however they overlap.
+
+    Summing `el.area` instead double-counts, and a real player is nested: the
+    container whose resource id names it, the surface inside it, and the
+    "Unmute video" button on top all match `_video_regions` and all describe
+    the same pixels. Measured on a 1080x2340 frame with a video over a third
+    of it, the sum reported 0.670 -- past `_VIDEO_FULL_BLEED`, so a video that
+    was plainly not full-bleed was treated as one and the veto never fired.
+
+    Coordinate compression rather than a sweep line: the region count here is
+    a handful, and the cell grid is easier to be sure of.
+    """
+    boxes = [el.bounds for el in elements if el.area > 0]
+    if not boxes:
+        return 0
+    xs = sorted({b[0] for b in boxes} | {b[2] for b in boxes})
+    ys = sorted({b[1] for b in boxes} | {b[3] for b in boxes})
+    total = 0
+    for x0, x1 in zip(xs, xs[1:]):
+        for y0, y1 in zip(ys, ys[1:]):
+            for left, top, right, bottom in boxes:
+                if left <= x0 and right >= x1 and top <= y0 and bottom >= y1:
+                    total += (x1 - x0) * (y1 - y0)
+                    break
+    return total
+
+
 def video_only_drift(before: Screen, after: Screen) -> bool:
     """True when a playing video explains a pixel change the tree never felt.
 
@@ -190,7 +218,7 @@ def video_only_drift(before: Screen, after: Screen) -> bool:
     total = before.width * before.height
     if total <= 0:
         return True
-    covered = min(1.0, sum(el.area for el in regions) / total)
+    covered = min(1.0, _union_area(regions) / total)
     return covered < _VIDEO_FULL_BLEED
 
 
