@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -2012,7 +2013,32 @@ def cmd_ui(args) -> int:
         kwargs["config_path"] = args.config
     app = create_app(**kwargs)
     out.say(f"  adbagent ui on http://{args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+
+    # Run the server by hand rather than through `uvicorn.run` so the interrupt
+    # can be seen as it lands. The live views are Server-Sent Events streams that
+    # follow a run for as long as it lasts -- for a watch, days -- and uvicorn
+    # waits for in-flight requests before it sends the lifespan shutdown. Left to
+    # itself it therefore waits forever (`timeout_graceful_shutdown` is None by
+    # default), gives up on the connection, and prints a CancelledError raised
+    # out of the middle of a StreamingResponse. Telling the app at the top of the
+    # shutdown lets those streams end themselves, so the wait is a moment and
+    # there is nothing to cancel.
+    config = uvicorn.Config(app, host=args.host, port=args.port,
+                            log_level="warning",
+                            # A backstop for a shutdown that never went through
+                            # the handler below, so it cannot hang indefinitely.
+                            timeout_graceful_shutdown=20)
+    server = uvicorn.Server(config)
+    signalled = server.handle_exit
+
+    def handle_exit(sig, frame):  # type: ignore[no-untyped-def]
+        leaving = getattr(app.state, "shutting_down", None)
+        if leaving is not None:
+            leaving.set()
+        signalled(sig, frame)
+
+    server.handle_exit = handle_exit  # type: ignore[method-assign]
+    server.run()
     return 0
 
 
@@ -2276,10 +2302,35 @@ def prevent_sleep():
                 pass
 
 
+def _catch_windows_break() -> None:
+    """Make CTRL_BREAK raise KeyboardInterrupt, as SIGINT does everywhere else.
+
+    The web UI stops a child by signalling it, and on Windows that signal has to
+    be CTRL_BREAK_EVENT: a child spawned into its own process group -- which it
+    must be, or stopping a run would take the server down with it -- cannot be
+    sent anything else. Left alone, SIGBREAK's default action is to terminate the
+    process where it stands. Nothing below would run: the phone would keep the
+    keyboard, animations, rotation and screen timeout the agent changed, and a
+    watch would never write up what its passes learned.
+
+    Everything that makes a stop orderly hangs off `KeyboardInterrupt`, so the
+    fix is to raise one -- with the handler Python already uses for SIGINT.
+    """
+    if sys.platform != "win32" or not hasattr(signal, "SIGBREAK"):
+        return
+    try:
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
+    except (ValueError, OSError):
+        # Not the main thread, or a platform that will not have it. A stop is
+        # still a stop; it is just the abrupt kind again.
+        log.debug("could not install a SIGBREAK handler", exc_info=True)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     setup_logging(getattr(args, "verbose", 0))
+    _catch_windows_break()
     with prevent_sleep():
         try:
             return args.func(args)

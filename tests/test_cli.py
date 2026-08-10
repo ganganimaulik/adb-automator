@@ -861,3 +861,99 @@ def test_an_unreachable_catalogue_is_not_a_misconfiguration(monkeypatch, capsys)
     cfg.llm.model_image = "accounts/fireworks/models/seeing"
     assert _check_vision(Out(), cfg) == 0
     assert "could not check vision support" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Stopping a child on Windows
+# ---------------------------------------------------------------------------
+
+def test_ctrl_break_is_turned_into_a_keyboard_interrupt(monkeypatch):
+    """The web UI signals a Windows child with CTRL_BREAK_EVENT -- the only
+    thing it can send one that lives in its own process group, and it must live
+    in one or stopping a run would take the server down too. SIGBREAK's default
+    action is to terminate the process on the spot, so nothing that makes a stop
+    orderly would run: the phone would keep the keyboard, animations, rotation
+    and screen timeout the agent changed, and a watch would never write up what
+    its passes learned. All of that hangs off KeyboardInterrupt."""
+    import signal as signalmod
+
+    from adbagent.cli import _catch_windows_break
+
+    installed = {}
+    monkeypatch.setattr("adbagent.cli.sys.platform", "win32")
+    monkeypatch.setattr(signalmod, "SIGBREAK", 21, raising=False)
+    monkeypatch.setattr(signalmod, "signal",
+                        lambda sig, handler: installed.update({sig: handler}))
+    _catch_windows_break()
+    assert installed == {21: signalmod.default_int_handler}
+
+
+def test_nothing_is_installed_off_windows(monkeypatch):
+    """Every other platform gets a real SIGINT, which Python already raises a
+    KeyboardInterrupt for."""
+    import signal as signalmod
+
+    from adbagent.cli import _catch_windows_break
+
+    monkeypatch.setattr("adbagent.cli.sys.platform", "linux")
+    monkeypatch.setattr(signalmod, "signal",
+                        lambda sig, handler: pytest.fail("signal touched"))
+    _catch_windows_break()
+
+
+def test_a_platform_that_refuses_the_handler_is_not_fatal(monkeypatch):
+    """`signal.signal` raises off the main thread. A stop that cannot be made
+    orderly is still a stop."""
+    import signal as signalmod
+
+    from adbagent.cli import _catch_windows_break
+
+    def refuse(sig, handler):
+        raise ValueError("signal only works in main thread")
+
+    monkeypatch.setattr("adbagent.cli.sys.platform", "win32")
+    monkeypatch.setattr(signalmod, "SIGBREAK", 21, raising=False)
+    monkeypatch.setattr(signalmod, "signal", refuse)
+    _catch_windows_break()   # does not raise
+
+
+def test_the_ui_tells_the_app_the_moment_the_interrupt_lands(monkeypatch, tmp_path):
+    """uvicorn waits for in-flight requests *before* it sends the lifespan
+    shutdown, and the live views are streams that follow a run for as long as it
+    lasts -- days, for a watch. So a flag set from the lifespan is one the stream
+    can never see: the server waits for a stream that is waiting for the server,
+    and `timeout_graceful_shutdown` is None by default, so that wait is forever.
+    The signal handler is the only place it can be set."""
+    import argparse
+    import signal as signalmod
+
+    import uvicorn
+
+    from adbagent.cli import cmd_ui
+
+    made, captured = {}, []
+
+    class FakeConfig:
+        def __init__(self, app, **kw):
+            made["app"] = app
+            made["kw"] = kw
+
+    class FakeServer:
+        def __init__(self, config):
+            self.config = config
+
+        def handle_exit(self, sig, frame):
+            captured.append(sig)
+
+        def run(self):
+            self.handle_exit(signalmod.SIGINT, None)   # as uvicorn does
+
+    monkeypatch.setattr(uvicorn, "Config", FakeConfig)
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    assert cmd_ui(argparse.Namespace(host="127.0.0.1", port=1,
+                                     artifacts_dir=str(tmp_path / "runs"),
+                                     config=None)) == 0
+    assert captured == [signalmod.SIGINT]                   # chained, not replaced
+    assert made["app"].state.shutting_down.is_set()          # and the app was told
+    # A shutdown that somehow misses the handler still cannot hang forever.
+    assert made["kw"]["timeout_graceful_shutdown"] == 20

@@ -8,13 +8,16 @@ CLI uses. Nothing here knows how to drive a phone.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import dataclasses
 import json
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Generator, Optional
+from typing import Any, AsyncIterator, Dict, Generator, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
@@ -30,6 +33,11 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 _MEDIA_TYPES = {".html": "text/html", ".js": "text/javascript",
                 ".css": "text/css", ".png": "image/png"}
+
+#: How long the server waits, on its way out, for the agents it started to put
+#: the phone back. Deliberately far short of the three minutes a stop from the
+#: browser allows a watch: there is somebody at a prompt waiting for it.
+SHUTDOWN_GRACE_S = 15.0
 
 
 class RunRequest(BaseModel):
@@ -138,7 +146,59 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
     def registry() -> SkillRegistry:
         return SkillRegistry(skills_dir or load_cfg().skills.skills_dir)
 
-    app = FastAPI(title="adbagent ui")
+    #: Set when the server is going down, so the live streams end themselves
+    #: rather than being cancelled mid-frame -- which is what fills the console
+    #: with `CancelledError` out of the middle of a `StreamingResponse`.
+    #:
+    #: Published on `app.state` because the only place it can usefully be set is
+    #: the moment the signal lands: uvicorn waits for in-flight requests *before*
+    #: it sends the lifespan shutdown, and a watch's stream never ends on its own,
+    #: so a flag set from the lifespan is one the stream can never see. `cmd_ui`
+    #: sets it from the signal handler; the lifespan below sets it too, for
+    #: shutdowns that never went through a signal at all.
+    shutting_down = threading.Event()
+
+    def live_children() -> List[ChildProcess]:
+        """Every child still driving the phone."""
+        kids: List[ChildProcess] = [c for c in (manager, watcher) if c.running()]
+        job = jobs.active()
+        if job is not None:
+            kids.append(job)
+        return kids
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """Take the children down with the server.
+
+        Ctrl+C in the console the server was started from does not reach them on
+        Windows: each child is spawned into its own process group -- it has to
+        be, or signalling one would take the server down too -- and a new group
+        has the console's Ctrl+C disabled. So the server would exit and leave a
+        watch running: still driving the phone, still replying to people, with
+        the only thing that could stop it now gone.
+
+        They are asked, not killed, and then waited for -- briefly. A watch does
+        real work on the way out and deserves the chance to finish it, but an
+        operator who pressed Ctrl+C is waiting at a prompt, so the wait is
+        seconds rather than the minute a stop from the browser allows.
+        """
+        yield
+        shutting_down.set()
+        kids = live_children()
+        if not kids:
+            return
+        print(f"  stopping {len(kids)} agent(s) still driving the phone…")
+        for kid in kids:
+            kid.stop()
+        deadline = time.monotonic() + SHUTDOWN_GRACE_S
+        while time.monotonic() < deadline and any(k.running() for k in kids):
+            await asyncio.sleep(0.25)
+        if any(k.running() for k in kids):
+            print("  one is still finishing -- the phone is being put back, and "
+                  "a watch writes up what it learned. It will exit on its own.")
+
+    app = FastAPI(title="adbagent ui", lifespan=lifespan)
+    app.state.shutting_down = shutting_down
 
     # -- pages ----------------------------------------------------------
 
@@ -390,7 +450,7 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
     # Declared before /api/runs/{run_id} so the literal path wins.
     @app.get("/api/runs/stream")
     def stream() -> StreamingResponse:
-        return StreamingResponse(_event_stream(manager),
+        return StreamingResponse(_event_stream(manager, shutting_down),
                                  media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache"})
 
@@ -491,7 +551,7 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
     # same ordering /api/runs/stream needs.
     @app.get("/api/watch/stream")
     def watch_stream() -> StreamingResponse:
-        return StreamingResponse(_event_stream(watcher),
+        return StreamingResponse(_event_stream(watcher, shutting_down),
                                  media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache"})
 
@@ -687,14 +747,16 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         job = jobs.job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
-        return StreamingResponse(_event_stream(job),
+        return StreamingResponse(_event_stream(job, shutting_down),
                                  media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache"})
 
     return app
 
 
-def _event_stream(child: ChildProcess) -> Generator[str, None, None]:
+def _event_stream(child: ChildProcess,
+                  shutting_down: Optional[threading.Event] = None,
+                  ) -> Generator[str, None, None]:
     """Replay then follow a child's run files as SSE frames.
 
     Any child that drives the phone: the goal run behind the Run tab, or the
@@ -717,6 +779,12 @@ def _event_stream(child: ChildProcess) -> Generator[str, None, None]:
     directory, so the tail follows the move and announces it with a fresh
     `run` frame. The client rules off there; the session's own totals -- the
     spend the budget bounds -- carry across.
+
+    `shutting_down` ends the stream when the server is going away. This is a
+    plain generator run on a thread, so it cannot be cancelled: without the flag
+    it goes on polling a run directory nobody is reading, and the shutdown tears
+    the response down underneath it -- which is the `CancelledError` raised out
+    of the middle of a `StreamingResponse` that a Ctrl+C prints to the console.
     """
     yield sse(child.state(), "state")
     state = child.state()
@@ -826,6 +894,9 @@ def _event_stream(child: ChildProcess) -> Generator[str, None, None]:
                 yield sse({"reason": "finished",
                            "returncode": state["returncode"]}, "end")
                 return
+        if shutting_down is not None and shutting_down.is_set():
+            yield sse({"reason": "the server is shutting down"}, "end")
+            return
         if time.monotonic() - last_heartbeat > 15:
             yield sse({"t": time.time()}, "ping")
             last_heartbeat = time.monotonic()
