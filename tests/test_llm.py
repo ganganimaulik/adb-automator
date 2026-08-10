@@ -9,9 +9,10 @@ import time
 import pytest
 
 from adbagent.actions import AgentAction
-from adbagent.llm import (Call, Ledger, LLMError, ModelInfo, PROVIDERS, RateLimiter,
-                          ScreenAnalysis, extract_json, harden_schema, image_part,
-                          list_models, qualify, text_part)
+from adbagent.llm import (Call, Ledger, LLMError, Location, ModelInfo, PROVIDERS,
+                          RateLimiter, ScreenAnalysis, extract_json, harden_schema,
+                          image_part, list_models, point_fractions, qualify,
+                          text_part)
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +285,62 @@ def test_image_part_is_a_data_uri():
 
 def test_text_part():
     assert text_part("hi") == {"type": "text", "text": "hi"}
+
+
+# ---------------------------------------------------------------------------
+# Locate grounding: whatever space the model answered in, the tap gets
+# fractions of the frame
+# ---------------------------------------------------------------------------
+
+def test_location_schema_imposes_no_range():
+    """A `maximum` in the schema does not make a pixel-native model answer in
+    fractions -- the constrained decoder deforms 540 into 1.0 or 0.54 instead,
+    and the tap lands somewhere else with no error anywhere."""
+    schema = harden_schema(Location)
+    for axis in ("x", "y"):
+        prop = schema["properties"][axis]
+        assert "minimum" not in repr(prop) and "maximum" not in repr(prop)
+
+
+def test_point_fractions_passes_fractions_through():
+    assert point_fractions(0.25, 0.75, 576, 1280) == (0.25, 0.75)
+
+
+def test_point_fractions_reads_absolute_pixels_of_the_shown_frame():
+    """The pixel-native grounding models (Qwen-VL, GLM-V) answer in the
+    downscaled capture's space, not the device's."""
+    assert point_fractions(288, 640, 576, 1280) == (0.5, 0.5)
+
+
+def test_point_fractions_reads_a_thousand_grid_when_pixels_cannot_fit():
+    """0..1000 answers are only distinguishable from pixels when they overrun
+    the frame -- a 700-wide answer on a 576-wide frame cannot be pixels."""
+    assert point_fractions(700, 500, 576, 1280) == (0.7, 0.5)
+
+
+def test_point_fractions_prefers_pixels_when_both_spaces_fit():
+    """(500, 800) on a 576x1280 frame reads as pixels or grid. Overrunning 0..1
+    at all is the signature of a pixel-trained model, and the providers'
+    vision models that do it are pixel-native, so pixels win."""
+    assert point_fractions(500, 800, 576, 1280) == (500 / 576, 800 / 1280)
+
+
+def test_point_fractions_rejects_what_fits_no_space():
+    """A point in no known space is a miss the caller reports, not a tap."""
+    assert point_fractions(1200, 2500, 576, 1280) is None
+    assert point_fractions(-3, 0.5, 576, 1280) is None
+
+
+def test_point_fractions_without_a_known_frame_size():
+    """An unreadable frame still carries fraction answers -- and only those."""
+    assert point_fractions(0.25, 0.75, 0, 0) == (0.25, 0.75)
+    assert point_fractions(288, 640, 0, 0) == (0.288, 0.64)   # the 0..1000 grid
+    assert point_fractions(1200, 2500, 0, 0) is None
+
+
+def test_point_fractions_propagates_not_visible():
+    assert point_fractions(None, None, 576, 1280) is None
+    assert point_fractions(0.5, None, 576, 1280) is None
 
 
 def test_llm_config_model_fallbacks():
