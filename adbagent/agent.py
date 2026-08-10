@@ -2266,8 +2266,11 @@ class Agent:
     def _hand_over(self, state: RunState, reason: str) -> None:
         """Stop and give the phone back to the person."""
         log.warning("handing over: %s", reason)
-        print(f"\n  The agent has stopped and needs you:\n    {reason}\n"
-              f"  Do it on the device yourself, then re-run the goal.\n")
+        try:
+            print(f"\n  The agent has stopped and needs you:\n    {reason}\n"
+                  f"  Do it on the device yourself, then re-run the goal.\n")
+        except OSError:
+            pass
         state.finished = "needs_user"
 
 

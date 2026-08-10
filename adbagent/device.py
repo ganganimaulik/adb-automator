@@ -930,23 +930,30 @@ class Device:
 
     # -- actions -----------------------------------------------------------
 
+    def _log_action(self, msg: str) -> None:
+        log.info("%s", msg)
+        try:
+            print(msg)
+        except OSError:
+            pass
+
     def tap(self, x: int, y: int) -> None:
         # Any coordinate below 1 is interpreted by u2 as a *fraction* of the
         # screen, so a legitimate pixel 0 must be nudged to 1.
         px, py = max(1, int(x)), max(1, int(y))
-        print(f"Tap at ({px}, {py})")
+        self._log_action(f"Tap at ({px}, {py})")
         self._act(lambda: self.u2.click(px, py), "tap")
 
     def long_press(self, x: int, y: int, duration: float = 0.6) -> None:
         px, py = max(1, int(x)), max(1, int(y))
-        print(f"Long press at ({px}, {py}) (duration={duration:.2f}s)")
+        self._log_action(f"Long press at ({px}, {py}) (duration={duration:.2f}s)")
         self._act(lambda: self.u2.long_click(px, py, duration),
                   "long_press")
 
     def swipe(self, fx: int, fy: int, tx: int, ty: int, duration: float = 0.25) -> None:
         pfx, pfy = max(1, int(fx)), max(1, int(fy))
         ptx, pty = max(1, int(tx)), max(1, int(ty))
-        print(f"Swipe ({pfx}, {pfy}) -> ({ptx}, {pty}) (duration={duration:.2f}s)")
+        self._log_action(f"Swipe ({pfx}, {pfy}) -> ({ptx}, {pty}) (duration={duration:.2f}s)")
         self._act(lambda: self.u2.swipe(pfx, pfy, ptx, pty, duration=duration), "swipe")
 
     def scroll(self, direction: str, scale: float = 0.6,
@@ -965,7 +972,7 @@ class Device:
         if duration is not None:
             extra.append(f"duration={duration:.2f}s")
         extra_str = f", {', '.join(extra)}" if extra else ""
-        print(f"Scrolling {direction} (scale={scale}{extra_str})")
+        self._log_action(f"Scrolling {direction} (scale={scale}{extra_str})")
         gesture = {"down": "up", "up": "down", "left": "left", "right": "right"}
         gesture_dir = gesture.get(direction, direction)
         kwargs: dict = {"scale": scale}
@@ -981,11 +988,11 @@ class Device:
         key = key.lower()
         if key not in PRESS_KEYS:
             raise ValueError(f"unsupported key {key!r}; server accepts {sorted(PRESS_KEYS)}")
-        print(f"Press key {key!r}")
+        self._log_action(f"Press key {key!r}")
         self._act(lambda: self.u2.press(key), "press")
 
     def input_text(self, text: str, clear: bool = True, press_enter: bool = False) -> None:
-        print(f"Input text {text!r} (clear={clear}, press_enter={press_enter})")
+        self._log_action(f"Input text {text!r} (clear={clear}, press_enter={press_enter})")
         self._act(lambda: self.u2.send_keys(text, clear=clear), "input_text")
         if press_enter:
             self.press("enter")
@@ -1000,7 +1007,7 @@ class Device:
             return out.strip()
 
     def set_clipboard(self, text: str) -> None:
-        print(f"Set clipboard {text!r}")
+        self._log_action(f"Set clipboard {text!r}")
         try:
             _guard(lambda: self.u2.set_clipboard(text), self.cfg.device.watchdog_s, "set_clipboard")
         except Exception as exc:  # noqa: BLE001
