@@ -1599,7 +1599,8 @@ def cmd_report(args) -> int:
             out.say(out.dim(f"        Vision{m_str}: {result}"))
         elif event["kind"] == "verify":
             out.say(f"      -> {event.get('grade')} {event.get('reason') or ''}")
-        elif event["kind"] in ("dismiss", "refused", "loop_break", "sensitive",
+        elif event["kind"] in ("dismiss", "refused", "scroll_refused",
+                               "loop_break", "sensitive",
                                "judge", "error", "gave_up"):
             # `llm` and `wall_s` are per-call metrics; they are summarised in the
             # cost block below rather than dumped inline as a dict.

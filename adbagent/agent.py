@@ -1232,6 +1232,41 @@ class Agent:
             state.want_screenshot = action.confidence == "low"
             source = "llm"
 
+            # A gesture that already revealed nothing on this exact frame is
+            # refused outright, before `record_scroll` logs it -- it is not
+            # going to happen. Telling the model was tried first: the
+            # `no_change` branch below puts "do not scroll down again here" in
+            # `last_failure`, and the model can keep scrolling anyway, at a
+            # device round trip plus a reasoning turn per repetition. The
+            # ledger is keyed on `exact_id`, so a screen whose content has
+            # since changed -- new items loaded, a refresh -- re-arms the
+            # gesture with no bookkeeping here.
+            if (action.action in ("scroll", "swipe") and action.direction
+                    and state.loops.scroll_dead(screen.skeleton_id,
+                                                action.direction,
+                                                screen.exact_id)):
+                log.info("step %d: refusing %s -- it already revealed nothing "
+                         "on this screen", state.step, action.describe())
+                self.on_event("loop_warning",
+                              message=f"step {state.step}: refusing "
+                                      f"{action.describe()} (already revealed "
+                                      f"nothing on this screen)")
+                rec.event("scroll_refused", step=state.step,
+                          action=action.describe())
+                state.last_failure = (
+                    f"{action.describe()} was refused: it already revealed no "
+                    f"new content on this screen, and repeating it on an "
+                    f"unchanged screen changes nothing. Try the opposite "
+                    f"direction, do something else, or report done/fail.")
+                state.remember(format_history_entry(
+                    state.step, action, screen=screen, grade="refused",
+                    reason="already revealed no new content on this screen"))
+                # Deliberately not a `consecutive_failure`, for the reason the
+                # stall refusal below gives: the stall ladder already bounds
+                # turns that buy nothing, and feeding both counters ends the
+                # run before the replan tier gets its chance.
+                continue
+
             # Track scroll direction globally (survives interleaved taps).
             if action.action in ("scroll", "swipe") and action.direction:
                 state.loops.record_scroll(action.direction)
@@ -1733,6 +1768,13 @@ class Agent:
                 if action.action not in ("scroll", "swipe"):
                     state.loops.ban(screen.skeleton_id, action.signature())
                 if action.action in ("scroll", "swipe"):
+                    # Recorded against the frame the *next* decision runs on
+                    # (`after` becomes `screen` below), which is what
+                    # `scroll_dead` will be asked about then.
+                    if action.direction:
+                        state.loops.mark_scroll_dead(screen.skeleton_id,
+                                                     action.direction,
+                                                     after.exact_id)
                     h_dir = action.direction in ("left", "right")
                     axis = "horizontal" if h_dir else "vertical"
                     act_name = "Swiping" if action.action == "swipe" else "Scrolling"

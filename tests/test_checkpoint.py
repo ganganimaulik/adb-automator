@@ -54,6 +54,7 @@ def populated_state() -> RunState:
     state.loops.record_element_action("skel1", 4, "tap/#4", "tap #4 'Wi-Fi'")
     state.loops.record_scroll("down")
     state.loops.record_scroll("up")
+    state.loops.mark_scroll_dead("skel1", "down", "exact1")
     state.loops.consecutive_backs = 1
     state.want_screenshot = True
     state.last_failure = "tap #4 failed: nothing changed"
@@ -101,6 +102,7 @@ def test_round_trip_preserves_everything_the_loop_needs(cfg):
         "skel1": [(4, "tap/#4", "tap #4 'Wi-Fi'")]}
     assert fresh.loops.scroll_dir_log == ["down", "up"]
     assert fresh.loops.total_scroll_count == 2
+    assert fresh.loops.dead_scrolls == {"skel1/down": "exact1"}
     assert fresh.loops.consecutive_backs == 1
     assert fresh.want_screenshot is True
     assert fresh.last_failure == state.last_failure

@@ -300,6 +300,16 @@ every `decide` event carries the stall count it was made at, so a run that ends
 this way can be read back rather than guessed at. Set any threshold to `0` to
 switch that tier off.
 
+One refusal does not wait for a stall. A scroll or swipe that reveals nothing
+is graded `no_change` by comparing the screen before and after — the hierarchy
+hash, the text inside scrollable containers, a perceptual hash of the pixels;
+no model reads an image for it — and the gesture is remembered against that
+exact frame. Proposed again on an unchanged screen, it is refused before it
+runs (`scroll_refused`), instead of being re-advised against one
+`last_failure` at a time. The memory is keyed on the frame, not the screen's
+shape, so a feed that has since loaded more content re-arms the gesture on its
+own: end-of-list is a property of the content.
+
 ## Galleries and carousels
 
 A photo viewer breaks screen identity: photo 7 and photo 8 are structurally the

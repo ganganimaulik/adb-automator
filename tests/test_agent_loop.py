@@ -634,6 +634,70 @@ def test_scroll_swipe_no_change_does_not_ban_action(cfg, mem):
     assert "scroll/down" not in state.loops.bans_for(dev.observe().skeleton_id)
 
 
+def test_a_scroll_that_revealed_nothing_is_refused_the_second_time(cfg, mem):
+    """The stop is enforced in code, not left as advice the model can ignore.
+
+    The first scroll down grades no_change on the unchanged screen. When the
+    model proposes the identical gesture again on the identical frame, the
+    harness refuses it before it reaches the device -- and the detection that
+    feeds the refusal is hierarchy comparison, not an LLM reading an image.
+    """
+    dev = fake.FakeDevice(cfg)
+    step_count = {"n": 0}
+
+    def policy(screen, llm):
+        step_count["n"] += 1
+        if step_count["n"] <= 2:
+            return AgentAction(observation="feed", reasoning="scroll down",
+                               action="scroll", direction="down")
+        return AgentAction(observation="feed", reasoning="done",
+                           action="done", text="finished")
+
+    llm = fake.FakeLLM(dev, policy)
+    outcome, state = Agent(dev, mem, llm, cfg).run("scroll the feed")
+    assert outcome == "success"
+    # The device saw exactly one scroll; the second was refused in code.
+    assert dev.actions.count("scroll(down)") == 1
+    assert "refused" in state.last_failure
+
+
+def test_a_dead_scroll_rearms_after_the_screen_changes(cfg, mem):
+    """The refusal is keyed on the exact frame, not the screen's shape.
+
+    A feed that loads more content is the same skeleton with a different
+    exact_id, and the gesture must be legal there again -- otherwise one
+    premature end-of-list verdict would lock the direction for the whole run.
+    """
+    dev = fake.FakeDevice(cfg)
+    step_count = {"n": 0}
+
+    def policy(screen, llm):
+        step_count["n"] += 1
+        n = step_count["n"]
+        if n <= 2:
+            return AgentAction(observation="feed", reasoning="scroll down",
+                               action="scroll", direction="down")
+        if n == 3:
+            # Stand in for the feed loading more content: a tap that toggles
+            # a checkbox changes the tree, and therefore the exact_id.
+            el = next(e for e in screen.elements if e.checkable)
+            return AgentAction(observation="feed", reasoning="tap the toggle",
+                               action="tap", target={"index": el.index})
+        if n == 4:
+            return AgentAction(observation="feed", reasoning="scroll down again",
+                               action="scroll", direction="down")
+        return AgentAction(observation="feed", reasoning="done",
+                           action="done", text="finished")
+
+    llm = fake.FakeLLM(dev, policy)
+    outcome, state = Agent(dev, mem, llm, cfg).run("scroll the feed")
+    assert outcome == "success"
+    # Both post-change scrolls reached the device: step 2's was refused, but
+    # the toggle changed the frame, so step 4's ran and was graded on its own
+    # merits -- the first scroll executed, then the re-armed one.
+    assert dev.actions.count("scroll(down)") == 2
+
+
 
 
 # ---------------------------------------------------------------------------
