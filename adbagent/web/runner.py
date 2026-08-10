@@ -23,6 +23,7 @@ them for as long as the child lives.
 from __future__ import annotations
 
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -106,13 +107,16 @@ class ChildProcess:
             self._returncode = None
             self._output = []
             self._started_at = time.time()
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
             self._proc = subprocess.Popen(
                 argv,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
                 errors="replace",
+                env=env,
             )
             proc = self._proc
         # The threads are handed the process rather than reading it back off
