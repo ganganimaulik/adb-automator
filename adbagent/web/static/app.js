@@ -1684,22 +1684,76 @@ $("btn-gen").addEventListener("click", async () => {
 
 /* -------------------------------------------------------- persistence
 
-   The prompt a run or watch was last started with, recalled on the next load
-   so a prompt that was right once does not have to be retyped. localStorage
-   rather than the server: it is a convenience of the browser, not a setting. */
+   The inputs a run or watch was set with are saved to localStorage so fields
+   do not have to be retyped across page reloads or browser sessions. */
 
-function saveGoal(key, value) {
+const PERSIST_FIELDS = [
+  // Run page fields
+  { id: "goal", key: "adbagent.goal", type: "text" },
+  { id: "opt-max-steps", key: "adbagent.opt-max-steps", type: "text" },
+  { id: "opt-budget", key: "adbagent.opt-budget", type: "text" },
+  { id: "opt-repeat", key: "adbagent.opt-repeat", type: "text" },
+  { id: "opt-serial", key: "adbagent.opt-serial", type: "text" },
+  { id: "opt-dry-run", key: "adbagent.opt-dry-run", type: "checkbox" },
+  { id: "opt-destructive", key: "adbagent.opt-destructive", type: "checkbox" },
+  { id: "opt-no-learn", key: "adbagent.opt-no-learn", type: "checkbox" },
+  { id: "opt-assert-shell", key: "adbagent.opt-assert-shell", type: "text" },
+  { id: "opt-assert-equals", key: "adbagent.opt-assert-equals", type: "text" },
+  { id: "opt-assert-text", key: "adbagent.opt-assert-text", type: "text" },
+
+  // Watch page fields
+  { id: "watch-goal", key: "adbagent.watch-goal", type: "text" },
+  { id: "watch-draft", key: "adbagent.watch-draft", type: "checkbox" },
+  { id: "watch-interval", key: "adbagent.watch-interval", type: "text" },
+  { id: "watch-steps", key: "adbagent.watch-steps", type: "text" },
+  { id: "watch-serial", key: "adbagent.watch-serial", type: "text" },
+  { id: "watch-rph", key: "adbagent.watch-rph", type: "text" },
+  { id: "watch-rpc", key: "adbagent.watch-rpc", type: "text" },
+  { id: "watch-cooldown", key: "adbagent.watch-cooldown", type: "text" },
+  { id: "watch-usd", key: "adbagent.watch-usd", type: "text" },
+];
+
+function saveValue(key, value) {
   try { localStorage.setItem(key, value); } catch {}
 }
-function loadGoal(key) {
-  try { return localStorage.getItem(key) || ""; } catch { return ""; }
+
+function loadValue(key) {
+  try { return localStorage.getItem(key); } catch { return null; }
 }
+
+function bindPersistence() {
+  for (const f of PERSIST_FIELDS) {
+    const el = $(f.id);
+    if (!el) continue;
+
+    // Restore saved value
+    const saved = loadValue(f.key);
+    if (saved !== null) {
+      if (f.type === "checkbox") {
+        el.checked = saved === "true";
+      } else {
+        el.value = saved;
+      }
+    }
+
+    // Save on input/change
+    const eventName = f.type === "checkbox" ? "change" : "input";
+    el.addEventListener(eventName, () => {
+      const val = f.type === "checkbox" ? String(el.checked) : el.value;
+      saveValue(f.key, val);
+    });
+  }
+}
+
+// Backwards compatibility functions if referenced anywhere
+function saveGoal(key, value) { saveValue(key, value); }
+function loadGoal(key) { return loadValue(key) || ""; }
 
 /* -------------------------------------------------------------- boot */
 
-$("goal").value = loadGoal("adbagent.goal");
-$("watch-goal").value = loadGoal("adbagent.watch-goal");
+bindPersistence();
 refreshStatus();
 setInterval(refreshStatus, 5000);
 loadRuns().catch(() => {});  // warm the history cache for later
 loadedTabs.add("run");
+
