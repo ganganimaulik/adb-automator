@@ -600,6 +600,40 @@ function paintCounters(v) {
   }
 }
 
+/* The tail of the feed while a child is shutting down.
+
+   One card, grown a line at a time from the child's stdout. It exists because
+   the shutdown is the one part of the work that leaves no events behind it: the
+   loop has ended, the run directory is closed, and what is still happening --
+   the phone's keyboard, animations and rotation being put back, then a model
+   call folding every pass into the app's skill -- is reported nowhere else.
+   Under a watch that is a minute of a feed that has stopped moving, which is
+   indistinguishable from a stop that did not work. */
+function appendExitLine(feed, line) {
+  if (!feed._exitLog) {
+    const card = document.createElement("div");
+    card.className = "banner";
+    card.innerHTML = "<b>stopping</b><br><span class=\"small\">the phone is "
+      + "restored first, then what the passes learned about the app is written "
+      + "into its skill — one model call, which can take a minute.</span>";
+    const pre = document.createElement("pre");
+    pre.className = "log";
+    pre.style.marginTop = "8px";
+    card.appendChild(pre);
+    feed._exitLog = pre;
+    followPageTail(feed, () => feed.appendChild(card));
+  }
+  // Two tails to chase: the page's, and the log box's own -- `pre.log` scrolls
+  // internally past 400px, and a long write-up would otherwise grow off the
+  // bottom of a box that stayed at its first line.
+  //
+  // Text nodes, not innerHTML: these are the child's own lines, and one of them
+  // is a goal or a skill name it read off the phone.
+  const pre = feed._exitLog;
+  followPageTail(feed, () => followTail(pre, () =>
+    pre.appendChild(document.createTextNode(line + "\n"))));
+}
+
 /* ------------------------------------------------- a live surface
 
    The counters strip, the feed under it, and the SSE connection that fills
@@ -619,6 +653,10 @@ function makeLive(prefix, boxId, feedId) {
     step: 0, calls: 0, cost: 0, skill: "", iteration: 1,
     records: 0, progress: "", maxSteps: 0, budget: 0,
     source: null, startedAt: 0, timer: null,
+    // Stopped, but not over: the child still holds the phone while it restores
+    // it and writes up what it learned. Its own state, because showing it as
+    // "running" is what made a stop look like it had been ignored.
+    stopping: false,
     url: "",           // where to stream from; a job's is known only once it starts
     box: $(boxId), feed,
     els: { runid: el("runid"), step: el("step"), calls: el("calls"),
@@ -647,17 +685,35 @@ function resetCounters(v) {
   v.budget = 0;
 }
 
-/* Keep a surface's clock and status telling the truth. */
+/* Keep a surface's clock and status telling the truth.
+
+   Three states, not two: a child that has been asked to stop is still running
+   -- still holding the phone, still spending -- for as long as its shutdown
+   takes, which for a watch is a model call that writes the app's skill. The
+   clock keeps going through it, because that time is still being spent. */
 function setLiveRunning(v, running) {
-  v.els.state.textContent = running ? "running" : "idle";
-  v.els.state.style.color = running ? "var(--green)" : "var(--text-dim)";
+  const stopping = running && v.stopping;
+  if (!running) v.stopping = false;
+  v.els.state.textContent = stopping ? "stopping…" : (running ? "running" : "idle");
+  v.els.state.style.color = stopping ? "var(--yellow)"
+    : (running ? "var(--green)" : "var(--text-dim)");
   clearInterval(v.timer);
   if (running) {
     v.timer = setInterval(() => {
       v.els.elapsed.textContent = fmtDur((Date.now() / 1000) - v.startedAt);
     }, 1000);
   }
-  v.setRunning(running);
+  v.setRunning(running, stopping);
+}
+
+/* Move a surface into the stopping phase and show it at once.
+
+   Called on the click rather than waiting for the server to say so: the request
+   answers immediately now, but a button that only responds once a round trip has
+   landed is the same button that looked broken before. */
+function setStopping(v) {
+  v.stopping = true;
+  setLiveRunning(v, true);
 }
 
 function openStream(v) {
@@ -711,9 +767,15 @@ function openStream(v) {
     // and the panel batches its own appends and scrolling by frame.
     handleLlmEvent(JSON.parse(e.data), feed);
   });
+  // The child's own account of its shutdown, which no run file carries: the
+  // phone being put back, and the skill written from everything the passes saw.
+  source.addEventListener("output", (e) => {
+    appendExitLine(feed, JSON.parse(e.data).line);
+  });
   source.addEventListener("state", (e) => {
     const st = JSON.parse(e.data);
     if (st.started_at) v.startedAt = st.started_at;
+    if (st.stopping) v.stopping = true;
     setLiveRunning(v, !!st.running);
     if (!st.running && st.returncode != null) {
       v.els.state.textContent = "exited (" + st.returncode + ")";
@@ -740,10 +802,15 @@ function openStream(v) {
 
 const live = makeLive("c-", "live", "feed");
 live.url = "/api/runs/stream";
-live.setRunning = (running) => {
+live.setRunning = (running, stopping) => {
   $("btn-start").disabled = running;
-  $("btn-stop").disabled = !running;
+  // One SIGINT is all it takes. A second lands in the shutdown -- outside the
+  // handler that catches the first -- and takes down the work it is doing there.
+  $("btn-stop").disabled = !running || stopping;
 };
+// The hint is about something in progress -- stopping, resuming -- and none of
+// it is still true once the run is over.
+live.onEnd = () => { $("run-hint").textContent = ""; };
 
 function setRunningUI(running) {
   setLiveRunning(live, running);
@@ -773,6 +840,7 @@ function runOptions() {
 function beginLive(v) {
   resetCounters(v);
   v.iteration = 1;
+  v.stopping = false;
   v.startedAt = Date.now() / 1000;
   v.feed.innerHTML = "";
   armPageTail();  // a new run is followed however the last one was left
@@ -781,6 +849,7 @@ function beginLive(v) {
   v.feed._skill = "";
   v.feed._notes = null;
   v.feed._notesCard = null;
+  v.feed._exitLog = null;   // cleared with the feed it hung off
   v.els.runid.textContent = "starting…";
   paintCounters(v);
   setLiveRunning(v, true);
@@ -820,9 +889,10 @@ async function resumeRun(id) {
 }
 
 $("btn-stop").addEventListener("click", async () => {
+  setStopping(live);
+  $("run-hint").textContent = "stopping — the agent restores the phone first";
   try {
     await api("/api/runs/stop", { method: "POST" });
-    $("run-hint").textContent = "stopping — the agent restores the phone first";
   } catch (err) {
     notice(err.message);
   }
@@ -837,12 +907,19 @@ async function refreshStatus() {
     parts.push(st.device_serial ? `device ${esc(st.device_serial)}` : `<span class="warn">no device serial</span>`);
     parts.push(st.model ? esc(st.model.split("/").pop()) : `<span class="warn">no model</span>`);
     parts.push(st.api_key_present ? `<span class="ok">api key</span>` : `<span class="warn">no api key</span>`);
-    if (st.run && st.run.running) parts.push(`<span class="ok">● running: ${esc(st.run.goal)}</span>`);
+    if (st.run && st.run.running) {
+      parts.push(st.run.stopping
+        ? `<span class="warn">● stopping the run</span>`
+        : `<span class="ok">● running: ${esc(st.run.goal)}</span>`);
+    }
     if (st.watch && st.watch.running) {
       // The mode is part of the status line, not just the tab: a watch outlives
       // every reload, and "is it sending?" should be answerable at a glance from
-      // any tab.
-      parts.push(st.watch.draft
+      // any tab. A watch on its way out is neither mode -- it is no longer
+      // replying to anything -- so it says that instead.
+      parts.push(st.watch.stopping
+        ? `<span class="warn">● stopping the watch — writing up what it learned</span>`
+        : st.watch.draft
         ? `<span class="ok">● watching (draft): ${esc(st.watch.goal)}</span>`
         : `<span class="warn">● watching LIVE: ${esc(st.watch.goal)}</span>`);
     }
@@ -852,13 +929,16 @@ async function refreshStatus() {
     if (st.run && st.run.running && !live.source) {
       resetCounters(live);
       live.startedAt = st.run.started_at || Date.now() / 1000;
+      live.stopping = !!st.run.stopping;
       setRunningUI(true);
       openStream(live);
     }
-    // And to a watch, which outlives a reload by days rather than minutes.
+    // And to a watch, which outlives a reload by days rather than minutes --
+    // including a reload during the minute it takes to stop one.
     if (st.watch && st.watch.running && !watchLive.source) {
       resetCounters(watchLive);
       watchLive.startedAt = st.watch.started_at || Date.now() / 1000;
+      watchLive.stopping = !!st.watch.stopping;
       $("watch-draft").checked = !!st.watch.draft;
       setLiveRunning(watchLive, true);
       openStream(watchLive);
@@ -879,15 +959,18 @@ async function refreshStatus() {
 const watchLive = makeLive("w-", "watch-live", "watch-feed");
 watchLive.url = "/api/watch/stream";
 watchLive.passLabel = "pass";
-watchLive.setRunning = (running) => {
+watchLive.setRunning = (running, stopping) => {
   $("btn-watch-start").disabled = running;
-  $("btn-watch-stop").disabled = !running;
+  // Not clickable twice. The second SIGINT arrives while the first is being
+  // acted on -- during the skill write-up, which is not inside the loop's
+  // interrupt handler -- and losing that is losing everything the watch learned.
+  $("btn-watch-stop").disabled = !running || stopping;
   // The policy is read once, at startup. Editing it under a running watch would
   // take effect at no predictable moment, so the server refuses and the form
   // says so before you type into it.
   $("watch-policy").readOnly = running;
   $("btn-policy-save").disabled = running;
-  paintWatchBanner(running);
+  paintWatchBanner(running, stopping);
 };
 // Every pass writes a reply or it does not; either way the ledger is what
 // changed, so refresh it when one ends rather than making the reader ask.
@@ -895,10 +978,11 @@ watchLive.onEvent = (ev) => {
   if (ev.kind === "reply_attempt" || ev.kind === "reply_confirmed"
       || ev.kind === "run_end") loadLedger().catch(() => {});
 };
+watchLive.onEnd = () => { $("watch-hint").textContent = ""; };
 
 let watchDefaults = {};
 
-function paintWatchBanner(running) {
+function paintWatchBanner(running, stopping) {
   const draft = $("watch-draft").checked;
   const el = $("watch-mode-banner");
   el.className = "banner " + (draft ? "ok" : "danger");
@@ -909,7 +993,12 @@ function paintWatchBanner(running) {
     : "<b>LIVE</b> — replies WILL be sent to real people from this device."
       + "<br><span class=\"small\">The harness will not answer the same message"
       + " twice, whatever the policy says.</span>";
-  if (running) el.innerHTML += "<br><span class=\"small\">watching…</span>";
+  if (stopping) {
+    el.innerHTML += "<br><span class=\"small\">stopping — no more replies will "
+      + "be sent; it is finishing up and writing what it learned.</span>";
+  } else if (running) {
+    el.innerHTML += "<br><span class=\"small\">watching…</span>";
+  }
 }
 
 function watchOptions() {
@@ -950,7 +1039,7 @@ async function loadWatch() {
   // the remembered one. With no active watch, the remembered goal stays.
   if (active.goal) $("watch-goal").value = active.goal;
   if (active.running) $("watch-draft").checked = !!active.draft;
-  paintWatchBanner(!!active.running);
+  paintWatchBanner(!!active.running, !!active.stopping);
   await loadPolicy();
   await loadLedger();
 }
@@ -1016,9 +1105,14 @@ $("watch-form").addEventListener("submit", async (e) => {
 });
 
 $("btn-watch-stop").addEventListener("click", async () => {
+  // Said before the request, not after it: a watch takes as long to stop as its
+  // shutdown takes, and the whole complaint about this button was that it looked
+  // inert until that was over.
+  setStopping(watchLive);
+  $("watch-hint").textContent =
+    "stopping — restoring the phone, then writing up what it learned";
   try {
     await api("/api/watch/stop", { method: "POST" });
-    $("watch-hint").textContent = "stopping…";
   } catch (err) { notice(err.message); }
 });
 
@@ -1607,9 +1701,9 @@ function clearLog(pre) {
    same files. */
 const genLive = makeLive("gc-", "gen-live", "gen-feed");
 genLive.jobId = 0;
-genLive.setRunning = (running) => {
+genLive.setRunning = (running, stopping) => {
   $("btn-gen").disabled = running;
-  $("btn-gen-stop").disabled = !running;
+  $("btn-gen-stop").disabled = !running || stopping;
 };
 genLive.onEnd = () => loadSkills().catch(() => {});
 genLive.onEvent = (ev) => {
@@ -1659,9 +1753,10 @@ function watchGeneration(jobId, { fresh = true } = {}) {
 }
 
 $("btn-gen-stop").addEventListener("click", async () => {
+  setStopping(genLive);
+  $("gen-status").textContent = "stopping — the tour restores the phone first";
   try {
     await api("/api/jobs/" + genLive.jobId + "/stop", { method: "POST" });
-    $("gen-status").textContent = "stopping — the tour restores the phone first";
   } catch (err) {
     notice(err.message);
   }
