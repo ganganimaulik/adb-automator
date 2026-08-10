@@ -243,6 +243,8 @@ def describe_action(action: Any) -> str:
     target = _target_key(data.get("target"))
     if target:
         bits.append(target)
+    if data.get("x") is not None and data.get("y") is not None:
+        bits.append(f"({data['x']:.2f},{data['y']:.2f})")
     for extra in ("key", "direction"):
         if data.get(extra):
             bits.append(str(data[extra]))
@@ -283,6 +285,9 @@ def compare(recorded: Dict[str, Any], replayed: Any) -> str:
         return "same_action"
     for extra in ("key", "direction"):
         if (recorded.get(extra) or "") != (fresh.get(extra) or ""):
+            return "same_action"
+    for extra in ("x", "y"):
+        if (recorded.get(extra) or 0) != (fresh.get(extra) or 0):
             return "same_action"
     return "match"
 

@@ -24,8 +24,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__, checkpoint, conversation, prompts, runlog, safety
-from .actions import (ActionError, AgentAction, append_history, execute,
-                      format_history_entry, synthesise_postcondition, verify)
+from .actions import (ActionError, AgentAction, Target, append_history,
+                      element_at_point, execute, format_history_entry,
+                      resolve_target, synthesise_postcondition, verify)
 from .config import Config
 from .device import Device, DeviceTimeout, DeviceLost
 from .fingerprint import crop_frac
@@ -1141,7 +1142,11 @@ class Agent:
             # prompt prefix from the provider's cache.
             situational = prompts.situational_notes(
                 scrolls=state.loops.total_scroll_count,
-                packages_seen=len(state.packages))
+                packages_seen=len(state.packages),
+                # tap_at is revealed only once ordinary targeting has failed
+                # somehow: a stall, or an action that did not work. On a
+                # healthy turn the model never hears the hatch exists.
+                struggle=stalled + state.consecutive_failures)
             # Placed ahead of the older hints on purpose: when the run has
             # stopped getting anywhere, that is the most important thing on the
             # turn, and it is the only block that names the actions the harness
@@ -1469,6 +1474,54 @@ class Agent:
             if (action.action in ("scroll", "swipe") and action.direction
                     and cfg.run.pager_sweep and not cfg.run.never_screenshot):
                 self._ensure_screenshot(screen)
+            # tap_at is the escape hatch, not a shortcut. When the list can
+            # name what was asked for -- the text matches a listed element, or
+            # the point lands on a button-sized one -- the tap is refused with
+            # the #N it should have used, before any locate call is paid for.
+            # A refusal is guidance, not a failure: like the reply gate, it is
+            # remembered and the turn continues, and it moves no counters.
+            if action.action == "tap_at":
+                listed = None
+                if action.x is not None and action.y is not None:
+                    listed = element_at_point(screen, action.x, action.y)
+                elif (action.text or "").strip():
+                    listed = resolve_target(Target(text=action.text.strip()),
+                                            screen)
+                if listed is not None:
+                    label = f' "{listed.best_text}"' if listed.best_text else ""
+                    state.last_failure = (
+                        f"tap_at refused: {label} is in the list as "
+                        f"#{listed.index} -- tap it by index. tap_at is only "
+                        f"for controls the list does not name.")
+                    state.remember(format_history_entry(
+                        state.step, action, screen=screen, grade="refused",
+                        reason=state.last_failure))
+                    continue
+            # A tap_at that names a control instead of a point is grounded here:
+            # the decider never saw pixels, so the vision model places the
+            # control on this turn's own frame -- the pixels the tree the model
+            # reasoned over was dumped with -- and the answer rides into execute
+            # as ordinary x/y. A miss (call failed, control not found) is a
+            # failed step, never a tap at a guess.
+            if (action.action == "tap_at" and self.llm is not None
+                    and (action.x is None or action.y is None)
+                    and (action.text or "").strip()
+                    and not cfg.run.never_screenshot):
+                where = self.llm.locate(self._ensure_screenshot(screen),
+                                        action.text.strip(), goal=state.goal,
+                                        step=state.step, recorder=rec,
+                                        on_event=self.on_event)
+                if where is None:
+                    state.last_failure = (
+                        f"could not locate {action.text.strip()!r} on the "
+                        f"screen; it may not be visible, or name it differently")
+                    state.consecutive_failures += 1
+                    state.remember(format_history_entry(
+                        state.step, action, screen=screen, grade="failed",
+                        reason=state.last_failure))
+                    self._maybe_give_up(state)
+                    continue
+                action.x, action.y = where
             try:
                 element = execute(self.dev, action, screen)
             except (ActionError, ValueError) as exc:

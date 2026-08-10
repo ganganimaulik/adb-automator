@@ -810,6 +810,8 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
                 label = "LLM judge"
             elif purpose == "analyze_image":
                 label = "LLM image analyzer"
+            elif purpose == "locate":
+                label = "LLM locator"
             else:
                 label = "LLM"
             out.say(out.cyan(f"        calling {label} ({model}{shot})..."))
@@ -900,6 +902,8 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
                 tag = "LLM judge responded"
             elif purpose == "analyze_image":
                 tag = "LLM image analyzer responded"
+            elif purpose == "locate":
+                tag = "LLM locator responded"
             else:
                 tag = "LLM responded"
             out.say(out.dim(f"        {tag} in {elapsed:.2f}s{tokens_info}"))

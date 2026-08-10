@@ -53,8 +53,7 @@ both, every time: `"target": {"index": 14, "key": "a3f1"}`.
 turn, so the same control can be #1 now and #4 next turn, and a #N from the \
 history usually points somewhere else by now. `k=` names the element itself, so \
 sending it is what lets the harness notice the list moved under you.
-- Never invent an index or a key that is not in the list, and never reply with \
-pixel coordinates.
+- Never invent an index or a key that is not in the list.
 - `@zone` is roughly where it sits: @top, @mid, @bottom-right, and @full for \
 something filling the frame. Three bands per axis -- read it as which end and \
 which side, never as a measurement. List order is NOT screen order: it follows \
@@ -450,11 +449,29 @@ switch.
 switching — the previous screen will be gone.
 - Track which app you are in, and what remains, in `progress`."""
 
-def situational_notes(*, scrolls: int = 0, packages_seen: int = 1) -> str:
+#: The coordinate escape hatch is deliberately NOT in THE ACTIONS: a tool whose
+#: whole value is being the last resort should not be advertised on turns where
+#: ordinary targeting is working. It is revealed here, once the run has actually
+#: struggled -- and the harness refuses it when a listed element would do, so
+#: seeing the block is not a licence to reach for it first.
+TAP_AT_ADVICE = """\
+TAP AT A POINT (element targeting is not working here, so this is now available):
+- `tap_at` presses a control the list does NOT name -- an image button, a \
+canvas, a map. If a #N fits what you want, tap that instead: a tap_at that \
+names or lands on a listed element is refused.
+- If a screenshot is attached, give `x` and `y` as fractions of the screen \
+from the top-left, 0.0 to 1.0.
+- If none is, name the control in `text` (e.g. "the red record button") and \
+it will be located on a fresh screenshot for you."""
+
+def situational_notes(*, scrolls: int = 0, packages_seen: int = 1,
+                      struggle: int = 0) -> str:
     """The advice that applies to *this* turn, and nothing else.
 
     Gated purely on what the run has *done*: the scrolling block once it has
-    scrolled, the app-switching block once it has crossed apps.
+    scrolled, the app-switching block once it has crossed apps, the tap_at
+    block once something has failed or the run has stopped getting anywhere
+    (`struggle` is the loop's stall and consecutive-failure counts, summed).
 
     Both gates used to also fire on keywords in the goal, to get the advice out
     one turn earlier than behaviour could. Guessing the situation from English
@@ -474,6 +491,8 @@ def situational_notes(*, scrolls: int = 0, packages_seen: int = 1) -> str:
         parts.append(SCROLLING_ADVICE)
     if packages_seen > 1:
         parts.append(MULTI_APP_ADVICE)
+    if struggle > 0:
+        parts.append(TAP_AT_ADVICE)
     return "\n\n".join(parts)
 
 
@@ -679,6 +698,32 @@ def image_analysis_user(goal: str = "", rendered: str = "") -> str:
     if rendered:
         parts.append(f"ACCESSIBILITY TREE (rendered text):\n{rendered}")
     parts.append("Analyse the screenshot and fill the four fields.")
+    return "\n\n".join(parts)
+
+
+#: The grounding half of a text-mode `tap_at`. The decider names a control the
+#: tree does not list; this call places it on the screenshot. "Not there" is a
+#: first-class answer because the alternative is a tap at a guessed point.
+LOCATE_SYSTEM = """\
+You are locating ONE control on an Android screenshot.
+
+You are told what the control is and what it is wanted for. Reply with a single \
+JSON object: {"x": float, "y": float} -- the centre of that control as \
+fractions of the image, 0.0 the left or top edge, 1.0 the right or bottom edge.
+
+- If the control is not visible, or you cannot tell which of several it is, \
+answer {"x": null, "y": null}. A wrong point taps the wrong thing, so "not \
+there" is a better answer than a guess.
+- The status bar and the navigation buttons belong to Android, not to the app. \
+They are never the control being asked for.
+"""
+
+
+def locate_user(description: str, goal: str = "") -> str:
+    parts = [f'Locate this control: "{description}".']
+    if goal:
+        parts.append(f"It is wanted for this goal: {goal}")
+    parts.append("Reply with its centre as described above.")
     return "\n\n".join(parts)
 
 

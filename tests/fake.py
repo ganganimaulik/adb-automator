@@ -283,6 +283,14 @@ class FakeLLM:
         #: The phone's date each decide turn was told, one per call. A goal
         #: bounded in time -- "today and yesterday" -- is unreadable without it.
         self.dates_seen: List[str] = []
+        #: What `locate` answers a text-mode tap_at with: (x, y) fractions, or
+        #: None for "not on screen". None by default, the same shape as
+        #: `goal_check_result`: a test that is not about grounding runs exactly
+        #: as it did, and one that is sets the point it wants tapped.
+        self.location: Optional[Tuple[float, float]] = None
+        self.locates = 0
+        #: The control descriptions each locate was asked to find, in order.
+        self.locates_seen: List[str] = []
         #: Tier 3 of the stall ladder. Counted apart from `calls` for the same
         #: reason the sweep's reads are: a test asserting how many reasoning
         #: turns a change costs must not have a rescue call folded into it.
@@ -327,6 +335,19 @@ class FakeLLM:
         self.ledger.record(Call(model=self.model_image, prompt_tokens=400,
                                 completion_tokens=30, purpose="read_item"))
         return f"reading of {label or 'an unlabelled item'}"
+
+    def locate(self, screenshot: bytes, description: str, *, goal: str = "",
+               step: int = 0, **kwargs) -> Optional[Tuple[float, float]]:
+        """Grounds a named control, as the real client does with the vision model.
+
+        Counted apart from `calls`: a locate is a vision read, not a reasoning
+        turn, the same distinction `analyze_image` keeps.
+        """
+        self.locates += 1
+        self.locates_seen.append(description)
+        self.ledger.record(Call(model=self.model_image, prompt_tokens=400,
+                                completion_tokens=20, purpose="locate"))
+        return self.location
 
     def decide(self, *, goal: str, rendered: str, history, width: int, height: int,
                package: str = "", today: str = "", screenshot: Optional[bytes] = None,

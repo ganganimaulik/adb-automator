@@ -770,3 +770,122 @@ def test_a_line_with_no_step_number_is_never_folded():
     history = ["some free-form note the loop wrote"]
     append_history(history, "another free-form note")
     assert len(history) == 2
+
+
+# ---------------------------------------------------------------------------
+# tap_at -- the coordinate escape hatch
+# ---------------------------------------------------------------------------
+
+def test_tap_at_requires_coordinates_or_a_control_name():
+    with pytest.raises(ValidationError):
+        act(action="tap_at")                    # neither
+    with pytest.raises(ValidationError):
+        act(action="tap_at", x=0.5)             # only one coordinate
+    a = act(action="tap_at", x=0.5, y=0.25)
+    assert (a.x, a.y) == (0.5, 0.25)
+    # Text mode: the control is named and the vision locate grounds it at act
+    # time -- the decider never saw pixels, so it cannot have meant fractions.
+    named = act(action="tap_at", text="the record button")
+    assert named.x is None and named.text == "the record button"
+
+
+def test_tap_at_coordinates_are_fractions_of_the_screen():
+    with pytest.raises(ValidationError):
+        act(action="tap_at", x=1.5, y=0.5)      # past the right edge
+    with pytest.raises(ValidationError):
+        act(action="tap_at", x=0.5, y=-0.1)     # above the top
+
+
+def test_tap_at_signature_is_quantised_so_a_retried_guess_still_matches():
+    """A blind tap retried a few pixels off is the same action to the loop
+    detector -- otherwise the ban list would never catch a blind-tap loop."""
+    a = act(action="tap_at", x=0.521, y=0.812)
+    b = act(action="tap_at", x=0.524, y=0.814)
+    c = act(action="tap_at", x=0.526, y=0.812)
+    assert a.signature() == b.signature()
+    assert a.signature() != c.signature()
+
+
+def test_tap_at_text_mode_signatures_key_on_the_control_name():
+    """Until the locate grounds it, the name is the identity -- so asking for
+    the same control twice reads as the repeat it is."""
+    a = act(action="tap_at", text="the Record   button")
+    b = act(action="tap_at", text="the record button")
+    c = act(action="tap_at", text="the stop button")
+    assert a.signature() == b.signature()
+    assert a.signature() != c.signature()
+
+
+def test_tap_at_execution_converts_fractions_to_clamped_pixels():
+    from tests.fake import FakeDevice
+    from adbagent.actions import execute
+
+    dev = FakeDevice()
+    screen = s(X.settings_screen())             # X.W x X.H = 1080 x 2340
+
+    execute(dev, act(action="tap_at", x=0.5, y=0.5), screen)
+    assert dev.taps[-1] == (540, 1170)
+
+    # The edges clamp into the screen -- and never to 0, which u2 would read
+    # as a fraction rather than a pixel (device.tap nudges it, but the harness
+    # should not rely on that).
+    execute(dev, act(action="tap_at", x=0.0, y=1.0), screen)
+    assert dev.taps[-1] == (1, X.H - 1)
+
+
+def test_an_ungrounded_tap_at_never_taps_a_guess():
+    """A text-mode tap_at reaches execute only when nothing grounded it; the
+    agent loop's vision locate answers before execute, so this is the guard
+    against a tap at (1,1)."""
+    from tests.fake import FakeDevice
+    from adbagent.actions import ActionError, execute
+
+    dev = FakeDevice()
+    with pytest.raises(ActionError):
+        execute(dev, act(action="tap_at", text="the record button"),
+                s(X.settings_screen()))
+    assert dev.taps == []
+
+
+def test_tap_at_needs_known_screen_dimensions():
+    from tests.fake import FakeDevice
+    from adbagent.actions import ActionError, execute
+
+    dev = FakeDevice()
+    # No nodes and no explicit size -> the parser's 0x0 fallback.
+    empty = attach(parse("<hierarchy rotation=\"0\" />"))
+    assert empty.width == 0 and empty.height == 0
+    with pytest.raises(ActionError):
+        execute(dev, act(action="tap_at", x=0.5, y=0.5), empty)
+
+
+def test_tap_at_that_changes_nothing_grades_no_change():
+    """The grade feeds the ban list, so the same dud blind tap is not retried."""
+    action = act(action="tap_at", x=0.5, y=0.5)
+    assert verify(action, BASE, BASE).grade == "no_change"
+
+    other = s(X.settings_screen(rows=3, title="Bluetooth",
+                                labels=["Pair new device", "Previously connected",
+                                        "Bluetooth settings"]))
+    assert verify(action, BASE, other).grade == "success"
+
+
+def test_element_at_point_finds_the_button_sized_control_under_a_point():
+    from adbagent.actions import element_at_point
+    # The centre of the first row of the scripted settings screen.
+    el = element_at_point(BASE, 0.5, 580 / X.H)
+    assert el is not None and el.best_text == "Option 1"
+
+
+def test_element_at_point_ignores_containers_too_big_to_be_the_target():
+    """A map or video surface IS listed, but what is wanted inside it is not
+    -- so landing on the surface alone is legitimate tap_at territory."""
+    from adbagent.actions import element_at_point
+    xml = X.dump(X.N("android.widget.FrameLayout", (0, 0, X.W, X.H),
+                     rid="content", children=[
+        X.N("android.view.View", (0, 0, X.W, 1900), rid="map", clickable=True),
+        X.N("android.widget.Button", (400, 400, 680, 520), text="Go",
+            rid="go", clickable=True)]))
+    screen = s(xml)
+    assert element_at_point(screen, 0.5, 460 / X.H).best_text == "Go"
+    assert element_at_point(screen, 0.5, 0.8) is None
