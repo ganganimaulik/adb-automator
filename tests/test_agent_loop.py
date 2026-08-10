@@ -87,6 +87,133 @@ def test_a_phone_that_will_not_give_its_date_is_not_guessed_for(cfg, mem):
 
 
 # ---------------------------------------------------------------------------
+# tap_at with a named control, grounded by the vision locate
+# ---------------------------------------------------------------------------
+
+def test_a_named_tap_at_is_grounded_by_the_vision_locate(cfg, mem):
+    """The decider names a control it has no pixels for; the locate places it.
+
+    Works in every model configuration because the decider never handles
+    coordinates itself: the point it taps is the one the vision model read off
+    this turn's own frame.
+    """
+    dev = fake.FakeDevice(cfg)
+    expected = []
+
+    def policy(screen, llm):
+        if dev.state == "wifi":
+            return AgentAction(observation="arrived", reasoning="goal reached",
+                               action="done", text="reached wifi")
+        wanted = next(e for e in screen.elements if e.best_text == "Wi-Fi")
+        # What a vision model would answer for the named control on this frame.
+        llm.location = (wanted.center[0] / screen.width,
+                        wanted.center[1] / screen.height)
+        expected.append(wanted.center)
+        # The name must NOT resolve to a listed element -- "Wi-Fi" itself is in
+        # the tree, and naming it would be refused with its #N.
+        return AgentAction(observation="the tree does not list it",
+                           reasoning="name it and have it located",
+                           action="tap_at", text="the Wi-Fi row icon")
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert dev.state == "wifi"
+    assert llm.locates == 1 and llm.locates_seen == ["the Wi-Fi row icon"]
+    # The tap that went out is the located point, within a pixel of the
+    # control's centre (fractions truncate, they do not round).
+    cx, cy = expected[0]
+    assert abs(dev.taps[0][0] - cx) <= 1 and abs(dev.taps[0][1] - cy) <= 1
+
+
+def test_a_tap_at_naming_a_listed_element_is_refused_with_its_index(cfg, mem):
+    """The escape hatch is not a shortcut: what the list can name, the list taps."""
+    dev = fake.FakeDevice(cfg)
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="refused", reasoning="moving on",
+                               action="done", text="taught the index")
+        tried.append(True)
+        return AgentAction(observation="Wi-Fi is right there",
+                           reasoning="lazy coordinate tap", action="tap_at",
+                           text="Wi-Fi")
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert llm.locates == 0             # refused before any locate was paid for
+    assert dev.taps == []
+    assert "tap_at refused" in (state.last_failure or "")
+    assert "#" in (state.last_failure or "")
+
+
+def test_a_tap_at_landing_on_a_listed_control_is_refused(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="refused", reasoning="moving on",
+                               action="done", text="taught the index")
+        tried.append(True)
+        # The centre of the "Wi-Fi" row, in fractions: (540, 580) on 1080x2340.
+        return AgentAction(observation="saw it on the screenshot",
+                           reasoning="lazy coordinate tap", action="tap_at",
+                           x=0.5, y=0.248)
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert dev.taps == []
+    assert "tap_at refused" in (state.last_failure or "")
+
+
+def test_a_tap_at_on_bare_canvas_is_not_refused(cfg, mem):
+    """The guard refuses listed controls, not coordinates: a point that hits
+    nothing button-sized in the list goes straight through."""
+    dev = fake.FakeDevice(cfg)
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="done probing", reasoning="finished",
+                               action="done", text="probed")
+        tried.append(True)
+        # (540, 468): below the tabs, above the list -- nothing interactive.
+        return AgentAction(observation="a canvas with no elements",
+                           reasoning="press where the control is drawn",
+                           action="tap_at", x=0.5, y=0.2)
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert dev.taps == [(540, 468)]
+
+
+def test_a_locate_miss_is_a_failed_step_never_a_tapped_guess(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="moving on", reasoning="giving up",
+                               action="done", text="could not press it")
+        tried.append(True)
+        return AgentAction(observation="no such control in the list",
+                           reasoning="name it anyway", action="tap_at",
+                           text="the record button")
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert llm.locates == 1            # the locate was asked...
+    assert dev.taps == []              # ...and its miss was not tapped
+    assert "could not locate" in (state.last_failure or "")
+
+
+# ---------------------------------------------------------------------------
 # Completion
 # ---------------------------------------------------------------------------
 

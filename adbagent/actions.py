@@ -33,7 +33,7 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle only matters for typing
 log = logging.getLogger("adbagent.actions")
 
 ActionName = Literal[
-    "tap", "long_press", "input_text", "press_key", "scroll", "swipe",
+    "tap", "tap_at", "long_press", "input_text", "press_key", "scroll", "swipe",
     "open_app", "list_apps", "get_clipboard", "set_clipboard", "wait", "sleep", "ask_user", "done", "fail",
 ]
 
@@ -49,7 +49,7 @@ PostKind = Literal["screen_changed", "element_state", "text_present",
 
 TERMINAL_ACTIONS = frozenset({"done", "fail", "ask_user"})
 #: Actions whose whole purpose is to move to a different screen.
-NAVIGATIONAL = frozenset({"tap", "long_press", "press_key", "open_app"})
+NAVIGATIONAL = frozenset({"tap", "tap_at", "long_press", "press_key", "open_app"})
 
 
 class Target(BaseModel):
@@ -142,11 +142,22 @@ class AgentAction(BaseModel):
     action: ActionName
     target: Optional[Target] = Field(
         None, description="For tap, long_press, input_text and element scrolls.")
+    x: Optional[float] = Field(
+        None, description="For tap_at: horizontal position as a fraction of "
+                          "screen width, 0.0 (left edge) to 1.0 (right edge). "
+                          "Omit -- and name the control in `text` instead -- "
+                          "when no screenshot is attached.",
+        ge=0, le=1)
+    y: Optional[float] = Field(
+        None, description="For tap_at: vertical position as a fraction of "
+                          "screen height, 0.0 (top edge) to 1.0 (bottom edge).",
+        ge=0, le=1)
     text: Optional[str] = Field(
         None,
         description="input_text: what to type. open_app: package name or app search query. "
                     "list_apps: optional package name or keyword filter. "
                     "set_clipboard: text to put in clipboard. "
+                    "tap_at: the control to locate, when x and y are omitted. "
                     "ask_user: the question. done/fail: a one-line summary.")
     clear: Optional[bool] = Field(
         None, description="For input_text: clear field before typing (default True). Set False to append.")
@@ -202,6 +213,10 @@ class AgentAction(BaseModel):
         need_target = {"tap", "long_press", "input_text"}
         if self.action in need_target and self.target is None:
             raise ValueError(f"{self.action} requires a target")
+        if self.action == "tap_at" and (self.x is None or self.y is None) \
+                and not (self.text or "").strip():
+            raise ValueError("tap_at requires x and y, or the control's name "
+                             "in text")
         if self.action == "input_text" and self.text is None:
             raise ValueError("input_text requires text")
         if self.action == "press_key" and self.key is None:
@@ -231,6 +246,15 @@ class AgentAction(BaseModel):
         parts = [self.action]
         if self.target is not None:
             parts.append(self.target.identity())
+        if self.action == "tap_at":
+            if self.x is not None and self.y is not None:
+                # Quantised to a ~1% grid: a blind tap retried a few pixels off
+                # is the same action for loop-detection purposes.
+                parts.append(f"{self.x:.2f},{self.y:.2f}")
+            elif self.text:
+                # A named control is grounded by the vision locate at act time;
+                # until then its name is the identity.
+                parts.append(" ".join(self.text.lower().split()))
         for extra in (self.key, self.direction):
             if extra:
                 parts.append(str(extra))
@@ -240,9 +264,12 @@ class AgentAction(BaseModel):
         bits = [self.action]
         if self.target is not None:
             bits.append(describe_target(self.target, element))
+        if self.action == "tap_at" and self.x is not None and self.y is not None:
+            bits.append(f"({self.x:.2f},{self.y:.2f})")
         if self.action == "input_text" and self.text is not None:
             bits.append(f"{self.text!r}")
-        elif self.action in ("open_app", "list_apps", "done", "fail", "ask_user") and self.text:
+        elif self.action in ("open_app", "list_apps", "done", "fail", "ask_user",
+                             "tap_at") and self.text:
             bits.append(self.text)
         if self.key:
             bits.append(self.key)
@@ -509,6 +536,37 @@ def resolve_target(target: Target, screen: Screen) -> Optional[Element]:
     return None
 
 
+#: A point that lands on a listed control no bigger than this (as a fraction of
+#: the screen) is a tap an element target would have done better, and `tap_at`
+#: is refused for it. Bigger containers -- a map, a video surface, a scroll
+#: region -- are legitimate tap_at territory: the thing wanted inside them has
+#: no element of its own.
+_POINT_GUARD_MAX_AREA = 0.25
+
+
+def element_at_point(screen: Screen, x: float, y: float) -> Optional[Element]:
+    """The listed control under a fractional point, when there is a small one.
+
+    The point half of the tap_at refusal guard (the text half is
+    `resolve_target`): the agent loop refuses a tap_at that lands on a
+    button-sized listed element, with the #N it should have used. Returns None
+    when the point hits nothing interactive, or only a container too big to be
+    the thing meant.
+    """
+    if screen.width <= 0 or screen.height <= 0:
+        return None
+    px, py = x * screen.width, y * screen.height
+    hits = [e for e in screen.elements if e.interactive
+            and e.bounds[0] <= px <= e.bounds[2]
+            and e.bounds[1] <= py <= e.bounds[3]]
+    if not hits:
+        return None
+    innermost = min(hits, key=lambda e: e.area)
+    if innermost.area > screen.width * screen.height * _POINT_GUARD_MAX_AREA:
+        return None
+    return innermost
+
+
 class ActionError(RuntimeError):
     """The action could not be carried out on this screen."""
 
@@ -528,6 +586,17 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
     if action.action == "tap":
         assert element is not None
         dev.tap(*element.center)
+    elif action.action == "tap_at":
+        if action.x is None or action.y is None:
+            # A text-mode tap_at reaches here only when nothing grounded it --
+            # the agent loop's vision locate answers before execute.
+            raise ActionError("tap_at has no point: the control was never located")
+        if screen.width <= 0 or screen.height <= 0:
+            raise ActionError("tap_at needs the screen dimensions, which are "
+                              "unknown for this screen")
+        px = min(max(1, int(action.x * screen.width)), screen.width - 1)
+        py = min(max(1, int(action.y * screen.height)), screen.height - 1)
+        dev.tap(px, py)
     elif action.action == "long_press":
         assert element is not None
         dev.long_press(*element.center)

@@ -1340,6 +1340,9 @@ def test_the_system_prompt_no_longer_carries_the_situational_blocks():
     # buys: `runs/963a4f4ae96c` spent 17 decide turns walking a recency-ordered
     # list past the window its goal asked for, which is nearer 90,000 tokens.
     # Anything wanting the next 500 should have a comparison like that one.
+    # `tap_at` cost 300 characters here until it moved to the situational
+    # notes: a last resort should be revealed by failure, not advertised on
+    # every healthy turn.
     assert len(prompts.SYSTEM) < 7600
 
 
@@ -1356,8 +1359,20 @@ def test_scrolling_advice_arrives_once_scrolling_starts():
 
 def test_app_switching_advice_arrives_once_the_run_crosses_apps():
     from adbagent.prompts import situational_notes
-    assert "SWITCHING APPS" not in situational_notes(packages_seen=1)
+    assert "SWITCHING APPS" not in situational_notes()
     assert "SWITCHING APPS" in situational_notes(packages_seen=2)
+
+
+def test_tap_at_advice_arrives_only_once_the_run_has_struggled():
+    from adbagent.prompts import situational_notes
+    assert "tap_at" not in situational_notes()
+    assert "tap_at" in situational_notes(struggle=1)
+
+
+def test_the_system_prompt_does_not_advertise_the_escape_hatch():
+    """tap_at is the last resort; naming it on a healthy turn invites it."""
+    from adbagent import prompts
+    assert "tap_at" not in prompts.SYSTEM
 
 
 def test_the_blocks_stack_when_they_all_apply():

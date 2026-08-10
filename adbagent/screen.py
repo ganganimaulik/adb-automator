@@ -556,9 +556,10 @@ def zone(el: Element, width: int, height: int) -> str:
     is to answer "which end of the screen" and "which side", which is what the
     questions actually turn on, and a finer grid would cost tokens on every
     element of every turn to answer questions nobody asks. It is also why this
-    reports a zone and not the bounds -- the model is told it can neither see nor
-    set pixels, and handing it four numbers per element invites exactly the
-    coordinate reasoning that rule exists to prevent.
+    reports a zone and not the bounds -- routine taps name an element, and
+    handing the model four numbers per element would invite coordinate reasoning
+    on every tap, when coordinates are the deliberate exception (`tap_at`), not
+    the rule.
 
     An element covering nearly the whole frame gets "full" instead: its centre is
     the middle of the screen, but saying "mid" of a scroller that spans the view

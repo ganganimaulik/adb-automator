@@ -700,6 +700,26 @@ class ScreenAnalysis(BaseModel):
         return "\n".join(lines)
 
 
+class Location(BaseModel):
+    """Where on a screenshot one control sits, as fractions of the frame.
+
+    Both null means "not visible". The prompt makes that a first-class answer
+    because the alternative is a tap at a guessed point -- see
+    :data:`prompts.LOCATE_SYSTEM`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    x: Optional[float] = Field(
+        None, description="Horizontal centre of the control, 0.0 (left edge) "
+                          "to 1.0 (right edge). Null when it is not visible.",
+        ge=0, le=1)
+    y: Optional[float] = Field(
+        None, description="Vertical centre of the control, 0.0 (top edge) to "
+                          "1.0 (bottom edge). Null when it is not visible.",
+        ge=0, le=1)
+
+
 class LLMClient:
     """OpenAI-protocol client, pointed at whichever provider is configured."""
 
@@ -1176,6 +1196,65 @@ class LLMClient:
                             max_tokens=self.cfg.llm.image_max_tokens(),
                             purpose="read_item", **kw)
         return " ".join(raw.split())
+
+    def locate(self, screenshot: bytes, description: str, *, goal: str = "",
+               step: int = 0, recorder: Optional[Any] = None,
+               on_event: Optional[Callable[..., None]] = None
+               ) -> Optional[Tuple[float, float]]:
+        """The (x, y) fractions of the control `description` names, or None.
+
+        The grounding half of a text-mode `tap_at`: the decider names a control
+        the tree does not list, the vision model places it on the screenshot.
+        None when the call fails or the model says the control is not there --
+        either way the caller reports a miss rather than tapping a guess.
+        """
+        from . import prompts
+
+        messages = [
+            {"role": "system", "content": prompts.LOCATE_SYSTEM},
+            {"role": "user", "content": [
+                text_part(prompts.locate_user(description, goal=goal)),
+                image_part(screenshot),
+            ]},
+        ]
+        shot = ""
+        if recorder is not None:
+            recorder.dump_messages(step, messages, purpose="locate")
+            if hasattr(recorder, "screenshot"):
+                # Kept on disk so the UI can show what was submitted beside what
+                # came back, as with `analyze_image`.
+                shot = recorder.screenshot(step, screenshot, "locate")
+        log.info("locating %r (%d bytes%s) with image model (%s)",
+                 description, len(screenshot), f", kept as {shot}" if shot else "",
+                 self.model_image)
+        if on_event:
+            on_event("llm_start", step=step, purpose="locate",
+                     model=self.model_image, screenshot=True, shot=shot)
+        t0 = time.monotonic()
+        kw = {}
+        if on_event is not None:
+            kw["on_event"] = on_event
+        try:
+            where = self.structured(messages, Location, model=self.model_image,
+                                    max_tokens=self.cfg.llm.image_max_tokens(),
+                                    purpose="locate", **kw)
+        except LLMError as exc:
+            # As with `analyze_image`: an aid that did not come back is not worth
+            # failing the step over, but the caller has to know it never happened.
+            log.warning("locate %r produced no usable answer: %s",
+                        description, exc)
+            if on_event:
+                on_event("vision_unavailable", step=step,
+                         model=self.model_image, error=str(exc))
+            return None
+        if on_event:
+            on_event("llm_end", step=step, purpose="locate",
+                     elapsed=time.monotonic() - t0,
+                     call=self.ledger.calls[-1] if self.ledger.calls else None)
+        if where.x is None or where.y is None:
+            log.info("locate %r: not on screen", description)
+            return None
+        return (where.x, where.y)
 
     def decide(self, *, goal: str, rendered: str, history: Sequence[str],
                width: int, height: int, package: str = "", today: str = "",
