@@ -328,6 +328,12 @@ navigate. And it hands back at either end of the set, on a full ledger, on a
 hidden caption, on a dialog, on an app switch, or after `run.pager_sweep_max`
 items.
 
+The per-item read is the model's choice, not a fixed cost: setting
+`read_each=false` on a scroll or swipe keeps the mechanical repeat but skips
+analysing each screen — for paging through a long feed to reach something, when
+the in-between content does not matter. The pixels still decide whether the
+content moved, so the repeat stops at the end of the content either way.
+
 ## Collected data
 
 For goals that gather information, the model sends each fact as a `{key, value}`

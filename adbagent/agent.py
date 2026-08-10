@@ -1913,6 +1913,11 @@ class Agent:
         read = 0
         reason = ""
         package = screen.package
+        # The model's choice about whether each screen the repeat lands on is
+        # worth a vision read. `None` is the default: read. The repeat itself
+        # is unaffected either way -- the pixels still decide whether the
+        # content moved, which is what keeps the sweep honest.
+        read_each = action.read_each is not False
         state.sweep.start(gesture_name)
 
         while True:
@@ -1946,7 +1951,8 @@ class Agent:
             reading: Optional[Prefetch] = None
             shot_name = ""
             ledger_mark = self.llm.ledger.mark() if self.llm else 0
-            if self.llm is not None and not cfg.run.never_screenshot:
+            if (read_each and self.llm is not None
+                    and not cfg.run.never_screenshot):
                 shot = self._ensure_screenshot(screen)
                 # Kept here rather than inside `read_item`: the read runs on
                 # another thread, and the name has to be in hand on this one to
