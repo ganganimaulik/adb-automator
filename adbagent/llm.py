@@ -701,23 +701,74 @@ class ScreenAnalysis(BaseModel):
 
 
 class Location(BaseModel):
-    """Where on a screenshot one control sits, as fractions of the frame.
+    """Where on a screenshot one control sits.
 
     Both null means "not visible". The prompt makes that a first-class answer
     because the alternative is a tap at a guessed point -- see
     :data:`prompts.LOCATE_SYSTEM`.
+
+    The numbers are deliberately unbounded. The prompt asks for fractions of
+    the frame, but grounding models have trained-in coordinate spaces a prompt
+    does not always override -- pixels of the image they were shown (Qwen-VL,
+    GLM-V), a 0..1000 grid (Gemini-style). A schema ``maximum`` does not make
+    such a model comply: the constrained decoder just deforms the answer into
+    range, and 540 becomes 1.0 or 0.54 with no error anywhere -- a tap that
+    lands somewhere else. What arrives here is whatever the model really said;
+    `point_fractions` brings it into fractions against the frame's real
+    dimensions, and what cannot be placed is a miss, never a clamped guess.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     x: Optional[float] = Field(
-        None, description="Horizontal centre of the control, 0.0 (left edge) "
-                          "to 1.0 (right edge). Null when it is not visible.",
-        ge=0, le=1)
+        None, description="Horizontal centre of the control: a fraction, 0.0 "
+                          "(left edge) to 1.0 (right edge), or in absolute "
+                          "pixels of the image. Null when it is not visible.")
     y: Optional[float] = Field(
-        None, description="Vertical centre of the control, 0.0 (top edge) to "
-                          "1.0 (bottom edge). Null when it is not visible.",
-        ge=0, le=1)
+        None, description="Vertical centre of the control: a fraction, 0.0 "
+                          "(top edge) to 1.0 (bottom edge), or in absolute "
+                          "pixels of the image. Null when it is not visible.")
+
+
+def _image_size(image: bytes) -> Tuple[int, int]:
+    """The (width, height) of a captured frame, (0, 0) when unreadable.
+
+    Only the size is wanted, so a decode failure is not an error worth raising
+    into a locate: fractions still normalise without it.
+    """
+    try:
+        import io
+
+        from PIL import Image
+        with Image.open(io.BytesIO(image)) as img:
+            return img.size
+    except Exception:  # a frame we cannot size can still carry fraction answers
+        return (0, 0)
+
+
+def point_fractions(x: Optional[float], y: Optional[float],
+                    width: int, height: int) -> Optional[Tuple[float, float]]:
+    """A located point as fractions of the frame, whatever space it came in.
+
+    The locate prompt asks for 0..1 fractions, but a grounding model answers
+    in the space it was trained on when the two disagree: absolute pixels of
+    the image it was shown (``width`` x ``height`` -- the downscaled capture,
+    not the device's), or a 0..1000 grid. All three land here, and the checks
+    run most-specific first: a point that fits the frame's pixel dimensions is
+    treated as pixels, because overrunning the asked-for 0..1 range at all is
+    the signature of a pixel-trained model, and the supported providers'
+    vision models that do this are pixel-native. What fits nothing is None --
+    a miss the caller reports, not a point it taps.
+    """
+    if x is None or y is None:
+        return None
+    if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+        return (x, y)
+    if width > 0 and height > 0 and 0 <= x <= width and 0 <= y <= height:
+        return (x / width, y / height)
+    if 0 <= x <= 1000 and 0 <= y <= 1000:
+        return (x / 1000.0, y / 1000.0)
+    return None
 
 
 class LLMClient:
@@ -1210,10 +1261,15 @@ class LLMClient:
         """
         from . import prompts
 
+        # The dimensions of the exact frame the model is shown -- the downscaled
+        # capture, not the device's -- so the prompt can state them and a
+        # pixel-space answer can be brought back to fractions.
+        width, height = _image_size(screenshot)
         messages = [
             {"role": "system", "content": prompts.LOCATE_SYSTEM},
             {"role": "user", "content": [
-                text_part(prompts.locate_user(description, goal=goal)),
+                text_part(prompts.locate_user(description, goal=goal,
+                                              width=width, height=height)),
                 image_part(screenshot),
             ]},
         ]
@@ -1254,7 +1310,20 @@ class LLMClient:
         if where.x is None or where.y is None:
             log.info("locate %r: not on screen", description)
             return None
-        return (where.x, where.y)
+        point = point_fractions(where.x, where.y, width, height)
+        if point is None:
+            # A point in no known space is the model misplacing the control,
+            # not placing it -- the same "never a tapped guess" rule as a
+            # failed call applies.
+            log.warning("locate %r: (%s, %s) fits no coordinate space for a "
+                        "%dx%d frame; treating as a miss",
+                        description, where.x, where.y, width, height)
+            return None
+        if point != (where.x, where.y):
+            log.info("locate %r: (%s, %s) read as (%.3f, %.3f) of the %dx%d "
+                     "frame", description, where.x, where.y, point[0], point[1],
+                     width, height)
+        return point
 
     def decide(self, *, goal: str, rendered: str, history: Sequence[str],
                width: int, height: int, package: str = "", today: str = "",

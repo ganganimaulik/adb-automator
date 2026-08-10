@@ -707,25 +707,40 @@ def image_analysis_user(goal: str = "", rendered: str = "") -> str:
 #: The grounding half of a text-mode `tap_at`. The decider names a control the
 #: tree does not list; this call places it on the screenshot. "Not there" is a
 #: first-class answer because the alternative is a tap at a guessed point.
+#:
+#: Fractions are what the caller uses, but the answer is accepted in the
+#: model's native grounding space too -- pixels of the image, a 0..1000 grid --
+#: because a schema range cannot make a trained-in space go away: the
+#: constrained decoder would deform the point into range instead, and the tap
+#: would land somewhere else with no error raised. The client converts (see
+#: `llm.point_fractions`), so the one rule worth stating is: never force a
+#: point to fit.
 LOCATE_SYSTEM = """\
 You are locating ONE control on an Android screenshot.
 
-You are told what the control is and what it is wanted for. Reply with a single \
-JSON object: {"x": float, "y": float} -- the centre of that control as \
-fractions of the image, 0.0 the left or top edge, 1.0 the right or bottom edge.
+You are told what the control is and what it is wanted for, and the image's \
+size in pixels. Reply with a single JSON object: {"x": float, "y": float} -- \
+the centre of that control as fractions of the image, 0.0 the left or top \
+edge, 1.0 the right or bottom edge.
 
 - If the control is not visible, or you cannot tell which of several it is, \
 answer {"x": null, "y": null}. A wrong point taps the wrong thing, so "not \
 there" is a better answer than a guess.
 - The status bar and the navigation buttons belong to Android, not to the app. \
 They are never the control being asked for.
+- Fractions are preferred. If you ground in absolute pixels of the image, give \
+those instead -- they are converted -- but never clamp or rescale a point to \
+force it into a range, and use one space for both numbers.
 """
 
 
-def locate_user(description: str, goal: str = "") -> str:
+def locate_user(description: str, goal: str = "",
+                width: int = 0, height: int = 0) -> str:
     parts = [f'Locate this control: "{description}".']
     if goal:
         parts.append(f"It is wanted for this goal: {goal}")
+    if width > 0 and height > 0:
+        parts.append(f"The image is {width}x{height} pixels.")
     parts.append("Reply with its centre as described above.")
     return "\n\n".join(parts)
 
