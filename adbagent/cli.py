@@ -76,12 +76,18 @@ class Out:
 
     def write(self, text: str = "") -> None:
         if not self.quiet:
-            sys.stdout.write(text)
-            sys.stdout.flush()
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except OSError:
+                pass
 
     def say(self, text: str = "") -> None:
         if not self.quiet:
-            print(text)
+            try:
+                print(text)
+            except OSError:
+                pass
 
     def ok(self, text: str) -> None:
         self.say(f"  {self.green('OK')}    {text}")
