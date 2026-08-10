@@ -130,6 +130,22 @@ def album_walker():
     return policy
 
 
+def unread_album_walker():
+    """The same walk, opting out of the per-item read with `read_each=False`.
+
+    The model's business here is only getting to the far end of the album --
+    what is in between does not matter, so it declines the per-screen analysis
+    while keeping the mechanical repeat.
+    """
+    def policy(screen: Screen, llm: fake.FakeLLM) -> AgentAction:
+        action = album_walker()(screen, llm)
+        if action.action == "swipe":
+            action = action.model_copy(update={"read_each": False})
+        return action
+
+    return policy
+
+
 @pytest.fixture
 def cfg(tmp_path):
     c = Config()
@@ -274,6 +290,33 @@ def test_sweeping_off_restores_a_turn_per_photo(cfg, mem):
     assert outcome == "success"
     assert llm.reads_requested == []
     assert decides(llm) >= len(STAMPS)
+
+
+def test_the_model_can_sweep_without_the_per_item_read(cfg, mem):
+    """`read_each=False` skips the vision read, not the repeat: the album is
+    still walked to the end in a handful of decisions, and no frame is read
+    or kept for it."""
+    from pathlib import Path
+
+    dev = AlbumDevice(cfg, chrome_fades_after=999)
+    llm = fake.FakeLLM(dev, unread_album_walker())
+    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert outcome == "success"
+    assert dev.index == len(STAMPS) - 1, "the album was not walked to the end"
+    # The repeat still happened in code, so the reasoning bill stays small.
+    assert decides(llm) <= 4, f"{decides(llm)} decide calls"
+    # But nothing was read: no vision calls, no readings, no frames kept.
+    assert llm.reads_requested == []
+    assert llm.item_frames_seen == []
+    events = _events(cfg, state.run_id)
+    assert not [e for e in events if e["kind"] == "item_reading"]
+    sweeps = [e for e in events if e["kind"] == "sweep"]
+    assert sweeps, "the gesture was never repeated"
+    assert all(e["read"] == 0 for e in sweeps), sweeps
+    assert any("stopped changing" in e["reason"] for e in sweeps), sweeps
+    assert not list((Path(cfg.run.artifacts_dir) / state.run_id).glob(
+        "*read_item*"))
 
 
 def test_a_sweep_only_ever_swipes(cfg, mem):

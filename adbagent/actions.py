@@ -172,6 +172,11 @@ class AgentAction(BaseModel):
     base_scale: Optional[float] = Field(
         None, description="For scroll: base drag scale per step (default 0.6, range 0.1 to 1.0; use 0.8 for larger page coverage per swipe).",
         ge=0.1, le=1.0)
+    read_each: Optional[bool] = Field(
+        None, description="For scroll/swipe: when the harness repeats this gesture for you, whether to "
+                          "analyse each new screen with the vision model (default true). Set false to keep "
+                          "paging without reading the screens in between -- e.g. skipping through a long "
+                          "feed to reach something, when the in-between content does not matter.")
     duration: Optional[float] = Field(
         None, description="For swipe/scroll/wait/sleep: duration in seconds (e.g. 0.15 for fast flick, 0.3 for scroll, 1.0 for wait/sleep).",
         ge=0.05, le=30.0)
@@ -278,6 +283,8 @@ class AgentAction(BaseModel):
             bits.append(f"amount={self.scroll_amount}")
             if self.base_scale is not None:
                 bits.append(f"base_scale={self.base_scale}")
+            if self.read_each is False:
+                bits.append("read_each=false")
         return " ".join(bits)
 
 

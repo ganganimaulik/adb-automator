@@ -1343,7 +1343,11 @@ def test_the_system_prompt_no_longer_carries_the_situational_blocks():
     # `tap_at` cost 300 characters here until it moved to the situational
     # notes: a last resort should be revealed by failure, not advertised on
     # every healthy turn.
-    assert len(prompts.SYSTEM) < 7600
+    # 7,735 with the `read_each` rule -- 247 characters, about 60 tokens, telling
+    # the model it can sweep without the per-item vision read. One 12-item
+    # sweep's reads are 12 image calls; skipping them when the in-between
+    # content does not matter saves that whole bill.
+    assert len(prompts.SYSTEM) < 7800
 
 
 def test_an_ordinary_turn_gets_no_situational_advice():
