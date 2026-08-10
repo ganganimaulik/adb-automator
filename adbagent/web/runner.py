@@ -183,11 +183,17 @@ class ChildProcess:
             proc = self._proc
         if proc is None or proc.poll() is not None:
             return False
-        proc.send_signal(signal.SIGINT)
+        try:
+            proc.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            return True
         try:
             proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
         return True
 
     def wait_for_run_dir(self, timeout_s: float = 60.0) -> Optional[Path]:
