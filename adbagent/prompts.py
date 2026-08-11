@@ -909,3 +909,20 @@ Error: {error}
 
 Reply again with ONLY the corrected JSON object. No explanation, no fences."""
 
+
+#: For a reply that parsed but said nothing. Naming the schema here would be a
+#: lie the model can act on -- it fixes JSON that was never broken and sends
+#: back the same empty object. So the complaint is about the content, and the
+#: instruction is the one that actually applies: whatever you worked out while
+#: thinking belongs in the fields, not in the thinking.
+REPAIR_UNUSABLE = """\
+Your previous reply was well-formed JSON but unusable.
+
+Problem: {error}
+
+Whatever you worked out while thinking has to appear in the JSON fields -- the
+thinking itself is discarded and never reaches the reader. Write the values you
+settled on into the object.
+
+Reply again with ONLY the JSON object. No explanation, no fences."""
+
