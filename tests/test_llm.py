@@ -1454,6 +1454,117 @@ def test_a_vision_model_that_cannot_hold_the_schema_does_not_fail_the_step(monke
 
 
 # ---------------------------------------------------------------------------
+# Frames with nothing on them
+# ---------------------------------------------------------------------------
+
+
+def _jpeg(content: str = "none") -> bytes:
+    """A 900x1600 frame with a status-bar clock, plus `content`.
+
+    "none" is the white flash after a send. "control" is the case the flatness
+    test must NOT call blank: one low-contrast pill on an otherwise empty screen.
+    "list" is an ordinary populated screen.
+    """
+    import io
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (900, 1600), "white")
+    pen = ImageDraw.Draw(img)
+    pen.text((30, 24), "5:52", fill=(20, 20, 20))          # the clock, always
+    if content == "control":
+        pen.rectangle((250, 700, 650, 800), fill=(232, 232, 232))
+        pen.text((300, 740), "Send Priority Like", fill=(90, 90, 90))
+    elif content == "list":
+        for y in range(200, 1500, 160):
+            pen.rectangle((40, y, 860, y + 90), fill=(40, 40, 40))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def test_a_frame_holding_only_the_status_bar_reads_as_featureless():
+    """The clock is why the measure is a deviation and not a min-to-max range:
+    it is real dark pixels, 46 levels of range, on an otherwise blank field."""
+    from adbagent.fingerprint import frame_is_featureless
+
+    assert frame_is_featureless(_jpeg("none"))
+    assert not frame_is_featureless(_jpeg("list"))
+
+
+def test_one_low_contrast_control_is_not_a_blank_frame():
+    """The case that set the threshold. A percentile band ignores small features
+    by design and scores a lone pill exactly as it scores an empty screen; the
+    deviation reads 3.7 against 1.1, so the line goes between them."""
+    from adbagent.fingerprint import frame_is_featureless
+
+    assert not frame_is_featureless(_jpeg("control"))
+
+
+def test_an_undecodable_frame_is_never_called_featureless():
+    """Not knowing is a reason to let the model look, not a reason to skip it."""
+    from adbagent.fingerprint import frame_is_featureless
+
+    assert not frame_is_featureless(b"")
+    assert not frame_is_featureless(b"not a jpeg at all")
+
+
+def test_a_blank_frame_is_described_without_a_model_call(monkeypatch):
+    """Three of the twelve vision calls in ``runs/a7ef4e0e45e9`` were the white
+    flash after a send: ~10s and ~1,700 output tokens each to report "blank
+    white screen; app content not rendered"."""
+    from adbagent.llm import FEATURELESS_NOTE
+
+    client = _client(monkeypatch)
+    calls = {"n": 0}
+
+    def structured(*a, **kw):
+        calls["n"] += 1
+        raise AssertionError("the model should not have been asked")
+
+    monkeypatch.setattr(client, "structured", structured)
+    analysis = client.analyze_image(_jpeg("none"))
+    assert calls["n"] == 0
+    assert FEATURELESS_NOTE in analysis.render()
+    # A frame that was read and found empty, not a call that failed: the
+    # difference is what tells `needs_screenshot` whether to buy another look.
+    assert not analysis.unavailable
+
+
+def test_a_populated_frame_still_goes_to_the_vision_model(monkeypatch):
+    from adbagent.llm import ScreenAnalysis
+
+    client = _client(monkeypatch)
+    seen = {"n": 0}
+
+    def structured(messages, model_cls, **kw):
+        seen["n"] += 1
+        return ScreenAnalysis(notable="two photos of a profile")
+
+    monkeypatch.setattr(client, "structured", structured)
+    assert "two photos" in client.analyze_image(_jpeg("list")).render()
+    assert seen["n"] == 1
+
+
+def test_a_locate_is_never_skipped_for_a_flat_frame(monkeypatch):
+    """A locate runs *because* the control is not in the element list, so a false
+    "blank" refuses the only route left to it -- and the flatness test cannot
+    tell an empty screen from one holding a single low-contrast control, which is
+    the shape a locate is asked about. So it does not get the short-circuit."""
+    from adbagent.llm import Location
+
+    client = _client(monkeypatch)
+    seen = {"n": 0}
+
+    def structured(messages, model_cls, **kw):
+        seen["n"] += 1
+        return Location(x=0.5, y=0.5)
+
+    monkeypatch.setattr(client, "structured", structured)
+    assert client.locate(_jpeg("none"), "the send button") == (0.5, 0.5)
+    assert seen["n"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Situational advice, gated
 # ---------------------------------------------------------------------------
 #
@@ -1672,13 +1783,44 @@ def cfg_with(effort="low", hard="high"):
     return cfg
 
 
-def test_nothing_is_capped_until_the_feature_is_switched_on():
+def test_no_depth_is_asked_for_until_the_feature_is_switched_on():
+    """...for the calls that reason. The vision floor is not part of the switch
+    -- see `test_a_frame_is_never_read_with_the_thinking_left_on`."""
     from adbagent.config import Config
 
     cfg = Config()
-    for purpose in ("decide", "judge", "analyze_image", "read_item"):
+    for purpose in ("decide", "judge", "goal_check", "replan"):
         assert cfg.llm.effort_for(purpose) == ""
         assert cfg.llm.effort_for(purpose, hard=True) == ""
+
+
+def test_a_frame_is_never_read_with_the_thinking_left_on():
+    """"Send nothing" is not "do not think": a hybrid model thinks by default.
+
+    With the switch off this method used to return "" for every purpose, so the
+    vision pin never ran and the default stood. In ``runs/a7ef4e0e45e9`` that
+    default spent 6,165 characters of thinking per `analyze_image` call to fill
+    four fields with 200 of answer -- 95% of that purpose's output tokens -- and
+    ran `locate` at 35:1 for a coordinate pair.
+    """
+    from adbagent.config import Config
+    from adbagent.llm import reasoning_body
+
+    cfg = Config()
+    assert not cfg.llm.reasoning_effort          # the switch is off by default
+    for purpose in cfg.llm.VISION_PURPOSES:
+        assert cfg.llm.effort_for(purpose) == "none"
+        assert cfg.llm.effort_for(purpose, hard=True) == "none"
+    # ...and the depth reaches the wire for the model that was doing the reading.
+    assert reasoning_body("accounts/fireworks/models/qwen3p7-plus", "none",
+                          "auto") == {"reasoning_effort": "none"}
+
+
+def test_the_vision_floor_costs_nothing_on_a_model_that_cannot_reason():
+    """An unrecognised family gets no field at all, so pinning it is free."""
+    from adbagent.llm import reasoning_body
+
+    assert reasoning_body("some-vendor/ocr-v2", "none", "auto") == {}
 
 
 def test_a_routine_turn_gets_the_shallow_depth():
@@ -1697,7 +1839,7 @@ def test_vision_calls_never_pay_for_reasoning():
     """"What does this scale read" has no chain of thought worth buying, so a
     transcription is pinned to the floor even when the run is struggling."""
     cfg = cfg_with(effort="high", hard="high")
-    for purpose in ("analyze_image", "read_item"):
+    for purpose in ("analyze_image", "read_item", "locate"):
         assert cfg.llm.effort_for(purpose) == "none"
         assert cfg.llm.effort_for(purpose, hard=True) == "none"
 
@@ -2281,3 +2423,194 @@ def test_the_judge_does_not_recompute_an_empty_analysis(monkeypatch):
 
     client.judge(goal="g", rendered="screen", history=[], screenshot=b"jpeg")
     assert analyses["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# What the prompt stops paying for
+# ---------------------------------------------------------------------------
+#
+# Measured on ``runs/a7ef4e0e45e9``: 23 decide calls, 248,372 prompt tokens, of
+# which the block that changes every turn -- the element list -- was 2.5%. The
+# tests below hold the cuts that came out of it.
+
+
+def test_the_prompt_copy_of_the_schema_carries_the_shape_not_the_prose():
+    """`response_format` is the grammar; the prompt copy is the field list.
+
+    The hardened schema is 6,613 characters, 2,066 tokens on every decide call
+    and 19% of that run's prompt, and four fifths of it is `description`,
+    `title` and `default` restating THE ACTIONS. The answer is constrained by
+    `response_format` either way, so the prompt keeps what tells the model the
+    object exists: names, types, enums and what is required.
+    """
+    import json as _json
+    from adbagent.actions import AgentAction
+    from adbagent.llm import harden_schema
+    from adbagent.prompts import system_prompt
+
+    enforced = harden_schema(AgentAction)
+    prompt = system_prompt(enforced)
+    shown = _json.loads(prompt[prompt.index('{"additionalProperties"'):])
+
+    assert set(shown["properties"]) == set(enforced["properties"])
+    assert shown["required"] == enforced["required"]
+    assert shown["properties"]["action"]["enum"] == \
+        enforced["properties"]["action"]["enum"]
+    assert shown["additionalProperties"] is False
+    # The prose is gone from the copy the model reads...
+    assert "title" not in shown["properties"]["scroll_amount"]
+    assert "description" not in shown["properties"]["scroll_amount"]
+    assert "description" not in shown["properties"]["notes"]
+    # ...and untouched in the copy the answer is held to.
+    assert "description" in enforced["properties"]["scroll_amount"]
+    assert len(_json.dumps(shown)) < len(_json.dumps(enforced)) / 2
+
+
+def test_the_fields_the_prose_never_documents_keep_their_description():
+    """THE ACTIONS lists neither `tap_at` nor the fallback targeting forms, so
+    the schema is the only place the model is told what x, y and resource_id
+    are for."""
+    from adbagent.actions import AgentAction
+    from adbagent.llm import harden_schema
+    from adbagent.prompts import system_prompt
+
+    prompt = system_prompt(harden_schema(AgentAction))
+    assert "fraction of screen width" in prompt
+    assert "Short resource-id" in prompt
+
+
+def test_scrolling_advice_needs_something_on_screen_to_scroll():
+    """`scrolls > 0` is a fact about the run, and it pinned a page of
+    list-searching strategy to 20 of 23 calls in that run -- including the ones
+    inside a modal composer and on a four-row conversation list."""
+    from adbagent.prompts import situational_notes
+
+    assert "SCROLLING STRATEGY" in situational_notes(scrolls=1, scrollable=True)
+    assert "SCROLLING STRATEGY" not in situational_notes(scrolls=1,
+                                                         scrollable=False)
+
+
+def test_the_rules_for_keeping_records_wait_until_there_are_records():
+    """The `notes` contract stays in SYSTEM; maintaining a record set does not.
+
+    That goal collected nothing -- COLLECTED DATA rendered empty on all 23 calls
+    -- and paid for the long-form rules and a note-shaped few-shot example every
+    time.
+    """
+    from adbagent import prompts
+
+    assert "DATA COLLECTION" in prompts.SYSTEM
+    assert "`notes`" in prompts.SYSTEM          # the field is never a surprise
+    assert "do not re-send" not in prompts.SYSTEM
+    assert prompts.COLLECTION_ADVICE not in prompts.situational_notes()
+    assert "Do NOT restate" in prompts.situational_notes(collecting=True)
+
+
+def test_the_skill_drops_what_the_policy_above_it_already_said():
+    """A skill is learned from runs of the app its policy was written for, so it
+    converges on the same sentences: 47% of that run's skill block restated a
+    REPLY POLICY line sitting immediately above it."""
+    from adbagent.prompts import skill_block
+
+    policy = ("- The first photo's heart is the topmost one: prefer "
+              "`@top-right` over `@bottom-right`. The lower heart belongs to "
+              "the card below and likes the wrong photo.")
+    skill = ("APP SKILL & GUIDANCE (Hinge):\n"
+             "Nuances & UI Quirks:\n"
+             "  - The first photo's heart is the TOPMOST: prefer @top-right "
+             "over @bottom-right. Tapping the lower one likes the card below "
+             "it.\n"
+             "  - The Matches tab is the messages and chat area, labelled "
+             "'Matches' in the bottom navigation bar.")
+    out = skill_block(skill, policy=policy)
+    assert "TOPMOST" not in out
+    assert "Matches tab is the messages" in out
+    # Without the policy there is nothing to compare against.
+    assert "TOPMOST" in skill_block(skill)
+
+
+def test_the_skill_keeps_a_line_that_adds_a_fact_to_a_restated_one():
+    """The threshold is deliberately shy. Dropping a repeat late costs tokens;
+    dropping a nuance the policy does not state costs a like on the wrong
+    photo."""
+    from adbagent.prompts import skill_block
+
+    policy = ("- Before every like, check the element list for the profile "
+              "name and pronouns at top-left.")
+    skill = ("APP SKILL & GUIDANCE (Hinge):\n"
+             "Nuances & UI Quirks:\n"
+             "  - Before every like, check the element list for the profile "
+             "name and pronouns at top-left. In runs/9b9c69095095 that check "
+             "was skipped for profile 'S' and the like landed on the last "
+             "photo while the step reported being at the first.")
+    assert "9b9c69095095" in skill_block(skill, policy=policy)
+
+
+def test_the_skill_block_never_rewrites_a_line():
+    """Lifting the restated sentences out of a line and keeping the rest reads
+    like the original and is not: it left a parenthesis unclosed, and left
+    "That check is cheap" as the whole of its bullet, pointing at the sentence
+    that had been explaining it. A line is repetition or it is not."""
+    from adbagent.prompts import skill_block
+
+    policy = ("- Scroll back up to the first photo with direction='up', "
+              "scroll_amount=4, base_scale=0.9 and read_each=false.\n"
+              "- The name and pronouns render only at the head of the card.")
+    skill = ("APP SKILL & GUIDANCE (Hinge):\n"
+             "Workflows:\n"
+             "  - to_top: Scroll back up to the first photo with "
+             "direction='up', scroll_amount=4, base_scale=0.9 and "
+             "read_each=false. Then CONFIRM you arrived: if the name is not "
+             "listed, repeat the up-scroll before doing anything else.\n"
+             "  - skip: tap the skip control at bottom-left for the next "
+             "profile, which is the only control that advances the card.")
+    original = set(skill.splitlines())
+    for line in skill_block(skill, policy=policy).splitlines():
+        assert line in original, line
+
+
+def test_a_skill_that_is_all_restatement_is_not_sent_at_all():
+    from adbagent.prompts import skill_block
+
+    policy = "- Use the bottom navigation bar for all navigation in this app."
+    skill = ("APP SKILL & GUIDANCE (Hinge):\n"
+             "Nuances & UI Quirks:\n"
+             "  - Use the bottom navigation bar for all navigation in this "
+             "app.")
+    assert skill_block(skill, policy=policy) == ""
+
+
+def test_a_history_line_drops_the_pixel_centre_and_the_repeated_package():
+    """Neither is reachable or new. The model targets by #N and k=, the
+    coordinate form it can use is a fraction of the frame, and the package was
+    on 23 of the 40 rendered lines of a run that never left one app."""
+    from adbagent.prompts import history_only_block
+
+    block = history_only_block([
+        '1. tap #5 [Button "Discover" at (90,1555)] in co.hinge.app -> success',
+        '2. tap #2 [Button "Like photo" at (819,1050)] in co.hinge.app -> ok',
+        '3. tap #1 [Button "Back"] in com.android.settings -> success',
+    ])
+    assert "at (90,1555)" not in block
+    assert "at (819,1050)" not in block
+    lines = block.splitlines()
+    assert lines[1].endswith("in co.hinge.app -> success")   # first one says it
+    assert "in co.hinge.app" not in lines[2]                 # then only changes
+    assert "in com.android.settings" in lines[3]
+
+
+def test_the_compacted_history_still_only_grows_between_jumps():
+    """The compaction reads a line and its predecessor, both immutable, so the
+    prefix stays cacheable. A transform that looked at the whole block -- say,
+    trimming observations older than N steps -- would rewrite it every turn."""
+    from adbagent.prompts import HISTORY_CHUNK, history_only_block
+
+    history = [f'{i}. tap #{i} [Button "x" at ({i},{i})] in com.app -> success'
+               for i in range(1, 60)]
+    rewrites, previous = 0, ""
+    for n in range(1, len(history) + 1):
+        block = history_only_block(history[:n])
+        if previous and not block.startswith(previous):
+            rewrites += 1
+        previous = block
+    assert rewrites <= len(history) // HISTORY_CHUNK + 1

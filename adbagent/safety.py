@@ -198,6 +198,10 @@ class LoopDetector:
     #: Used to detect direction reversals even when taps break the
     #: consecutive-scroll counter.
     scroll_dir_log: List[str] = field(default_factory=list)
+    #: Positions in `scroll_dir_log` whose gesture had already run out of
+    #: content when it was taken. Reversing away from one of those is the only
+    #: move left, not a change of mind -- see `direction_reversals`.
+    scroll_exhausted: List[int] = field(default_factory=list)
     total_scroll_count: int = 0
     #: Scroll gestures that revealed nothing, "{skeleton_id}/{direction}" ->
     #: the ``exact_id`` of the frame they failed on. Valued by ``exact_id``
@@ -418,6 +422,33 @@ class LoopDetector:
         self.scroll_dir_log.append(direction)
         self.total_scroll_count += 1
 
+    def mark_scroll_exhausted(self) -> None:
+        """Record that the last scroll logged had nothing left to reveal.
+
+        Called when the harness learns the gesture stopped advancing -- either
+        the action came back ``no_change``, or a mechanical sweep repeated it
+        until the content stopped moving. `direction_reversals` reads this to
+        tell "it changed its mind" from "it reached the end".
+        """
+        if not self.scroll_dir_log:
+            return
+        last = len(self.scroll_dir_log) - 1
+        if last not in self.scroll_exhausted:
+            self.scroll_exhausted.append(last)
+
+    def _axis_pairs(self, axis: str = "") -> List[Tuple[str, bool]]:
+        """The scroll log as (direction, was exhausted) pairs, narrowed to axis."""
+        if axis == "horizontal":
+            wanted = ("left", "right")
+        elif axis == "vertical":
+            wanted = ("up", "down")
+        else:
+            wanted = ()
+        done = set(self.scroll_exhausted)
+        return [(d, i in done)
+                for i, d in enumerate(self.scroll_dir_log)
+                if not wanted or d in wanted]
+
     def axis_log(self, axis: str = "") -> List[str]:
         """The scroll log, optionally narrowed to one axis.
 
@@ -435,23 +466,40 @@ class LoopDetector:
         return [d for d in self.scroll_dir_log if d in wanted]
 
     def direction_reversals(self, axis: str = "") -> int:
-        """Count how many times the scroll direction has flipped.
+        """Count how many times the scroll direction has flipped *pointlessly*.
 
         A reversal is any transition from one vertical direction to its
         opposite (up→down or down→up), or horizontal (left→right, right→left).
         Consecutive scrolls in the same direction count as one "run".
         Pass *axis* to count only reversals on that axis.
+
+        A reversal away from a gesture that had already run out of content does
+        not count. There is nothing left that way, so the opposite direction is
+        the only move on that axis -- and the harness says as much itself, both
+        in `last_failure` ("Try the opposite direction") and in the sweep, which
+        is "browsing, not thrashing" and already exempt from the loop detector.
+
+        Counting them was not free. In ``runs/a7ef4e0e45e9`` the policy's own
+        loop is one scroll to the bottom of a profile and one back to the top,
+        three times, and every one of those six gestures had been repeated until
+        the content stopped moving. That scored 5 reversals, which put
+        `scroll_direction_hint` into the prompt on 10 of 23 decide calls telling
+        the model "You MUST stop reversing now" about the up-scroll its policy
+        made mandatory -- and left it one reversal short of
+        `agent`'s >=5 threshold for refusing the gesture outright.
         """
-        log_entries = self.axis_log(axis)
-        if len(log_entries) < 2:
+        pairs = self._axis_pairs(axis)
+        if len(pairs) < 2:
             return 0
         reversals = 0
-        prev = log_entries[0]
-        for d in log_entries[1:]:
-            if d != prev and d == _SCROLL_OPPOSITES.get(prev, ""):
-                reversals += 1
-            if d != prev:
-                prev = d
+        prev, prev_spent = pairs[0]
+        for direction, spent in pairs[1:]:
+            if direction != prev:
+                if (direction == _SCROLL_OPPOSITES.get(prev, "")
+                        and not prev_spent):
+                    reversals += 1
+                prev = direction
+            prev_spent = spent
         return reversals
 
     def scroll_direction_hint(self, axis: str = "") -> Optional[str]:

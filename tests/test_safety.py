@@ -417,3 +417,56 @@ def test_scroll_context_mentions_vertical_axis():
     ctx = loops.scroll_context()
     assert ctx is not None
     assert "vertically" in ctx
+
+
+# ---------------------------------------------------------------------------
+# Reversals that had nowhere left to go
+# ---------------------------------------------------------------------------
+
+
+def test_a_reversal_after_the_content_ran_out_is_not_thrashing():
+    """The shape of a profile walk: down to the bottom, back up to the top.
+
+    Both gestures were repeated until the content stopped moving, so each
+    reversal was the only move left on the axis -- the harness says so itself
+    ("Try the opposite direction"). Counted as a change of mind, the three
+    profiles of ``runs/a7ef4e0e45e9`` scored 5 reversals, which put a warning
+    reading "You MUST stop reversing now" on 10 of 23 decide calls, against a
+    policy that made the up-scroll mandatory.
+    """
+    loops = safety.LoopDetector()
+    for _ in range(3):
+        loops.record_scroll("down")
+        loops.mark_scroll_exhausted()
+        loops.record_scroll("up")
+        loops.mark_scroll_exhausted()
+    assert loops.direction_reversals("vertical") == 0
+    assert loops.scroll_direction_hint("vertical") is None
+    # The log itself is untouched: it is what the warning quotes back.
+    assert loops.axis_log("vertical") == ["down", "up"] * 3
+
+
+def test_thrashing_is_still_counted_when_the_content_was_moving():
+    """The case the counter exists for: reversing while there was more to see."""
+    loops = safety.LoopDetector()
+    for direction in ("down", "up", "down", "up", "down", "up"):
+        loops.record_scroll(direction)
+    assert loops.direction_reversals("vertical") == 5
+    hint = loops.scroll_direction_hint("vertical")
+    assert hint is not None and "reversed your scroll direction" in hint
+
+
+def test_only_the_reversal_off_the_exhausted_gesture_is_excused():
+    """Running out going down excuses the turn upward, and nothing after it."""
+    loops = safety.LoopDetector()
+    loops.record_scroll("down")
+    loops.mark_scroll_exhausted()
+    loops.record_scroll("up")      # excused: down had nothing left
+    loops.record_scroll("down")    # not excused: up was still moving
+    assert loops.direction_reversals("vertical") == 1
+
+
+def test_marking_needs_a_scroll_to_mark():
+    loops = safety.LoopDetector()
+    loops.mark_scroll_exhausted()
+    assert loops.scroll_exhausted == []

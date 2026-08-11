@@ -79,6 +79,7 @@ def save(cfg: Any, state: Any) -> None:
                 for k, v in state.loops.element_actions.items()
             },
             "scroll_dir_log": state.loops.scroll_dir_log,
+            "scroll_exhausted": state.loops.scroll_exhausted,
             "total_scroll_count": state.loops.total_scroll_count,
             "dead_scrolls": state.loops.dead_scrolls,
             "consecutive_backs": state.loops.consecutive_backs,
@@ -203,6 +204,10 @@ def restore(state: Any, data: Dict[str, Any]) -> None:
         for k, v in (loops.get("element_actions") or {}).items()
     }
     state.loops.scroll_dir_log = [str(d) for d in loops.get("scroll_dir_log") or []]
+    # Missing in checkpoints written before the flag existed: an older file
+    # restores with nothing marked, which counts reversals the way it used to.
+    state.loops.scroll_exhausted = [int(i) for i in
+                                    loops.get("scroll_exhausted") or []]
     state.loops.total_scroll_count = int(loops.get("total_scroll_count") or 0)
     state.loops.dead_scrolls = {str(k): str(v)
                                 for k, v in (loops.get("dead_scrolls") or {}).items()}
