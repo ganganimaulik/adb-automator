@@ -27,6 +27,7 @@ from ..config import Config, _set_path, find_config_file, load_config
 from ..runlog import SHOT_RE, STREAM_NAME
 from ..skills import Skill, SkillRegistry
 from . import runparse
+from .reload import LiveReload
 from .runner import ChildProcess, JobManager, RunManager, WatchManager, sse
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -104,12 +105,17 @@ class GenerateRequest(BaseModel):
     serial: str = ""
 
 
-def _static(name: str) -> Response:
+def _static(name: str, no_store: bool = False) -> Response:
     path = STATIC_DIR / name
     if not path.is_file() or path.parent != STATIC_DIR:
         raise HTTPException(status_code=404, detail="not found")
     media = _MEDIA_TYPES.get(path.suffix, "application/octet-stream")
-    return Response(content=path.read_bytes(), media_type=media)
+    # Read off disk per request, so an edit is live the moment the page asks
+    # again -- but only if the browser does ask. Nothing here carries a
+    # validator, so a heuristically cached app.js would survive the reload that
+    # was triggered by editing it. Under live reload, say not to keep it.
+    headers = {"Cache-Control": "no-store"} if no_store else None
+    return Response(content=path.read_bytes(), media_type=media, headers=headers)
 
 
 def attached_serials() -> List[str]:
@@ -168,7 +174,8 @@ def screencap(serial: str = "", max_long_edge: int = 720,
 
 
 def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
-               config_path: str = "") -> FastAPI:
+               config_path: str = "",
+               live_reload: Optional[LiveReload] = None) -> FastAPI:
     runs_dir = Path(artifacts_dir)
     manager = RunManager(runs_dir, config_path=config_path)
     # The same artifacts directory: a `skills generate` tour writes a run there
@@ -266,16 +273,32 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
 
     app = FastAPI(title="adbagent ui", lifespan=lifespan)
     app.state.shutting_down = shutting_down
+    #: Published for whoever started the server: live reload has to know when a
+    #: restart would orphan an agent, and this is the same answer the API gives
+    #: anyone else who wants the phone.
+    app.state.phone_busy = phone_busy
+    app.state.live_reload = live_reload
 
     # -- pages ----------------------------------------------------------
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> Response:
-        return _static("index.html")
+        return _static("index.html", no_store=live_reload is not None)
 
     @app.get("/static/{name}")
     def static_file(name: str) -> Response:
-        return _static(name)
+        return _static(name, no_store=live_reload is not None)
+
+    # -- live reload -----------------------------------------------------
+
+    @app.get("/api/dev/reload")
+    def dev_reload() -> StreamingResponse:
+        """What changed on disk, as it changes. Absent unless reload is on."""
+        if live_reload is None:
+            raise HTTPException(status_code=404, detail="live reload is off")
+        return StreamingResponse(_reload_stream(live_reload, shutting_down),
+                                 media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache"})
 
     # -- status & devices ------------------------------------------------
 
@@ -310,6 +333,10 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             "device_attached": (cfg.device.serial in serials if cfg.device.serial
                                 else len(serials) == 1),
             "artifacts_dir": str(runs_dir),
+            # Whether there is a reload stream worth opening. Asked here rather
+            # than by opening it and seeing: a page that guessed wrong would
+            # reconnect to a 404 every few seconds for as long as it stayed up.
+            "live_reload": live_reload is not None,
             "run": manager.state(),
             # Reported alongside the run for the same reason a tour is: a page
             # reloaded hours later has to know there is a watch to reattach to.
@@ -879,6 +906,43 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
                                  headers={"Cache-Control": "no-cache"})
 
     return app
+
+
+#: How often the reload stream looks for new changes. A tenth of a second is
+#: below the point where a save feels like it took a moment, and the look is an
+#: integer comparison behind a lock.
+RELOAD_POLL_S = 0.1
+
+
+def _reload_stream(reloader: LiveReload,
+                   shutting_down: Optional[threading.Event] = None,
+                   ) -> Generator[str, None, None]:
+    """Publish what the reloader saw, as SSE frames.
+
+    The first frame identifies the process. That is how a code reload is seen
+    from the browser at all: the restart takes this stream down with it, the
+    page's `EventSource` reconnects on its own, and a `hello` bearing a boot id
+    the page has not seen before means the server it was loaded from is gone.
+
+    A plain generator, like `_event_stream`, and for the same reason: Starlette
+    runs it on a thread, so `shutting_down` is what ends it -- without that it
+    polls a reloader nobody is listening to while the shutdown tears the
+    response down underneath it.
+    """
+    # Read before the frame is built, not after it is sent: a generator is only
+    # resumed when the client reads, so a version taken on the far side of the
+    # yield is the version at some later moment -- and everything that changed
+    # in between is a change this stream would never mention.
+    seen = reloader.version
+    yield sse({"boot": reloader.boot, "version": seen,
+               "restarts": reloader.restarts,
+               "watching": reloader.watching()}, "hello")
+    while shutting_down is None or not shutting_down.is_set():
+        for change in reloader.since(seen):
+            seen = change.version
+            yield sse(change.as_frame(), "reload")
+        time.sleep(RELOAD_POLL_S)
+    yield sse({"reason": "server going away"}, "end")
 
 
 def _event_stream(child: ChildProcess,

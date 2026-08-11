@@ -1275,6 +1275,27 @@ pre.log {
 .notice.error { border: 1px solid var(--red); color: var(--red); background: #f851490d; }
 .notice.ok { border: 1px solid var(--green); color: var(--green); background: #3fb9500d; }
 
+/* -- live reload ------------------------------------------------------------ */
+
+/* The harness talking about itself: which file changed, and what became of it.
+   Bottom corner and dim on purpose — it belongs to whoever is editing the
+   source, and it must never be mistaken for something the run said. */
+.devbar {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 60;
+  max-width: min(60ch, calc(100vw - 24px));
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-raise);
+  color: var(--text-dim);
+  font: 12px/1.4 var(--mono);
+  overflow-wrap: anywhere;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
 /* -- device state ----------------------------------------------------------- */
 
 /* A configured serial is not an attached phone, and which of the two it is

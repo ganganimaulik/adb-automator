@@ -10,6 +10,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -2002,6 +2003,64 @@ def cmd_skills(args) -> int:
 # ui
 # ---------------------------------------------------------------------------
 
+def _ui_live_reload(args, out: Out):
+    """The file watcher behind the UI's live reload, or None when it is off.
+
+    On by default in a source checkout and off in an installed copy, because
+    that is where the answer is obvious either way: files in the repo are being
+    edited, files in site-packages are not, and re-execing a server nobody is
+    working on is a surprise rather than a convenience. `--reload` and
+    `--no-reload` say so explicitly.
+
+    Started here rather than by the server: the phone-busy question it has to
+    ask, and the restart it has to perform, both live on this side.
+    """
+    from .web.reload import for_ui, in_source_checkout
+
+    package_dir = Path(__file__).resolve().parent
+    want = getattr(args, "reload", None)
+    if want is None:
+        want = in_source_checkout(package_dir)
+    if not want:
+        return None
+
+    from .config import load_config
+
+    loaded = load_config(getattr(args, "config", None))
+    cfg = loaded.config
+    policy = (cfg.watch.policy or "").strip()
+    reloader = for_ui(
+        package_dir,
+        # A config file that does not exist yet is still worth watching: the UI
+        # writes exactly this path the first time the config form is saved.
+        config_path=Path(loaded.path) if loaded.path else Path.cwd() / "config.json",
+        skills_dir=Path(cfg.skills.skills_dir).expanduser(),
+        policy_path=Path(policy).expanduser() if policy else None)
+    out.say(out.dim("  live reload: code, static, config, skills, policy "
+                    "(--no-reload to turn it off)"))
+    return reloader
+
+
+def _reexec() -> int:
+    """Start this same command again, in place of this process.
+
+    Replacing the process is the only way to pick up an edited module: this one
+    imported them all at startup and will not import them again. argv is reused
+    verbatim so the new server is the one that was asked for -- same port, same
+    config, same artifacts directory.
+    """
+    argv = list(sys.argv)
+    if not sys.executable:  # an embedded interpreter has nothing to re-run
+        print("  cannot restart: no interpreter to re-run", file=sys.stderr)
+        return 1
+    if Path(argv[0]).name == "__main__.py":
+        argv = ["-m", "adbagent", *argv[1:]]   # started as `python -m adbagent`
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(sys.executable, [sys.executable, *argv])
+    return 0  # not reached
+
+
 def cmd_ui(args) -> int:
     try:
         import uvicorn
@@ -2018,8 +2077,18 @@ def cmd_ui(args) -> int:
         kwargs["artifacts_dir"] = args.artifacts_dir
     if getattr(args, "config", None):
         kwargs["config_path"] = args.config
+    reloader = _ui_live_reload(args, out)
+    if reloader is not None:
+        kwargs["live_reload"] = reloader
     app = create_app(**kwargs)
     out.say(f"  adbagent ui on http://{args.host}:{args.port}")
+    # Flushed rather than left to the buffer. Piped into a supervisor rather
+    # than a terminal, stdout is block-buffered, so the line saying the server
+    # is up sits unread until something else fills the buffer -- and after a
+    # live-reload restart nothing does, which reads as a server that never
+    # came back.
+    with contextlib.suppress(OSError):
+        sys.stdout.flush()
 
     # Run the server by hand rather than through `uvicorn.run` so the interrupt
     # can be seen as it lands. The live views are Server-Sent Events streams that
@@ -2038,14 +2107,42 @@ def cmd_ui(args) -> int:
     server = uvicorn.Server(config)
     signalled = server.handle_exit
 
-    def handle_exit(sig, frame):  # type: ignore[no-untyped-def]
+    def leave() -> None:
         leaving = getattr(app.state, "shutting_down", None)
         if leaving is not None:
             leaving.set()
+
+    def handle_exit(sig, frame):  # type: ignore[no-untyped-def]
+        leave()
         signalled(sig, frame)
 
     server.handle_exit = handle_exit  # type: ignore[method-assign]
-    server.run()
+
+    restarting = threading.Event()
+    if reloader is not None:
+        # A restart while an agent holds the phone would orphan it: the run and
+        # watch children are in their own process groups on purpose, so they
+        # outlive this process, and the server that comes back has no handle on
+        # the thing still tapping the screen. So the reloader asks first, and
+        # waits -- the browser is told it is waiting, and what for.
+        reloader.busy = app.state.phone_busy
+
+        def restart() -> None:
+            restarting.set()
+            leave()             # so the live streams end themselves, as on Ctrl+C
+            server.should_exit = True
+
+        reloader.on_restart = restart
+        reloader.start()
+
+    try:
+        server.run()
+    finally:
+        if reloader is not None:
+            reloader.stop()
+    if restarting.is_set():
+        out.say(out.dim("  code changed — restarting"))
+        return _reexec()
     return 0
 
 
@@ -2264,6 +2361,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=8765, help="port (default 8765)")
     p.add_argument("--artifacts-dir", dest="artifacts_dir",
                    help="directory of recorded runs (default: config's run.artifacts_dir)")
+    # Tri-state on purpose: unset means "decide by whether this is a checkout".
+    p.add_argument("--reload", dest="reload", action="store_true", default=None,
+                   help="apply edits to code, static files, config, skills and "
+                        "policy without restarting by hand (default: on when "
+                        "running from a source checkout)")
+    p.add_argument("--no-reload", dest="reload", action="store_false",
+                   help="never watch files or restart on a change")
     _add_common(p)
     p.set_defaults(func=cmd_ui)
 
