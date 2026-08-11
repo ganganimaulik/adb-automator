@@ -1526,6 +1526,7 @@ async function refreshStatus() {
       genLive.startedAt = st.job.started_at || Date.now() / 1000;
       watchGeneration(st.job.id, { fresh: false });
     }
+    if (st.live_reload) openReloadStream();
   } catch {
     $("status").innerHTML = `<span class="st bad">server unreachable</span>`;
   }
@@ -1628,7 +1629,10 @@ async function loadWatch() {
 
 async function loadPolicy() {
   const data = await api("/api/watch/policy");
-  $("watch-policy").value = data.text || "";
+  const box = $("watch-policy");
+  // `_loaded` is what the file said. Kept so live reload can tell a box nobody
+  // has touched -- safe to replace -- from one holding an unsaved edit.
+  box.value = box._loaded = data.text || "";
   $("watch-policy-path").textContent =
     data.path ? data.path + (data.exists ? "" : " (not written yet)")
               : "(no policy path set — set watch.policy in Config)";
@@ -2523,8 +2527,16 @@ async function loadConfig() {
   modelFields.forEach(fillModelSelect);  // with the current values, at least
   syncVisionHint();
   filterConfig();
+  cfgDirty = false;                      // the form says what the file says
   if (!catalogue.loaded) loadModels();   // and with the catalogue when it lands
 }
+
+/* Sixty-two fields are too many to diff, so the form remembers instead whether
+   anything was typed into it since it was last loaded or saved. Live reload
+   asks: config.json changing on disk must not silently discard an edit that is
+   still on screen. */
+let cfgDirty = false;
+$("cfg-form").addEventListener("input", () => { cfgDirty = true; });
 
 /* Search over both tiers. Sixty-two settings need a way in that is not
    scrolling, and the names you would search for are the Python ones. */
@@ -2594,6 +2606,19 @@ $("btn-cfg-save").addEventListener("click", async () => {
 
 /* ------------------------------------------------------------- skills */
 
+/* The skill the editor is showing, if any. Held so the list can be repainted
+   -- by a save, or by the file changing underneath -- without losing which one
+   was open. */
+let openSkill = "";
+
+function showSkill(full) {
+  openSkill = full.name;
+  $("skill-editor").hidden = false;
+  $("skill-name").textContent = full.name;
+  const box = $("skill-json");
+  box.value = box._loaded = JSON.stringify(full, null, 2);
+}
+
 async function loadSkills() {
   const d = await api("/api/skills");
   const list = $("skills-list");
@@ -2603,7 +2628,7 @@ async function loadSkills() {
   }
   for (const s of d.skills) {
     const item = document.createElement("div");
-    item.className = "skill-item";
+    item.className = "skill-item" + (s.name === openSkill ? " active" : "");
     item.innerHTML = `<div class="nm">${esc(s.name)}</div>` +
       `<div class="pkg">${esc(s.packages.join(", ") || "—")}</div>` +
       `<div class="small">${s.workflows} workflows · ${s.nuances} nuances</div>`;
@@ -2611,10 +2636,7 @@ async function loadSkills() {
       document.querySelectorAll(".skill-item").forEach((el) => el.classList.remove("active"));
       item.classList.add("active");
       try {
-        const full = await api("/api/skills/" + encodeURIComponent(s.name));
-        $("skill-editor").hidden = false;
-        $("skill-name").textContent = full.name;
-        $("skill-json").value = JSON.stringify(full, null, 2);
+        showSkill(await api("/api/skills/" + encodeURIComponent(s.name)));
       } catch (err) { notice(err.message); }
     });
     list.appendChild(item);
@@ -2636,6 +2658,7 @@ $("btn-skill-save").addEventListener("click", async () => {
       method: "PUT", body: JSON.stringify(body),
     });
     notice("saved to " + r.path, false);
+    $("skill-json")._loaded = $("skill-json").value;  // the file says this now
     loadSkills().catch(() => {});
   } catch (err) {
     notice(err.message);
@@ -2758,6 +2781,121 @@ $("btn-gen").addEventListener("click", async () => {
   }
   watchGeneration(jobId);
 });
+
+/* --------------------------------------------------------- live reload
+
+   `adbagent ui` run from a source checkout watches everything the page is made
+   of and streams what changed. Three answers, because the three cost different
+   things to apply:
+
+     assets  — the page is stale as a whole: reload it.
+     config, skills, policy — one panel is holding an old copy of a file the
+       server reads per request: refetch that panel, and only if doing so does
+       not take something out from under whoever is typing.
+     code    — the server imported it once and cannot re-import it, so it
+       restarts. Nothing to do here but say so and wait for it.
+
+   The boot id is how a restart is seen at all. EventSource reconnects on its
+   own, so the restart itself is invisible — but the server on the far side of
+   it announces a different id, and a page still running the JS a dead process
+   served is exactly the page that has to reload. */
+
+let reloadStream = null;
+let serverBoot = null;      // the process this page's assets came from
+let serverRestarts = false; // whether a code change leads anywhere
+
+function openReloadStream() {
+  if (reloadStream) return;
+  reloadStream = new EventSource("/api/dev/reload");
+  reloadStream.addEventListener("hello", (e) => {
+    const d = JSON.parse(e.data);
+    if (serverBoot && d.boot !== serverBoot) { location.reload(); return; }
+    serverBoot = d.boot;
+    serverRestarts = !!d.restarts;
+    devbar("");
+  });
+  reloadStream.addEventListener("reload", (e) => {
+    const d = JSON.parse(e.data);
+    applyChange(d).catch((err) => devbar(err.message));
+  });
+}
+
+async function applyChange(d) {
+  const names = (d.paths || []).join(", ");
+  switch (d.kind) {
+    case "assets":
+      devbar(`reloading — ${names}`, true);
+      location.reload();
+      return;
+    case "code":
+      devbar(serverRestarts ? `${names} — restarting`
+                            : `${names} changed; restart the server to pick it up`, true);
+      return;
+    case "restart":
+      // Held because something is still driving the phone. Said with what, so
+      // the wait reads as a decision rather than a hang.
+      devbar(d.note ? `restart waiting: ${d.note}` : "restarting", true);
+      return;
+    case "config":  return reloadPane("config", names, refreshConfigFile);
+    case "skills":  return reloadPane("skills", names, refreshSkillFiles);
+    case "policy":  return refreshPolicyFile(names);
+  }
+}
+
+/* Safe to overwrite: nothing is being typed into it, and what it holds is what
+   the file last said. Anything else is an unsaved edit, and a file that changed
+   underneath it is news to report rather than grounds to discard it. */
+function beingEdited(el) {
+  return !el || document.activeElement === el || el.value !== el._loaded;
+}
+
+async function reloadPane(pane, names, refresh) {
+  if (!loadedPanes.has(pane)) return;   // never opened; it will load current
+  await refresh(names);
+}
+
+async function refreshConfigFile(names) {
+  if (cfgDirty || $("cfg-form").contains(document.activeElement)) {
+    devbar(`${names} changed on disk — your unsaved edits are still here`, true);
+    return;
+  }
+  await loadConfig();
+  refreshStatus();                      // the header reads model and serial off it
+  devbar(`${names} reloaded`);
+}
+
+async function refreshSkillFiles(names) {
+  await loadSkills();                   // the list holds no edits, so it always goes
+  const box = $("skill-json");
+  if (openSkill && !beingEdited(box)) {
+    try {
+      showSkill(await api("/api/skills/" + encodeURIComponent(openSkill)));
+    } catch { /* deleted, or renamed: the list above already says so */ }
+  }
+  devbar(`${names} reloaded`);
+}
+
+async function refreshPolicyFile(names) {
+  if (!loadedTabs.has("watch")) return;
+  if (beingEdited($("watch-policy"))) {
+    devbar(`${names} changed on disk — your unsaved edits are still here`, true);
+    return;
+  }
+  await loadPolicy();
+  devbar(`${names} reloaded`);
+}
+
+let devbarTimer = null;
+function devbar(text, sticky = false) {
+  const el = $("devbar");
+  if (!el) return;
+  clearTimeout(devbarTimer);
+  el.textContent = text;
+  el.hidden = !text;
+  // A state that is waiting for something stays up until it stops waiting.
+  // A change already applied is news for a moment.
+  if (text && !sticky) devbarTimer = setTimeout(() => { el.hidden = true; }, 4000);
+}
 
 /* -------------------------------------------------------- persistence
 

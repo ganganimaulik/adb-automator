@@ -640,6 +640,40 @@ iteration. An unbounded repeat with a budget set is the way to leave it
 working — it stops on the ceiling, on Stop, or on the first iteration that
 needs you.
 
+### Live reload
+
+Run from a source checkout, `adbagent ui` watches everything the page is made
+of and applies a change without being restarted by hand. Nothing to set up;
+`--no-reload` turns it off, `--reload` forces it on for an installed copy.
+
+```bash
+adbagent ui                 # live reload on, in a checkout
+adbagent ui --no-reload     # never watch, never restart
+```
+
+Each kind of change is applied by the cheapest thing that would work:
+
+| what changed | what happens |
+| --- | --- |
+| `web/static/*` — the HTML, JS, CSS | the page reloads itself |
+| `config.json`, `skills/*.json`, the reply policy | that panel refetches, and nothing else moves |
+| any `.py` | the server restarts, and the page comes back on it |
+
+The distinction is worth the machinery: the server reads static files, config,
+skills and the policy off disk per request, so none of them needs a restart —
+and restarting to pick up a CSS edit would stop the run the server is following.
+Only Python needs one, because the process imported it once and cannot import it
+again.
+
+**A restart waits for the phone.** Runs and watches are subprocesses in their
+own process groups, so they survive the server being replaced — a restart in the
+middle of one would leave it tapping the screen with nothing left holding its
+handle. So a code change made while an agent is working is held, and the corner
+of the page says what it is waiting for until the phone is free.
+
+A panel is never refetched out from under you either: a config form, a skill or
+a policy with unsaved edits in it keeps them, and says the file changed instead.
+
 ## App skills
 
 A skill is per-app guidance — workflows, UI quirks, what to avoid — injected into
