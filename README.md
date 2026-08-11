@@ -209,6 +209,9 @@ guarantee, and it cannot be talked out of it.
 | `--usd-per-hour` | off | runaway spend — this pauses the loop, it does not end it |
 | `--fail-open` | off | sending into a conversation the harness cannot identify |
 
+`--sweep` is the one dial here that spends rather than saves; it is described
+[below](#unless-the-work-does-not-announce-itself).
+
 ### Nothing changed means nothing spent
 
 Between passes the loop dumps the UI — an adb round trip, no model call — and
@@ -223,6 +226,26 @@ forever; comparing against the anchor reads it as "not where I should be" and
 spends a pass getting back. A screen that went off, an app that got killed and a
 notification shade left open all look the same to it, and all get fixed the same
 way.
+
+### Unless the work does not announce itself
+
+That probe asks "did anything arrive?", which is the whole question for an inbox
+and the wrong question for a goal whose work is generated somewhere the screen
+cannot show — a feed with more items below the fold, a queue to take a few from
+each time, anything meant to happen on a period. Those leave the screen exactly
+as the last pass left it and still have work to do, so a purely reactive loop
+does one pass and then sleeps forever with nothing to report.
+
+```bash
+adbagent watch "work through the feed and reply to anyone new" --policy feed.md --sweep 300
+```
+
+`--sweep SECONDS` is a second trigger: run a pass at least this often whatever the
+digest says. Novelty still fires immediately — the two are an *or*, so a message
+that arrives 20 seconds into a 5-minute sweep is answered in 20 seconds, not in
+5 minutes. It is off by default, because which kind of goal this is cannot be read
+off the app, only off what you asked for, and because switching it on is exactly
+the trade of "nothing changed means nothing spent" for "a pass on the clock".
 
 Each pass is an ordinary bounded run, so `LoopDetector`, the stall ladder and the
 step budget all keep working — none of them had to be weakened. Only the

@@ -149,6 +149,7 @@ OVERRIDES = {
     # `run.max_steps` are different budgets and sharing `--max-steps` between
     # them would silently drop whichever one lost -- see `Watch.__init__`.
     "watch_interval": "watch.interval_s",
+    "watch_sweep": "watch.sweep_s",
     "watch_max_steps": "watch.max_steps",
     "watch_draft": "watch.draft",
     "watch_policy": "watch.policy",
@@ -1313,6 +1314,12 @@ def _watch_banner(out: Out, cfg, goal: str, policy: str, ledger) -> None:
         f"<={w.max_replies_per_thread_per_hour}/conversation/h | "
         f"{w.thread_cooldown_s:g}s cooldown | "
         f"fail_{'closed' if w.fail_closed else 'OPEN'}"))
+    if w.sweep_s > 0:
+        # Said on its own line because it changes what the loop costs: without
+        # it a quiet app spends nothing, with it a pass runs on the clock
+        # whether or not anything arrived.
+        out.say(out.dim(f"  sweep: a pass every {w.sweep_s:g}s even when "
+                        f"nothing has changed"))
     if w.max_usd_per_hour:
         out.say(out.dim(f"  spend ceiling: ${w.max_usd_per_hour:g}/h"))
     out.say(out.dim("  Ctrl-C to stop"))
@@ -2280,6 +2287,13 @@ def build_parser() -> argparse.ArgumentParser:
                    metavar="SECONDS",
                    help="how often to look when nothing has changed "
                         "(default 45)")
+    p.add_argument("--sweep", dest="watch_sweep", type=float,
+                   metavar="SECONDS",
+                   help="run a pass this often even when nothing on screen has "
+                        "changed. For goals whose work does not announce itself "
+                        "-- a feed to work through, a queue to drain, a periodic "
+                        "check. Off by default, which watches for new messages "
+                        "and spends nothing while there are none")
     p.add_argument("--steps-per-pass", dest="watch_max_steps", type=int,
                    metavar="N",
                    help="step budget for one pass over the inbox (default 25)")

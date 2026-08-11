@@ -38,6 +38,27 @@ class StubLLM:
         self.ledger = StubLedgerHolder()
 
 
+class FakeClock:
+    """A monotonic clock that only moves when the loop sleeps.
+
+    Which is the truth about this loop: between probes it is either sleeping or
+    doing something with a stub that takes no time at all. Without it every
+    wall-clock ceiling -- the sweep, the rolling spend window -- would sit at
+    zero elapsed forever while the test ran through a day of probes.
+    """
+
+    def __init__(self):
+        self.t = 0.0
+        self.slept = []
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.t += seconds
+
+    def __call__(self) -> float:
+        return self.t
+
+
 class StubDevice:
     """Hands back scripted screens; raises whatever is scripted instead."""
 
@@ -99,14 +120,14 @@ def cfg():
 def build(cfg, frames, outcomes=(), spend=0.0, ledger_path=None, tmp_path=None):
     """A Watch wired to stubs, plus the lists that record what it did."""
     llm = StubLLM()
-    slept, goals = [], []
+    clock, goals = FakeClock(), []
     agent = StubAgent(list(outcomes), goals, spend=spend, llm=llm)
     watch = Watch(StubDevice(frames), None, llm, cfg,
                   policy="be brief",
                   ledger=ReplyLedger(ledger_path or (tmp_path / "l.jsonl")),
                   make_agent=lambda: agent,
-                  sleep=slept.append)
-    return watch, slept, goals
+                  sleep=clock.sleep, clock=clock)
+    return watch, clock.slept, goals
 
 
 # -- the novelty signal -----------------------------------------------------
@@ -161,6 +182,40 @@ def test_new_content_spends_a_pass(cfg, tmp_path):
     assert len(goals) == 2, "a new message did not trigger a pass"
 
 
+def test_the_sweep_is_off_unless_it_is_asked_for(cfg, tmp_path):
+    """The default has to stay reactive: a quiet app costs a dump, not a pass."""
+    assert cfg.watch.sweep_s == 0
+    watch, slept, goals = build(cfg, [chat()], ["success"], tmp_path=tmp_path)
+    watch.run("watch instagram dms", max_passes=6)
+    assert len(goals) == 1
+
+
+def test_a_sweep_spends_a_pass_on_an_unchanged_screen(cfg, tmp_path):
+    """Work that does not announce itself -- a feed, a queue, a periodic check.
+
+    The screen the last pass left behind is exactly the screen that is there now,
+    and there is still something to do, so novelty cannot be the only trigger.
+    """
+    cfg.watch.sweep_s = 120.0
+    watch, slept, goals = build(cfg, [chat()], ["success"] * 2,
+                                tmp_path=tmp_path)
+    # 45s of probing at a time: passes at t=0 and t=135, skips in between.
+    watch.run("watch instagram dms", max_passes=5)
+    assert len(goals) == 2, "the sweep never came due"
+    assert watch.stats.skipped == 3, "it swept more often than it was asked to"
+
+
+def test_a_new_message_does_not_wait_for_the_sweep(cfg, tmp_path):
+    """The sweep is a second trigger, not a floor on how often a pass may run."""
+    cfg.watch.sweep_s = 3600.0
+    frames = [chat(), chat(), chat(messages=["hey", "you around?", "hello?"])]
+    watch, slept, goals = build(cfg, frames, ["success", "success"],
+                                tmp_path=tmp_path)
+    watch.run("watch instagram dms", max_passes=1)
+    watch.run("watch instagram dms", max_passes=2)
+    assert len(goals) == 2
+
+
 def test_wandering_off_the_app_spends_a_pass(cfg, tmp_path):
     """A phone left on the launcher must be brought back, not watched."""
     frames = [chat(), chat(), settings()]
@@ -180,7 +235,20 @@ def test_the_pass_goal_carries_the_iteration_contract(cfg, tmp_path):
     assert goal.startswith("watch instagram dms")
     assert "ONE PASS" in goal
     assert "At most one reply per conversation" in goal
-    assert "Finish on the conversation list" in goal
+    assert "Finish on the screen you worked from" in goal
+
+
+def test_the_iteration_contract_does_not_assume_an_inbox(cfg, tmp_path):
+    """It frames a pass; the goal and the policy say what the work is.
+
+    Naming conversations and incoming messages here made it a second, competing
+    description of the task for any goal that was not an inbox sweep.
+    """
+    watch, slept, goals = build(cfg, [chat()], ["success"], tmp_path=tmp_path)
+    watch.run("work through my feed", max_passes=1)
+    contract = goals[0].split("ONE PASS", 1)[1]
+    assert "the goal works from" in contract
+    assert "whatever the goal counts as work" in contract
 
 
 # -- surviving failure ------------------------------------------------------
@@ -269,12 +337,21 @@ def test_rolling_spend_ceiling_pauses_the_loop(cfg, tmp_path):
     cfg.watch.max_usd_per_hour = 0.10
     watch, slept, goals = build(cfg, distinct(12), ["success"] * 6, spend=0.06,
                                 tmp_path=tmp_path)
-    watch.run("watch instagram dms", max_passes=4)
-    # Two passes at $0.06 clear the $0.10 ceiling, so the loop must pause rather
-    # than start a third -- even though every probe is finding fresh work.
+    watch.run("watch instagram dms", max_passes=3)
+    # Two passes at $0.06 clear the $0.10 ceiling, so the third probe must pause
+    # rather than start a pass -- even though it is finding fresh work.
     assert len(goals) == 2
-    assert watch.stats.paused > 0
+    assert watch.stats.paused == 1
     assert any(s > cfg.watch.interval_s for s in slept)
+
+
+def test_the_spend_ceiling_pauses_and_does_not_end_the_loop(cfg, tmp_path):
+    """It is a ceiling per rolling hour, so an hour later there is room again."""
+    cfg.watch.max_usd_per_hour = 0.10
+    watch, slept, goals = build(cfg, distinct(12), ["success"] * 6, spend=0.06,
+                                tmp_path=tmp_path)
+    watch.run("watch instagram dms", max_passes=4)
+    assert len(goals) == 3, "the loop never came back from the pause"
 
 
 def test_no_spend_ceiling_by_default(cfg, tmp_path):
