@@ -276,24 +276,36 @@ class SweepLog:
 
     def render(self, reason: str = "") -> str:
         """The block handed to the model after a sweep hands back."""
-        if not self.readings:
-            return ""
-        lines = [f"YOU REPEATED `{self.gesture}` {self.repeats} time(s) and read, "
-                 f"in order:"]
-        shown = self.readings
-        if len(shown) > MAX_SWEEP_RENDER:
-            dropped = len(shown) - MAX_SWEEP_RENDER
-            lines.append(f"  (... {dropped} earlier reading(s) omitted)")
-            shown = shown[-MAX_SWEEP_RENDER:]
-        start = len(self.readings) - len(shown) + 1
-        for position, reading in enumerate(shown, start=start):
-            lines.append(f"  {position}. {reading}")
         why = reason or self.reason
+        if not self.readings and not why:
+            return ""
+        if self.readings:
+            lines = [f"YOU REPEATED `{self.gesture}` {self.repeats} time(s) and "
+                     f"read, in order:"]
+            shown = self.readings
+            if len(shown) > MAX_SWEEP_RENDER:
+                dropped = len(shown) - MAX_SWEEP_RENDER
+                lines.append(f"  (... {dropped} earlier reading(s) omitted)")
+                shown = shown[-MAX_SWEEP_RENDER:]
+            start = len(self.readings) - len(shown) + 1
+            for position, reading in enumerate(shown, start=start):
+                lines.append(f"  {position}. {reading}")
+        else:
+            # A `read_each=false` sweep used to render nothing at all: the whole
+            # block was gated on readings, so the one thing such a sweep does
+            # establish -- where on the content it stopped -- was left entirely
+            # to the model's memory of its own gestures. See `landed_at`.
+            lines = [f"YOU REPEATED `{self.gesture}` {self.repeats} time(s) "
+                     f"without reading the frames in between."]
         if why:
             lines.append(f"The repeat stopped because {why}.")
+            landed = landed_at(self.gesture, why)
+            if landed:
+                lines.append(landed)
         # No claim about what remains: nothing here knows.
-        lines.append("Record anything you need from these in `notes` -- this "
-                     "list is not kept for you.")
+        if self.readings:
+            lines.append("Record anything you need from these in `notes` -- this "
+                         "list is not kept for you.")
         return "\n".join(lines)
 
 
@@ -335,13 +347,80 @@ def stop_repeating(after: Screen, *, package: str = "",
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Where a sweep left the screen
+# ---------------------------------------------------------------------------
+#
+# `stop_repeating` says *why* the gesture handed back. That is not the same as
+# where it left the content, and the difference cost a run: in
+# ``runs/9b9c69095095`` a `scroll down` sweep ran a Hinge profile to its last
+# photo, and the next step tapped the like button there while observing "profile
+# S at the first photo". Nothing in the prompt contradicted it -- the sweep had
+# `read_each=false`, so `SweepLog.render` returned "", and the history line said
+# only that the content stopped changing, never which end it stopped against.
+#
+# Position is the one thing a sweep that ran out of road genuinely establishes,
+# and it is a fact about the gesture, not a claim about the set: what is on
+# screen is as far as that direction reaches. Saying it is inside the line
+# `SweepLog` draws; saying what is *in* the list would not be.
+
+#: Which end of the content each direction runs toward. "left" is the next
+#: photo/card and "right" the previous one -- the swipe semantics THE ACTIONS
+#: hands the model -- so they pair with down and up.
+_END_REACHED = {
+    "down": "the BOTTOM",
+    "up": "the TOP",
+    "left": "the FAR end",
+    "right": "the START",
+}
+
+#: The directions that run away from the start, and so the ones worth an extra
+#: sentence: mistaking the far end for the start is what the note is for.
+_AWAY_FROM_START = ("down", "left")
+
+
+def _end_reached(gesture: str, reason: str) -> str:
+    """Which end the sweep stopped against, or ``""`` when that is not known.
+
+    Only a sweep that ran out of content says anything about position. An app
+    switch or a missing screenshot stops the repeat without establishing where
+    the content sits, so those get nothing.
+    """
+    if "stopped changing" not in (reason or ""):
+        return ""
+    words = (gesture or "").split()
+    if not words:
+        return ""
+    return _END_REACHED.get(words[-1].lower(), "")
+
+
+def landed_at(gesture: str, reason: str) -> str:
+    """Where a sweep that ran out of road has left the screen, in prose."""
+    end = _end_reached(gesture, reason)
+    if not end:
+        return ""
+    note = f"That leaves the screen at {end} of what `{gesture}` reaches."
+    if (gesture or "").split()[-1].lower() in _AWAY_FROM_START:
+        note += (" It is not the start of the content -- you are back there "
+                 "only after gesturing the other way until that stops "
+                 "advancing too.")
+    return note
+
+
 def sweep_summary(first_step: int, last_step: int, gesture: str,
                   swept: int, read: int, reason: str) -> str:
     """One history line for a whole sweep, so it costs one entry not N."""
     span = f"steps {first_step}-{last_step}" if last_step > first_step \
         else f"step {first_step}"
-    return (f"{span}: repeated `{gesture}` {swept} time(s), read {read} "
+    line = (f"{span}: repeated `{gesture}` {swept} time(s), read {read} "
             f"-> stopped because {reason}")
+    # Carried in the history line as well as the hand-back block, because the
+    # block is handed over once and dropped while the history line is what a
+    # decision three turns later still has to go on.
+    end = _end_reached(gesture, reason)
+    if end:
+        line += f", leaving the screen at {end}"
+    return line
 
 
 # A `loop_id` used to live here: `exact_id` plus the content hash, so that the

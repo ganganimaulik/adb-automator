@@ -437,12 +437,18 @@ more content in fewer turns.
 `scroll_amount=1.0` or `0.5` so you do not overshoot.
 - Backtrack if overshot: if you passed your target, take one small step the other \
 way (`scroll_amount=0.5`).
-- Pick a direction and COMMIT to it. Do not reverse, and do not tap any button \
-that jumps to the end or a labelled anchor: that undoes all your scrolling \
-progress.
+- Pick a direction and COMMIT to it while you are searching: do not flip back \
+and forth every turn, and do not tap a button that jumps to the end or a \
+labelled anchor, which undoes all your scrolling progress. Reversing on purpose \
+is a different thing and is allowed -- when the goal or the policy says to go \
+back to the start of a list, scroll the other way until that gesture stops \
+advancing too.
 - Record the range you have covered as a note record (key "covered", value \
 "scrolled up through section 3, now in section 1"). That is your spatial memory.
-- If no new content appears, you have seen everything in that direction. Stop."""
+- If no new content appears, you have seen everything in that direction. Stop.
+- Scrolling leaves you where it stopped, at the far end of the direction you \
+went. You are not back at the start of a list because you finished reading it: \
+you are back there only after scrolling the other way."""
 
 MULTI_APP_ADVICE = """\
 SWITCHING APPS:

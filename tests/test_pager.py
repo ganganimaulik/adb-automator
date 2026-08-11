@@ -226,6 +226,52 @@ def test_an_empty_sweep_renders_nothing():
     assert pager.SweepLog().render() == ""
 
 
+# ---------------------------------------------------------------------------
+# Where the sweep left the screen
+# ---------------------------------------------------------------------------
+#
+# In ``runs/9b9c69095095`` a `scroll down` sweep with `read_each=false` ran a
+# Hinge profile to its last photo. The whole block was gated on readings, so it
+# rendered nothing, and the next step liked that photo while observing "profile
+# S at the first photo". Position is the one thing such a sweep does establish.
+
+def test_a_sweep_that_read_nothing_still_says_where_it_stopped():
+    log = pager.SweepLog()
+    log.start("scroll down")
+    log.repeats = 5
+    rendered = log.render(reason="the content stopped changing, so the gesture "
+                                 "no longer advances")
+    assert "scroll down" in rendered
+    assert "BOTTOM" in rendered
+    assert "not the start" in rendered
+
+
+def test_sweeping_back_up_lands_at_the_top():
+    log = pager.SweepLog()
+    log.start("scroll up")
+    log.repeats = 4
+    rendered = log.render(reason="the content stopped changing")
+    assert "the TOP" in rendered
+    # The warning is for the direction that runs away from the start; arriving
+    # at the top does not need to be argued with.
+    assert "not the start" not in rendered
+
+
+def test_a_sweep_that_stopped_for_another_reason_claims_no_position():
+    """An app switch says nothing about where the content sits."""
+    log = pager.SweepLog()
+    log.start("scroll down")
+    log.repeats = 2
+    rendered = log.render(reason="the foreground app changed to com.other.app")
+    assert "BOTTOM" not in rendered
+
+
+def test_an_unknown_gesture_claims_no_position():
+    assert pager.landed_at("", "the content stopped changing") == ""
+    assert pager.landed_at("pinch outwards",
+                           "the content stopped changing") == ""
+
+
 def test_the_log_is_bounded():
     log = pager.SweepLog()
     log.start("swipe left")
@@ -267,6 +313,21 @@ def test_a_sweep_is_summarised_as_one_history_line():
 def test_a_one_step_sweep_does_not_render_a_range():
     line = pager.sweep_summary(4, 4, "swipe up", swept=1, read=1, reason="x")
     assert "step 4" in line and "4-4" not in line
+
+
+def test_the_history_line_says_which_end_the_sweep_stopped_against():
+    """The hand-back block is handed over once and dropped; this line is what a
+    decision several turns later still has."""
+    line = pager.sweep_summary(19, 23, "scroll down", swept=5, read=0,
+                               reason="the content stopped changing, so the "
+                                      "gesture no longer advances")
+    assert "leaving the screen at the BOTTOM" in line
+
+
+def test_a_history_line_for_a_sweep_cut_short_claims_no_position():
+    line = pager.sweep_summary(4, 6, "scroll down", swept=2, read=0,
+                               reason="the foreground app changed to com.x")
+    assert "BOTTOM" not in line
 
 
 # ---------------------------------------------------------------------------
