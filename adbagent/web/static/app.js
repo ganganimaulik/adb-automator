@@ -89,8 +89,9 @@ function goalRest(goal) {
 
 /* ------------------------------------------------------- follow the tail
 
-   Live surfaces -- the event feed, a streaming llm panel, the generator log --
-   chase their newest line only while the reader is at the bottom. Scrolling up
+   The boxes that scroll inside themselves -- a streaming llm panel, the child's
+   exit log, the generator's log -- are read top to bottom and chase their
+   newest line, but only while the reader is at the bottom of one. Scrolling up
    parks the view where it was left; scrolling back down resumes the chase.
 
    Decided here and now on each new line, never from a scroll listener: scroll
@@ -123,17 +124,59 @@ function followTail(box, grow) {
   box._autoTop = box.scrollTop;  // read back: the write above was clamped
 }
 
-/* The event feed rides the page's own scrollbar, which lives on the document. */
-function followPageTail(feed, grow) {
-  if (!feed.offsetParent) { grow(); return; }  // hidden tab: no tail to chase
-  followTail(document.scrollingElement, grow);
-}
+/* --------------------------------------------------------- newest first
 
-/* Treat wherever the page sits now as the tail, so the next live line resumes
-   the chase: a reader opening the work tab mid-run wants the newest of it. */
-function armPageTail() {
+   A feed is written head-first: every step, banner and card goes in at the top
+   of it. The newest of a run is then always in the same place -- just under the
+   feed's heading -- instead of at the end of a page that grows all afternoon,
+   and nothing has to chase it down. Only the top level is reversed: a step's own
+   screenshots, reads and trace fold stay in the order they happened, because
+   that is one step's story rather than the run's.
+
+   What is left to do is hold the reader's place. Everything a live run writes
+   lands at the head or in the row that is still at the head -- so a reader down
+   among older steps would be pushed down the page by every step, every chip and
+   every screenshot, and is given back exactly what arrived instead. A reader
+   with the head in view is not moved at all: the feed grows away from them
+   rather than under them.
+
+   The browser offers to do this itself (scroll anchoring), but not in every
+   browser, and it cannot tell those two cases apart: parked at the head it
+   holds whatever was newest a moment ago exactly where it is, which puts the
+   row that just arrived off the top of the screen. Left on alongside this it
+   also pays for the same growth twice, since the anchor it settles on is an
+   ancestor of the feed -- measured: 274px of scroll for a 137px answer block.
+   So the sheet declines it for the document, and the arithmetic is done here,
+   on the frame the content lands in. */
+
+/* Run `grow`, and put back whatever it cost a reader who is below the head.
+
+   Measured off the foot of the feed in document coordinates, which moves by
+   exactly what an older row moves by: a step row is inserted with "thinking…"
+   in it and goes on growing for as long as the step lasts -- its observation,
+   its chips, its screenshots, the llm panel streaming into it -- and the
+   readouts and the ledger above the feed push the whole of it down as they
+   fill. All of that is one measurement rather than a tally of insertions. */
+function holdPlace(feed, grow) {
+  // Nothing to hold: a hidden tab, a finished run being replayed into the page
+  // in one go, or a nested call -- the outermost one measures the whole event.
+  if (!feed._live || !feed.offsetParent || feed._holding) { grow(); return; }
   const page = document.scrollingElement;
-  page._autoTop = page.scrollTop;
+  const before = feed.getBoundingClientRect().bottom + page.scrollTop;
+  feed._holding = true;
+  try { grow(); } finally { feed._holding = false; }
+  const box = feed.getBoundingClientRect();
+  // A head still in view is a reader watching the newest end: nothing to give
+  // back, because nothing they are looking at moved.
+  if (box.top >= 0) { feed._owed = 0; return; }
+  const was = page.scrollTop;
+  const owed = box.bottom + was - before + (feed._owed || 0);
+  page.scrollTop = was + owed;
+  // The scroller lands on a device pixel, so part of a row goes unpaid every
+  // time -- measured on a 2x display: 70.297px of row against 70.5px of scroll,
+  // a fifth of a pixel a step. Carried to the next row rather than left to add
+  // up, which over a watch's afternoon is the reader's place walking away.
+  feed._owed = owed - (page.scrollTop - was);
 }
 
 /* ------------------------------------------------------------- density
@@ -174,8 +217,6 @@ $("tabs").addEventListener("click", (e) => {
   document.querySelectorAll("section.tab").forEach((s) =>
     s.classList.toggle("active", s.id === "tab-" + btn.dataset.tab));
   const name = btn.dataset.tab;
-  // The other tab's scroll position isn't a reader's decision about this feed.
-  armPageTail();
   if (!loadedTabs.has(name)) {
     loadedTabs.add(name);
     tabLoaders[name]().catch((err) => notice(err.message));
@@ -370,9 +411,11 @@ function notesPanel(ev, feed) {
 
 /* --------------------------------------------------------- step rows */
 
-function feedAppend(feed, el) {
-  if (feed._live) followPageTail(feed, () => feed.appendChild(el));
-  else feed.appendChild(el);
+/* The one way anything enters a feed: at the head, holding the reader's place.
+   Every top-level row goes through here so that "newest first" is a property of
+   the feed rather than a habit of nine call sites. */
+function feedAdd(feed, el) {
+  holdPlace(feed, () => feed.prepend(el));
 }
 
 /* The step's row, created on first sight of it -- which is the model starting to
@@ -410,7 +453,7 @@ function feedStep(feed, step) {
     more: el.querySelector(".step-more"),
   };
   steps.set(key, node);
-  feedAppend(feed, el);
+  feedAdd(feed, el);
   return node;
 }
 
@@ -485,7 +528,7 @@ function banner(feed, cls, html, traceOnly) {
   const div = document.createElement("div");
   div.className = "banner " + cls + (traceOnly ? " trace-only" : "");
   div.innerHTML = html;
-  feedAppend(feed, div);
+  feedAdd(feed, div);
 }
 
 function tele(feed, ev, text) {
@@ -494,13 +537,13 @@ function tele(feed, ev, text) {
   div.className = "tele";
   div.textContent = text;
   if (node) node.more.appendChild(div);
-  else { div.classList.add("trace-only"); feedAppend(feed, div); }
+  else { div.classList.add("trace-only"); feedAdd(feed, div); }
 }
 
 /* One event, folded into the feed wherever it belongs: onto its step's row, into
    that step's trace fold, or -- for the handful that are about the run rather
    than a step -- as a rule between steps. */
-function appendEvent(ev, feed) {
+function foldEvent(ev, feed) {
   const kind = ev.kind || "";
 
   if (kind === "decide") {
@@ -575,7 +618,7 @@ function appendEvent(ev, feed) {
     const thumb = llmShot(ev, feed._runId);
     if (thumb) row.appendChild(thumb);
     if (node) node.reads.appendChild(row);
-    else feedAppend(feed, row);
+    else feedAdd(feed, row);
 
   } else if (kind === "image_analysis") {
     const node = stepFor(feed, ev);
@@ -585,7 +628,7 @@ function appendEvent(ev, feed) {
       `<details><summary>vision read · ${esc(ev.model || "")}</summary>` +
       `<div class="why" style="margin-top:6px">${esc(ev.result || "")}</div></details>`;
     if (node) node.more.appendChild(card);
-    else { card.classList.add("trace-only"); feedAppend(feed, card); }
+    else { card.classList.add("trace-only"); feedAdd(feed, card); }
 
   } else if (kind === "scratchpad" && (ev.records || []).length) {
     // A run recorded before the event carried its records has only the keys, and
@@ -593,7 +636,7 @@ function appendEvent(ev, feed) {
     const node = stepFor(feed, ev);
     const panel = notesPanel(ev, feed);
     if (node) node.more.appendChild(panel);
-    else { panel.classList.add("trace-only"); feedAppend(feed, panel); }
+    else { panel.classList.add("trace-only"); feedAdd(feed, panel); }
 
   } else if (kind === "active_skill") {
     // Recorded on every step -- it is the per-step record of what the prompt
@@ -820,12 +863,12 @@ function handleLlmEvent(ev, feed) {
       `<div class="llm-sec response"><div class="llm-sec-label">response</div>` +
       `<div class="llm-text"></div></div></details>`;
     if (node) node.more.appendChild(card);
-    else { card.classList.add("trace-only"); feedAppend(feed, card); }
+    else { card.classList.add("trace-only"); feedAdd(feed, card); }
     // The frame outside the fold: it is evidence, not machinery.
     const shot = llmShot(ev, feed._runId);
     if (shot) {
       if (node) node.shots.appendChild(shot);
-      else feedAppend(feed, shot);
+      else feedAdd(feed, shot);
     }
     const section = (name) => ({
       sec: card.querySelector(`.llm-sec.${name}`),
@@ -838,9 +881,9 @@ function handleLlmEvent(ev, feed) {
       summary: card.querySelector("summary"),
       secs: [section("thinking"), section("response")],
       frame: 0,
-      // Replaying a finished run appends hundreds of panels in one go and must
-      // not drag the page down with each; a live feed chases its newest line.
-      chase: feed._live ? (grow) => followPageTail(feed, grow) : (grow) => grow(),
+      // The panel is already in the feed; what streaming into it moves is
+      // everything below it, which is a reader's place to hold like any other.
+      chase: (grow) => holdPlace(feed, grow),
     };
   } else if (ev.kind === "llm_stream" && feed._llm) {
     llmPush(feed._llm, ev.stream_type, ev.text || "");
@@ -892,16 +935,17 @@ function appendExitLine(feed, line) {
     pre.className = "log";
     card.appendChild(pre);
     feed._exitLog = pre;
-    followPageTail(feed, () => feed.appendChild(card));
+    feedAdd(feed, card);   // the newest thing there is: at the head, like a step
   }
-  // Two tails to chase: the page's, and the log box's own -- `pre.log` scrolls
-  // internally past 400px, and a long write-up would otherwise grow off the
-  // bottom of a box that stayed at its first line.
+  // The card grows downward inside itself even though the feed grows upward:
+  // this is one thing happening, and its lines are in the order it says them.
+  // `pre.log` scrolls internally past 400px, so a long write-up would otherwise
+  // grow off the bottom of a box that stayed at its first line.
   //
   // Text nodes, not innerHTML: these are the child's own lines, and one of them
   // is a goal or a skill name it read off the phone.
   const pre = feed._exitLog;
-  followPageTail(feed, () => followTail(pre, () =>
+  holdPlace(feed, () => followTail(pre, () =>
     pre.appendChild(document.createTextNode(line + "\n"))));
 }
 
@@ -1146,7 +1190,8 @@ function openStream(v) {
     const data = JSON.parse(e.data);
     // Sent again for every `--repeat` iteration, each of which is a separate
     // run in its own directory. Rule off rather than letting the next one's
-    // step 1 land under the last one's step 40.
+    // step 1 land against the last one's step 40. The rule goes in at the head
+    // like everything else, and the iteration it announces then grows above it.
     if (feed._runId && feed._runId !== data.run_id) {
       finalizeLlm(feed, null);        // an iteration can end mid-call
       const rule = document.createElement("div");
@@ -1156,7 +1201,7 @@ function openStream(v) {
       // inbox an "iteration" reads as though the goal were being retried.
       rule.innerHTML = `<b>${v.passLabel} ${esc(data.iteration || "?")}</b>` +
         `<br><span class="small runid">${esc(data.run_id)}</span>`;
-      followPageTail(feed, () => feed.appendChild(rule));
+      feedAdd(feed, rule);
       // Steps are per iteration, and so are the ledger and the progress note --
       // each iteration pursues the goal from scratch in its own run directory.
       // Calls and spend are the session's, because that is what --budget-usd
@@ -1179,14 +1224,21 @@ function openStream(v) {
   });
   source.addEventListener("event", (e) => {
     const ev = JSON.parse(e.data);
-    appendEvent(ev, feed);
-    updateCountersFromEvent(ev, v);
-    v.onEvent(ev);
+    // Everything one event does to the page inside one measurement: the row it
+    // adds or grows, and the readouts, the answer and the ledger above the
+    // feed, which push it down the page as they fill.
+    holdPlace(feed, () => {
+      foldEvent(ev, feed);
+      updateCountersFromEvent(ev, v);
+      v.onEvent(ev);
+    });
   });
   source.addEventListener("llm", (e) => {
-    // Not wrapped in followPageTail: a stream chunk is one of tens of thousands
-    // and the panel batches its own appends and scrolling by frame.
-    handleLlmEvent(JSON.parse(e.data), feed);
+    const ev = JSON.parse(e.data);
+    // A stream chunk is one of tens of thousands and lays out nothing: it goes
+    // into a buffer, and the frame that flushes it holds the place itself.
+    if (ev.kind === "llm_stream") handleLlmEvent(ev, feed);
+    else holdPlace(feed, () => handleLlmEvent(ev, feed));
   });
   // The child's own account of its shutdown, which no run file carries: the
   // phone being put back, and the skill written from everything the passes saw.
@@ -1318,7 +1370,6 @@ function beginLive(v) {
   v.stopping = false;
   v.startedAt = Date.now() / 1000;
   v.feed.innerHTML = "";
-  armPageTail();  // a new run is followed however the last one was left
   v.feed._llm = null;
   v.feed._runId = "";
   v.feed._skill = "";
@@ -1921,7 +1972,7 @@ async function openRunDetail(id) {
       if (typeof ev.kind === "string" && ev.kind.startsWith("llm_")) {
         handleLlmEvent(ev, feed);
       } else {
-        appendEvent(ev, feed);
+        foldEvent(ev, feed);
       }
     }
     finalizeLlm(feed, null);  // a run that died mid-call has no llm_end
