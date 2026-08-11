@@ -357,6 +357,106 @@ def test_a_seeing_deciders_named_point_is_kept(cfg, mem):
 
 
 # ---------------------------------------------------------------------------
+# input_text aimed at a container: the vision locate finds the field
+# ---------------------------------------------------------------------------
+
+def test_input_text_aimed_at_a_scroller_is_grounded_by_the_locate(cfg, mem):
+    """A composer the model aims at through the message-list scroller must not
+    be typed into via the scroller's centre: nothing there takes focus, the
+    keys go nowhere, and the tree keeps rendering the field's old text. The
+    same vision locate that grounds a named tap_at places the real field, and
+    the focus tap goes to that point."""
+    dev = fake.FakeDevice(cfg, start="thread",
+                          app={"thread": fake.FakeScreen(xml=X.chat_thread())})
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="the draft is in",
+                               reasoning="send it", action="done",
+                               text="message typed")
+        tried.append(True)
+        scroller = next(e for e in screen.elements if e.kind() == "Scroller")
+        field = next(e for e in screen.elements if e.editable)
+        # What the vision model answers for the composer on this frame.
+        llm.location = (field.center[0] / screen.width,
+                        field.center[1] / screen.height)
+        return AgentAction(observation="the composer folds into the list",
+                           reasoning="type into it", action="input_text",
+                           target={"index": scroller.index}, text="hello there")
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert llm.locates == 1 and llm.locates_seen == ["the text input field"]
+    # The located composer centre is what was tapped -- the scroller's centre
+    # (540, 1100) never was.
+    cx, cy = (450, 2020)     # the composer's centre in the fixture
+    assert len(dev.taps) == 1
+    assert abs(dev.taps[0][0] - cx) <= 1 and abs(dev.taps[0][1] - cy) <= 1
+    assert any(a.startswith("input_text('hello there'") for a in dev.actions)
+
+
+def test_an_input_text_container_locate_miss_is_never_tapped(cfg, mem):
+    """A locate that cannot find the field is a failed step, never a tap at
+    the container's centre -- that tap would focus nothing and type into the
+    void."""
+    dev = fake.FakeDevice(cfg, start="thread",
+                          app={"thread": fake.FakeScreen(xml=X.chat_thread())})
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="no field could be placed",
+                               reasoning="stop poking", action="done",
+                               text="gave up")
+        tried.append(True)
+        scroller = next(e for e in screen.elements if e.kind() == "Scroller")
+        # llm.location stays None: the field is not on screen.
+        return AgentAction(observation="the composer folds into the list",
+                           reasoning="type into it", action="input_text",
+                           target={"index": scroller.index}, text="hello")
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert llm.locates == 1
+    assert dev.taps == []      # the container's centre was never tapped
+    assert not any(a.startswith("input_text") for a in dev.actions)
+    assert "could not locate" in (state.last_failure or "")
+
+
+def test_an_input_text_that_changes_nothing_is_a_failed_step(cfg, mem):
+    """Failed focus, caught after the fact: the tap that was meant to focus
+    the field hit nothing editable, the keys went nowhere, and the dump is
+    byte-identical. It used to grade a success -- the field's stale text was
+    still there to read -- and the run walked on believing the text was in."""
+    dev = fake.FakeDevice(cfg, start="thread",
+                          app={"thread": fake.FakeScreen(xml=X.chat_thread())})
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="typing failed", reasoning="stop",
+                               action="done", text="could not type")
+        tried.append(True)
+        # A legitimate, small target -- so no locate is paid for -- whose tap
+        # still focuses nothing: the fake phone's screen never moves.
+        send = next(e for e in screen.elements if e.best_text == "Send")
+        return AgentAction(observation="type the reply", reasoning="...",
+                           action="input_text", target={"index": send.index},
+                           text="on my way")
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"   # the run goes on to decide what comes next
+    assert llm.locates == 0
+    assert state.consecutive_failures >= 1
+    assert "never took focus" in (state.last_failure or "")
+    assert any("-> no_change" in line for line in state.history)
+
+
+# ---------------------------------------------------------------------------
 # Completion
 # ---------------------------------------------------------------------------
 
