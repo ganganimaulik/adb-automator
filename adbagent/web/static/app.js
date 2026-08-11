@@ -251,20 +251,62 @@ async function loadSetup() {
 
 /* ------------------------------------------------------- event rendering */
 
-function actionSummary(a) {
+function trunc(s, n) {
+  s = String(s ?? "");
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+/* Which control the step is about to touch.
+
+   `tap #3` is the action as the model wrote it, and `#3` is a position in an
+   element list that is not on this page -- so the row said what the harness did
+   and left *what it did it to* to be guessed from the screenshot underneath.
+   `el` is what the harness resolved that ordinal to on the screen the decision
+   was made from (the `target_element` of the `decide` event):
+
+     undefined  a run recorded before that was written down -- render as before
+     null       nothing on the screen matched, which for a tap is the reason the
+                step is about to fail, and is worth saying rather than hiding
+     object     the element, led by whatever a human would call it */
+function targetName(t, el) {
+  const ord = t.index != null ? `#${t.index}`
+    : t.resource_id ? `#${t.resource_id}`
+    : t.text ? `"${t.text}"` : "";
+  if (el === undefined) return t.text ? `"${t.text}"` : ord;
+  if (el === null) return `${ord} (not on screen)`;
+  const label = (el.text || "").trim();
+  const name = label ? `"${trunc(label, 40)}"`
+    : el.resource_id ? `id=${el.resource_id}`
+    : el.kind || "";
+  return [ord, name].filter(Boolean).join(" ");
+}
+
+/* The rest of the resolved element, for the row's tooltip: the parts that
+   identify it rather than name it. A toggle's state leads, because "tap #3
+   Notifications" reads the same whether it is about to turn them on or off. */
+function targetTitle(el) {
+  if (!el || typeof el !== "object") return "";
+  const bits = [];
+  if (el.checkable) bits.push(el.checked ? "checked" : "unchecked");
+  if (el.selected) bits.push("selected");
+  if (el.enabled === false) bits.push("disabled");
+  if (el.kind) bits.push(el.kind);
+  if (el.text) bits.push(`"${el.text}"`);
+  if (el.resource_id) bits.push(`id=${el.resource_id}`);
+  if (el.center) bits.push(`at (${el.center[0]},${el.center[1]})`);
+  return bits.join(" · ");
+}
+
+function actionSummary(a, el) {
   if (!a || typeof a !== "object") return "";
   const kind = a.action || "?";
   const bits = [];
   const t = a.target;
-  if (t && typeof t === "object") {
-    if (t.text) bits.push(`"${t.text}"`);
-    else if (t.resource_id) bits.push(`#${t.resource_id}`);
-    else if (t.index != null) bits.push(`#${t.index}`);
-  }
+  if (t && typeof t === "object") bits.push(targetName(t, el));
   if (a.text) bits.push(kind === "open_app" ? a.text : `"${a.text}"`);
   if (a.direction) bits.push(a.direction);
   if (a.key) bits.push(a.key);
-  return `${kind}${bits.length ? " " + bits.join(" ") : ""}`;
+  return `${kind}${bits.length ? " " + bits.filter(Boolean).join(" ") : ""}`;
 }
 
 /* `success` was missing here, so every `verify` the harness graded `success`
@@ -466,8 +508,9 @@ function stepFor(feed, ev) {
   return feedStep(feed, step);
 }
 
-function setAct(node, text) {
+function setAct(node, text, title) {
   node.act.textContent = text;
+  if (title) node.act.title = title;
   delete node.act.dataset.placeholder;
 }
 
@@ -550,7 +593,8 @@ function foldEvent(ev, feed) {
     const a = ev.action || {};
     const node = stepFor(feed, ev);
     if (!node) return;
-    setAct(node, actionSummary(a) || "—");
+    setAct(node, actionSummary(a, ev.target_element) || "—",
+           targetTitle(ev.target_element));
     setLine(node.obs, a.observation);
     node.chips.innerHTML =
       // Why the turn was given deep reasoning, on the chip that says it was:
@@ -718,7 +762,7 @@ function updateCountersFromEvent(ev, v) {
     if ((ev.action || {}).progress) v.progress = ev.action.progress;
     // The first of the three primary readouts: what it is doing, in the words
     // the action itself is written in.
-    v.now = actionSummary(ev.action) || v.now;
+    v.now = actionSummary(ev.action, ev.target_element) || v.now;
   }
   const llm = ev.llm;
   if (llm && typeof llm === "object") {
@@ -1596,6 +1640,7 @@ function watchOptions() {
     no_learn: $("watch-no-learn").checked,
     serial: $("watch-serial").value.trim(),
     interval_s: num("watch-interval"),
+    sweep_s: num("watch-sweep"),
     max_steps: num("watch-steps", true),
     replies_per_hour: num("watch-rph", true),
     replies_per_conversation: num("watch-rpc", true),
@@ -1613,6 +1658,9 @@ async function loadWatch() {
   // filling them in would silently pin today's defaults into every start.
   const ph = (id, v) => { if (v !== undefined && v !== null) $(id).placeholder = String(v); };
   ph("watch-interval", watchDefaults.interval_s);
+  // Only when it is on: the markup already says "off", which is what 0 means
+  // and a good deal clearer than showing a 0.
+  if (watchDefaults.sweep_s) ph("watch-sweep", watchDefaults.sweep_s);
   ph("watch-steps", watchDefaults.max_steps);
   ph("watch-rph", watchDefaults.max_replies_per_hour);
   ph("watch-rpc", watchDefaults.max_replies_per_thread_per_hour);
@@ -2285,6 +2333,8 @@ const CFG_SPEC = [
     ["ledger", "text", { label: "Reply ledger file",
       help: "The record the never-double-reply guarantee is built on." }],
     ["interval_s", "number", { label: "Seconds between passes" }],
+    ["sweep_s", "number", { label: "Sweep every (s)",
+      help: "Run a pass this often even when nothing on screen has changed, for work that does not announce itself. 0 is off, and off only ever spends on a screen that changed." }],
     ["max_steps", "number", { label: "Steps per pass" }],
     ["draft", "bool", { label: "Draft only",
       help: "Compose and record replies, and never send them." }],
@@ -2921,6 +2971,7 @@ const PERSIST_FIELDS = [
   { id: "watch-draft", key: "adbagent.watch-draft", type: "checkbox" },
   { id: "watch-no-learn", key: "adbagent.watch-no-learn", type: "checkbox" },
   { id: "watch-interval", key: "adbagent.watch-interval", type: "text" },
+  { id: "watch-sweep", key: "adbagent.watch-sweep", type: "text" },
   { id: "watch-steps", key: "adbagent.watch-steps", type: "text" },
   { id: "watch-serial", key: "adbagent.watch-serial", type: "text" },
   { id: "watch-rph", key: "adbagent.watch-rph", type: "text" },

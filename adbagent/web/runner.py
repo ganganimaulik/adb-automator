@@ -433,6 +433,7 @@ class WatchManager(ChildProcess):
     def start(self, goal: str, *, policy: str, draft: bool = False,
               no_learn: bool = False,
               interval_s: Optional[float] = None,
+              sweep_s: Optional[float] = None,
               max_steps: Optional[int] = None,
               replies_per_hour: Optional[int] = None,
               replies_per_conversation: Optional[int] = None,
@@ -451,6 +452,8 @@ class WatchManager(ChildProcess):
                 argv.append("--no-learn")
             if interval_s is not None:
                 argv += ["--interval", str(interval_s)]
+            if sweep_s is not None:
+                argv += ["--sweep", str(sweep_s)]
             if max_steps is not None:
                 argv += ["--steps-per-pass", str(max_steps)]
             if replies_per_hour is not None:

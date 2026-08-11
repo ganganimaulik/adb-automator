@@ -1032,6 +1032,57 @@ def test_a_vision_turn_is_attributed_both_of_its_calls(cfg, mem, tmp_path):
     assert decides[0]["llm"]["completion_tokens"] == 150
 
 
+def test_a_decision_records_the_element_its_ordinal_resolved_to(cfg, mem, tmp_path):
+    """`tap #3` names a position in a list that is not in the artifact.
+
+    So the trace -- and the live feed the web UI builds off it -- could say what
+    the run did but not what it did it *to*, and reading a step back meant
+    matching an ordinal against the screenshot by eye.
+    """
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    taps = [e for e in _events(tmp_path, state.run_id)
+            if e["kind"] == "decide" and e["action"]["action"] == "tap"]
+    assert taps
+    target = taps[0]["target_element"]
+    assert target["index"] == taps[0]["action"]["target"]["index"]
+    assert target["text"] == "Wi-Fi"
+    assert target["kind"] and target["center"]
+
+
+def test_an_action_without_a_target_records_no_element(cfg, mem, tmp_path):
+    """The field is absent rather than null, so a reader can tell "nothing to
+    resolve" from "resolved to nothing" -- which for a tap is the reason the
+    step is about to fail."""
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    untargeted = [e for e in _events(tmp_path, state.run_id)
+                  if e["kind"] == "decide" and not e["action"].get("target")]
+    assert untargeted, "the run never took an action without a target"
+    assert all("target_element" not in e for e in untargeted)
+
+
+def test_a_target_that_matches_nothing_is_recorded_as_such(cfg, mem, tmp_path):
+    dev = fake.FakeDevice(cfg)
+
+    def policy(screen, llm):
+        if llm.calls == 1:
+            return AgentAction(observation="settings", reasoning="tap a ghost",
+                               action="tap", target={"index": 999})
+        return AgentAction(observation="settings", reasoning="give up",
+                           action="fail", text="no such element")
+
+    _, state = Agent(dev, mem, fake.FakeLLM(dev, policy), cfg).run(GOAL)
+
+    first = next(e for e in _events(tmp_path, state.run_id)
+                 if e["kind"] == "decide")
+    assert first["target_element"] is None
+
+
 def test_the_judge_is_costed_separately_from_the_step_that_proposed_done(cfg, mem, tmp_path):
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))

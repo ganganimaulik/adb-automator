@@ -311,6 +311,18 @@ class WatchConfig:
     #: is dumped once per interval (no LLM call), so this is the resolution at
     #: which a new message is noticed, not a cost dial.
     interval_s: float = 45.0
+    #: Run a pass at least this often even when the screen has not changed.
+    #: 0 leaves the loop purely reactive.
+    #:
+    #: The novelty probe answers "did anything arrive?", and for an inbox that is
+    #: the whole question -- no new message, nothing to do. It is the wrong
+    #: question for a goal whose work is not announced on the screen: a feed with
+    #: more items below, a queue to drain a few at a time, anything the operator
+    #: wants done on a period. There the last pass's screen is unchanged *and*
+    #: there is work, and a purely reactive loop runs once and then sleeps
+    #: forever. Which of the two a goal is cannot be read off the app -- it is a
+    #: property of what was asked for -- so the operator declares it here.
+    sweep_s: float = 0.0
     #: Steps one iteration may spend before it is abandoned and re-anchored. An
     #: iteration is "look at the inbox, handle what is new, come back" -- if that
     #: takes 25 steps something is wrong, and the fix is a fresh iteration rather

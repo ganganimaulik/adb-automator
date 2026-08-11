@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__, checkpoint, conversation, prompts, runlog, safety
 from .actions import (_POINT_GUARD_MAX_AREA, ActionError, AgentAction, Target,
-                      append_history, element_at_point, execute,
+                      append_history, element_at_point, element_summary, execute,
                       format_history_entry, input_target_is_container,
                       resolve_target, synthesise_postcondition, verify)
 from .config import Config
@@ -1400,6 +1400,16 @@ class Agent:
                       # screen really repeat" after the fact.
                       exact=screen.exact_id,
                       stalled=stalled, action=action.model_dump(),
+                      # What `#3` actually is on this screen. The action records
+                      # the ordinal the model wrote, which is a position in a
+                      # list nobody reading the run afterwards can see -- so a
+                      # trace, and the live feed off it, said "tap #3" and left
+                      # what was tapped to the screenshot. Resolved here against
+                      # the very screen the decision was made from, which is the
+                      # one `execute` will resolve it against a moment later.
+                      **({"target_element":
+                          element_summary(resolve_target(action.target, screen))}
+                         if action.target is not None else {}),
                       screenshot=bool(screenshot),
                       effort=effort, hard_because=hard_because,
                       wall_s=round(t_step_llm, 3), llm=step_metrics(step_calls))

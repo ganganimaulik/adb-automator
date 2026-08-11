@@ -20,6 +20,16 @@ it sleeps. That is what turns "an LLM call every 45 seconds forever" into "an LL
 call per actual new message", and it is also the honest answer to "how would you
 know something arrived": you looked.
 
+**Unless the work does not announce itself.** That probe asks "did anything
+arrive?", which is the whole question for an inbox and the wrong question for a
+goal whose work is generated somewhere the screen cannot show: a feed with more
+items below the fold, a queue to take a few from each time, anything meant to
+happen on a period. Those leave the screen exactly as the last pass left it and
+still have work, so a purely reactive loop does one pass and sleeps forever after
+it. `watch.sweep_s` is the second trigger -- run a pass at least this often
+whatever the digest says -- and it is off by default, because which kind of goal
+this is cannot be read off the app, only off what the operator asked for.
+
 The comparison is against a remembered *anchor* -- package plus digest -- rather
 than against the previous probe. Comparing consecutive probes would read a phone
 sitting on the launcher as "nothing changed" and watch the wrong screen forever;
@@ -55,11 +65,19 @@ from .screen import Screen
 log = logging.getLogger("adbagent.watch")
 
 #: What one pass of the loop is, appended to the operator's goal. Generic across
-#: chat apps on purpose -- it says what a pass *is*, not what any app looks like.
+#: apps on purpose -- it says what a pass *is*, not what any app looks like.
 #:
-#: The last line is what makes the cheap probe possible: a pass that ends on the
-#: conversation list leaves an anchor the next probe can compare against, so a
-#: quiet inbox costs one UI dump instead of a model call.
+#: It used to say it in inbox nouns: get to the conversation list, find the new
+#: incoming messages, reply, come back. That reads as a description of the task
+#: rather than a description of a pass, and against any goal that was not an
+#: inbox sweep -- work a feed, drain a queue, do a periodic check -- it competed
+#: with the goal instead of framing it. The numbered shape is worth keeping, so
+#: it stayed and the nouns went: the goal and the policy name the screen and say
+#: what counts as work, and this says how much of it one pass does.
+#:
+#: The last line is what makes the cheap probe possible: a pass that ends back on
+#: the list it worked from leaves an anchor the next probe can compare against,
+#: so a quiet inbox costs one UI dump instead of a model call.
 #:
 #: "Do not start conversations" defers to the policy rather than overriding it.
 #: Flatly forbidding openers here contradicted any policy that wanted one -- and
@@ -70,12 +88,14 @@ log = logging.getLogger("adbagent.watch")
 ITERATION_CONTRACT = """\
 This is ONE PASS of a monitoring loop that runs continuously. Do this pass only,
 then stop:
-  1. Get to the conversation list of the app named above.
-  2. Find the conversations with a new incoming message.
-  3. For each one, open it, read it, and if the REPLY POLICY says it should be
-     answered, send ONE reply that follows the policy. Then go back to the
-     conversation list.
-  4. When nothing is left that needs answering, report done.
+  1. Get to the screen the goal works from -- the conversation list, the feed,
+     whatever the goal and the REPLY POLICY describe.
+  2. Find what needs handling there: a conversation with a new incoming message,
+     an item not dealt with yet -- whatever the goal counts as work.
+  3. Handle each one the way the REPLY POLICY says, then come back to that
+     screen.
+  4. When nothing is left, or when the goal's quota for one pass is met, report
+     done.
 
 Rules for this pass:
   - At most one reply per conversation. Never two.
@@ -84,8 +104,9 @@ Rules for this pass:
     and it is always right.
   - Do not start conversations with anyone who has not messaged first, unless
     the REPLY POLICY explicitly says to open one. Silence in the policy means no.
-  - Finish on the conversation list. The next pass starts from wherever you leave
-    the screen."""
+  - Do not carry on past what this pass asks for. There is always another pass.
+  - Finish on the screen you worked from, not buried inside one of the items. The
+    next pass starts from wherever you leave the screen."""
 
 
 def screen_digest(screen: Screen) -> str:
@@ -155,7 +176,8 @@ class Watch:
                  say: Optional[Callable[[str], None]] = None,
                  on_event: Optional[Callable[..., None]] = None,
                  make_agent: Optional[Callable[..., Agent]] = None,
-                 sleep: Optional[Callable[[float], None]] = None):
+                 sleep: Optional[Callable[[float], None]] = None,
+                 clock: Optional[Callable[[], float]] = None):
         self.dev = dev
         self.mem = mem
         self.llm = llm
@@ -164,9 +186,13 @@ class Watch:
         self.ledger = ledger
         self.say = say or (lambda msg: None)
         self.on_event = on_event
-        # Injected so the loop can be tested without a device or a model.
+        # Injected so the loop can be tested without a device or a model. The
+        # clock comes with the sleep: a test whose `sleep` only records the delay
+        # leaves real time barely moving, so anything measured in wall clock --
+        # the sweep, the spend window -- would never come due.
         self._make_agent = make_agent or self._default_agent
         self._sleep = sleep or time.sleep
+        self._now = clock or time.monotonic
         # A pass is bounded by `watch.max_steps`, not by `run.max_steps`: the
         # run-level budget is sized for a whole task and a pass is one sweep of an
         # inbox. Set here rather than left to the caller so that a `Watch`
@@ -184,6 +210,8 @@ class Watch:
         self.last_state: Optional[Any] = None
         #: (finished_at, usd) per pass, for the rolling spend ceiling.
         self._spend: List[Tuple[float, float]] = []
+        #: When the last pass finished, for the sweep. None until one has.
+        self._last_pass_at: Optional[float] = None
         self._stop = False
 
     # -- construction ------------------------------------------------------
@@ -243,11 +271,14 @@ class Watch:
                 continue
 
             if self.anchor.matches(screen):
-                self.stats.skipped += 1
-                log.debug("nothing new on %s; sleeping %.0fs",
-                          screen.package, w.interval_s)
-                self._sleep(w.interval_s)
-                continue
+                if not self._sweep_due():
+                    self.stats.skipped += 1
+                    log.debug("nothing new on %s; sleeping %.0fs",
+                              screen.package, w.interval_s)
+                    self._sleep(w.interval_s)
+                    continue
+                log.debug("nothing new on %s, but the %.0fs sweep is due",
+                          screen.package, w.sweep_s)
 
             # -- is the loop allowed to spend? -----------------------------
             paused = self._spend_pause()
@@ -263,7 +294,10 @@ class Watch:
             outcome, usd = self._one_pass(full_goal)
             self.stats.passes += 1
             self.stats.usd += usd
-            self._spend.append((time.monotonic(), usd))
+            self._spend.append((self._now(), usd))
+            # Set for a failed pass too: the sweep says how often to *try*, and a
+            # pass that failed already has the backoff deciding when to try next.
+            self._last_pass_at = self._now()
 
             if outcome in ("success", "needs_user"):
                 consecutive_failures = 0
@@ -346,12 +380,26 @@ class Watch:
         delay = w.backoff_initial_s * (2 ** max(0, consecutive - 1))
         return float(min(delay, w.backoff_max_s))
 
+    def _sweep_due(self) -> bool:
+        """Is a pass owed on time alone, whatever the screen says?
+
+        Off unless the operator asked for it. The first probe of a watch is never
+        held back by this -- an empty anchor never matches, so the loop is already
+        past the check by the time it is asked.
+        """
+        every = self.cfg.watch.sweep_s
+        if every <= 0:
+            return False
+        if self._last_pass_at is None:
+            return True
+        return self._now() - self._last_pass_at >= every
+
     def _spend_pause(self) -> float:
         """Seconds to wait before spending again, or 0."""
         ceiling = self.cfg.watch.max_usd_per_hour
         if ceiling <= 0:
             return 0.0
-        now = time.monotonic()
+        now = self._now()
         window = [(t, u) for t, u in self._spend if now - t < 3600.0]
         self._spend = window
         if sum(u for _t, u in window) < ceiling:

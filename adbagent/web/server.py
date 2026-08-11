@@ -79,6 +79,7 @@ class WatchRequest(BaseModel):
     draft: bool = False
     no_learn: bool = False
     interval_s: Optional[float] = None
+    sweep_s: Optional[float] = None
     max_steps: Optional[int] = None
     replies_per_hour: Optional[int] = None
     replies_per_conversation: Optional[int] = None
@@ -804,7 +805,8 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         try:
             return watcher.start(
                 goal, policy=policy, draft=req.draft, no_learn=req.no_learn,
-                interval_s=req.interval_s, max_steps=req.max_steps,
+                interval_s=req.interval_s, sweep_s=req.sweep_s,
+                max_steps=req.max_steps,
                 replies_per_hour=req.replies_per_hour,
                 replies_per_conversation=req.replies_per_conversation,
                 cooldown_s=req.cooldown_s, usd_per_hour=req.usd_per_hour,

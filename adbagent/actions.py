@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 from pydantic import (BaseModel, ConfigDict, Field, field_validator,
                       model_validator)
@@ -286,6 +286,33 @@ class AgentAction(BaseModel):
             if self.read_each is False:
                 bits.append("read_each=false")
         return " ".join(bits)
+
+
+def element_summary(element: Optional[Element]) -> Optional[Dict[str, Any]]:
+    """What a target resolved to, flattened for `events.jsonl` and the web UI.
+
+    The same facts `describe_target` puts in a string for the prompt history and
+    the terminal, kept apart instead: `#3` is a position in a list the reader of
+    a run cannot see, and a UI that wants to lead with the label and demote the
+    id and the coordinates cannot get them back out of the rendered form.
+
+    `None` for an unresolved target is not the same as no target at all -- for a
+    tap it is the reason the step is about to fail -- so the caller writes the
+    field only when there was something to resolve.
+    """
+    if element is None:
+        return None
+    return {
+        "index": element.index,
+        "kind": element.kind(),
+        "text": " ".join(element.best_text.split()),
+        "resource_id": element.resource_id,
+        "center": list(element.center),
+        "checkable": element.checkable,
+        "checked": element.checked,
+        "selected": element.selected,
+        "enabled": element.enabled,
+    }
 
 
 def describe_target(target: Target, element: Optional[Element] = None) -> str:
