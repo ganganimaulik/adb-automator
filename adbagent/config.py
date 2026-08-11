@@ -108,17 +108,40 @@ class LLMConfig:
     #: nothing. See `llm.reasoning_body`.
     reasoning_style: str = "auto"
 
+    #: Calls that read a frame and report what is on it. Transcription, not
+    #: reasoning: "what does this scale read" and "where is the send button" have
+    #: no chain of thought worth paying for, and the answer is four short strings
+    #: or a coordinate pair.
+    VISION_PURPOSES = ("analyze_image", "read_item", "locate")
+
     def effort_for(self, purpose: str = "decide", hard: bool = False) -> str:
         """Reasoning depth for one call. Empty means "send nothing".
 
-        Vision calls transcribe rather than reason -- "what does this scale read"
-        has no chain of thought worth paying for -- so they are pinned to the
-        floor whenever the feature is on at all.
+        Vision calls are pinned to the floor, and pinned *before* the switch is
+        consulted, because "send nothing" is not the same as "do not think". A
+        hybrid model thinks by default, so leaving its own default alone buys a
+        chain of thought nobody asked for -- and the ratio it buys is not
+        marginal. In ``runs/a7ef4e0e45e9`` (`reasoning_effort` unset, so this
+        method returned "" for every purpose and the pin below never ran)
+        `analyze_image` spent 6,165 characters of thinking per call to fill four
+        fields with 200, 38 chars of thought per char of answer; `locate` ran
+        35:1 for a coordinate pair. That was 95% of the run's `analyze_image`
+        output tokens and 153 of its 739 seconds.
+
+        Reaching it through the switch was not an option: `reasoning_effort` is
+        one setting for every purpose, so the config could not say "vision does
+        not think" without also opting `decide`, `judge` and `goal_check` into
+        depths they had not asked for -- `judge` is called with ``hard=True``
+        and would have gone straight to "high".
+
+        Costs nothing on a model that does not reason: `llm.reasoning_body`
+        sends a field only for a family known to take one, and `_post` drops it
+        for good if the provider rejects it anyway.
         """
+        if purpose in self.VISION_PURPOSES:
+            return "none"
         if not self.reasoning_effort:
             return ""
-        if purpose in ("analyze_image", "read_item"):
-            return "none"
         if hard:
             return self.reasoning_effort_hard or self.reasoning_effort
         return self.reasoning_effort

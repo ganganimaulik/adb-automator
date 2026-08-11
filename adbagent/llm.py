@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
 
 from .background import Prefetch  # re-exported: callers import it from here
 from .config import Config
+from .fingerprint import frame_is_featureless
 
 log = logging.getLogger("adbagent.llm")
 
@@ -673,6 +674,16 @@ def image_part(jpeg: bytes) -> Dict[str, Any]:
 
 def text_part(text: str) -> Dict[str, Any]:
     return {"type": "text", "text": text}
+
+
+#: What a featureless frame is reported as, in place of the paragraph a vision
+#: model spends on saying it. Worded for both frames that qualify: one the app has
+#: not painted yet, and one whose surface a screenshot cannot capture at all --
+#: what the two have in common is that the element list is the whole of the
+#: evidence this turn, which is the part the decider has to act on.
+FEATURELESS_NOTE = ("the captured frame is blank apart from the status bar -- no "
+                    "content in the pixels, so the element list is all there is "
+                    "this turn")
 
 
 class ScreenAnalysis(BaseModel):
@@ -1320,11 +1331,40 @@ class LLMClient:
         """
         return not self.cfg.llm.decider_sees()
 
+    def _note_featureless(self, screenshot: bytes, *, step: int, purpose: str,
+                          recorder: Optional[Any] = None,
+                          on_event: Optional[Callable[..., None]] = None) -> None:
+        """Record a vision call that was answered without asking a model.
+
+        The frame is still written to the run directory: "nothing was on it" is a
+        claim about pixels, and the pixels have to be there to check it against.
+        """
+        shot = ""
+        if recorder is not None and hasattr(recorder, "screenshot"):
+            shot = recorder.screenshot(step, screenshot, purpose)
+        log.info("step %d: %s frame carries nothing but system chrome "
+                 "(%d bytes%s); answered without a model call",
+                 step, purpose, len(screenshot),
+                 f", kept as {shot}" if shot else "")
+        if recorder is not None and hasattr(recorder, "event"):
+            recorder.event("vision_skipped", step=step, purpose=purpose,
+                           bytes=len(screenshot), shot=shot,
+                           reason="featureless frame")
+        if on_event:
+            on_event("vision_skipped", step=step, purpose=purpose,
+                     reason="featureless frame")
+
     def analyze_image(self, screenshot: bytes, *, goal: str = "", rendered: str = "",
                       step: int = 0, recorder: Optional[Any] = None,
                       on_event: Optional[Callable[..., None]] = None) -> ScreenAnalysis:
         """Use the vision model (self.model_image) ONLY to analyze the image content."""
         from . import prompts
+
+        if frame_is_featureless(screenshot):
+            self._note_featureless(screenshot, step=step,
+                                   purpose="analyze_image", recorder=recorder,
+                                   on_event=on_event)
+            return ScreenAnalysis(notable=FEATURELESS_NOTE)
 
         prompt_text = prompts.image_analysis_user(goal=goal, rendered=rendered)
         content: List[Dict[str, Any]] = [
@@ -1437,6 +1477,13 @@ class LLMClient:
         """
         from . import prompts
 
+        # No featureless short-circuit here, on purpose. `analyze_image` has one,
+        # and the same reasoning does not carry: a locate runs precisely when the
+        # control is not in the element list, so a false "blank" would refuse the
+        # one route left to it -- and the flatness test cannot tell an empty
+        # screen from a screen holding a single low-contrast control, which is
+        # exactly the shape a locate is asked about. See `frame_is_featureless`.
+        #
         # The dimensions of the exact frame the model is shown -- the downscaled
         # capture, not the device's -- so the prompt can state them and a
         # pixel-space answer can be brought back to fractions.
@@ -1560,8 +1607,11 @@ class LLMClient:
             messages.append({"role": "user",
                              "content": prompts.policy_block(policy)})
         if skill:
-            # Above the history on purpose -- see `prompts.skill_block`.
-            messages.append({"role": "user", "content": prompts.skill_block(skill)})
+            # Above the history on purpose, and handed the policy so it can drop
+            # the lines that restate it -- see `prompts.skill_block`.
+            skill_text = prompts.skill_block(skill, policy=policy)
+            if skill_text.strip():
+                messages.append({"role": "user", "content": skill_text})
         messages.append(
             {"role": "user", "content": prompts.history_only_block(history)})
         if state_text:

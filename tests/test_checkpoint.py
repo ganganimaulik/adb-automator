@@ -53,6 +53,7 @@ def populated_state() -> RunState:
     state.loops.ban("skel1", "scroll/#2/down")
     state.loops.record_element_action("skel1", 4, "tap/#4", "tap #4 'Wi-Fi'")
     state.loops.record_scroll("down")
+    state.loops.mark_scroll_exhausted()
     state.loops.record_scroll("up")
     state.loops.mark_scroll_dead("skel1", "down", "exact1")
     state.loops.consecutive_backs = 1
@@ -101,6 +102,9 @@ def test_round_trip_preserves_everything_the_loop_needs(cfg):
     assert fresh.loops.element_actions == {
         "skel1": [(4, "tap/#4", "tap #4 'Wi-Fi'")]}
     assert fresh.loops.scroll_dir_log == ["down", "up"]
+    # Without this the resumed run re-counts a reversal it had already excused,
+    # and can talk itself into refusing the only gesture left on the axis.
+    assert fresh.loops.scroll_exhausted == [0]
     assert fresh.loops.total_scroll_count == 2
     assert fresh.loops.dead_scrolls == {"skel1/down": "exact1"}
     assert fresh.loops.consecutive_backs == 1

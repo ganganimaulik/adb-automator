@@ -1166,8 +1166,15 @@ class Agent:
             # system prompt: this block is rebuilt every turn anyway, so varying
             # it is free, whereas varying the system message evicts the whole
             # prompt prefix from the provider's cache.
+            scratch_text = state.scratchpad.render(cfg.run.scratchpad_max_chars)
             situational = prompts.situational_notes(
                 scrolls=state.loops.total_scroll_count,
+                # ...and something on *this* screen to scroll. Having scrolled
+                # once is a fact about the run; a composer sheet or a four-row
+                # list is not a long feed, whatever the run did earlier.
+                scrollable=any(el.scrollable for el in screen.elements),
+                # The rules for maintaining a record set, once there is one.
+                collecting=bool(scratch_text.strip()),
                 packages_seen=len(state.packages),
                 # tap_at is revealed only once ordinary targeting has failed
                 # somehow: a stall, or an action that did not work. On a
@@ -1236,7 +1243,7 @@ class Agent:
                 width=screen.width, height=screen.height, package=screen.package,
                 today=self._today,
                 screenshot=screenshot, note=notes,
-                scratchpad=state.scratchpad.render(cfg.run.scratchpad_max_chars),
+                scratchpad=scratch_text,
                 progress="\n".join(state.progress_log), skill=skill_note,
                 policy=self.policy,
                 # Where the run is against its ceilings. Nothing used to say --
@@ -1910,6 +1917,11 @@ class Agent:
                         state.loops.mark_scroll_dead(screen.skeleton_id,
                                                      action.direction,
                                                      after.exact_id)
+                        # ...and the same fact for the reversal counter, which
+                        # asks it of the run rather than of this screen: turning
+                        # round after this gesture is the only move left on the
+                        # axis, so it is not the thrashing that counter is for.
+                        state.loops.mark_scroll_exhausted()
                     h_dir = action.direction in ("left", "right")
                     axis = "horizontal" if h_dir else "vertical"
                     act_name = "Swiping" if action.action == "swipe" else "Scrolling"
@@ -2230,6 +2242,10 @@ class Agent:
             if not moved:
                 reason = ("the content stopped changing, so the gesture no "
                           "longer advances")
+                # The sweep is already exempt from the loop detector for being
+                # browsing rather than thrashing; the reversal counter needs the
+                # same exemption, and this is the moment that earns it.
+                state.loops.mark_scroll_exhausted()
                 screen = after
                 break
             screen = after

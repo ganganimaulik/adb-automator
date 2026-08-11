@@ -649,6 +649,61 @@ def compute_dhash(image_bytes: bytes, hash_size: int = 8,
         return None
 
 
+#: How much a frame's brightness may vary before it counts as having something
+#: on it. Standard deviation over a 64x64 grayscale downscale.
+#:
+#: Measured, on the frames of ``runs/a7ef4e0e45e9`` and on drawn cases either
+#: side of them: 1.07, 1.12 and 1.16 for the three frames the app had not painted
+#: yet; 3.7 for a white screen carrying one low-contrast pill and its label;
+#: 51.8 for the emptiest real screen in the run, a mostly-white conversation
+#: list; 92.7 for an ordinary populated one. This sits between the first two
+#: groups, nearer neither.
+#:
+#: Deviation and not a min-to-max range, because a blank frame is not uniform --
+#: it still carries the status-bar clock, 46 levels of full range on those three
+#: -- and not a percentile band either, which ignores small features by design
+#: and so scores the lone pill exactly as it scores an empty screen. Deviation is
+#: the measure that separates the two, and it needs no help: a feature covering
+#: even 0.05% of the frame at full contrast lifts it past 5.
+FEATURELESS_STDEV = 2.0
+
+
+def frame_is_featureless(image_bytes: bytes, *,
+                         stdev: float = FEATURELESS_STDEV) -> bool:
+    """True when there is nothing in these pixels to read.
+
+    A frame the app has not painted yet -- the white flash after a send, a
+    launch that has not drawn -- has no content for a vision model to describe,
+    and asking one anyway buys a paragraph saying so. In that run it bought
+    three: 10 seconds and ~1,700 output tokens each to report "blank white
+    screen; app content not rendered".
+
+    Deliberately shy, and used only where being wrong is cheap. A false "blank"
+    costs a screen description the decider would rather have had on a turn where
+    it still has the element list. It must never be the answer to "where is this
+    control": that is the one question whose wrong answer gets tapped, and the
+    threshold above is the reason -- one control on an empty screen is the case
+    this cannot see. So `analyze_image` consults it and `locate` does not.
+
+    False when the frame cannot be decoded. Not knowing is a reason to let the
+    model look, never a reason to skip it.
+    """
+    if not image_bytes:
+        return False
+    try:
+        import io
+        import statistics
+        from PIL import Image
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            small = img.convert("L").resize((64, 64), Image.Resampling.BILINEAR)
+            pixels = list(small.getdata())
+    except Exception:
+        return False
+    if len(pixels) < 20:
+        return False
+    return statistics.pstdev(pixels) <= stdev
+
+
 def dhash_distance(h1: Optional[int], h2: Optional[int]) -> Optional[int]:
     """Compute Hamming distance between two 64-bit dHash integers."""
     if h1 is None or h2 is None:

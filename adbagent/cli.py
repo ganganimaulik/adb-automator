@@ -932,6 +932,14 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
                 f"screenshot ({kw.get('error', 'no answer')}). Deciding from the "
                 f"element list alone -- check: adbagent doctor"))
 
+        elif kind == "vision_skipped":
+            # Dim, not yellow: unlike `vision_unavailable` nothing went wrong
+            # here. The frame was read -- by a percentile, not a model -- and it
+            # held nothing.
+            out.say(out.dim(
+                f"        Vision: frame is blank, {kw.get('purpose', 'read')} "
+                f"answered without a model call"))
+
         elif kind == "vision_reread":
             out.say(out.dim(
                 f"        Vision: value reported unreadable, re-reading at "
