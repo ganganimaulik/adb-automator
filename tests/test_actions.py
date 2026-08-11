@@ -232,6 +232,33 @@ def test_navigational_tap_that_changes_nothing_is_no_change():
     assert not outcome.ok
 
 
+def test_input_text_that_changes_nothing_is_no_change():
+    """A byte-identical dump after typing means the field never took focus.
+
+    The element_state postcondition cannot catch this on its own: when the
+    field has no resource-id to find, `_find` answers None and a missing
+    element is inconclusive-but-passing -- so "nothing was typed" graded a
+    success, and the run proceeded as if the text were in.
+    """
+    action = act(action="input_text", target=Target(index=1), text="hello")
+    outcome = verify(action, BASE, BASE)
+    assert outcome.grade == "no_change" and not outcome.ok
+    assert "never took focus" in outcome.reason
+
+
+def test_input_text_that_lands_is_success():
+    """The guard fires on a *byte-identical* tree only: a field whose text
+    moved passes its postcondition exactly as before."""
+    before = s(X.chat_thread(draft=""))
+    after = s(X.chat_thread(draft="hello"))
+    field = next(e for e in before.elements if e.editable)
+    action = act(action="input_text", target=Target(index=field.index),
+                 text="hello")
+    post = synthesise_postcondition(action, field)
+    assert post.kind == "element_state" and post.resource_id == "composer"
+    assert verify(action, before, after, post).grade == "success"
+
+
 def test_successful_navigation():
     outcome = verify(act(action="tap", target=Target(index=1)), BASE, s(X.detail_screen()))
     assert outcome.grade == "success" and outcome.ok
@@ -610,6 +637,59 @@ def test_smarter_input_text():
     execute(dev, action, screen)
 
     dev.input_text.assert_called_once_with("search query", clear=False, press_enter=True)
+
+
+def test_input_target_is_container():
+    """What the loop's locate guard fires on: a scroller, or anything covering
+    most of the screen -- but never an editable field, however big it is."""
+    from adbagent.actions import input_target_is_container
+
+    chat = s(X.chat_thread())
+    scroller = next(e for e in chat.elements if e.kind() == "Scroller")
+    assert input_target_is_container(scroller, chat)
+    field = next(e for e in chat.elements if e.editable)
+    assert not input_target_is_container(field, chat)
+    send = next(e for e in chat.elements if e.best_text == "Send")
+    assert not input_target_is_container(send, chat)
+
+    # A big clickable surface that is not a field is a container too.
+    canvas = s(X.dump(X.N("android.widget.FrameLayout", (0, 0, X.W, X.H),
+                          clickable=True)))
+    holder = next(e for e in canvas.elements if e.clickable)
+    assert input_target_is_container(holder, canvas)
+
+    # ...while a full-screen editor is the field itself: its centre focuses fine.
+    editor = s(X.dump(X.N("android.widget.EditText", (0, 0, X.W, X.H),
+                          clickable=True, focusable=True)))
+    big_field = next(e for e in editor.elements if e.editable)
+    assert not input_target_is_container(big_field, editor)
+
+
+def test_input_text_taps_the_located_focus_point():
+    """When the loop's vision locate placed the field, the focus tap goes to
+    that point rather than the (container) target's centre."""
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    screen = s(X.chat_thread())
+    scroller = next(e for e in screen.elements if e.kind() == "Scroller")
+
+    action = act(action="input_text", target=Target(index=scroller.index),
+                 text="hello")
+    setattr(action, "_focus_point", (0.42, 0.86))
+    execute(dev, action, screen)
+
+    dev.tap.assert_called_once_with(int(0.42 * X.W), int(0.86 * X.H))
+    assert dev.tap.call_args.args != scroller.center
+    dev.input_text.assert_called_once_with("hello", clear=True, press_enter=False)
+
+    # Without the override the target's own centre is tapped, as before.
+    dev2 = MagicMock()
+    plain = act(action="input_text", target=Target(index=scroller.index),
+                text="hello")
+    execute(dev2, plain, screen)
+    dev2.tap.assert_called_once_with(*scroller.center)
 
 
 def test_condition_based_wait():

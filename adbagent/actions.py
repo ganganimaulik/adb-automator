@@ -550,6 +550,31 @@ def resolve_target(target: Target, screen: Screen) -> Optional[Element]:
 #: no element of its own.
 _POINT_GUARD_MAX_AREA = 0.25
 
+#: An input_text target bigger than this (as a fraction of the screen) is not
+#: the field: it is a container the field was folded into. Tapping its centre
+#: focuses nothing, and the IME broadcast types into whatever has focus --
+#: i.e. into nothing. The agent loop answers with the vision locate instead.
+_INPUT_CONTAINER_MIN_AREA = 0.5
+
+
+def input_target_is_container(element: Element, screen: Screen) -> bool:
+    """True when an input_text target is a container, not the field itself.
+
+    A chat composer or a search page whose real field the tree does not list
+    -- folded into the scroller's aggregated label, or simply never focusable
+    -- leaves the model aiming `input_text` at the biggest thing that mentions
+    it. Tapping that thing's centre hits bare canvas or a list item, never the
+    field, so the keys go nowhere. Editable elements are exempt however large
+    they are: a full-screen notes editor's centre takes focus fine.
+    """
+    if element.editable:
+        return False
+    if element.kind() == "Scroller":
+        return True
+    return (screen.width > 0 and screen.height > 0
+            and element.area
+            > screen.width * screen.height * _INPUT_CONTAINER_MIN_AREA)
+
 
 def element_at_point(screen: Screen, x: float, y: float) -> Optional[Element]:
     """The listed control under a fractional point, when there is a small one.
@@ -610,8 +635,16 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
     elif action.action == "input_text":
         assert element is not None
         # Focus the field first; the IME broadcast path types into whatever has
-        # focus, not into a selector.
-        dev.tap(*element.center)
+        # focus, not into a selector. `_focus_point` is the harness's override:
+        # set when the agent loop's vision locate placed the field because the
+        # target was a container whose centre focuses nothing.
+        focus = getattr(action, "_focus_point", None)
+        if focus is not None and screen.width > 0 and screen.height > 0:
+            px = min(max(1, int(focus[0] * screen.width)), screen.width - 1)
+            py = min(max(1, int(focus[1] * screen.height)), screen.height - 1)
+            dev.tap(px, py)
+        else:
+            dev.tap(*element.center)
         should_clear = action.clear if action.clear is not None else True
         should_enter = bool(action.press_enter)
         dev.input_text(action.text or "", clear=should_clear, press_enter=should_enter)
@@ -988,6 +1021,20 @@ def verify(action: AgentAction, before: Screen, after: Screen,
     # ban list, so the same dud tap is not retried forever.
     if action.action in NAVIGATIONAL and after.exact_id == before.exact_id:
         return VerifyOutcome(grade="no_change", reason="nothing on screen changed")
+
+    # The typing half of the check above. A dump that is byte-identical after
+    # an input_text means the tap that was meant to focus the field landed on
+    # nothing that takes focus -- the centre of a scroller, say -- and the
+    # keys went nowhere. It must be caught here, before the postcondition,
+    # because the element_state condition cannot: it passes vacuously whenever
+    # the field has no resource-id to find (`_find` answers None and a missing
+    # element is inconclusive-but-passing), which graded "nothing was typed" a
+    # success and let the run proceed as if the text were in.
+    if action.action == "input_text" and after.exact_id == before.exact_id:
+        return VerifyOutcome(
+            grade="no_change",
+            reason="nothing on screen changed -- the field never took focus, "
+                   "so nothing was typed")
 
     passed, why = check_postcondition(condition, before, after)
     if not passed:

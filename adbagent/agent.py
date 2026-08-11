@@ -26,8 +26,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import __version__, checkpoint, conversation, prompts, runlog, safety
 from .actions import (_POINT_GUARD_MAX_AREA, ActionError, AgentAction, Target,
                       append_history, element_at_point, execute,
-                      format_history_entry, resolve_target,
-                      synthesise_postcondition, verify)
+                      format_history_entry, input_target_is_container,
+                      resolve_target, synthesise_postcondition, verify)
 from .config import Config
 from .device import Device, DeviceTimeout, DeviceLost
 from .fingerprint import crop_frac
@@ -1640,6 +1640,42 @@ class Agent:
                         reason=state.last_failure))
                     self._maybe_give_up(state)
                     continue
+            # The input_text half of the tap_at container guard above. A target
+            # that resolves to a whole scroller, or to anything covering most
+            # of the screen, names a field the tree folded into the container's
+            # label -- and tapping the container's centre focuses nothing, so
+            # the keys go nowhere while the tree keeps rendering the field's
+            # old text. The same vision locate that grounds a named tap_at
+            # places the real field, and the point rides into execute as
+            # `_focus_point`. A miss is a failed step, never a tap at the
+            # container's centre.
+            if (action.action == "input_text" and action.target is not None
+                    and self.llm is not None and not cfg.run.never_screenshot):
+                holder = resolve_target(action.target, screen)
+                if (holder is not None
+                        and input_target_is_container(holder, screen)):
+                    description = ((action.target.text or holder.hint or "")
+                                   .strip() or "the text input field")
+                    where = self.llm.locate(self._ensure_screenshot(screen),
+                                            description, goal=state.goal,
+                                            step=state.step, recorder=rec,
+                                            on_event=self.on_event,
+                                            misses=_banned_tap_points(state,
+                                                                      screen))
+                    if where is None:
+                        state.last_failure = (
+                            f"could not locate {description!r} on the screen; "
+                            f"it may not be visible, or name it differently")
+                        state.consecutive_failures += 1
+                        state.remember(format_history_entry(
+                            state.step, action, screen=screen, grade="failed",
+                            reason=state.last_failure))
+                        self._maybe_give_up(state)
+                        continue
+                    log.info("step %d: input_text target #%d is a container; "
+                             "the locate placed the field at (%.2f, %.2f)",
+                             state.step, holder.index, where[0], where[1])
+                    setattr(action, "_focus_point", where)
             try:
                 element = execute(self.dev, action, screen)
             except (ActionError, ValueError) as exc:
