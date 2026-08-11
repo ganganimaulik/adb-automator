@@ -2130,6 +2130,108 @@ def test_a_vision_pass_that_answers_is_not_flagged(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# The reply that parses and says nothing
+# ---------------------------------------------------------------------------
+#
+# `qwen3p7-plus` answered `analyze_image` with the empty object `{}` on 150 of
+# 181 calls across `runs/` -- 83%, against 0 of 98 for every other image model.
+# Its thinking held the whole answer each time ("notable: 'Hey' typed in comment
+# box ... Send Priority Like button visible"); only the JSON was empty. Nothing
+# caught it: pydantic fills the missing keys from their defaults, `render()`
+# returns "", and "" is what a screen with nothing to report looks like.
+#
+# `runs/2be9d2bf5401` is what that costs. The composer was open with the comment
+# typed and the send pill on screen; the policy would not send without visual
+# confirmation of the text; the confirmation came back empty four turns running.
+# The agent re-typed (no pixel changed, so `no_change`, so banned), tapped the
+# field twice (banned, banned), and stalled with every route to the send button
+# closed -- on a screen that had been ready to send since step 12.
+
+def test_the_vision_schema_requires_every_field(monkeypatch):
+    """A constrained decoder only forces the keys `required` names, and pydantic
+    leaves a field with a default out of it -- so `{}` was a valid answer."""
+    schema = harden_schema(ScreenAnalysis)
+    assert schema["required"] == [
+        "reading", "item_label", "blocking_dialog", "notable"]
+    assert harden_schema(Location)["required"] == ["x", "y"]
+
+
+def test_the_action_schema_keeps_its_optional_fields_optional():
+    """The opposite treatment, and deliberately: 20 properties, 3 required. Force
+    the rest and every action carries an `x`/`y` the model had to invent."""
+    schema = harden_schema(AgentAction)
+    assert schema["required"] == ["observation", "reasoning", "action"]
+
+
+def test_an_empty_object_is_refused_and_repaired(monkeypatch):
+    """The keys are missing, not empty -- the exact signature, and the model gets
+    told what actually went wrong rather than that its JSON was malformed."""
+    client = _client(monkeypatch)
+    sent = []
+
+    def post(messages, *, model, schema, max_tokens, purpose, **kw):
+        sent.append(messages)
+        if len(sent) == 1:
+            return "{\n}", Call(model=model, reasoning_chars=3819)
+        return ('{"reading":"","item_label":"S","blocking_dialog":"",'
+                '"notable":"Hey typed in comment box"}'), Call(model=model)
+
+    monkeypatch.setattr(client, "_post", post)
+    analysis = client.analyze_image(b"jpeg", goal="send a like")
+
+    assert analysis.notable == "Hey typed in comment box"
+    assert not analysis.unavailable
+    repair = sent[1][-1]["content"]
+    assert "left out" in repair
+    assert "not valid against the schema" not in repair
+
+
+def test_a_blank_reply_after_long_thinking_is_refused(monkeypatch):
+    """The same failure wearing the keys. Four empty strings after paragraphs of
+    reasoning is an answer that was reached and then dropped."""
+    client = _client(monkeypatch)
+    blank = ('{"reading":"","item_label":"","blocking_dialog":"","notable":""}')
+    calls = []
+
+    def post(messages, *, model, schema, max_tokens, purpose, **kw):
+        calls.append(messages)
+        return blank, Call(model=model, reasoning_chars=4000)
+
+    monkeypatch.setattr(client, "_post", post)
+    events = []
+    analysis = client.analyze_image(
+        b"jpeg", goal="send a like",
+        on_event=lambda kind, **kw: events.append(kind))
+
+    # Refused three times over, and then reported as what it is. A decider told
+    # "nothing notable" acts on the screenshot; one told the screenshot was not
+    # read falls back to the element list -- see `ScreenAnalysis.unavailable`.
+    assert len(calls) == 3
+    assert analysis.unavailable
+    assert "vision_unavailable" in events
+
+
+def test_a_prompt_answer_of_nothing_is_still_an_answer(monkeypatch):
+    """Not every blank is a bug. A model that writes all four keys empty without
+    deliberating has looked and found the tree already said it all -- refusing
+    that would buy two more calls and a false `unavailable` on a plain screen."""
+    client = _client(monkeypatch)
+    calls = []
+
+    def post(messages, *, model, schema, max_tokens, purpose, **kw):
+        calls.append(messages)
+        return ('{"reading":"","item_label":"","blocking_dialog":"",'
+                '"notable":""}'), Call(model=model, reasoning_chars=0)
+
+    monkeypatch.setattr(client, "_post", post)
+    analysis = client.analyze_image(b"jpeg", goal="send a like")
+
+    assert len(calls) == 1
+    assert analysis.render() == ""
+    assert not analysis.unavailable
+
+
+# ---------------------------------------------------------------------------
 # "Nothing to report" is an answer, and must not be paid for twice
 # ---------------------------------------------------------------------------
 

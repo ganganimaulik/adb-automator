@@ -23,7 +23,8 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, TypeVar
+from typing import (Any, Callable, ClassVar, Dict, List, Optional, Sequence,
+                    Tuple, Type, TypeVar)
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
@@ -42,6 +43,10 @@ class LLMError(RuntimeError):
 
 class TruncatedResponse(LLMError):
     """finish_reason == "length": the JSON is cut off and cannot be valid."""
+
+
+class UnusableReply(LLMError):
+    """Valid against the schema, rejected by the caller's own `accept` check."""
 
 
 class BudgetExceeded(LLMError):
@@ -343,9 +348,27 @@ def harden_schema(model: Type[BaseModel]) -> Dict[str, Any]:
     Inlines `$defs` (external refs are not resolvable server-side and nested
     definitions are handled inconsistently), and forbids extra properties
     everywhere so the model cannot invent fields.
+
+    A model carrying `answer_every_field` also gets every property listed in
+    `required`. Pydantic leaves a field with a default out of `required`, and a
+    constrained decoder only forces the keys `required` names -- so on a schema
+    whose fields all default to "" the empty object `{}` is a fully valid
+    answer, and a reasoning model that works the answer out in its thinking and
+    then emits `{}` passes every check the harness has. That is not
+    hypothetical: `qwen3p7-plus` did it on 83% of `analyze_image` calls across
+    `runs/` (150 of 181), against 0 of 98 for every other image model, and the
+    empty result is indistinguishable from "read the screen, nothing notable".
+    Naming the fields in `required` costs four empty strings on a screen with
+    nothing to report and fixes the case outright -- see the class docstrings
+    of `ScreenAnalysis` and `Location` for why an empty value stays legal.
+
+    Not a blanket rule: `AgentAction` has 20 properties and 3 required ones,
+    and forcing the rest would make the model emit `x`/`y` on every action --
+    the guessed coordinate that `LOCATE_SYSTEM` exists to prevent.
     """
     schema = model.model_json_schema()
     defs = schema.pop("$defs", {})
+    require_all = bool(getattr(model, "answer_every_field", False))
 
     def resolve(node: Any) -> Any:
         if isinstance(node, dict):
@@ -364,6 +387,8 @@ def harden_schema(model: Type[BaseModel]) -> Dict[str, Any]:
 
     hardened = resolve(schema)
     hardened.pop("$id", None)
+    if require_all and "properties" in hardened:
+        hardened["required"] = list(hardened["properties"])
     return hardened
 
 
@@ -657,9 +682,18 @@ class ScreenAnalysis(BaseModel):
     apply" -- so the model is never pushed into inventing a dialog or a reading
     to fill a slot. See :data:`prompts.IMAGE_ANALYSIS_SYSTEM` for why this
     replaced free prose.
+
+    Optional in *value*, not in presence: the four keys are all `required`, so
+    the model has to write `"notable": ""` rather than omit it. See
+    `harden_schema` and `answer_every_field` -- omission is what let a whole
+    class of blind steps through.
     """
 
     model_config = ConfigDict(extra="forbid")
+
+    #: Read by `harden_schema`. A ClassVar, so pydantic keeps it out of the
+    #: schema the model is held to.
+    answer_every_field: ClassVar[bool] = True
 
     reading: str = Field("", description="The fact the goal asks for, read off "
                                         "the image. Empty if not applicable.")
@@ -700,6 +734,49 @@ class ScreenAnalysis(BaseModel):
         return "\n".join(lines)
 
 
+#: How much thinking makes "nothing to report" implausible. A model that emits
+#: four empty strings straight away is answering; one that deliberates for
+#: paragraphs and *then* empties every field has worked something out and
+#: dropped it on the way to the JSON. Non-reasoning models report 0 here and
+#: are never caught by this clause -- which is right, since none of them has
+#: ever produced the failure.
+DELIBERATED_CHARS = 400
+
+
+def _analysis_is_an_answer(analysis: "ScreenAnalysis", raw: str,
+                           call: "Call") -> str:
+    """`structured`'s `accept` for `analyze_image`: did the model actually say?
+
+    Both shapes of "it didn't" are the same bug seen twice -- the answer was
+    reached and then not written down. The first is exact: pydantic fills a
+    missing key from its default, so `{}` and four explicit empty strings parse
+    to the identical object, and only the raw text still knows which arrived.
+    Every key present and empty is a real answer ("I looked, the tree has it
+    all"); a key missing is a model that never wrote one. The second is the
+    backstop for the same failure wearing the keys -- see `DELIBERATED_CHARS`.
+
+    Refusing these matters more than the retry costs. An empty analysis reads
+    to the decider as "nothing notable", so a step that needed the screenshot
+    -- verifying typed text before an irreversible send, say -- proceeds on
+    evidence it never got, and blames the app when the screen will not budge.
+    """
+    if analysis.render():
+        return ""
+    try:
+        keys = set(json.loads(extract_json(raw)))
+    except (LLMError, json.JSONDecodeError, TypeError):
+        keys = set()
+    missing = [f for f in type(analysis).model_fields if f not in keys]
+    if missing:
+        return (f"you left out {', '.join(missing)} entirely, so the reply "
+                f"carried no observation at all")
+    if call.reasoning_chars >= DELIBERATED_CHARS:
+        return (f"every field came back empty after {call.reasoning_chars} "
+                f"characters of thinking, so the reading you reached never "
+                f"made it into the reply")
+    return ""
+
+
 class Location(BaseModel):
     """Where on a screenshot one control sits.
 
@@ -716,9 +793,16 @@ class Location(BaseModel):
     lands somewhere else. What arrives here is whatever the model really said;
     `point_fractions` brings it into fractions against the frame's real
     dimensions, and what cannot be placed is a miss, never a clamped guess.
+
+    Both keys are `required` for the reason given in `harden_schema`: "not
+    visible" is `null`, written out, and never an absent key that pydantic
+    would quietly default to the same thing.
     """
 
     model_config = ConfigDict(extra="forbid")
+
+    #: Read by `harden_schema`; see `ScreenAnalysis`.
+    answer_every_field: ClassVar[bool] = True
 
     x: Optional[float] = Field(
         None, description="Horizontal centre of the control: a fraction, 0.0 "
@@ -1151,9 +1235,22 @@ class LLMClient:
     def structured(self, messages: List[Dict[str, Any]], model_cls: Type[M], *,
                    model: str = "", max_tokens: int = 0,
                    purpose: str = "decide", effort: str = "",
+                   accept: Optional[Callable[[M, str, Call], str]] = None,
                    on_event: Optional[Callable[..., None]] = None) -> M:
-        """One schema-constrained call, with a bounded repair loop."""
-        from .prompts import REPAIR
+        """One schema-constrained call, with a bounded repair loop.
+
+        `accept` is the caller's own check on a reply the schema already
+        passed: given the parsed object, the raw text it came from and the call
+        that produced it, it returns "" to accept, or the complaint to send
+        back. The raw text is there because parsing erases the difference
+        between a key written empty and a key never written. It exists because
+        valid is not the same as usable -- a schema whose fields may all be
+        empty cannot, on its own, tell a screen with nothing to report from a
+        model that reasoned out an answer and then emitted `{}`. A complaint
+        takes the same repair path as a validation error, deeper thinking and
+        all.
+        """
+        from .prompts import REPAIR, REPAIR_UNUSABLE
 
         schema = harden_schema(model_cls)
         target = model or self.model
@@ -1167,9 +1264,9 @@ class LLMClient:
         last_error = ""
         for attempt in range(3):
             try:
-                raw, _ = self._post(conversation, model=target, schema=schema,
-                                    max_tokens=budget, purpose=purpose,
-                                    effort=effort, **kw)
+                raw, call = self._post(conversation, model=target, schema=schema,
+                                       max_tokens=budget, purpose=purpose,
+                                       effort=effort, **kw)
             except TruncatedResponse as exc:
                 # Asking again with the same ceiling would truncate again. Give
                 # the model more room instead, once.
@@ -1181,14 +1278,24 @@ class LLMClient:
                 last_error = str(exc)
                 continue
             try:
-                return model_cls.model_validate_json(extract_json(raw))
+                parsed = model_cls.model_validate_json(extract_json(raw))
+                complaint = accept(parsed, raw, call) if accept is not None else ""
+                if not complaint:
+                    return parsed
+                raise UnusableReply(complaint)
             except (ValidationError, LLMError, json.JSONDecodeError) as exc:
                 last_error = str(exc)[:600]
-                log.warning("invalid structured reply (attempt %d): %s",
+                unusable = isinstance(exc, UnusableReply)
+                log.warning("%s structured reply (attempt %d): %s",
+                            "unusable" if unusable else "invalid",
                             attempt + 1, last_error)
+                # The schema is not the complaint when `accept` is: telling a
+                # model its JSON was malformed when it was well-formed and
+                # merely blank buys another well-formed blank.
+                repair = REPAIR_UNUSABLE if unusable else REPAIR
                 conversation = conversation + [
                     {"role": "assistant", "content": raw[:2000]},
-                    {"role": "user", "content": REPAIR.format(error=last_error)},
+                    {"role": "user", "content": repair.format(error=last_error)},
                 ]
                 # A reply that missed the schema is the clearest evidence there
                 # is that this turn was harder than the caller assumed, so the
@@ -1255,7 +1362,8 @@ class LLMClient:
             analysis = self.structured(messages, ScreenAnalysis,
                                        model=self.model_image,
                                        max_tokens=self.cfg.llm.image_max_tokens(),
-                                       purpose="analyze_image", **kw)
+                                       purpose="analyze_image",
+                                       accept=_analysis_is_an_answer, **kw)
         except LLMError as exc:
             # A vision model that cannot hold the schema is not worth failing the
             # step over: the description is an aid, and the element list the

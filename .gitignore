@@ -73,3 +73,4 @@ policies/
 # are local state rather than source. `SkillRegistry.load_skills` recreates the
 # directory on a fresh clone, which then learns its own.
 skills/
+watch-replies.jsonl
