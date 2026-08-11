@@ -42,6 +42,13 @@ body {
   color: var(--text);
   font: 14px/1.55 var(--sans);
   -webkit-text-size-adjust: 100%;
+  /* The feeds grow head-first and hold the reader's place by arithmetic
+     (`holdPlace` in app.js). The browser's own scroll anchoring would pay for
+     the same growth a second time -- measured: an answer landing above the feed
+     moved the page 274px for a 137px block, because the anchor it picks is an
+     ancestor of the feed rather than anything in it. Declined for the whole
+     document, since that ancestor is above every feed on the page. */
+  overflow-anchor: none;
 }
 
 /* -- chrome ---------------------------------------------------------------- */
@@ -611,6 +618,9 @@ aside.phone.standalone { position: static; margin-top: 0; border: none; padding:
 
 /* -- the feed -------------------------------------------------------------- */
 
+/* Written head-first: the newest step is the one under the heading. Nothing in
+   the sheet reverses anything -- the order is the DOM's, so what is read down
+   the page is what is copied out of it. */
 .feed { display: flex; flex-direction: column; gap: 8px; }
 
 /* One row per step by default. Everything the trace carries is still in the
