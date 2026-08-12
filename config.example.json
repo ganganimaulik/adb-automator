@@ -24,7 +24,7 @@
     "serial": "",
     "max_depth": 40,
     "compressed": true,
-    "settle_budget_s": 2.0,
+    "settle_budget_s": 6.0,
     "launch_timeout_s": 8.0,
     "watchdog_s": 60.0,
     "disable_animations": true,
