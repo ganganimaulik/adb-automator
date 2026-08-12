@@ -2068,8 +2068,13 @@ def _reexec() -> int:
     if not sys.executable:  # an embedded interpreter has nothing to re-run
         print("  cannot restart: no interpreter to re-run", file=sys.stderr)
         return 1
-    if Path(argv[0]).name == "__main__.py":
-        argv = ["-m", "adbagent", *argv[1:]]   # started as `python -m adbagent`
+    p0 = Path(argv[0])
+    if (
+        p0.name == "__main__.py"
+        or p0.stem.lower().startswith("adbagent")
+        or not (p0.is_file() and p0.suffix.lower() == ".py")
+    ):
+        argv = ["-m", "adbagent", *argv[1:]]   # started as `adbagent` or `python -m adbagent`
     sys.stdout.flush()
     sys.stderr.flush()
     os.execv(sys.executable, [sys.executable, *argv])

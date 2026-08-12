@@ -367,7 +367,7 @@ def test_a_restart_runs_the_same_command_again(monkeypatch):
     monkeypatch.setattr(cli.sys, "argv", ["/venv/bin/adbagent", "ui", "--port", "9"])
     cli._reexec()
     assert called == [("/usr/bin/python3",
-                       ["/usr/bin/python3", "/venv/bin/adbagent", "ui", "--port", "9"])]
+                       ["/usr/bin/python3", "-m", "adbagent", "ui", "--port", "9"])]
 
     # `python -m adbagent` has to go back through -m: running __main__.py as a
     # script puts the package's own directory on sys.path instead of its parent,
