@@ -1,7 +1,13 @@
 # adbagent
 
 An Android automation agent. Give it a goal in plain language and it drives a real
-phone until the goal is met.
+phone until the goal is met — either interactively in your browser with the **Web UI**
+(`adbagent ui`) or directly from the terminal (`adbagent run`).
+
+```
+$ adbagent ui
+Serving web UI at http://127.0.0.1:8765
+```
 
 ```
 $ adbagent run "turn on airplane mode"
@@ -16,6 +22,30 @@ $ adbagent run "turn on airplane mode"
   SUCCESS  2 steps, 3 LLM calls, $0.0091, 11.4s
   trace: runs/8f21c0a4e1b9 (events.jsonl, run.log, step prompts)
 ```
+
+## Key Capabilities
+
+- **Interactive Web UI (`adbagent ui`)**: Real-time goal execution, live phone screen streaming, visual history, model selector, config editor, skill generator, and watch policy editor.
+- **Accessibility Tree First**: Reads screen elements via Android accessibility tree rather than pixels, using vision/screenshots only when necessary (WebViews, image galleries, ambiguous controls).
+- **Self-Improving App Skills**: Automatically learns workflows, UI quirks, and optimal interaction paths per app from every run.
+- **Safe Watch Mode**: Continuous monitoring and policy-guided replies with duplicate prevention gates and budget ceilings.
+
+## Table of Contents
+
+- [Install](#install)
+- [Connect a Phone](#connect-a-phone)
+- [Choose a Model](#choose-a-model)
+- [Web UI](#web-ui)
+- [Run (CLI)](#run)
+- [Watch](#watch)
+- [Safety](#safety)
+- [When It Stops Getting Anywhere](#when-it-stops-getting-anywhere)
+- [Galleries and Carousels](#galleries-and-carousels)
+- [Collected Data](#collected-data)
+- [Reports & Replay](#reports)
+- [App Skills](#app-skills)
+- [Tuning](#tuning)
+- [Development](#development)
 
 Every run ends with what it concluded, under its own heading — the answer to
 "read X and tell me" goals, not just the outcome word. `adbagent report` prints
@@ -38,6 +68,20 @@ adbagent doctor
 
 `doctor` checks the interpreter, the dependencies, `adb`, the attached devices,
 the API key and the model, and tells you which of them needs attention.
+
+### Launching adbagent
+
+You can start the interactive **Web UI**:
+
+```bash
+adbagent ui
+```
+
+Then open `http://127.0.0.1:8765` in your browser. Or run goals directly from the CLI:
+
+```bash
+adbagent run "turn on airplane mode"
+```
 
 ## Connect a phone
 
