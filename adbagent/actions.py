@@ -33,14 +33,23 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle only matters for typing
 log = logging.getLogger("adbagent.actions")
 
 ActionName = Literal[
-    "tap", "tap_at", "long_press", "input_text", "press_key", "scroll", "swipe",
-    "open_app", "list_apps", "get_clipboard", "set_clipboard", "wait", "sleep", "ask_user", "done", "fail",
+    "tap", "tap_at", "long_press", "long_press_at", "double_tap", "drag",
+    "input_text", "press_key", "scroll", "scroll_to_edge", "swipe",
+    "open_app", "open_url", "restart_app", "list_apps",
+    "get_clipboard", "set_clipboard", "wait", "sleep", "ask_user", "done", "fail",
 ]
 
-#: Only names the on-device server actually accepts.
+#: Only names the on-device server actually accepts, plus the two panels
+#: `Device.press` opens directly because they have no keycode.
+#:
+#: `power` is absent on purpose. The server accepts it, and a run that pressed
+#: it would blank the screen it is driving -- on a phone with a PIN,
+#: unrecoverably, since `Device.wake` can swipe a lock screen away but cannot
+#: answer it. `camera` is absent for want of a use.
 KeyName = Literal["back", "home", "enter", "recent", "delete", "search", "menu",
                   "center", "up", "down", "left", "right",
-                  "volume_up", "volume_down"]
+                  "volume_up", "volume_down", "volume_mute",
+                  "notifications", "quick_settings"]
 
 ScrollDir = Literal["down", "up", "left", "right"]
 
@@ -49,7 +58,12 @@ PostKind = Literal["screen_changed", "element_state", "text_present",
 
 TERMINAL_ACTIONS = frozenset({"done", "fail", "ask_user"})
 #: Actions whose whole purpose is to move to a different screen.
-NAVIGATIONAL = frozenset({"tap", "tap_at", "long_press", "press_key", "open_app"})
+NAVIGATIONAL = frozenset({"tap", "tap_at", "long_press", "long_press_at",
+                          "double_tap", "press_key", "open_app", "open_url",
+                          "restart_app"})
+#: Actions that take a point rather than an element, and so are quantised into
+#: their loop-detection signature the same way.
+POINT_ACTIONS = frozenset({"tap_at", "long_press_at", "double_tap"})
 
 
 class Target(BaseModel):
@@ -143,21 +157,31 @@ class AgentAction(BaseModel):
     target: Optional[Target] = Field(
         None, description="For tap, long_press, input_text and element scrolls.")
     x: Optional[float] = Field(
-        None, description="For tap_at: horizontal position as a fraction of "
+        None, description="For tap_at, long_press_at, double_tap and the start "
+                          "of a drag: horizontal position as a fraction of "
                           "screen width, 0.0 (left edge) to 1.0 (right edge). "
                           "Omit -- and name the control in `text` instead -- "
                           "when no screenshot is attached.",
         ge=0, le=1)
     y: Optional[float] = Field(
-        None, description="For tap_at: vertical position as a fraction of "
+        None, description="For tap_at, long_press_at, double_tap and the start "
+                          "of a drag: vertical position as a fraction of "
                           "screen height, 0.0 (top edge) to 1.0 (bottom edge).",
         ge=0, le=1)
+    to_x: Optional[float] = Field(
+        None, description="For drag: horizontal position to release at, as a "
+                          "fraction of screen width.", ge=0, le=1)
+    to_y: Optional[float] = Field(
+        None, description="For drag: vertical position to release at, as a "
+                          "fraction of screen height.", ge=0, le=1)
     text: Optional[str] = Field(
         None,
-        description="input_text: what to type. open_app: package name or app search query. "
+        description="input_text: what to type. open_app/restart_app: package name or app search query. "
+                    "open_url: the link (https:, tel:, mailto:, geo:, sms:, market:) "
+                    "or a Settings screen such as android.settings.WIFI_SETTINGS. "
                     "list_apps: optional package name or keyword filter. "
                     "set_clipboard: text to put in clipboard. "
-                    "tap_at: the control to locate, when x and y are omitted. "
+                    "tap_at/long_press_at/double_tap: the control to locate, when x and y are omitted. "
                     "ask_user: the question. done/fail: a one-line summary.")
     clear: Optional[bool] = Field(
         None, description="For input_text: clear field before typing (default True). Set False to append.")
@@ -178,8 +202,16 @@ class AgentAction(BaseModel):
                           "paging without reading the screens in between -- e.g. skipping through a long "
                           "feed to reach something, when the in-between content does not matter.")
     duration: Optional[float] = Field(
-        None, description="For swipe/scroll/wait/sleep: duration in seconds (e.g. 0.15 for fast flick, 0.3 for scroll, 1.0 for wait/sleep).",
+        None, description="For swipe/scroll/wait/sleep: duration in seconds (e.g. 0.15 for fast flick, 0.3 for scroll, 1.0 for wait/sleep). "
+                          "For long_press/long_press_at: how long to hold (default 0.6; use 1.5 or more for press-and-hold controls such as a voice-note button). "
+                          "For drag: how long the move takes (default 0.5).",
         ge=0.05, le=30.0)
+    expect_text: Optional[str] = Field(
+        None,
+        description="Optional. Text that must be on screen afterwards for this "
+                    "action to count as having worked, e.g. \"Sent\". Use it "
+                    "when the action has a silent failure mode; the harness "
+                    "checks it and tells you if it did not appear.")
     wait_for_text: Optional[str] = Field(
         None, description="For wait/sleep: text to wait for on screen before returning.")
     timeout: Optional[float] = Field(
@@ -218,18 +250,27 @@ class AgentAction(BaseModel):
         need_target = {"tap", "long_press", "input_text"}
         if self.action in need_target and self.target is None:
             raise ValueError(f"{self.action} requires a target")
-        if self.action == "tap_at" and (self.x is None or self.y is None) \
+        if self.action in POINT_ACTIONS and (self.x is None or self.y is None) \
                 and not (self.text or "").strip():
-            raise ValueError("tap_at requires x and y, or the control's name "
-                             "in text")
+            raise ValueError(f"{self.action} requires x and y, or the "
+                             f"control's name in text")
+        if self.action == "drag":
+            if self.x is None or self.y is None:
+                raise ValueError("drag requires x and y to start from")
+            if self.to_x is None or self.to_y is None:
+                raise ValueError("drag requires to_x and to_y to release at")
         if self.action == "input_text" and self.text is None:
             raise ValueError("input_text requires text")
         if self.action == "press_key" and self.key is None:
             raise ValueError("press_key requires key")
-        if self.action in ("scroll", "swipe") and self.direction is None:
+        if self.action in ("scroll", "swipe", "scroll_to_edge") \
+                and self.direction is None:
             raise ValueError(f"{self.action} requires direction")
-        if self.action == "open_app" and not self.text:
-            raise ValueError("open_app requires the package name in text")
+        if self.action in ("open_app", "restart_app") and not self.text:
+            raise ValueError(f"{self.action} requires the package name in text")
+        if self.action == "open_url" and not self.text:
+            raise ValueError("open_url requires the link or Settings action "
+                             "in text")
         if self.action == "ask_user" and not self.text:
             raise ValueError("ask_user requires the question in text")
         return self
@@ -251,7 +292,7 @@ class AgentAction(BaseModel):
         parts = [self.action]
         if self.target is not None:
             parts.append(self.target.identity())
-        if self.action == "tap_at":
+        if self.action in POINT_ACTIONS:
             if self.x is not None and self.y is not None:
                 # Quantised to a ~1% grid: a blind tap retried a few pixels off
                 # is the same action for loop-detection purposes.
@@ -260,6 +301,15 @@ class AgentAction(BaseModel):
                 # A named control is grounded by the vision locate at act time;
                 # until then its name is the identity.
                 parts.append(" ".join(self.text.lower().split()))
+        if self.action == "drag" and None not in (self.x, self.y,
+                                                  self.to_x, self.to_y):
+            parts.append(f"{self.x:.2f},{self.y:.2f}->"
+                         f"{self.to_x:.2f},{self.to_y:.2f}")
+        if self.action in ("open_app", "open_url", "restart_app") and self.text:
+            # The whole identity of these: two `open_url`s to different links
+            # are different actions, and repeating one is what the ban list is
+            # for.
+            parts.append(" ".join(self.text.lower().split()))
         for extra in (self.key, self.direction):
             if extra:
                 parts.append(str(extra))
@@ -269,22 +319,33 @@ class AgentAction(BaseModel):
         bits = [self.action]
         if self.target is not None:
             bits.append(describe_target(self.target, element))
-        if self.action == "tap_at" and self.x is not None and self.y is not None:
+        if self.action in POINT_ACTIONS and self.x is not None \
+                and self.y is not None:
             bits.append(f"({self.x:.2f},{self.y:.2f})")
+        if self.action == "drag" and None not in (self.x, self.y,
+                                                  self.to_x, self.to_y):
+            bits.append(f"({self.x:.2f},{self.y:.2f})->"
+                        f"({self.to_x:.2f},{self.to_y:.2f})")
         if self.action == "input_text" and self.text is not None:
             bits.append(f"{self.text!r}")
-        elif self.action in ("open_app", "list_apps", "done", "fail", "ask_user",
-                             "tap_at") and self.text:
+        elif self.action in ("open_app", "open_url", "restart_app", "list_apps",
+                             "done", "fail", "ask_user") and self.text:
+            bits.append(self.text)
+        elif self.action in POINT_ACTIONS and self.text:
             bits.append(self.text)
         if self.key:
             bits.append(self.key)
         if self.direction:
             bits.append(self.direction)
-            bits.append(f"amount={self.scroll_amount}")
+            if self.action != "scroll_to_edge":
+                bits.append(f"amount={self.scroll_amount}")
             if self.base_scale is not None:
                 bits.append(f"base_scale={self.base_scale}")
             if self.read_each is False:
                 bits.append("read_each=false")
+        if self.action in ("long_press", "long_press_at") \
+                and self.duration is not None:
+            bits.append(f"hold={self.duration:.2f}s")
         return " ".join(bits)
 
 
@@ -630,6 +691,21 @@ class ActionError(RuntimeError):
     """The action could not be carried out on this screen."""
 
 
+def _point(action: "AgentAction", screen: Screen,
+           fx: Optional[float], fy: Optional[float]) -> Tuple[int, int]:
+    """A fractional point as device pixels, clamped inside the frame."""
+    if fx is None or fy is None:
+        # A text-mode point action reaches here only when nothing grounded it
+        # -- the agent loop's vision locate answers before execute.
+        raise ActionError(f"{action.action} has no point: the control was "
+                          f"never located")
+    if screen.width <= 0 or screen.height <= 0:
+        raise ActionError(f"{action.action} needs the screen dimensions, "
+                          f"which are unknown for this screen")
+    return (min(max(1, int(fx * screen.width)), screen.width - 1),
+            min(max(1, int(fy * screen.height)), screen.height - 1))
+
+
 # ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
@@ -645,20 +721,25 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
     if action.action == "tap":
         assert element is not None
         dev.tap(*element.center)
-    elif action.action == "tap_at":
-        if action.x is None or action.y is None:
-            # A text-mode tap_at reaches here only when nothing grounded it --
-            # the agent loop's vision locate answers before execute.
-            raise ActionError("tap_at has no point: the control was never located")
-        if screen.width <= 0 or screen.height <= 0:
-            raise ActionError("tap_at needs the screen dimensions, which are "
-                              "unknown for this screen")
-        px = min(max(1, int(action.x * screen.width)), screen.width - 1)
-        py = min(max(1, int(action.y * screen.height)), screen.height - 1)
-        dev.tap(px, py)
+    elif action.action in POINT_ACTIONS:
+        px, py = _point(action, screen, action.x, action.y)
+        if action.action == "tap_at":
+            dev.tap(px, py)
+        elif action.action == "long_press_at":
+            dev.long_press(px, py, duration=action.duration or 0.6)
+        else:
+            dev.double_tap(px, py)
+    elif action.action == "drag":
+        fx, fy = _point(action, screen, action.x, action.y)
+        tx, ty = _point(action, screen, action.to_x, action.to_y)
+        dev.drag(fx, fy, tx, ty, duration=action.duration or 0.5)
     elif action.action == "long_press":
         assert element is not None
-        dev.long_press(*element.center)
+        # `duration` used to be dropped here, which made every long press
+        # exactly the device default. A press-and-hold control -- a voice-note
+        # button, a shutter, a reorder handle -- wants a hold measured in
+        # seconds, and there was no way to ask for one.
+        dev.long_press(*element.center, duration=action.duration or 0.6)
     elif action.action == "input_text":
         assert element is not None
         # Focus the field first; the IME broadcast path types into whatever has
@@ -722,6 +803,30 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
             if remainder >= 0.1:
                 dev.scroll(action.direction or "down",
                            scale=round(base_scale * remainder, 2), box=box, duration=duration)
+    elif action.action == "scroll_to_edge":
+        direction = action.direction or "up"
+        moved = dev.fling_to_edge(direction)
+        edge = {"up": "top", "down": "bottom",
+                "left": "start", "right": "end"}.get(direction, direction)
+        setattr(action, "_result_summary",
+                f"flung to the {edge}" if moved
+                else f"already at the {edge}; nothing moved")
+    elif action.action == "open_url":
+        summary = dev.open_url((action.text or "").strip())
+        setattr(action, "_result_summary", summary)
+    elif action.action == "restart_app":
+        raw_pkg = (action.text or "").strip()
+        target_pkg = raw_pkg
+        if "." not in raw_pkg:
+            pkgs = dev.list_apps(query=raw_pkg)
+            if pkgs:
+                target_pkg = _best_app_match(pkgs, raw_pkg)
+        setattr(action, "_resolved_package", target_pkg)
+        landed = dev.restart_app(target_pkg)
+        summary = f"force-stopped and relaunched {target_pkg}"
+        if landed is False:
+            summary += "; it was still not in front when the wait ran out"
+        setattr(action, "_result_summary", summary)
     elif action.action == "open_app":
         raw_pkg = (action.text or "").strip()
         target_pkg = raw_pkg
@@ -769,16 +874,13 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
         past_verb = "slept" if action.action == "sleep" else "waited"
         timeout = action.timeout if action.timeout is not None else (action.duration or (5.0 if action.wait_for_text else 1.0))
         if action.wait_for_text:
-            wanted = action.wait_for_text.strip().lower()
-            deadline = time.monotonic() + timeout
-            found = False
-            while time.monotonic() <= deadline + 0.05:
-                curr = dev.observe()
-                els = getattr(curr, "all_elements", None) or getattr(curr, "elements", [])
-                if any(wanted in el.best_text.strip().lower() for el in els if hasattr(el, "best_text") and el.best_text):
-                    found = True
-                    break
-                time.sleep(0.1)
+            # Asked of the device, not of a poll loop here. This used to call
+            # `dev.observe()` every 0.1s, and each of those is a whole
+            # `dump_hierarchy` -- 0.55s on the phone in `device.current_app`'s
+            # notes and far more over wireless adb -- so a long wait could
+            # spend its entire budget on two or three polls and then report a
+            # timeout for a screen that had already arrived.
+            found = dev.wait_for_text(action.wait_for_text, timeout)
             summary = f"{past_verb} for {action.wait_for_text!r} -> {'found' if found else 'timed out'}"
             setattr(action, "_result_summary", summary)
         else:
@@ -817,18 +919,27 @@ def synthesise_postcondition(action: AgentAction,
     into a field must NOT navigate anywhere -- both would be scored as failures
     by a naive screen-changed test.
     """
+    # The model's own expectation outranks anything derived here: it knows what
+    # the action was for, and the synthesised conditions are a guess from the
+    # action's shape. Only `text_present` is offered -- the rest of the DSL
+    # needs a resource-id the model does not reliably have, and one string is
+    # what the silent-failure cases ("did the message actually send?") need.
+    if (action.expect_text or "").strip():
+        return Postcondition(kind="text_present", text=action.expect_text.strip())
     if action.action == "input_text":
         return Postcondition(kind="element_state",
                              resource_id=element.resource_id if element else None,
                              field="text", value=action.text or "")
-    if action.action in ("tap", "long_press") and element is not None and element.checkable:
+    if action.action in ("tap", "long_press", "long_press_at", "double_tap") \
+            and element is not None and element.checkable:
         return Postcondition(kind="element_state", resource_id=element.resource_id,
                              field="checked",
                              value="false" if element.checked else "true")
-    if action.action == "open_app":
+    if action.action in ("open_app", "restart_app"):
         pkg = getattr(action, "_resolved_package", (action.text or "").strip())
         return Postcondition(kind="app_is", package=pkg)
-    if action.action in ("wait", "sleep", "list_apps", "get_clipboard", "set_clipboard", "scroll", "swipe"):
+    if action.action in ("wait", "sleep", "list_apps", "get_clipboard",
+                         "set_clipboard", "scroll", "swipe", "scroll_to_edge"):
         return Postcondition(kind="noop_ok")
     return Postcondition(kind="screen_changed")
 
@@ -1034,11 +1145,31 @@ def verify(action: AgentAction, before: Screen, after: Screen,
         result_text = getattr(action, "_result_summary", "")
         reason = f"listed apps ({result_text})" if result_text else "listed apps"
         return VerifyOutcome(grade="success", reason=reason)
+    if action.action == "open_url":
+        # Graded on the screen and not on `am`'s exit status: `am start` exits
+        # zero whether or not anything handled the intent, and the refusals it
+        # does report are raised in `Device.open_url` before this is reached.
+        result_text = getattr(action, "_result_summary", "")
+        if after.exact_id == before.exact_id:
+            return VerifyOutcome(
+                grade="no_change",
+                reason=f"{result_text or 'opened the link'}, but nothing on "
+                       f"screen changed -- no app handled it")
+        return VerifyOutcome(grade="success", reason=result_text)
 
     condition = post or synthesise_postcondition(action, None)
 
     # Scroll/swipe that didn't move = end of list or edge of gallery, not a hard failure.
-    if action.action in ("scroll", "swipe") and not _scroll_changed(before, after, action=action):
+    if action.action in ("scroll", "swipe", "scroll_to_edge") \
+            and not _scroll_changed(before, after, action=action):
+        # A fling that moves nothing has told the model something a plain
+        # scroll's silence does not: it is already at that edge, and the
+        # harness said so rather than leaving it to be inferred.
+        if action.action == "scroll_to_edge":
+            return VerifyOutcome(
+                grade="no_change",
+                reason=getattr(action, "_result_summary", "")
+                       or "already at that edge; nothing moved")
         return VerifyOutcome(grade="no_change",
                              reason=f"{action.action}ing did not reveal new content")
 

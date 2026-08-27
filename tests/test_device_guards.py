@@ -13,8 +13,9 @@ import time
 import pytest
 
 from adbagent import fingerprint as fp
-from adbagent.device import (DENY_PATTERNS, DeviceTimeout, PRESS_KEYS, ShellDenied,
-                             _guard, check_shell, patch_socket_timeout)
+from adbagent.device import (ALLOWED_URI_SCHEMES, DENY_PATTERNS, DeviceTimeout,
+                             PRESS_KEYS, ShellDenied, _guard, check_shell,
+                             check_uri, patch_socket_timeout)
 from adbagent.screen import parse
 
 from . import xmlgen as X
@@ -851,3 +852,94 @@ def test_reconnect_drops_the_replaced_devices_atexit_hook(monkeypatch):
 
     dev.close()
     assert dropped == [original.stop_uiautomator, replacement.stop_uiautomator]
+
+
+# ---------------------------------------------------------------------------
+# Deep-link targets
+# ---------------------------------------------------------------------------
+#
+# `open_url` takes a string chosen by a model that has spent the whole run
+# reading screen text it does not control, so the question this guard answers is
+# "is this one of the few things the action was built for", never "is this one
+# of the things somebody thought to forbid".
+
+@pytest.mark.parametrize("target,expected", [
+    ("https://example.com/a?b=1&c=2", "view"),
+    ("http://example.com", "view"),
+    ("tel:+441632960960", "view"),
+    ("mailto:someone@example.com", "view"),
+    ("geo:51.5,-0.12", "view"),
+    ("sms:+441632960960", "view"),
+    ("market://details?id=com.whatsapp", "view"),
+    ("android.settings.WIFI_SETTINGS", "action"),
+    ("android.settings.AIRPLANE_MODE_SETTINGS", "action"),
+])
+def test_allowed_targets(target, expected):
+    kind, value = check_uri(target)
+    assert kind == expected
+    assert value == target
+
+
+@pytest.mark.parametrize("target", [
+    # The reason this guard exists. An `intent:` URI's fragment carries
+    # `component=pkg/cls` and arbitrary extras, so ACTION_VIEW on one is a
+    # launcher for any component on the phone wearing a URL's clothes.
+    "intent://scan/#Intent;scheme=zxing;package=com.evil;end",
+    "intent:#Intent;component=com.android.settings/.Settings;end",
+    # ...and the same payload smuggled behind a scheme that is allowed.
+    "https://example.com#Intent;component=com.evil/.Main;end",
+    # A local file read through whatever app claims the type.
+    "file:///data/data/com.bank/databases/accounts.db",
+    "content://com.android.contacts/data",
+    # Not a URI at all.
+    "javascript:alert(1)",
+    "com.android.settings",
+    "just some words",
+    "",
+    "   ",
+    # A Settings action is matched anchored and upper-case, so neither of these
+    # can smuggle a different action past it.
+    "android.settings.WIFI_SETTINGS extra",
+    "prefix android.settings.WIFI_SETTINGS",
+    "android.intent.action.CALL",
+])
+def test_refused_targets(target):
+    with pytest.raises(ShellDenied):
+        check_uri(target)
+
+
+def test_a_query_string_is_not_mistaken_for_shell_syntax():
+    """`&` and `$` are ordinary URI characters. The shell metacharacter set is
+    the wrong rule here -- and the right one, because `open_url` passes argv and
+    never builds a command string."""
+    kind, value = check_uri("https://example.com/s?q=a&b=2&utm=x")
+    assert (kind, value) == ("view", "https://example.com/s?q=a&b=2&utm=x")
+
+
+@pytest.mark.parametrize("target", [
+    "https://example.com/\nrm -rf /",
+    "https://example.com/a b",
+    "https://example.com/\ttab",
+    "https://exa‮mple.com",          # a bidi override in a hostname
+])
+def test_a_uri_with_whitespace_or_control_characters_is_refused(target):
+    with pytest.raises(ShellDenied):
+        check_uri(target)
+
+
+def test_the_scheme_allowlist_holds_no_launcher_schemes():
+    for banned in ("intent", "file", "content", "javascript", "android-app"):
+        assert banned not in ALLOWED_URI_SCHEMES
+
+
+def test_force_stop_is_not_on_the_blocklist():
+    """`restart_app` depends on it, and unlike `pm clear` it destroys no data:
+    the app comes back at its launcher entry point with its state intact."""
+    check_shell("am force-stop com.whatsapp")
+
+
+def test_the_panel_names_press_accepts_are_not_keycodes():
+    """`notifications` and `quick_settings` are handled before the keycode
+    lookup, so they must not be in the set that lookup validates against."""
+    assert "notifications" not in PRESS_KEYS
+    assert "quick_settings" not in PRESS_KEYS

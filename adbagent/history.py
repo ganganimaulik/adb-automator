@@ -104,7 +104,8 @@ def packages_in(events: Sequence[Dict[str, Any]]) -> Set[str]:
             last_end = event
         elif kind == "decide":
             action = event.get("action") or {}
-            if isinstance(action, dict) and action.get("action") == "open_app":
+            if isinstance(action, dict) and action.get("action") in (
+                    "open_app", "restart_app"):
                 text = str(action.get("text") or "")
                 if "." in text:
                     opened.add(text)

@@ -303,7 +303,11 @@ function actionSummary(a, el) {
   const bits = [];
   const t = a.target;
   if (t && typeof t === "object") bits.push(targetName(t, el));
-  if (a.text) bits.push(kind === "open_app" ? a.text : `"${a.text}"`);
+  /* A package name, a link and a Settings action are identifiers, not prose:
+     quoting them the way a typed string is quoted reads as if the agent typed
+     them somewhere. */
+  const BARE = new Set(["open_app", "restart_app", "open_url", "list_apps"]);
+  if (a.text) bits.push(BARE.has(kind) ? a.text : `"${a.text}"`);
   if (a.direction) bits.push(a.direction);
   if (a.key) bits.push(a.key);
   return `${kind}${bits.length ? " " + bits.filter(Boolean).join(" ") : ""}`;
