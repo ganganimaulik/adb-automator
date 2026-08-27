@@ -53,7 +53,14 @@ function fmtTime(epoch) {
 function fmtDur(s) {
   s = Math.round(s || 0);
   if (s < 60) return `${s}s`;
-  return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+  // A run is minutes and a history is days, and the same function formats
+  // both. Left at minutes, 26 hours of accumulated wall clock reported as
+  // `1546m56s` -- a number nobody can read at a glance and nobody wants to
+  // the second.
+  if (s < 3600) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+  const h = Math.floor(s / 3600);
+  if (h < 24) return `${h}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+  return `${Math.floor(h / 24)}d${h % 24}h`;
 }
 
 /* `09/08/2026, 19:29:14` does not say which number is the month, and nobody
@@ -85,6 +92,19 @@ function goalTitle(goal) {
 function goalRest(goal) {
   const lines = String(goal || "").split("\n").map((l) => l.trim()).filter(Boolean);
   return lines.length > 1 ? lines.length - 1 : 0;
+}
+
+/* Two goals are the same goal when they differ only by a number.
+   Grouping on the exact string is what a history looks like to a machine, not
+   what one looks like to the person who made it: "send likes on 3 new
+   profiles" and "…on 7 new profiles" are one thing tried twice, and filing
+   them apart split 165 of these 169 runs five ways, each group reporting its
+   own success rate for what was really one practice. So the key folds every
+   run of digits to a single mark and leaves every word alone — a goal that
+   differs by a count is one goal, a goal that differs by a word is two. */
+function goalKey(goal) {
+  return goalTitle(goal).toLowerCase().replace(/\s+/g, " ").trim()
+    .replace(/\d+(?:[.,]\d+)*/g, "#");
 }
 
 /* ------------------------------------------------------- follow the tail
@@ -1444,6 +1464,63 @@ function runOptions() {
   return body;
 }
 
+/* What the folded options currently say, on the line you fold them behind.
+
+   Seven settings, all defaulted, and the run that changes one is rare — so
+   they cost every run the space of being read and told most of them nothing.
+   Folded they cost a line, and this is that line: only what is actually set,
+   with the guardrails first because they are the two that spend money and
+   break things. A default left alone is not mentioned, so the summary is
+   empty exactly when there is nothing to know. */
+function paintRunOpts() {
+  const bits = [];
+  const budget = $("opt-budget").value.trim();
+  const steps = $("opt-max-steps").value.trim();
+  const repeat = $("opt-repeat").value.trim();
+  const serial = $("opt-serial").value.trim();
+  if ($("opt-dry-run").checked) bits.push(`<b class="warn">dry run</b>`);
+  if ($("opt-destructive").checked) bits.push(`<b class="bad">destructive allowed</b>`);
+  if (budget) bits.push(`$${esc(budget)}`);
+  if (steps) bits.push(`${esc(steps)} steps`);
+  if (repeat && repeat !== "1") bits.push(`<b class="warn">repeat ${esc(repeat)}</b>`);
+  if (serial) bits.push(esc(serial));
+  if ($("opt-no-learn").checked) bits.push("no learning");
+  if ($("opt-assert-shell").value.trim() || $("opt-assert-text").value.trim())
+    bits.push("assertion set");
+  $("runopts-summary").innerHTML = bits.length
+    ? `options · ${bits.join(" · ")}`
+    : `options · <span class="dim">defaults</span>`;
+  return bits.length > 0;
+}
+
+$("runopts").addEventListener("input", paintRunOpts);
+$("runopts").addEventListener("change", paintRunOpts);
+
+/* The same line for a watch's ceilings. These read as "12 replies/hour" rather
+   than bare numbers, because a ceiling with no unit on it is the one kind of
+   number worth misreading — and the placeholder is the default, so a field
+   left alone is reported as the default rather than as blank. */
+function paintWatchOpts() {
+  const bits = [];
+  const put = (id, fmt) => {
+    const v = $(id).value.trim();
+    if (v) bits.push(fmt(v));
+  };
+  put("watch-rph", (v) => `${v} replies/hour`);
+  put("watch-rpc", (v) => `${v} per conversation`);
+  put("watch-cooldown", (v) => `${v}s cooldown`);
+  put("watch-usd", (v) => `$${v}/hour`);
+  put("watch-serial", (v) => v);
+  if ($("watch-no-learn").checked) bits.push("no learning");
+  $("watchopts-summary").innerHTML = bits.length
+    ? `limits · ${bits.join(" · ")}`
+    : `limits · <span class="dim">defaults</span>`;
+  return bits.length > 0;
+}
+
+$("watchopts").addEventListener("input", paintWatchOpts);
+$("watchopts").addEventListener("change", paintWatchOpts);
+
 /* Clear a surface and attach it to whatever is starting now. */
 function beginLive(v) {
   resetCounters(v);
@@ -1484,6 +1561,16 @@ $("run-form").addEventListener("submit", async (e) => {
   if (!body.goal) { notice("a goal is required"); return; }
   saveGoal("adbagent.goal", body.goal);
   await startRun(body);
+});
+
+/* The goal box is a textarea because goals are paragraphs, so Enter belongs to
+   the text and the run needs the modifier — the same bargain every compose box
+   makes. Without it the only way to start was to leave the keyboard. */
+$("goal").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    $("run-form").requestSubmit();
+  }
 });
 
 $("btn-new-run").addEventListener("click", () => {
@@ -1533,21 +1620,28 @@ $("btn-stop").addEventListener("click", async () => {
    other end of it, which is the one fact that decides whether Start run can
    work at all. */
 
+/* The fourth field is a serial the page can offer to switch to. Saying "not
+   attached" is the right diagnosis and was, on its own, a dead end: the fix
+   lives four navigations away in the config form, and the only thing it wants
+   typed is a serial adb is already reporting on this very line. So when there
+   is exactly one attached phone and it is not the configured one, the status
+   pill carries the fix rather than just the finding. */
 function deviceStatus(st) {
   const serials = st.devices_attached || [];
   const serial = st.device_serial || "";
-  if (serial && st.device_attached) return ["ok", `device ${serial}`, ""];
+  const lone = serials.length === 1 && serials[0] !== serial ? serials[0] : "";
+  if (serial && st.device_attached) return ["ok", `device ${serial}`, "", ""];
   if (serial) {
     return ["warn", `${serial} · not attached`,
       "the serial in config.json is set, but adb does not see it — a run " +
-      "cannot start until it is connected"];
+      "cannot start until it is connected", lone];
   }
-  if (serials.length === 1) return ["ok", `device ${serials[0]}`, ""];
+  if (serials.length === 1) return ["ok", `device ${serials[0]}`, "", ""];
   if (serials.length > 1) {
     return ["warn", `${serials.length} devices · none chosen`,
-      "set device.serial in Config, or name one per run"];
+      "set device.serial in Config, or name one per run", ""];
   }
-  return ["warn", "no device", "nothing is attached"];
+  return ["warn", "no device", "nothing is attached", ""];
 }
 
 async function refreshStatus() {
@@ -1555,9 +1649,13 @@ async function refreshStatus() {
     const st = await api("/api/status");
     LAST_STATUS = st;
     const parts = [];
-    const [cls, text, why] = deviceStatus(st);
+    const [cls, text, why, fix] = deviceStatus(st);
     parts.push(`<span class="st ${cls}"${why ? ` title="${esc(why)}"` : ""}>` +
-      `${esc(text)}</span>`);
+      `${esc(text)}` +
+      (fix ? `<button type="button" class="st-fix" data-use="${esc(fix)}"` +
+        ` title="write device.serial = ${esc(fix)} to config.json">` +
+        `use ${esc(fix)}</button>` : "") +
+      `</span>`);
     parts.push(st.model
       ? `<span class="st">${esc(st.model.split("/").pop())}</span>`
       : `<span class="st warn">no model</span>`);
@@ -1614,6 +1712,28 @@ async function refreshStatus() {
 }
 
 let LAST_STATUS = {};
+
+/* Delegated, because the status line is rebuilt from a string on every poll
+   and a listener bound to the button would be thrown away with it. */
+$("status").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-use]");
+  if (!btn) return;
+  const serial = btn.dataset.use;
+  btn.disabled = true;
+  try {
+    await api("/api/device/use",
+      { method: "POST", body: JSON.stringify({ serial }) });
+    notice(`device.serial is now ${serial}`, false);
+    await refreshStatus();
+    // The Device pane and the Config form both show the serial that just
+    // changed; refetch whichever the reader has already opened.
+    if (loadedPanes.has("device")) loadDevices().catch(() => {});
+    if (loadedPanes.has("config")) loadConfig().catch(() => {});
+  } catch (err) {
+    notice(err.message);
+    btn.disabled = false;
+  }
+});
 
 /* -------------------------------------------------------------- watch */
 
@@ -1979,18 +2099,21 @@ async function loadRuns() {
   RUNS_ACTIVE = !!(data.active && data.active.running);
   paintRuns();
   paintRecentGoals();
+  paintStanding();
 }
 
-/* Which outcomes the filter buttons stand for. `other` is everything a run can
-   end as that is neither of the two anybody filters for. */
-function outcomeBucket(outcome) {
-  if (outcome === "success") return "success";
-  if (outcome === "failed") return "failed";
-  return "other";
-}
-
+/* The filter matches the outcome word the chip already says, so there is
+   nothing to learn: `aborted` filters to the rows chipped `aborted`. The one
+   that is not an outcome is `resumable`, which is the question this list was
+   worst at answering — a checkpoint is the most useful thing in a history and
+   it was reachable only by opening runs one at a time to see if they had one. */
 function runMatches(r) {
-  if (RUN_FILTER.outcome && outcomeBucket(r.outcome) !== RUN_FILTER.outcome) return false;
+  const f = RUN_FILTER.outcome;
+  if (f === "resumable") {
+    if (!r.resumable) return false;
+  } else if (f && r.outcome !== f) {
+    return false;
+  }
   if (!RUN_FILTER.q) return true;
   const hay = `${r.goal} ${r.result} ${r.evidence} ${r.id} ${r.outcome}`.toLowerCase();
   return RUN_FILTER.q.split(/\s+/).every((word) => hay.includes(word));
@@ -2046,14 +2169,15 @@ function groupRuns(runs) {
   const groups = [];
   const byGoal = new Map();
   for (const r of runs) {
-    const key = String(r.goal || "").trim().toLowerCase().replace(/\s+/g, " ");
+    const key = goalKey(r.goal);
     let g = byGoal.get(key);
     if (!g) {
-      g = { key, goal: r.goal, runs: [] };
+      g = { key, goal: r.goal, runs: [], titles: new Set() };
       byGoal.set(key, g);
       groups.push(g);
     }
     g.runs.push(r);
+    g.titles.add(goalTitle(r.goal));
   }
   return groups;
 }
@@ -2082,22 +2206,39 @@ function paintRuns() {
     const newest = g.runs[0];
     const ok = g.runs.filter((r) => r.outcome === "success").length;
     const spend = g.runs.reduce((a, r) => a + (r.usd || 0), 0);
+    const left = g.runs.filter((r) => r.resumable).length;
     const det = document.createElement("details");
     det.className = "rungroup";
     const rest = goalRest(g.goal);
+    // What a group of attempts is worth knowing is what it cost to get a
+    // success out of it, and a group that never got one is the one worth
+    // seeing at a glance — eleven attempts and $3.62 for nothing is a goal to
+    // rewrite, not to run a twelfth time.
+    const each = ok ? `$${(spend / ok).toFixed(3)} each` : "nothing worked";
     det.innerHTML =
       `<summary>` +
         `<span class="oc">${chip(newest.outcome, newest.outcome)}</span>` +
         `<div class="goal" title="${esc(g.goal)}">${esc(goalTitle(g.goal))}` +
-        (rest ? ` <span class="small">+${rest} more lines</span>` : "") + `</div>` +
+        (rest ? ` <span class="small">+${rest} more lines</span>` : "") +
+        (g.titles.size > 1
+          ? ` <span class="variants" title="${esc([...g.titles].join("\n\n"))}">` +
+            `${g.titles.size} wordings</span>`
+          : "") + `</div>` +
         (newest.result ? `<div class="ans">${esc(newest.result)}</div>` : "") +
-        `<div class="tally">${g.runs.length} attempts · ${ok} succeeded · ` +
-        `$${spend.toFixed(3)} · last ` +
+        `<div class="tally">${g.runs.length} attempts · ` +
+        `<span class="${ok ? "" : "bad"}">${ok} succeeded</span> · ` +
+        `$${spend.toFixed(3)} · <span class="${ok ? "" : "bad"}">${each}</span>` +
+        (left ? ` · <span class="warn">${left} resumable</span>` : "") +
+        ` · last ` +
         `<span title="${esc(fmtTime(newest.started))}">${esc(fmtRel(newest.started))}</span>` +
         ` <span class="more">show each</span></div>` +
       `</summary><div class="kids"></div>`;
     const kids = det.querySelector(".kids");
-    for (const r of g.runs) kids.appendChild(runRow(r, { showGoal: false }));
+    // A group that folded several wordings together has to show them, or the
+    // rows inside it are indistinguishable and the fold has lost the thing it
+    // folded on.
+    const showGoal = g.titles.size > 1;
+    for (const r of g.runs) kids.appendChild(runRow(r, { showGoal }));
     list.appendChild(det);
   }
 }
@@ -2109,42 +2250,106 @@ $("runs-search").addEventListener("input", () => {
 
 document.querySelector("#runs-list-view .seg").addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-outcome]");
-  if (!btn) return;
-  RUN_FILTER.outcome = btn.dataset.outcome;
-  btn.parentElement.querySelectorAll("button").forEach((b) =>
-    b.classList.toggle("on", b === btn));
-  paintRuns();
+  if (btn) setOutcomeFilter(btn.dataset.outcome);
 });
 
 /* The five most recent distinct goals, as chips that fill the box. The blank
-   textarea was a cold start on a page whose whole history is retries. */
+   textarea was a cold start on a page whose whole history is retries.
+
+   Distinct by intent, not by string. Keyed on the exact goal these came back
+   as five chips reading "First go to Discover tab in Hinge and send likes
+   with 'Hey…" — the same truncation five times, twice for literally the same
+   text, because what told them apart was a number thirty characters past
+   where the chip ended. One chip per intent, and each chip says how that
+   intent has actually gone, so picking one is a decision rather than a
+   guess. */
 function paintRecentGoals() {
   const wrap = $("recent-goals");
   const box = $("recent-chips");
   box.innerHTML = "";
-  const seen = new Set();
-  const picks = [];
+  const seen = new Map();
   for (const r of RUNS) {
     const goal = (r.goal || "").trim();
-    const key = goal.toLowerCase().replace(/\s+/g, " ");
-    if (!goal || seen.has(key)) continue;
-    seen.add(key);
-    picks.push(goal);
-    if (picks.length === 5) break;
+    if (!goal) continue;
+    const key = goalKey(goal);
+    // The newest wording wins the chip; the rest of the group only feeds the
+    // tally, so the chip fills the box with a goal that was really run.
+    let g = seen.get(key);
+    if (!g) {
+      if (seen.size === 5) continue;
+      g = { goal, ok: 0, n: 0 };
+      seen.set(key, g);
+    }
+    g.n += 1;
+    if (r.outcome === "success") g.ok += 1;
   }
+  const picks = [...seen.values()];
   wrap.hidden = !picks.length;
-  for (const goal of picks) {
+  for (const p of picks) {
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.textContent = goalTitle(goal);
-    btn.title = goal;
+    btn.innerHTML = `<span>${esc(goalTitle(p.goal))}</span>` +
+      (p.n > 1 ? `<span class="tally ${p.ok ? "" : "bad"}">${p.ok}/${p.n}</span>` : "");
+    btn.title = `${p.ok} of ${p.n} succeeded\n\n${p.goal}`;
     btn.addEventListener("click", () => {
-      $("goal").value = goal;
-      saveValue("adbagent.goal", goal);
+      $("goal").value = p.goal;
+      saveValue("adbagent.goal", p.goal);
       $("goal").focus();
     });
     box.appendChild(btn);
   }
+}
+
+/* ------------------------------------------------------------- standing
+
+   The sums. Every number this page showed was about one run, and the
+   questions a history like this actually raises are all totals: what has it
+   cost, how often does it work, and how much of it is sitting half-finished.
+   169 runs, 79 of them successful and 90 of them holding a checkpoint nobody
+   went back to — none of that was on the page, and none of it needs a new
+   endpoint, only the addition the reader was being left to do. */
+function paintStanding() {
+  const box = $("standing");
+  if (!RUNS.length) { box.hidden = true; return; }
+  const ok = RUNS.filter((r) => r.outcome === "success").length;
+  const spend = RUNS.reduce((a, r) => a + (r.usd || 0), 0);
+  const secs = RUNS.reduce((a, r) => a + (r.duration_s || 0), 0);
+  const left = RUNS.filter((r) => r.resumable).length;
+  const rate = Math.round((ok / RUNS.length) * 100);
+  const cell = (k, v, cls = "", title = "") =>
+    `<span class="sc ${cls}"${title ? ` title="${esc(title)}"` : ""}>` +
+    `<b>${v}</b><span class="sk">${k}</span></span>`;
+  box.innerHTML =
+    cell("runs", RUNS.length) +
+    cell("succeeded", `${rate}%`, rate >= 50 ? "ok" : "warn",
+      `${ok} of ${RUNS.length}`) +
+    cell("spent", `$${spend.toFixed(2)}`, "",
+      ok ? `$${(spend / ok).toFixed(2)} per success` : "nothing has succeeded yet") +
+    cell("on the phone", fmtDur(secs)) +
+    (left
+      // The one number here that is a thing to do rather than a thing to know.
+      ? `<button type="button" class="sc act" id="standing-resumable"` +
+        ` title="runs that stopped with a checkpoint — each can be continued` +
+        ` instead of started over">` +
+        `<b>${left}</b><span class="sk">resumable</span></button>`
+      : "");
+  box.hidden = false;
+  const btn = $("standing-resumable");
+  if (btn) {
+    btn.addEventListener("click", () => {
+      setOutcomeFilter("resumable");
+      $("runs-list-view").scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+}
+
+/* Set from the filter buttons and from the standing strip, so both agree
+   about which button is lit. */
+function setOutcomeFilter(outcome) {
+  RUN_FILTER.outcome = outcome;
+  document.querySelectorAll("#runs-list-view .seg button[data-outcome]")
+    .forEach((b) => b.classList.toggle("on", b.dataset.outcome === outcome));
+  paintRuns();
 }
 
 /* Every skill a run had in its prompt, in the order it picked them up.
@@ -2282,10 +2487,41 @@ async function loadDevices() {
   $("dev-table").hidden = d.devices.length === 0;
   $("dev-candidates").textContent =
     d.candidates.length ? `wireless debugging advertised at: ${d.candidates.join(", ")}` : "";
+  const configured = (LAST_STATUS.device_serial || "").trim();
   for (const dev of d.devices) {
     const tr = document.createElement("tr");
     tr.innerHTML = `<td class="mono">${esc(dev.serial)}</td><td>${esc(dev.model)}</td>` +
       `<td>${esc(dev.android)}</td><td></td>`;
+    const cell = tr.lastElementChild;
+    // The table listed every phone adb can see and offered no way to run on
+    // one of them. Choosing meant reading the serial off this row and typing
+    // it into the config form two panes away.
+    if (dev.serial === configured) {
+      const tag = document.createElement("span");
+      tag.className = "small ok-text";
+      tag.textContent = "in use";
+      cell.appendChild(tag);
+    } else {
+      const use = document.createElement("button");
+      use.className = "primary";
+      use.textContent = "use this";
+      use.title = `write device.serial = ${dev.serial} to config.json`;
+      use.addEventListener("click", async () => {
+        use.disabled = true;
+        try {
+          await api("/api/device/use",
+            { method: "POST", body: JSON.stringify({ serial: dev.serial }) });
+          notice(`device.serial is now ${dev.serial}`, false);
+          await refreshStatus();
+          await loadDevices();
+          if (loadedPanes.has("config")) loadConfig().catch(() => {});
+        } catch (err) {
+          notice(err.message);
+          use.disabled = false;
+        }
+      });
+      cell.appendChild(use);
+    }
     const btn = document.createElement("button");
     btn.className = "ghost";
     btn.textContent = "screenshot";
@@ -2293,7 +2529,7 @@ async function loadDevices() {
       $("shot-serial").textContent = dev.serial;
       setupPhone.refresh();
     });
-    tr.lastElementChild.appendChild(btn);
+    cell.appendChild(btn);
     tbody.appendChild(tr);
   }
   paintDeviceState(d.devices);
@@ -3233,6 +3469,12 @@ function loadGoal(key) { return loadValue(key) || ""; }
 
 setDensity(loadValue(DENSITY_KEY) || "story");
 bindPersistence();
+// After the saved values are back in the fields, so the folded line describes
+// the options this page actually loaded with rather than the empty form. Open
+// it when something is set: a page that comes back with `repeat inf` and a
+// destructive tick still on it should not have to be unfolded to find out.
+$("runopts").open = paintRunOpts();
+$("watchopts").open = paintWatchOpts();
 workPhase("compose");
 paintWatchBanner(false, false);
 refreshStatus();

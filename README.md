@@ -590,15 +590,28 @@ adbagent ui --port 9000
 and browse what it answered before. Starting a run and reviewing one were never
 two different jobs.
 
+*Where you stand.* One line above the goal box: how many runs there have been,
+how often they worked, what they cost, how long the phone has spent on them —
+and how many stopped with a checkpoint. Every number this page showed was about
+a single run, and the questions a history actually raises are all sums; the last
+of them is a button, because a run holding a checkpoint is not a statistic but
+work you can pick back up.
+
 *Composing.* The goal box is the largest control on the page, and the goals
 already in your history sit under it as chips that fill it, because most goals
-are a retry of one that is already there. The options are two groups rather than
-one undifferentiated row of seven: the **guardrails** that decide what a run may
-spend and what it may break (budget, allow destructive, dry run), and the
-**tuning** that does neither (max steps, repeat, device, don't learn). A run can
-also carry a **success assertion**, folded away under them — the browser's only
-route to `--assert-shell`/`--assert-text`, since an assertion is per-run and not
-config.
+are a retry of one that is already there. Each chip carries how that goal has
+gone — `69/150` — so picking one is a decision rather than a guess. The options
+are folded behind the line that says what they currently are (`options · $5 ·
+repeat inf`): all seven are defaulted, the run that changes one is rare, and
+unfolded they charged every run the space of being read. They come back open if
+something is set, so a page restored with a destructive tick still on it does
+not hide it. Inside, they are two groups rather than one undifferentiated row of
+seven: the **guardrails** that decide what a run may spend and what it may break
+(budget, allow destructive, dry run), and the **tuning** that does neither (max
+steps, repeat, device, don't learn). A run can also carry a **success
+assertion** — the browser's only route to `--assert-shell`/`--assert-text`,
+since an assertion is per-run and not config. `⌘`/`Ctrl`+`Enter` starts the run
+from the goal box.
 
 *Live.* Starting a run replaces the composer in place; there is no tab to
 change. Three readouts lead: what it is doing right now, `step 12/60`, and
@@ -652,10 +665,31 @@ field the one you have to click for is a list nobody reads. Goals wrap rather
 than truncate to something six other runs also say, dates are relative with the
 absolute time on hover, and the run id is a small mono field at the end of the
 row instead of the first and widest column. Runs of the same goal fold into one
-entry that says so — *5 attempts · 3 succeeded · $0.767* — with the newest as the
-summary and the rest one click away, because the real story of most histories is
-one goal retried. There is a search over goals, answers and ids, and a filter
-over outcomes. Opening a run gives the goal once, the answer, four numbers, the
+entry that says so — *5 attempts · 3 succeeded · $0.767 · $0.256 each* — with the
+newest as the summary and the rest one click away, because the real story of most
+histories is one goal retried. Cost *per success* is the number that says whether
+a goal is worth running again, and a group that has never had one says so instead
+of a price.
+
+**The same goal with a number changed is the same goal.** Folding on the exact
+string is what a history looks like to a machine: "send likes on 3 new profiles"
+and "…on 7 new profiles" are one thing tried twice, and filing them apart split
+165 of one real history's 169 runs five ways, each group reporting its own
+success rate for what was one practice. So the key folds every run of digits to
+a single mark and leaves every word alone — a goal that differs by a count is
+one goal, a goal that differs by a word is two. A group that folded several
+wordings together says how many and shows the goal on each row inside it, since
+a fold that will not admit what it folded has lost it.
+
+There is a search over goals, answers and ids, and a filter over outcomes — one
+button per outcome a run can actually end as, each the word its own chip already
+says. (`other` used to hold aborted and interrupted together, which on a real
+history was 40% of every run in a bucket named after not being worth naming.)
+The last filter is not an outcome but **resumable**, which is the question the
+list was least able to answer: a checkpoint was reachable only by opening runs
+one at a time to see whether they had one.
+
+Opening a run gives the goal once, the answer, four numbers, the
 cost of thinking behind a fold, the finished ledger, and the whole trace at
 whichever density is set. A failed or interrupted run has a **resume** button,
 continuing it from its checkpoint exactly like `run --resume`.
@@ -664,7 +698,15 @@ continuing it from its checkpoint exactly like `run --resume`.
 
 **Device** says plainly whether a phone is attached and whether it is the one
 `device.serial` names — those are two different facts, and only one of them
-decides whether a run can start at all. It grabs a screenshot, lists **installed
+decides whether a run can start at all. Each attached phone has a **use this**
+button, and when the configured serial is missing while exactly one other phone
+is attached, the header carries the same button beside the finding: *not
+attached · use emulator-5554*. Saying a run cannot start was the right diagnosis
+and, on its own, a dead end — the fix lived four navigations away in the config
+form, and the only thing it wanted typed was a serial adb was already reporting
+on that very line. Only a serial on the list can be chosen this way; anything
+else is the config form's job, where a typo is visible and reversible. It grabs
+a screenshot, lists **installed
 apps** (which answers the question that comes up while writing a goal: what is
 this app actually called?), dumps **what the model sees** for the current screen —
 the same pruning and the same `#indices` it is told to aim at, which is the first
@@ -694,9 +736,10 @@ to stream ("no API key", "that app is not installed").
 
 The header carries the three facts a run needs — device, model, key — and never
 claims a device that is not attached: a serial configured with nothing on the
-other end reads as *not attached*, in yellow, because that is what it is. Nothing
-on the page scrolls sideways on a phone, and Stop appears only when there is
-something to stop.
+other end reads as *not attached*, in yellow, because that is what it is, and
+carries the one-click fix when there is one. Nothing on the page scrolls
+sideways on a phone — checked down to 300px, which is what six outcome filter
+buttons cost — and Stop appears only when there is something to stop.
 
 ### Watching from the browser
 

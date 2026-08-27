@@ -97,6 +97,24 @@ header .status .st {
   white-space: nowrap;
 }
 
+/* The fix, carried by the finding. A status pill that says a run cannot start
+   is only half an answer while the other half is four navigations away, and
+   the serial it wants typed is one adb is reporting on this very line. */
+header .status .st-fix {
+  font: inherit;
+  font-size: 11px;
+  margin-left: 7px;
+  padding: 0 7px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+header .status .st-fix:hover { background: var(--accent); color: var(--bg); }
+header .status .st-fix:disabled { opacity: 0.5; cursor: default; }
+
 header .status .st.ok { color: var(--green); border-color: #3fb95055; }
 header .status .st.warn { color: var(--yellow); border-color: #d2992255; }
 header .status .st.bad { color: var(--red); border-color: #f8514955; }
@@ -203,6 +221,46 @@ form.composer > textarea#watch-goal {
   border-radius: var(--radius);
 }
 
+/* -- standing --------------------------------------------------------------
+
+   The sums, on one line above the composer. Deliberately not a dashboard: four
+   facts and one thing to do, in the type size of a caption, because it is
+   context for the goal box rather than the reason to be on the page. */
+
+.standing {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 22px;
+  align-items: baseline;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  background: var(--bg-raise);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.standing .sc { display: flex; align-items: baseline; gap: 6px; }
+.standing .sc b { font-size: 15px; font-weight: 600; font-family: var(--mono); }
+.standing .sc .sk { font-size: 11.5px; color: var(--text-faint); }
+.standing .sc.ok b { color: var(--green); }
+.standing .sc.warn b { color: var(--yellow); }
+
+/* The resumable count is the one cell that is a button: ninety runs holding a
+   checkpoint is not a statistic, it is a pile of work you can pick back up. */
+.standing button.sc {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 2px 10px;
+  margin: -2px 0;
+  font: inherit;
+  cursor: pointer;
+  color: inherit;
+}
+
+.standing button.sc b { color: var(--accent); }
+.standing button.sc:hover { border-color: var(--accent); background: var(--bg-hover); }
+
 /* Recent goals, as chips. The blank-box cold start is the worst part of this
    page, and most goals are a retry of one already in history. */
 .recent { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
@@ -221,12 +279,75 @@ form.composer > textarea#watch-goal {
   /* A whole sentence per chip, five of them: capped, they stay a row of
      shortcuts rather than the paragraph they became at full length. */
   max-width: min(100%, 320px);
+  /* The goal truncates; the tally does not. Ellipsis on the button itself ate
+     the score off the end, which is the half of the chip that is not already
+     obvious from the box it fills. */
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.recent-chips button > :first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
 .recent-chips button:hover { color: var(--text); border-color: var(--accent); }
+.recent-chips .tally { font-family: var(--mono); flex: 0 0 auto; color: var(--text-faint); }
+.recent-chips .tally.bad { color: var(--red); }
+
+/* The options, folded behind what they currently say. Seven defaulted settings
+   taxed every run with the space of being read; folded they cost one line, and
+   that line is the summary rather than the word "options". */
+details.runopts { margin: 0; }
+
+details.runopts > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  padding: 6px 0;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+details.runopts > summary::-webkit-details-marker { display: none; }
+
+details.runopts > summary::before {
+  content: "▸";
+  font-size: 10px;
+  color: var(--text-faint);
+  flex: 0 0 auto;
+}
+
+details.runopts[open] > summary::before { content: "▾"; }
+details.runopts > summary:hover { color: var(--text); }
+details.runopts[open] > summary { margin-bottom: 12px; }
+details.runopts .dim { color: var(--text-faint); }
+details.runopts > summary b { font-weight: 600; }
+
+/* Vertical rather than beside: the assertion is a per-run definition of done,
+   not a fourth column of tuning. */
+details.runopts .optgroups { margin-bottom: 12px; }
+
+/* A closed `<details>` hides its content through the UA stylesheet, which sets
+   `display: none` — and an author `display` on a direct child overrides it.
+   Four folds on this page had one (`.opts`, `.optgroups`, `.readout-rest` and
+   `.panel-head` are all `display: flex`) and so rendered their contents open
+   whatever the marker said: the success assertion showed its three fields, the
+   config's Advanced pane showed its search box, the run detail showed its cost
+   table. Silent by construction, because the markup and the script are both
+   right and only the pixels are wrong.
+
+   Restated for every fold rather than the four that have the problem today,
+   since the next one to be given a `display` would fail the same way and look
+   like it worked. `summary` is the one child that stays. */
+details:not([open]) > *:not(summary) { display: none; }
 
 .optgroups { display: flex; gap: 12px; flex-wrap: wrap; }
 
@@ -849,6 +970,16 @@ body[data-density="story"] .trace-only { display: none; }
    watch banner want the same two colours. */
 .ok { color: var(--green); }
 .warn { color: var(--yellow); }
+.bad { color: var(--red); }
+.ok-text { color: var(--green); }
+
+/* The shortcut, said where the button is rather than left to be found. Dim
+   enough to become scenery once it has been read once. */
+.kbd-hint { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+
+/* Two controls in the device table's last cell, and they are not the same kind
+   of thing: one changes what every run will use, the other takes a picture. */
+#dev-table td:last-child { display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
 
 /* Where the run picked up an app's guidance. Purple, matching the step numbers:
    both say "context for what follows" rather than "outcome of what came before",
@@ -1087,6 +1218,14 @@ body:has(#run-detail-view:not([hidden])) #history { border-top: none; margin-top
 .filters { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
 .filters input[type="search"] { flex: 1 1 220px; width: auto; }
 
+/* The outcome filter is the one segment with six buttons in it -- every
+   outcome a run can end as, plus `resumable` -- and `.seg` is `flex: 0 0 auto`
+   with the overflow hidden, which at 375px put the row 43px past the viewport.
+   Nothing on this page scrolls sideways on a phone, so it wraps instead, and
+   the buttons grow to fill whatever rows it wraps into. */
+.filters .seg { flex: 0 1 auto; flex-wrap: wrap; }
+.filters .seg button { flex: 1 0 auto; }
+
 .runs { display: flex; flex-direction: column; gap: 8px; }
 
 /* One run. Outcome first because it is the strongest signal on the row; the
@@ -1176,6 +1315,22 @@ details.rungroup > summary:hover { background: var(--bg-hover); }
 details.rungroup[open] > summary { border-bottom: 1px solid var(--border); }
 details.rungroup .tally { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
 details.rungroup .tally .more { color: var(--accent); }
+details.rungroup .tally .bad { color: var(--red); }
+details.rungroup .tally .warn { color: var(--yellow); }
+
+/* A group folded on intent can hold several wordings of it — "on 3 new
+   profiles" and "on 7". Said on the summary, because a fold that does not
+   admit what it folded is a fold that lost something. */
+details.rungroup > summary .variants {
+  font-size: 11px;
+  font-family: var(--mono);
+  font-weight: 400;
+  color: var(--text-faint);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 7px;
+  white-space: nowrap;
+}
 details.rungroup .kids { display: flex; flex-direction: column; gap: 6px; padding: 8px; }
 details.rungroup .kids .run { background: var(--bg-sunk); }
 

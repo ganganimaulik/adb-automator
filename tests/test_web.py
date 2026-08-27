@@ -287,6 +287,38 @@ def test_status(web):
 
 
 # ---------------------------------------------------------------------------
+# picking a device
+# ---------------------------------------------------------------------------
+
+def test_use_device_writes_the_serial(web, monkeypatch):
+    """`configured, not attached` is the right diagnosis and was a dead end:
+    the fix lived four navigations away in the config form, and the only thing
+    it wanted typed was a serial adb was already reporting."""
+    from adbagent.web import server as srv
+
+    # A serial no real adb on any developer's machine would report, so this
+    # passes only because the stub was consulted.
+    monkeypatch.setattr(srv, "attached_serials", lambda: ["test-phone-0"])
+    res = web.post("/api/device/use", json={"serial": "test-phone-0"})
+    assert res.status_code == 200
+    assert web.get("/api/config").json()["config"]["device"]["serial"] \
+        == "test-phone-0"
+
+
+def test_use_device_refuses_a_serial_adb_cannot_see(web, monkeypatch):
+    """Only ever a phone on the list. Anything else is the config form's job,
+    where a typo is visible and reversible."""
+    from adbagent.web import server as srv
+
+    monkeypatch.setattr(srv, "attached_serials", lambda: ["test-phone-0"])
+    assert web.post("/api/device/use", json={"serial": "10.0.0.9:5555"}) \
+        .status_code == 409
+    assert web.post("/api/device/use", json={"serial": ""}).status_code == 400
+    # And a refusal writes nothing.
+    assert web.get("/api/config").json()["config"]["device"]["serial"] == ""
+
+
+# ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
 
@@ -1876,7 +1908,12 @@ DERIVED_ID_OMISSIONS = {"gc-iter", "gc-iter-wrap"}
 #: `CFG_SPEC`, plus what hangs off one -- so the page cannot ship them and the
 #: form rebuilds them on every load. Only those a literal `$()` reaches for need
 #: declaring here; the rest are built from the spec and never spelled out.
-GENERATED_ID_OMISSIONS = {"cfg-llm-vision_in_decider-auto"}
+#:
+#: `standing-resumable` is the same shape: the standing strip is painted from
+#: the run list, and the resumable cell only exists when there is something to
+#: resume -- a page that shipped the id would be claiming a button it has no
+#: number for. Every `$()` that reaches for it is guarded on the null.
+GENERATED_ID_OMISSIONS = {"cfg-llm-vision_in_decider-auto", "standing-resumable"}
 
 
 def html_ids() -> set:
@@ -1934,6 +1971,29 @@ def test_every_setup_pane_has_a_section_and_a_loader():
     body = js[js.index("const setupLoaders = {"):]
     loaders = set(re.findall(r"(\w+):", body[:body.index("};")]))
     assert panes == loaders, f"every pane needs a loader: {panes ^ loaders}"
+
+
+def test_every_folded_block_is_actually_hidden_when_folded():
+    """A closed `<details>` hides its content through the UA stylesheet, and an
+    author `display` on a direct child overrides it.
+
+    Four folds had one — `.opts`, `.optgroups`, `.readout-rest` and
+    `.panel-head` are all `display: flex` — and so rendered open whatever their
+    marker said: the success assertion showed its three fields, the config's
+    Advanced pane its search box, the run detail its cost table. Silent by
+    construction, since the markup and the script are both right and only the
+    pixels are wrong.
+
+    Stated once for every fold rather than per class, so the next block given a
+    `display` cannot reintroduce it.
+    """
+    css = (Path(__file__).resolve().parents[1]
+           / "adbagent/web/static/style.css").read_text(encoding="utf-8")
+    assert re.search(
+        r"details:not\(\[open\]\)\s*>\s*\*:not\(summary\)\s*\{[^}]*"
+        r"display:\s*none", css), (
+        "the rule that makes a closed <details> actually fold is missing; "
+        "any content with a display of its own will render while closed")
 
 
 def test_the_density_toggle_only_offers_the_two_densities():

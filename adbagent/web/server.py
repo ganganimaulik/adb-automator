@@ -124,6 +124,10 @@ class ConfigUpdate(BaseModel):
     sections: Dict[str, Dict[str, Any]]
 
 
+class UseDeviceRequest(BaseModel):
+    serial: str = ""
+
+
 class GenerateRequest(BaseModel):
     name: str = ""
     tasks: str = ""
@@ -391,6 +395,28 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         except Exception:  # noqa: BLE001
             candidates = []
         return {"devices": found, "candidates": candidates, "error": ""}
+
+    @app.post("/api/device/use")
+    def use_device(req: UseDeviceRequest) -> Dict[str, Any]:
+        """Point `device.serial` at a phone that is actually attached.
+
+        The status line's job is to say whether a run can start, and it did —
+        `configured, not attached` — and then left you to fix it four
+        navigations away in the config form. A serial that adb is reporting
+        right now is the one piece of config the page can offer to write for
+        you, because there is nothing to get wrong about it: it is on the
+        list.
+        """
+        serial = (req.serial or "").strip()
+        if not serial:
+            raise HTTPException(status_code=400, detail="no serial given")
+        # Only ever a serial adb is reporting. Anything else is the config
+        # form's job, where a typo is visible and reversible.
+        if serial not in attached_now():
+            raise HTTPException(
+                status_code=409,
+                detail=f"{serial} is not attached")
+        return put_config(ConfigUpdate(sections={"device": {"serial": serial}}))
 
     @app.get("/api/device/frame")
     def device_frame(serial: str = "", max_long_edge: int = 720) -> Response:
