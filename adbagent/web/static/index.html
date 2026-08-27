@@ -29,6 +29,13 @@
   <!-- ---------------------------------------------------------- Work -->
   <section class="tab active" id="tab-work">
 
+    <!-- Where the practice stands, in one line. A history is a list of runs
+         and the questions people actually have about one are sums: what has
+         this cost, how often does it work, and how many runs am I sitting on
+         that stopped half way. The page could answer none of them — every
+         number was per-run and you were left to add 169 of them up. -->
+    <div class="standing" id="standing" hidden></div>
+
     <!-- The goal is the most important control on the page, so it gets the
          page's first line and the recent goals sit under it: a blank box is a
          cold start, and most goals are a retry of one already in history. -->
@@ -40,6 +47,12 @@
         <span class="recent-chips" id="recent-chips"></span>
       </div>
 
+      <!-- Folded, and summarised by the line you fold it behind. All seven
+           settings have defaults, every run pays the space of reading them, and
+           the rare run that changes one is one click away. The summary says
+           what they currently are, so folding hides nothing. -->
+      <details class="runopts" id="runopts">
+        <summary><span id="runopts-summary"></span></summary>
       <div class="optgroups">
         <!-- What the run is allowed to do and spend. Separated from tuning
              because these three are the ones that cost money or change
@@ -77,10 +90,13 @@
             placeholder="Forget network"></label>
         </div>
       </details>
+      </details>
 
       <div class="actions">
         <button type="submit" class="primary big" id="btn-start">Start run</button>
         <span class="small" id="run-hint"></span>
+        <span class="grow"></span>
+        <span class="small kbd-hint" title="start the run from the goal box">⌘/Ctrl + ↵</span>
       </div>
     </form>
 
@@ -154,13 +170,22 @@
           <h3>History</h3>
           <span class="small" id="runs-count"></span>
         </div>
+        <!-- The outcomes a run can actually end as, each the word its own chip
+             already says. `other` used to hold aborted and interrupted
+             together, which on this history was 40% of every run in a bucket
+             named after not being worth naming — and stalling out is the most
+             common way a run ends badly, so it is the one you most want to
+             filter to. `resumable` is not an outcome but it is the question
+             the list is least able to answer: which of these can I continue? -->
         <div class="filters">
           <input type="search" id="runs-search" placeholder="search goals, answers, run ids">
           <div class="seg" role="group" aria-label="outcome filter">
             <button type="button" data-outcome="" class="on">all</button>
             <button type="button" data-outcome="success">success</button>
             <button type="button" data-outcome="failed">failed</button>
-            <button type="button" data-outcome="other">other</button>
+            <button type="button" data-outcome="aborted">aborted</button>
+            <button type="button" data-outcome="interrupted">interrupted</button>
+            <button type="button" data-outcome="resumable">resumable</button>
           </div>
         </div>
         <div class="runs" id="runs-list"></div>
@@ -227,19 +252,31 @@
           <label title="Run a pass this often even when nothing on screen has changed, for work that does not announce itself: a feed to work through, a queue to drain. Empty watches for new messages only.">sweep (seconds) <input type="number" id="watch-sweep" min="0" step="30" placeholder="off"></label>
           <label>steps/pass <input type="number" id="watch-steps" min="1" placeholder="25"></label>
         </fieldset>
-        <fieldset class="optgroup">
-          <legend>Limits</legend>
-          <label>replies/hour <input type="number" id="watch-rph" min="0" placeholder="12"></label>
-          <label>per conversation/hour <input type="number" id="watch-rpc" min="0" placeholder="2"></label>
-          <label>cooldown (seconds) <input type="number" id="watch-cooldown" min="0" step="30" placeholder="600"></label>
-          <label>$/hour <input type="number" id="watch-usd" min="0" step="0.1" placeholder="off"></label>
-        </fieldset>
-        <fieldset class="optgroup">
-          <legend>Tuning</legend>
-          <label>device <input type="text" id="watch-serial" placeholder="default serial"></label>
-          <label class="check"><input type="checkbox" id="watch-no-learn"> don't learn</label>
-        </fieldset>
       </div>
+
+      <!-- Folded, and summarised by the line you fold it behind — the same
+           bargain the Work composer makes. Policy and Mode stay out: which
+           instructions, and whether this thing can send, are the two decisions
+           a watch is actually started on. The eight below them are ceilings
+           with defaults, and a ceiling nobody changed is one to be told about
+           rather than made to read. -->
+      <details class="runopts" id="watchopts">
+        <summary><span id="watchopts-summary"></span></summary>
+        <div class="optgroups">
+          <fieldset class="optgroup">
+            <legend>Limits</legend>
+            <label>replies/hour <input type="number" id="watch-rph" min="0" placeholder="12"></label>
+            <label>per conversation/hour <input type="number" id="watch-rpc" min="0" placeholder="2"></label>
+            <label>cooldown (seconds) <input type="number" id="watch-cooldown" min="0" step="30" placeholder="600"></label>
+            <label>$/hour <input type="number" id="watch-usd" min="0" step="0.1" placeholder="off"></label>
+          </fieldset>
+          <fieldset class="optgroup">
+            <legend>Tuning</legend>
+            <label>device <input type="text" id="watch-serial" placeholder="default serial"></label>
+            <label class="check"><input type="checkbox" id="watch-no-learn"> don't learn</label>
+          </fieldset>
+        </div>
+      </details>
       <div class="actions">
         <button type="submit" class="primary big" id="btn-watch-start">Start watching</button>
         <span class="small" id="watch-hint"></span>
