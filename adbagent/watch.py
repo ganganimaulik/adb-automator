@@ -60,6 +60,7 @@ from .fingerprint import mask_goal
 from .ledger import ReplyLedger
 from .llm import BudgetExceeded, LLMClient, LLMError
 from .memory import Memory
+from .policies import instructions
 from .screen import Screen
 
 log = logging.getLogger("adbagent.watch")
@@ -425,11 +426,17 @@ def load_policy(path: str) -> str:
 
     A watch without a policy is a loop that decides for itself what to say to
     people, so an unreadable policy file is fatal rather than a warning.
+
+    Front matter is stripped (`policies.instructions`). It is a note about the
+    policy -- which goal it was written for, what to call it -- and a model
+    handed ``goal: ...`` in the middle of its reply instructions has been told
+    something nobody meant to tell it. `policies.read` is the way to the
+    metadata; this function is the way to the prompt.
     """
     p = Path(path).expanduser()
     if not p.is_file():
         raise FileNotFoundError(f"no policy file at {p}")
-    text = p.read_text(encoding="utf-8").strip()
+    text = instructions(p.read_text(encoding="utf-8"))
     if not text:
         raise ValueError(f"the policy file {p} is empty")
     return text

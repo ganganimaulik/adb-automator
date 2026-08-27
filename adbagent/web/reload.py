@@ -51,6 +51,10 @@ SKIP_DIRS = frozenset({"__pycache__", ".git", ".pytest_cache", ".mypy_cache",
 
 CODE_SUFFIXES = frozenset({".py"})
 ASSET_SUFFIXES = frozenset({".html", ".js", ".css", ".svg", ".png", ".ico"})
+#: What counts as a policy in the policies directory -- `policies.SUFFIXES`,
+#: duplicated rather than imported so this dev aid pulls in nothing at import
+#: time. A drift here costs a panel that does not refresh, not a wrong reply.
+POLICY_SUFFIXES = frozenset({".md", ".markdown", ".txt"})
 
 #: How long a restart frame is given to reach the browser before the process
 #: goes. Not needed for correctness -- a page whose stream reconnects to a
@@ -263,7 +267,8 @@ class LiveReload:
 
 def for_ui(package_dir: Path, *, config_path: Optional[Path] = None,
            skills_dir: Optional[Path] = None,
-           policy_path: Optional[Path] = None, **kwargs) -> LiveReload:
+           policy_path: Optional[Path] = None,
+           policies_dir: Optional[Path] = None, **kwargs) -> LiveReload:
     """The set the web UI is built from, in the kinds the page knows about."""
     reloader = LiveReload(**kwargs)
     reloader.watch("code", package_dir, CODE_SUFFIXES)
@@ -272,6 +277,12 @@ def for_ui(package_dir: Path, *, config_path: Optional[Path] = None,
         reloader.watch("config", config_path)
     if skills_dir:
         reloader.watch("skills", skills_dir, {".json"})
+    # Both, as one kind: the picker shows every policy there is and the editor
+    # holds one of them, so a policy arriving in the directory and the open one
+    # changing underneath are the same news to the same panel. The configured
+    # policy is watched separately because it may live outside the directory.
+    if policies_dir:
+        reloader.watch("policy", policies_dir, POLICY_SUFFIXES)
     if policy_path:
         reloader.watch("policy", policy_path)
     return reloader

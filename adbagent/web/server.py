@@ -23,7 +23,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from .. import policies as policymod
 from ..config import Config, _set_path, find_config_file, load_config
+from ..policies import same_file as _same_file
 from ..runlog import SHOT_RE, STREAM_NAME
 from ..skills import Skill, SkillRegistry
 from . import runparse
@@ -50,6 +52,19 @@ FRAME_TIMEOUT_S = 20.0
 #: the phone back. Deliberately far short of the three minutes a stop from the
 #: browser allows a watch: there is somebody at a prompt waiting for it.
 SHUTDOWN_GRACE_S = 15.0
+
+#: What a policy created from the browser starts as. Not empty: an empty policy
+#: is refused on save, so a blank editor is a dead end -- and the two things a
+#: policy has to answer are easier to fill in than to think of.
+NEW_POLICY_TEXT = """\
+## What to reply to
+
+- (which conversations, and which to leave alone)
+
+## What to say
+
+- (one short sentence; what never to promise)
+"""
 
 
 class RunRequest(BaseModel):
@@ -91,6 +106,17 @@ class WatchRequest(BaseModel):
 
 class PolicyUpdate(BaseModel):
     path: str = ""
+    text: str = ""
+    #: The goal this policy is written for, saved into its front matter. The
+    #: pairing is the point: these instructions are only correct under that goal,
+    #: so the editor saves both or neither.
+    goal: str = ""
+    title: str = ""
+
+
+class PolicyCreate(BaseModel):
+    name: str = ""
+    goal: str = ""
     text: str = ""
 
 
@@ -691,16 +717,34 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
 
     # -- watch -----------------------------------------------------------
 
+    def policy_store() -> policymod.PolicyStore:
+        """The policies on disk: the directory of them plus the configured one."""
+        return policymod.store_for(load_cfg())
+
     def _policy_path(explicit: str = "") -> str:
-        """The policy file, or "" when none is set anywhere.
+        """The policy file `explicit` names, or the configured one, or "".
 
         Returns a string rather than a Path on purpose: `Path("")` is
         `PosixPath('.')`, whose string is "." -- truthy, so a "no policy set"
         guard written against the Path silently passes and the write lands on a
         directory.
         """
-        raw = (explicit or load_cfg().watch.policy or "").strip()
-        return str(Path(raw).expanduser()) if raw else ""
+        return policy_store().resolve(explicit)
+
+    def _writable(path: str) -> None:
+        """Refuse a write outside the policies directory.
+
+        The browser sends a path now -- it has to, since it picks between
+        several -- and the endpoint used to write whatever arrived to wherever it
+        pointed. A page reachable from another tab is not something to leave
+        that open to, so a save has to land either in `watch.policies_dir` or on
+        the policy `watch.policy` already names.
+        """
+        if not policy_store().owns(path):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{path} is outside the policies directory; save policies "
+                       f"there, or point watch.policy at this file in Config")
 
     # Declared before any /api/watch/{...} route so the literal paths win, the
     # same ordering /api/runs/stream needs.
@@ -716,24 +760,77 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         return {"active": watcher.state(),
                 "defaults": dataclasses.asdict(cfg.watch),
                 "policy_path": _policy_path(),
+                "policies_dir": str(Path(cfg.watch.policies_dir).expanduser())
+                                if cfg.watch.policies_dir else "",
                 "ledger_path": str(Path(cfg.watch.ledger).expanduser())}
+
+    @app.get("/api/watch/policies")
+    def list_policies() -> Dict[str, Any]:
+        """Every policy there is, with the goal each was written for.
+
+        The list the picker is built from. The goal travels with the row rather
+        than being fetched per selection, so choosing one can fill in the goal
+        box without a round trip -- and so the picker can show what each policy
+        is *for*, which is the part a filename does not say.
+        """
+        cfg = load_cfg()
+        store = policy_store()
+        current = _policy_path()
+        return {
+            "dir": str(Path(cfg.watch.policies_dir).expanduser())
+                   if cfg.watch.policies_dir else "",
+            "current": current,
+            "policies": [{**p.to_dict(),
+                          "current": _same_file(str(p.path), current)}
+                         for p in store.list()],
+        }
+
+    @app.post("/api/watch/policies")
+    def create_policy(req: PolicyCreate) -> Dict[str, Any]:
+        """A new, empty-ish policy under `watch.policies_dir`.
+
+        Refuses to overwrite: "new" that quietly replaced an existing policy
+        would be a way to lose one, and the picker already offers every policy
+        there is to edit instead.
+        """
+        store = policy_store()
+        if store.dir is None:
+            raise HTTPException(
+                status_code=400,
+                detail="no policies directory configured: set "
+                       "watch.policies_dir in Config")
+        try:
+            path = store.path_for(req.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if path.exists():
+            raise HTTPException(status_code=409,
+                                detail=f"{path} already exists; open it from the "
+                                       f"list instead")
+        policy = store.write(str(path), req.text or NEW_POLICY_TEXT,
+                             goal=req.goal)
+        return {"created": True, **policy.to_dict()}
 
     @app.get("/api/watch/policy")
     def get_policy(path: str = "") -> Dict[str, Any]:
-        """The reply instructions, for the editor.
+        """One policy, split into its goal and its instructions, for the editor.
 
         A missing file is not an error here -- it is the normal state before one
         has been written -- so it comes back as empty text with `exists: false`
         rather than a 404 the editor would have to special-case.
+
+        `text` is the instructions alone, front matter stripped: the box holds
+        what goes into the prompt, and the goal is a field of its own. A file
+        with no front matter is unchanged by the round trip.
         """
         found = _policy_path(path)
         if not found:
-            return {"path": "", "text": "", "exists": False}
-        p = Path(found)
-        if not p.is_file():
-            return {"path": found, "text": "", "exists": False}
-        return {"path": found, "text": p.read_text(encoding="utf-8"),
-                "exists": True}
+            return {"path": "", "text": "", "exists": False, "goal": "",
+                    "title": "", "name": "", "label": ""}
+        policy = policymod.read(found)
+        return {"path": found, "text": policy.body, "exists": policy.exists,
+                "goal": policy.goal, "title": policy.title,
+                "name": policy.name, "label": policy.label}
 
     @app.put("/api/watch/policy")
     def put_policy(update: PolicyUpdate) -> Dict[str, Any]:
@@ -741,7 +838,6 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         if not found:
             raise HTTPException(status_code=400,
                                 detail="no policy path given, and none in config")
-        p = Path(found)
         if watcher.state()["running"]:
             # The child read the file once at startup, so a save now would take
             # effect at no predictable moment. Refusing says which it is.
@@ -753,9 +849,12 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             raise HTTPException(status_code=400,
                                 detail="an empty policy would let the model "
                                        "decide for itself what to say")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(update.text, encoding="utf-8")
-        return {"saved": True, "path": found}
+        _writable(found)
+        # `title or None` -- the editor has no title field, so an absent one is
+        # not a request to drop the one somebody wrote into the file by hand.
+        policy = policy_store().write(found, update.text, goal=update.goal,
+                                      title=update.title or None)
+        return {"saved": True, "path": found, "goal": policy.goal}
 
     @app.get("/api/watch/ledger")
     def get_ledger(limit: int = 100) -> Dict[str, Any]:
@@ -785,9 +884,6 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
     @app.post("/api/watch")
     def start_watch(req: WatchRequest) -> Dict[str, Any]:
         cfg = load_cfg()
-        goal = req.goal.strip()
-        if not goal:
-            raise HTTPException(status_code=400, detail="goal is required")
         policy = _policy_path(req.policy)
         if not policy:
             raise HTTPException(
@@ -797,6 +893,13 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         if not Path(policy).is_file():
             raise HTTPException(status_code=400,
                                 detail=f"no policy file at {policy}")
+        # Resolved before the goal is checked, because a policy carries the goal
+        # it was written for and that is the one to run it under. The page fills
+        # the box in on selection, so this is the fallback for a box that was
+        # cleared -- and for anything driving the API directly.
+        goal = req.goal.strip() or policymod.read(policy).goal
+        if not goal:
+            raise HTTPException(status_code=400, detail="goal is required")
         if not cfg.llm.model:
             raise HTTPException(status_code=400, detail="no model configured")
         busy = phone_busy()

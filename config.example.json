@@ -61,5 +61,10 @@
     "enabled": true,
     "skills_dir": "skills",
     "learn_after_run": true
+  },
+
+  "watch": {
+    "policy": "",
+    "policies_dir": "policies"
   }
 }
