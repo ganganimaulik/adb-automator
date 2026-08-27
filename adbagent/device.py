@@ -52,6 +52,14 @@ class DeviceLost(RuntimeError):
     """The device is gone and the recovery ladder could not bring it back."""
 
 
+class IntentRefused(RuntimeError):
+    """`am start` reported it could not open the target.
+
+    Its own class because `am start` exits zero on a refusal and says so on
+    stdout, so this is the only signal that a deep link went nowhere.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Shell blocklist
 # ---------------------------------------------------------------------------
@@ -97,6 +105,70 @@ def check_shell(command: str, allow_meta: bool = False) -> None:
                 f"refused: {command!r} matches the blocklist ({pattern.pattern})")
     if not allow_meta and _METACHARS.search(command):
         raise ShellDenied(f"refused: {command!r} contains shell metacharacters")
+
+
+# ---------------------------------------------------------------------------
+# Intent targets
+# ---------------------------------------------------------------------------
+
+#: URI schemes `open_url` will hand to ACTION_VIEW. An allowlist and not a
+#: blocklist: the string comes from a model that has been reading attacker-
+#: supplied screen text all run, so the question to answer is "is this one of
+#: the handful of things we meant to support", not "is this one of the things
+#: we thought to forbid".
+#:
+#: `file` is absent deliberately -- ACTION_VIEW on a file:// URI is a local file
+#: read through whatever app claims the type.
+ALLOWED_URI_SCHEMES = frozenset({
+    "http", "https", "tel", "mailto", "sms", "smsto", "geo", "market",
+})
+
+#: Settings screens are reached by *action*, not by URI: there is no
+#: `settings://wifi`. Anchored and upper-case-only, so this can name a Settings
+#: page and nothing else.
+_SETTINGS_ACTION = re.compile(r"^android\.settings\.[A-Z0-9_]+$")
+
+#: An `intent:` URI carries `#Intent;component=pkg/cls;S.extra=...;end`, which
+#: turns ACTION_VIEW into "start this exact component with these extras". That
+#: is an arbitrary-component launcher wearing a URL's clothes, so it is refused
+#: by scheme *and* by fragment -- the fragment check also catches the same
+#: payload smuggled behind an allowed scheme.
+_INTENT_FRAGMENT = re.compile(r"#Intent;", re.I)
+
+
+def check_uri(target: str) -> Tuple[str, str]:
+    """Validate a deep-link target. Returns ``(kind, value)``.
+
+    `kind` is ``"action"`` for a Settings screen and ``"view"`` for a URI.
+    Raises `ShellDenied` for anything else, with the reason.
+    """
+    value = (target or "").strip()
+    if not value:
+        raise ShellDenied("refused: no URI given")
+    if _SETTINGS_ACTION.match(value):
+        return "action", value
+    if _INTENT_FRAGMENT.search(value):
+        raise ShellDenied(
+            f"refused: {value!r} carries an #Intent; fragment, which launches "
+            f"an arbitrary component rather than opening a link")
+    scheme = value.split(":", 1)[0].lower() if ":" in value else ""
+    if not scheme:
+        raise ShellDenied(f"refused: {value!r} has no URI scheme")
+    if scheme not in ALLOWED_URI_SCHEMES:
+        raise ShellDenied(
+            f"refused: scheme {scheme!r} is not one of "
+            f"{sorted(ALLOWED_URI_SCHEMES)}")
+    # Deliberately NOT the shell metacharacter set. `&` and `$` are ordinary URI
+    # characters -- `?a=1&b=2` is most of the web -- and `_METACHARS` refuses
+    # them, which is right for a command string and wrong for a URI. The value
+    # never reaches a shell anyway: `Device.open_url` passes argv, which adbutils
+    # quotes. What is worth refusing is what RFC 3986 says cannot be in a URI at
+    # all, because a space or a newline in one means it is not a URI.
+    if any(ch.isspace() or ord(ch) < 0x21 or ord(ch) > 0x7E for ch in value):
+        raise ShellDenied(
+            f"refused: {value!r} contains whitespace or control characters, "
+            f"so it is not a URI")
+    return "view", value
 
 
 # ---------------------------------------------------------------------------
@@ -984,8 +1056,97 @@ class Device:
             lambda: self.u2.swipe_ext(gesture_dir, **kwargs),
             "scroll")
 
+    def drag(self, fx: int, fy: int, tx: int, ty: int,
+             duration: float = 0.5) -> None:
+        """Press, move and release -- a slider, a reorder handle, slide-to-confirm.
+
+        Distinct from `swipe`, which is a flick: a drag holds at the start
+        point long enough for the app to pick the item up, and moves at a speed
+        the app can follow. A flick along the same path is dropped by anything
+        that wanted a drag.
+        """
+        pfx, pfy = max(1, int(fx)), max(1, int(fy))
+        ptx, pty = max(1, int(tx)), max(1, int(ty))
+        self._log_action(
+            f"Drag ({pfx}, {pfy}) -> ({ptx}, {pty}) (duration={duration:.2f}s)")
+        self._act(lambda: self.u2.drag(pfx, pfy, ptx, pty, duration=duration),
+                  "drag")
+
+    def double_tap(self, x: int, y: int) -> None:
+        px, py = max(1, int(x)), max(1, int(y))
+        self._log_action(f"Double tap at ({px}, {py})")
+        self._act(lambda: self.u2.double_click(px, py), "double_tap")
+
+    def fling_to_edge(self, direction: str, max_swipes: int = 50) -> bool:
+        """Fling a scrollable to its beginning or end in one server-side call.
+
+        `scroll` with a large `scroll_amount` is a Python loop of fixed-size
+        swipes with sleeps between them: it costs a turn per call, several
+        gestures per turn, and still stops wherever it ran out of repetitions.
+        UiAutomator's own fling keeps going until the view reports it cannot
+        scroll further, so "back to the top" is one action rather than a guess
+        at how many pages up the top is.
+
+        Measured over ``runs/``: 487 of 1050 scrolls (46%) were an upward scroll
+        with `scroll_amount >= 2` -- the return-to-top pattern -- and 60 of 169
+        runs ended by exhausting the step budget.
+
+        Targets `scrollable=True`, which UiAutomator resolves to the first
+        scrollable view. On a screen with more than one, that is not necessarily
+        the one meant; the model still has `scroll` with an explicit target for
+        those. Returns whether the view moved.
+        """
+        vertical = direction in ("up", "down")
+        to_beginning = direction in ("up", "left")
+        self._log_action(
+            f"Fling to {'beginning' if to_beginning else 'end'} "
+            f"({'vertical' if vertical else 'horizontal'})")
+
+        def run() -> bool:
+            obj = self.u2(scrollable=True)
+            fling = obj.fling
+            fling._vertical = vertical
+            fling.action = "toBeginning" if to_beginning else "toEnd"
+            return bool(fling(max_swipes=max_swipes))
+
+        return bool(self._act(run, "fling_to_edge"))
+
+    def wait_for_text(self, text: str, timeout: float = 5.0) -> bool:
+        """Wait for `text` to appear, on the device rather than in a poll loop.
+
+        The previous implementation called `observe()` every 0.1s, and every one
+        of those is a full `dump_hierarchy`. On this phone a dump is 0.55s and a
+        settling observation far more (see `current_app`), so a 30s wait could
+        spend its whole budget on two or three polls and then report a timeout
+        for a screen that had arrived. UiAutomator can answer the same question
+        without sending a tree back at all.
+        """
+        wanted = text.strip()
+        if not wanted:
+            return True
+
+        def run() -> bool:
+            return bool(self.u2(textContains=wanted).wait(timeout=timeout))
+
+        try:
+            return bool(_guard(run, timeout + 5, "wait_for_text"))
+        except Exception as exc:  # noqa: BLE001 - a wait must not kill the run
+            log.debug("wait_for_text(%r) failed: %s", wanted, exc)
+            return False
+
     def press(self, key: str) -> None:
         key = key.lower()
+        # Two panels that are not keys. UiAutomator opens both directly, and
+        # there is no keycode for either -- the alternative is a swipe down from
+        # the top edge, which lands on whatever the app put there instead.
+        if key == "notifications":
+            self._log_action("Open notification shade")
+            self._act(lambda: self.u2.open_notification(), "open_notification")
+            return
+        if key == "quick_settings":
+            self._log_action("Open quick settings")
+            self._act(lambda: self.u2.open_quick_settings(), "open_quick_settings")
+            return
         if key not in PRESS_KEYS:
             raise ValueError(f"unsupported key {key!r}; server accepts {sorted(PRESS_KEYS)}")
         self._log_action(f"Press key {key!r}")
@@ -1032,6 +1193,61 @@ class Device:
         budget = (self.cfg.device.launch_timeout_s if timeout_s is None
                   else timeout_s)
         return self.wait_foreground(package, budget)
+
+    def open_url(self, target: str, timeout_s: Optional[float] = None) -> str:
+        """Open a deep link or a Settings screen. Returns what it did.
+
+        The point of the action: a Settings page that takes four taps to reach
+        by hand is one intent, and a link the goal names can be opened without
+        finding a browser first.
+
+        Sent as an argument *list* rather than a shell string. adbutils quotes
+        each element, so a URL's `&` and `?` reach `am` intact -- through
+        `self.shell` they would not, because `check_shell` refuses `&` and is
+        right to. The blocklist is not skipped so much as answered earlier and
+        more strictly: `check_uri` allows a Settings action or one of seven URI
+        schemes, and nothing else can be expressed here.
+        """
+        kind, value = check_uri(target)
+        if kind == "action":
+            argv = ["am", "start", "-a", value]
+            what = f"opened {value}"
+        else:
+            argv = ["am", "start", "-a", "android.intent.action.VIEW",
+                    "-d", value]
+            what = f"opened {value}"
+        self._log_action(f"Open {value!r}")
+        out = _guard(lambda: self.u2.adb_device.shell(argv, timeout=20),
+                     25, f"open_url({value[:40]})")
+        text = out if isinstance(out, str) else str(out)
+        # `am start` reports a refusal on stdout and still exits zero.
+        for marker in ("Error:", "Exception", "does not exist",
+                       "Permission Denial"):
+            if marker in text:
+                raise IntentRefused(f"{value!r} could not be opened: "
+                                    f"{' '.join(text.split())[:160]}")
+        return what
+
+    def restart_app(self, package: str, timeout_s: Optional[float] = None) -> bool:
+        """Force-stop `package` and launch it again.
+
+        The escape hatch for an app that is wedged rather than merely on the
+        wrong screen -- a WebView that never finished loading, a modal with no
+        reachable dismiss, a state no amount of `back` unwinds. Everything else
+        in the recovery ladder (`Device.recover`) repairs the *harness's* link
+        to the phone; this is the only thing that repairs the app.
+
+        `am force-stop` is not on the blocklist, and deliberately: unlike
+        `pm clear` it destroys no data. The app comes back at its launcher
+        entry point with its persisted state intact.
+        """
+        pkg = (package or "").strip()
+        if not pkg:
+            raise ValueError("restart_app needs a package name")
+        self._log_action(f"Force-stop and relaunch {pkg}")
+        self._safe(lambda: self.shell(f"am force-stop {pkg}", timeout=15))
+        time.sleep(0.5)
+        return self.open_app(pkg, timeout_s=timeout_s)
 
     def wait_foreground(self, package: str, timeout_s: float) -> bool:
         """Poll until `package` is the foreground app, or the budget expires."""

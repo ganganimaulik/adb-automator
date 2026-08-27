@@ -126,6 +126,126 @@ def test_a_named_tap_at_is_grounded_by_the_vision_locate(cfg, mem):
     assert abs(dev.taps[0][0] - cx) <= 1 and abs(dev.taps[0][1] - cy) <= 1
 
 
+def _locator(cfg, mem, dev, location):
+    """An agent, a state and a recorder, for calling `_locate_cached` directly."""
+    from adbagent.agent import Recorder
+
+    llm = fake.FakeLLM(dev, lambda *a: None)
+    llm.location = location
+    return (Agent(dev, mem, llm, cfg), llm,
+            RunState(goal=GOAL, run_id="r", intent_id="i"),
+            Recorder(cfg, "r"))
+
+
+def test_the_second_locate_of_the_same_control_is_free(cfg, mem):
+    """A locate is a screenshot plus a vision call, and it is asked the same
+    question over and over: across ``runs/``, 577 named `tap_at`s resolve to 94
+    distinct (skeleton, name) pairs, and "send priority like" on one Hinge
+    skeleton was located 134 separate times."""
+    dev = fake.FakeDevice(cfg)
+    screen = dev.observe()
+    agent, llm, state, rec = _locator(cfg, mem, dev, (0.5, 0.9))
+    try:
+        first = agent._locate_cached(state, rec, screen, "the send pill")
+        second = agent._locate_cached(state, rec, screen, "the send pill")
+        # Case and inner spacing are not a different control.
+        third = agent._locate_cached(state, rec, screen, "The  Send  Pill")
+    finally:
+        rec.close()
+
+    assert first == second == third == (0.5, 0.9)
+    assert llm.locates == 1
+
+
+def test_a_different_control_or_screen_is_located_afresh(cfg, mem):
+    dev = fake.FakeDevice(cfg)
+    screen = dev.observe()
+    agent, llm, state, rec = _locator(cfg, mem, dev, (0.5, 0.9))
+    try:
+        agent._locate_cached(state, rec, screen, "the send pill")
+        agent._locate_cached(state, rec, screen, "the attach button")
+        assert llm.locates == 2                     # a different name
+        dev.state = "wifi"
+        other = dev.observe()
+        assert other.skeleton_id != screen.skeleton_id
+        agent._locate_cached(state, rec, other, "the send pill")
+        assert llm.locates == 3                     # a different screen
+    finally:
+        rec.close()
+
+
+def test_a_locate_that_misses_is_not_cached(cfg, mem):
+    """There is nothing to remember, and caching "not found" would stop the
+    next turn looking on a screen that may since have drawn the control."""
+    dev = fake.FakeDevice(cfg)
+    screen = dev.observe()
+    agent, llm, state, rec = _locator(cfg, mem, dev, None)
+    try:
+        assert agent._locate_cached(state, rec, screen, "the send pill") is None
+        assert agent._locate_cached(state, rec, screen, "the send pill") is None
+    finally:
+        rec.close()
+    assert llm.locates == 2
+    assert mem.recall_locate(screen, "the send pill") is None
+
+
+def test_a_cached_point_that_taps_nothing_is_forgotten(cfg, mem):
+    """The invalidation half. Without it the cache is worse than paying for the
+    locate: a vision call that misses costs one turn, a cached miss would cost
+    every remaining turn that named the same control."""
+    dev = fake.FakeDevice(cfg)
+    screen = dev.observe()
+    # A point on bare canvas: tapping it changes nothing on the scripted phone.
+    mem.record_locate(screen, "the ghost button", 0.5, 0.97)
+    assert mem.recall_locate(screen, "the ghost button") is not None
+
+    tries = []
+
+    def policy(scr, llm):
+        if len(tries) >= 1:
+            return AgentAction(observation="that did nothing",
+                               reasoning="give up on it", action="done",
+                               text="the point was dead")
+        tries.append(True)
+        llm.location = (0.5, 0.97)
+        return AgentAction(observation="aiming at the remembered point",
+                           reasoning="tap where it was last seen",
+                           action="tap_at", text="the ghost button")
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert llm.locates == 0          # the cached point was used, not re-derived
+    # ...and having changed nothing, it is no longer remembered.
+    assert mem.recall_locate(screen, "the ghost button") is None
+
+
+def test_a_cached_point_on_the_ban_list_is_dropped_and_located_again(cfg, mem):
+    """Something has tapped there since and nothing happened. Falling through
+    to a real locate is the whole reason to check the ban list first."""
+    dev = fake.FakeDevice(cfg)
+    screen = dev.observe()
+    mem.record_locate(screen, "the ghost button", 0.5, 0.97)
+
+    state = RunState(goal=GOAL, run_id="r", intent_id="i")
+    state.loops.ban(screen.skeleton_id, "tap_at/0.50,0.97")
+
+    llm = fake.FakeLLM(dev, lambda *a: None)
+    llm.location = (0.4, 0.4)
+    agent = Agent(dev, mem, llm, cfg)
+
+    from adbagent.agent import Recorder
+    rec = Recorder(cfg, "r")
+    try:
+        where = agent._locate_cached(state, rec, screen, "the ghost button")
+    finally:
+        rec.close()
+
+    assert where == (0.4, 0.4)       # the fresh locate, not the banned point
+    assert llm.locates == 1
+    assert mem.recall_locate(screen, "the ghost button") == (0.4, 0.4)
+
+
 def test_a_tap_at_naming_a_listed_element_is_refused_with_its_index(cfg, mem):
     """The escape hatch is not a shortcut: what the list can name, the list taps."""
     dev = fake.FakeDevice(cfg)

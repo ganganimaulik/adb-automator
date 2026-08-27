@@ -1,16 +1,24 @@
-"""Run tracking and dead-end storage -- what the agent learns across runs.
+"""Run tracking, dead ends and located points -- what the agent learns across runs.
 
-Only two things live here, and both are read. Anything written and never read
-was removed rather than kept in case it became useful: a per-step SQLite commit
-feeding a table with no reader is a cost with no upside, and it reads to the next
-person like a feature.
+Only what is read lives here. Anything written and never read was removed rather
+than kept in case it became useful: a per-step SQLite commit feeding a table with
+no reader is a cost with no upside, and it reads to the next person like a
+feature.
 
-The dead-end table is the whole of the cross-run memory. A tap that changed
-nothing on a screen is knowledge that survives the process, so the agent does not
-rediscover the same dud control on the same screen in every run. It is keyed by
-intent as well as by screen, because "the Wi-Fi row does nothing" can be true of
-one goal and false of another, and it expires, because an app that was broken
-last night may be fixed this morning.
+Two kinds of cross-run memory, and they are keyed differently on purpose.
+
+The dead-end table records that an action on a screen led nowhere, so the agent
+does not rediscover the same dud control in every run. It is keyed by intent as
+well as by screen, because "the Wi-Fi row does nothing" can be true of one goal
+and false of another.
+
+The locate table records where a *named* control sits on a screen, so a `tap_at`
+that named one does not pay for the same vision call twice. It is deliberately
+NOT keyed by intent: where a control is on a layout is a fact about the layout,
+and the goal being pursued has no bearing on it.
+
+Both expire. An app that was broken last night may be fixed this morning, and an
+app that updates overnight may have moved the control.
 """
 
 from __future__ import annotations
@@ -27,7 +35,7 @@ from .screen import Screen
 
 log = logging.getLogger("adbagent.memory")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -65,6 +73,17 @@ CREATE TABLE IF NOT EXISTS dead_end (
 
 CREATE INDEX IF NOT EXISTS dead_end_lookup
     ON dead_end(app_key, skeleton_id, intent_id);
+
+CREATE TABLE IF NOT EXISTS locate (
+    app_key     TEXT NOT NULL,
+    skeleton_id TEXT NOT NULL,
+    description TEXT NOT NULL,
+    x           REAL NOT NULL,
+    y           REAL NOT NULL,
+    created_at  REAL NOT NULL,
+    expires_at  REAL NOT NULL,
+    PRIMARY KEY(app_key, skeleton_id, description)
+);
 """
 
 #: Tables from schema versions that no longer have a reader. Dropped rather than
@@ -185,3 +204,73 @@ class Memory:
             (screen.package, screen.skeleton_id, intent_id,
              time.time())).fetchall()
         return {row["action_sig"]: row["reason"] for row in rows}
+
+    # -- located points ----------------------------------------------------
+
+    #: Shorter than the dead-end TTL. A dead end stays true until the app is
+    #: fixed; a located point stops being true the moment the app updates and
+    #: moves the control, and a stale point taps the wrong thing rather than
+    #: merely wasting a turn. `forget_locate` is the real protection -- this is
+    #: the backstop for a layout that changed without any tap proving it.
+    _LOCATE_TTL_S = 43200  # 12 hours
+
+    @staticmethod
+    def _locate_key(description: str) -> str:
+        """How a control's name is matched against an earlier one.
+
+        Case and inner whitespace only. Nothing cleverer: the description is
+        the model's own words for the control, and two spellings that differ by
+        more than that ("the send pill", "Send Priority Like") may well be two
+        different controls, so they get their own rows and their own locates.
+        """
+        return " ".join(description.lower().split())
+
+    def recall_locate(self, screen: Screen,
+                      description: str) -> Optional[tuple]:
+        """Where this control was last found on this screen, as (x, y).
+
+        Measured over the 169 runs in ``runs/``: 577 `tap_at` actions named a
+        control, and they resolve to 94 distinct (skeleton, name) pairs. 211 of
+        them (37%) repeat a pair already located earlier *in the same run*, and
+        483 (84%) repeat one located in some earlier run -- "send priority like"
+        on one Hinge skeleton was located 134 separate times, each a screenshot
+        and a vision call for a point the harness had already been told.
+
+        Not keyed by intent, unlike `dead_ends`: where a control sits is a
+        property of the layout, and the goal has no bearing on it.
+        """
+        row = self.db.execute(
+            "SELECT x, y FROM locate WHERE app_key=? AND skeleton_id=? "
+            "AND description=? AND expires_at > ?",
+            (screen.package, screen.skeleton_id,
+             self._locate_key(description), time.time())).fetchone()
+        return (row["x"], row["y"]) if row else None
+
+    def record_locate(self, screen: Screen, description: str,
+                      x: float, y: float) -> None:
+        """Remember where a vision call placed this control."""
+        now = time.time()
+        self.db.execute(
+            "INSERT INTO locate(app_key, skeleton_id, description, x, y, "
+            " created_at, expires_at) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(app_key, skeleton_id, description) "
+            "DO UPDATE SET x=excluded.x, y=excluded.y, "
+            " created_at=excluded.created_at, expires_at=excluded.expires_at",
+            (screen.package, screen.skeleton_id, self._locate_key(description),
+             x, y, now, now + self._LOCATE_TTL_S))
+        self.db.commit()
+
+    def forget_locate(self, screen: Screen, description: str) -> None:
+        """Drop a cached point that turned out to be wrong.
+
+        Called when a tap at the cached point changed nothing. Without this the
+        cache would be strictly worse than paying for the locate: a vision call
+        that misses costs one turn, while a cached miss would cost every
+        remaining turn that named the same control.
+        """
+        self.db.execute(
+            "DELETE FROM locate WHERE app_key=? AND skeleton_id=? "
+            "AND description=?",
+            (screen.package, screen.skeleton_id,
+             self._locate_key(description)))
+        self.db.commit()

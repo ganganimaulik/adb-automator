@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "adbagent-ui",
-      "runtimeExecutable": "python3",
+      "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "adbagent", "ui", "--port", "8765"],
       "port": 8765
     }

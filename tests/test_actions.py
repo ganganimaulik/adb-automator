@@ -698,7 +698,7 @@ def test_condition_based_wait():
 
     dev = MagicMock()
     screen = s(X.settings_screen())
-    dev.observe.return_value = screen
+    dev.wait_for_text.return_value = True
 
     action = act(action="wait", wait_for_text="Option 1", timeout=2.0)
     execute(dev, action, screen)
@@ -706,6 +706,38 @@ def test_condition_based_wait():
     assert "found" in getattr(action, "_result_summary")
     # The text was already there, so nothing changed while it waited.
     assert verify(action, screen, screen).grade == "no_change"
+
+
+def test_a_wait_asks_the_device_rather_than_polling_dumps():
+    """It used to call `observe()` every 0.1s, and each of those is a whole
+    `dump_hierarchy` -- so a long wait over wireless adb could spend its entire
+    budget on two or three polls and then report a timeout for a screen that
+    had already arrived."""
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    screen = s(X.settings_screen())
+    dev.wait_for_text.return_value = True
+
+    execute(dev, act(action="wait", wait_for_text="Option 1", timeout=8.0),
+            screen)
+
+    dev.wait_for_text.assert_called_once_with("Option 1", 8.0)
+    dev.observe.assert_not_called()
+
+
+def test_a_wait_that_times_out_says_so():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    screen = s(X.settings_screen())
+    dev.wait_for_text.return_value = False
+
+    action = act(action="wait", wait_for_text="Never appears", timeout=1.0)
+    execute(dev, action, screen)
+    assert "timed out" in getattr(action, "_result_summary")
 
 
 def test_sleep_action():
@@ -731,7 +763,7 @@ def test_condition_based_sleep():
 
     dev = MagicMock()
     screen = s(X.settings_screen())
-    dev.observe.return_value = screen
+    dev.wait_for_text.return_value = True
 
     action = act(action="sleep", wait_for_text="Option 1", timeout=2.0)
     execute(dev, action, screen)
@@ -969,3 +1001,227 @@ def test_element_at_point_ignores_containers_too_big_to_be_the_target():
     screen = s(xml)
     assert element_at_point(screen, 0.5, 460 / X.H).best_text == "Go"
     assert element_at_point(screen, 0.5, 0.8) is None
+
+
+# ---------------------------------------------------------------------------
+# Points, holds and drags
+# ---------------------------------------------------------------------------
+
+def test_point_actions_need_a_point_or_a_name():
+    for name in ("tap_at", "long_press_at", "double_tap"):
+        with pytest.raises(ValidationError):
+            act(action=name)
+        # Either form on its own is enough.
+        act(action=name, x=0.5, y=0.5)
+        act(action=name, text="the red record button")
+
+
+def test_drag_needs_both_ends():
+    with pytest.raises(ValidationError):
+        act(action="drag", x=0.5, y=0.5)          # no destination
+    with pytest.raises(ValidationError):
+        act(action="drag", to_x=0.5, to_y=0.9)    # no origin
+    act(action="drag", x=0.5, y=0.5, to_x=0.5, to_y=0.9)
+
+
+def test_long_press_passes_its_duration_through():
+    """It used to be dropped here, so every hold was the device default and a
+    press-and-hold control (a voice note, a shutter) could not be asked for."""
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    action = act(action="long_press", target=Target(index=1), duration=2.5)
+    element = execute(dev, action, BASE)
+    dev.long_press.assert_called_once_with(*element.center, duration=2.5)
+
+
+def test_long_press_still_has_a_default_hold():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    action = act(action="long_press", target=Target(index=1))
+    element = execute(dev, action, BASE)
+    dev.long_press.assert_called_once_with(*element.center, duration=0.6)
+
+
+def test_point_actions_reach_the_right_device_call():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    for name, method in (("tap_at", "tap"), ("long_press_at", "long_press"),
+                         ("double_tap", "double_tap")):
+        dev = MagicMock()
+        execute(dev, act(action=name, x=0.5, y=0.25), BASE)
+        assert getattr(dev, method).called, name
+
+
+def test_drag_converts_both_ends_to_pixels():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    execute(dev, act(action="drag", x=0.5, y=0.25, to_x=0.5, to_y=0.75,
+                     duration=0.8), BASE)
+    dev.drag.assert_called_once_with(X.W // 2, X.H // 4, X.W // 2,
+                                     int(X.H * 0.75), duration=0.8)
+
+
+def test_a_point_action_with_no_point_is_an_action_error():
+    """A named point action reaches execute only after the locate grounded it."""
+    from unittest.mock import MagicMock
+    from adbagent.actions import ActionError, execute
+
+    with pytest.raises(ActionError, match="never located"):
+        execute(MagicMock(), act(action="tap_at", text="the pill"), BASE)
+
+
+def test_point_action_signatures_are_quantised_like_tap_at():
+    a = act(action="long_press_at", x=0.5011, y=0.25)
+    b = act(action="long_press_at", x=0.4989, y=0.2512)
+    assert a.signature() == b.signature()
+    # ...and a different action at the same point is a different action.
+    assert a.signature() != act(action="tap_at", x=0.50, y=0.25).signature()
+
+
+# ---------------------------------------------------------------------------
+# scroll_to_edge
+# ---------------------------------------------------------------------------
+
+def test_scroll_to_edge_needs_a_direction():
+    with pytest.raises(ValidationError):
+        act(action="scroll_to_edge")
+
+
+def test_scroll_to_edge_flings_and_reports_where_it_went():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    dev.fling_to_edge.return_value = True
+    action = act(action="scroll_to_edge", direction="up")
+    execute(dev, action, BASE)
+    dev.fling_to_edge.assert_called_once_with("up")
+    assert getattr(action, "_result_summary") == "flung to the top"
+
+
+def test_scroll_to_edge_that_moves_nothing_says_so():
+    """Already at that edge is information the model can act on, not a failure."""
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    dev.fling_to_edge.return_value = False
+    action = act(action="scroll_to_edge", direction="down")
+    execute(dev, action, BASE)
+    outcome = verify(action, BASE, BASE)
+    assert outcome.grade == "no_change"
+    assert "already at the bottom" in outcome.reason
+
+
+def test_scroll_to_edge_is_a_noop_postcondition():
+    action = act(action="scroll_to_edge", direction="up")
+    assert synthesise_postcondition(action, None).kind == "noop_ok"
+
+
+# ---------------------------------------------------------------------------
+# open_url and restart_app
+# ---------------------------------------------------------------------------
+
+def test_open_url_needs_a_target():
+    with pytest.raises(ValidationError):
+        act(action="open_url")
+
+
+def test_open_url_hands_the_target_to_the_device():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    dev.open_url.return_value = "opened android.settings.WIFI_SETTINGS"
+    action = act(action="open_url", text="android.settings.WIFI_SETTINGS")
+    execute(dev, action, BASE)
+    dev.open_url.assert_called_once_with("android.settings.WIFI_SETTINGS")
+
+
+def test_open_url_that_changes_nothing_is_no_change():
+    """`am start` exits zero whether or not anything handled the intent, so the
+    screen is the only evidence that the link went somewhere."""
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    dev.open_url.return_value = "opened market://details?id=com.nope"
+    action = act(action="open_url", text="market://details?id=com.nope")
+    execute(dev, action, BASE)
+    outcome = verify(action, BASE, BASE)
+    assert outcome.grade == "no_change"
+    assert "no app handled it" in outcome.reason
+
+
+def test_open_url_signature_distinguishes_links():
+    a = act(action="open_url", text="https://example.com/a")
+    b = act(action="open_url", text="https://example.com/b")
+    assert a.signature() != b.signature()
+    assert a.signature() == act(action="open_url",
+                                text="HTTPS://EXAMPLE.COM/A").signature()
+
+
+def test_restart_app_expects_the_app_in_front_afterwards():
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    dev.list_apps.return_value = ["com.whatsapp"]
+    dev.restart_app.return_value = True
+    action = act(action="restart_app", text="whatsapp")
+    execute(dev, action, BASE)
+    dev.restart_app.assert_called_once_with("com.whatsapp")
+    post = synthesise_postcondition(action, None)
+    assert post.kind == "app_is" and post.package == "com.whatsapp"
+
+
+def test_restart_app_needs_a_package():
+    with pytest.raises(ValidationError):
+        act(action="restart_app")
+
+
+# ---------------------------------------------------------------------------
+# The model's own postcondition
+# ---------------------------------------------------------------------------
+
+def test_expect_text_becomes_the_postcondition():
+    action = act(action="tap", target=Target(index=1), expect_text="Sent")
+    post = synthesise_postcondition(action, None)
+    assert post.kind == "text_present" and post.text == "Sent"
+
+
+def test_expect_text_outranks_the_synthesised_condition():
+    """The model knows what the action was for; the synthesised condition is a
+    guess from the action's shape."""
+    action = act(action="open_app", text="com.whatsapp", expect_text="Chats")
+    assert synthesise_postcondition(action, None).kind == "text_present"
+
+
+def test_an_unmet_expect_text_is_a_hard_failure():
+    action = act(action="tap", target=Target(index=1),
+                 expect_text="Message sent")
+    after = s(X.settings_screen(rows=3, labels=["A", "B", "C"]))
+    outcome = verify(action, BASE, after,
+                     synthesise_postcondition(action, None))
+    assert outcome.grade == "hard_fail"
+    assert "Message sent" in outcome.reason
+
+
+def test_a_met_expect_text_passes():
+    action = act(action="tap", target=Target(index=1), expect_text="Option 2")
+    after = s(X.settings_screen(rows=3, labels=["Option 1", "Option 2", "C"]))
+    outcome = verify(action, BASE, after,
+                     synthesise_postcondition(action, None))
+    assert outcome.grade == "success"
+
+
+def test_a_blank_expect_text_is_ignored():
+    action = act(action="open_app", text="com.whatsapp", expect_text="   ")
+    assert synthesise_postcondition(action, None).kind == "app_is"

@@ -24,12 +24,14 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__, checkpoint, conversation, prompts, runlog, safety
-from .actions import (_POINT_GUARD_MAX_AREA, ActionError, AgentAction, Target,
+from .actions import (_POINT_GUARD_MAX_AREA, POINT_ACTIONS, ActionError,
+                      AgentAction, Target,
                       append_history, element_at_point, element_summary, execute,
                       format_history_entry, input_target_is_container,
                       resolve_target, synthesise_postcondition, verify)
 from .config import Config
-from .device import Device, DeviceTimeout, DeviceLost
+from .device import (Device, DeviceTimeout, DeviceLost, IntentRefused,
+                     ShellDenied)
 from .fingerprint import crop_frac
 from .ledger import ReplyLedger
 from .llm import (BudgetExceeded, LLMClient, LLMError, Prefetch, ScreenAnalysis)
@@ -140,6 +142,12 @@ class RunState:
     #: Readings collected by the last mechanical sweep, in the order they were
     #: read. Not a ledger of a set -- see `pager.SweepLog`.
     sweep: SweepLog = field(default_factory=SweepLog)
+    #: Controls placed by a locate on *this* step, as (description, point).
+    #: Cleared at the top of every turn, and read only when the step turns out
+    #: to have changed nothing -- at which point whatever placed the point was
+    #: wrong and `Memory.forget_locate` has to drop it, or the cache would serve
+    #: the same dud point for the rest of the day.
+    located: List[Tuple[str, Tuple[float, float]]] = field(default_factory=list)
     #: What verification concluded about the last gesture: True the app's content
     #: moved, False it did not, None not observable (no screenshot).
     content_moved: Optional[bool] = None
@@ -611,6 +619,63 @@ class Agent:
             screen.dhash = compute_dhash(screen.screenshot)
         return screen.screenshot
 
+    def _locate_cached(self, state: RunState, rec: Recorder, screen: Screen,
+                       description: str) -> Optional[Tuple[float, float]]:
+        """Where `description` is on this screen, from memory or from vision.
+
+        A locate is the most expensive thing a turn can do that is not a decide:
+        a screenshot off the device, then a vision call on it. And it is asked
+        the same question over and over. Across the 169 runs in ``runs/``, 577
+        `tap_at` actions named a control and they resolve to 94 distinct
+        (skeleton, name) pairs -- 211 of them (37%) repeat a pair already
+        located earlier in the same run, and 483 (84%) repeat one located in
+        some earlier run. "send priority like" on one Hinge composer skeleton
+        was located 134 separate times.
+
+        The cache is keyed on `skeleton_id`, which is the content-free hash, so
+        every profile in a feed shares one entry -- which is what makes it worth
+        having, since the Send pill sits in the same place whoever is on screen.
+        The risk that buys is a layout where the point *does* move with the
+        content; `forget_locate` is what limits it, and a wrong point costs the
+        one turn it takes to notice.
+
+        A cached point that is already on this screen's ban list is dropped
+        rather than used: something has tapped there since and nothing happened.
+        Falling through to a real locate is the whole reason to check.
+        """
+        if self.mem is not None:
+            remembered = self.mem.recall_locate(screen, description)
+            if remembered is not None:
+                signature = f"tap_at/{remembered[0]:.2f},{remembered[1]:.2f}"
+                if signature in state.loops.bans_for(screen.skeleton_id):
+                    log.info("step %d: cached point for %r is banned here; "
+                             "forgetting it and locating again",
+                             state.step, description)
+                    self.mem.forget_locate(screen, description)
+                else:
+                    log.info("step %d: %r is remembered at (%.2f, %.2f); "
+                             "no vision call", state.step, description,
+                             *remembered)
+                    rec.event("locate_cache", step=state.step, hit=True,
+                              description=description, x=remembered[0],
+                              y=remembered[1])
+                    state.located.append((description, remembered))
+                    return remembered
+
+        where = self.llm.locate(self._ensure_screenshot(screen), description,
+                                goal=state.goal, step=state.step, recorder=rec,
+                                on_event=self.on_event,
+                                misses=_banned_tap_points(state, screen))
+        rec.event("locate_cache", step=state.step, hit=False,
+                  description=description,
+                  x=where[0] if where else None,
+                  y=where[1] if where else None)
+        if where is not None:
+            if self.mem is not None:
+                self.mem.record_locate(screen, description, *where)
+            state.located.append((description, where))
+        return where
+
     def _reread_sharper(self, state: RunState, screen: Screen, rec: Recorder, *,
                         rendered: str = "") -> Optional[ScreenAnalysis]:
         """Read the screen once more at full capture resolution.
@@ -872,6 +937,9 @@ class Agent:
             # -- a rejected action, a failed one, a dismissed nag -- and counting
             # at the bottom instead would let all of them through for free.
             state.steps_since_progress += 1
+            # Points placed on this turn only: read by the `no_change` handler
+            # to decide which cached locate was the wrong one.
+            state.located.clear()
 
             # ---- 1. perceive (no LLM) -----------------------------------
             if screen is None:
@@ -1610,20 +1678,18 @@ class Agent:
             # hitting it, on a prompt that read the image analysis as "a
             # screenshot is attached". A seeing decider's coordinates are its
             # own reading and are left alone.
-            if (action.action == "tap_at" and self.llm is not None
+            if (action.action in POINT_ACTIONS and self.llm is not None
                     and (action.text or "").strip()
                     and not cfg.run.never_screenshot
                     and (action.x is None or action.y is None
                          or not cfg.llm.decider_sees())):
                 if action.x is not None and action.y is not None:
-                    log.info("step %d: tap_at (%.2f, %.2f) overridden: blind "
+                    log.info("step %d: %s (%.2f, %.2f) overridden: blind "
                              "decider; locating %r instead", state.step,
-                             action.x, action.y, action.text.strip())
-                where = self.llm.locate(self._ensure_screenshot(screen),
-                                        action.text.strip(), goal=state.goal,
-                                        step=state.step, recorder=rec,
-                                        on_event=self.on_event,
-                                        misses=_banned_tap_points(state, screen))
+                             action.action, action.x, action.y,
+                             action.text.strip())
+                where = self._locate_cached(state, rec, screen,
+                                            action.text.strip())
                 if where is None:
                     state.last_failure = (
                         f"could not locate {action.text.strip()!r} on the "
@@ -1673,12 +1739,7 @@ class Agent:
                         and input_target_is_container(holder, screen)):
                     description = ((action.target.text or holder.hint or "")
                                    .strip() or "the text input field")
-                    where = self.llm.locate(self._ensure_screenshot(screen),
-                                            description, goal=state.goal,
-                                            step=state.step, recorder=rec,
-                                            on_event=self.on_event,
-                                            misses=_banned_tap_points(state,
-                                                                      screen))
+                    where = self._locate_cached(state, rec, screen, description)
                     if where is None:
                         state.last_failure = (
                             f"could not locate {description!r} on the screen; "
@@ -1695,7 +1756,13 @@ class Agent:
                     setattr(action, "_focus_point", where)
             try:
                 element = execute(self.dev, action, screen)
-            except (ActionError, ValueError) as exc:
+            except (ActionError, ValueError, ShellDenied, IntentRefused) as exc:
+                # `ShellDenied` and `IntentRefused` are both `open_url` saying
+                # no -- the first because the target is not something this
+                # action will open, the second because nothing on the phone
+                # would handle it. Neither is a device fault, and both are
+                # worth telling the model in the same breath as a bad target:
+                # it can pick a different link, or navigate by hand instead.
                 log.warning("step %d: %s", state.step, exc)
                 state.last_failure = str(exc)
                 state.consecutive_failures += 1
@@ -1897,6 +1964,15 @@ class Agent:
                 if outcome.grade == "no_change":
                     self.mem.record_dead_end(screen, state.intent_id,
                                              action.signature(), outcome.reason)
+                    # Whatever placed the point was wrong -- a tap there did
+                    # nothing. Drop it, or the cache would keep answering with
+                    # it for the rest of its TTL and turn one bad vision call
+                    # into a bad answer on every future turn that named the
+                    # same control. The dead-end row above stops *this* point
+                    # being retried; this is what lets the next locate find a
+                    # different one.
+                    for described, _point in state.located:
+                        self.mem.forget_locate(screen, described)
 
             if outcome.ok and not passive_noop:
                 state.consecutive_failures = 0

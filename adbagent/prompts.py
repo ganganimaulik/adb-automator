@@ -65,13 +65,23 @@ THE ACTIONS
 - tap             press an element. The usual action.
 - long_press      press and hold.
 - input_text      type into a field. Give the target and text. Supports optional `clear=false` to append without clearing, and `press_enter=true` to submit/search immediately.
-- press_key       back, home, enter, recent, delete, search, menu.
+- press_key       back, home, enter, recent, delete, search, menu, notifications \
+(pull down the notification shade), quick_settings.
 - scroll          move the content in lists or feeds. "down" reveals what is below; "up" reveals what is above. \
 Set scroll_amount to control distance or multi-step scrolling: 0.5 for small adjustment, 1 for single page (default), or 2 to 5 for fast multi-step scrolling in a single turn. \
 Supports optional `base_scale` to control swipe scale per step (e.g. 0.8 or 0.9 for larger page coverage per step, default 0.6, range 0.1 to 1.0).
+- scroll_to_edge  go all the way to one end of a list in ONE action -- direction \
+"up" for the very top, "down" for the very bottom. Prefer this over a big \
+scroll_amount whenever you want the start or end rather than a measured \
+distance: it keeps going until the list stops moving, so it cannot fall short.
 - swipe           fast flick gesture to switch photos, cards, tabs, or full-page views. Use direction "left" for next photo/item \
 and "right" for previous photo/item. Supports `target` (element box), `scroll_amount` (scale), and `duration` (speed, default 0.15s).
 - open_app        launch an app by package name (e.g. com.android.settings) or common name (e.g. "whatsapp", "spotify").
+- open_url        jump straight to a link or a Settings page instead of \
+navigating to it. `text` takes a link (https:, tel:, mailto:, geo:, sms:, \
+market:) or a Settings screen by name, e.g. android.settings.WIFI_SETTINGS, \
+android.settings.AIRPLANE_MODE_SETTINGS, android.settings.APPLICATION_DETAILS_SETTINGS. \
+Several taps of menu-hunting in one action.
 - list_apps       list or search installed app packages on the device. Set `text` to a search query (e.g. "whatsapp" or "spotify") or leave empty to list installed apps.
 - get_clipboard   read text currently stored in device clipboard.
 - set_clipboard   copy text into device clipboard. Give text in `text`.
@@ -95,6 +105,9 @@ in code, analysing each new screen. Set `read_each=false` to keep paging \
 without those analyses when the in-between content does not matter.
 - Set confidence to "low" when you are guessing; you will be given a screenshot \
 on the next turn.
+- When an action has a silent failure mode -- a send, a save, a submit that may \
+do nothing -- set `expect_text` to a word that will be on screen if it worked \
+("Sent", "Saved"). The harness checks it and tells you when it did not appear.
 - Only answer `done` when the goal is genuinely satisfied -- by the screen, or by \
 the records under COLLECTED DATA. A goal to read or report is satisfied by the \
 data, not by the current frame.
@@ -716,6 +729,34 @@ model's reading. So NEVER invent `x` and `y`: name the control in `text` \
 for you. Coordinates sent alongside a name are ignored in favour of the \
 located point."""
 
+#: The rest of the escape hatches, revealed on the same trigger and for the same
+#: reason as `TAP_AT_ADVICE`: each is the right answer to a situation that is
+#: rare, and advertising them on every turn would invite them into situations
+#: where an ordinary tap works. They are in the schema throughout -- a model that
+#: reaches for one unprompted is not refused -- but they are only *described*
+#: once the run has actually struggled.
+#:
+#: `restart_app` is last and hedged hardest. It is the only action here that
+#: throws away where the run had got to, and an agent told about it early enough
+#: will use it as a general-purpose "I am confused" button.
+STUCK_ADVICE = """\
+OTHER WAYS THROUGH (ordinary tapping is not working here, so these are now \
+available):
+- `long_press_at` and `double_tap` take the same point or control name as \
+`tap_at`, for a control the list does not name that needs a hold or a double \
+press. `long_press`/`long_press_at` take `duration` -- use 1.5 or more for a \
+press-and-hold control such as a voice-note button.
+- `drag` presses at (`x`, `y`), moves to (`to_x`, `to_y`) and releases: \
+sliders, reorder handles, slide-to-confirm. A `swipe` along the same path is a \
+flick and is dropped by anything that wanted a drag.
+- `open_url` reaches a Settings page or a link directly, which is often a way \
+around a screen you cannot get through by tapping.
+- `restart_app` force-stops an app and relaunches it. ONLY for an app that is \
+genuinely wedged -- a screen that never finished loading, a dialog with no \
+dismiss, a state `back` will not unwind. It loses your place in the app, so \
+never use it merely because a control is hard to find."""
+
+
 def situational_notes(*, scrolls: int = 0, packages_seen: int = 1,
                       struggle: int = 0, decider_sees: bool = True,
                       scrollable: bool = True, collecting: bool = False) -> str:
@@ -757,6 +798,7 @@ def situational_notes(*, scrolls: int = 0, packages_seen: int = 1,
         parts.append(MULTI_APP_ADVICE)
     if struggle > 0:
         parts.append(TAP_AT_ADVICE if decider_sees else TAP_AT_ADVICE_BLIND)
+        parts.append(STUCK_ADVICE)
     return "\n\n".join(parts)
 
 

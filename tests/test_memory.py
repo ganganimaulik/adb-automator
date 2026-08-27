@@ -142,6 +142,82 @@ def test_opening_an_existing_database_twice_is_harmless(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# The locate cache
+# ---------------------------------------------------------------------------
+#
+# 577 `tap_at` actions across ``runs/`` named a control and resolve to 94
+# distinct (skeleton, name) pairs: 37% of them repeat a pair located earlier in
+# the same run, 84% one located in an earlier run. Each repeat was a screenshot
+# and a vision call for an answer the harness already had.
+
+def test_a_located_point_is_recalled(mem):
+    mem.record_locate(BASE, "Send Priority Like", 0.7, 0.68)
+    assert mem.recall_locate(BASE, "Send Priority Like") == (0.7, 0.68)
+
+
+def test_recall_misses_when_nothing_was_stored(mem):
+    assert mem.recall_locate(BASE, "Send Priority Like") is None
+
+
+def test_the_name_is_matched_on_case_and_spacing_only(mem):
+    mem.record_locate(BASE, "Send Priority Like", 0.7, 0.68)
+    assert mem.recall_locate(BASE, "send   priority like") == (0.7, 0.68)
+    # Two genuinely different wordings get their own rows rather than one
+    # answering for the other: they may well be two different controls.
+    assert mem.recall_locate(BASE, "the send button") is None
+
+
+def test_relocating_the_same_control_moves_the_point(mem):
+    mem.record_locate(BASE, "Send", 0.5, 0.5)
+    mem.record_locate(BASE, "Send", 0.7, 0.9)
+    assert mem.recall_locate(BASE, "Send") == (0.7, 0.9)
+    assert mem.db.execute("SELECT COUNT(*) c FROM locate").fetchone()["c"] == 1
+
+
+def test_a_located_point_expires(mem):
+    mem.record_locate(BASE, "Send", 0.7, 0.68)
+    mem.db.execute("UPDATE locate SET expires_at = 0")
+    mem.db.commit()
+    assert mem.recall_locate(BASE, "Send") is None
+
+
+def test_forgetting_a_point_drops_it(mem):
+    """The invalidation half. A cached point that taps nothing must not be
+    served again, or one bad vision call becomes a bad answer all day."""
+    mem.record_locate(BASE, "Send", 0.7, 0.68)
+    mem.forget_locate(BASE, "Send")
+    assert mem.recall_locate(BASE, "Send") is None
+
+
+def test_forgetting_matches_the_same_way_recall_does(mem):
+    mem.record_locate(BASE, "Send Priority Like", 0.7, 0.68)
+    mem.forget_locate(BASE, "send priority like")
+    assert mem.recall_locate(BASE, "Send Priority Like") is None
+
+
+def test_a_point_is_not_shared_between_screens(mem):
+    other = s(X.settings_screen(rows=3, labels=["A", "B", "C"]))
+    assert other.skeleton_id != BASE.skeleton_id
+    mem.record_locate(BASE, "Send", 0.7, 0.68)
+    assert mem.recall_locate(other, "Send") is None
+
+
+def test_a_point_is_shared_across_intents(mem):
+    """Unlike a dead end. Where a control sits is a fact about the layout, and
+    the goal being pursued has no bearing on it."""
+    mem.record_locate(BASE, "Send", 0.7, 0.68)
+    # `recall_locate` takes no intent at all -- that is the assertion.
+    assert mem.recall_locate(BASE, "Send") == (0.7, 0.68)
+
+
+def test_the_locate_table_survives_reopening(tmp_path):
+    with memory(tmp_path) as m:
+        m.record_locate(BASE, "Send", 0.7, 0.68)
+    with memory(tmp_path) as m:
+        assert m.recall_locate(BASE, "Send") == (0.7, 0.68)
+
+
+# ---------------------------------------------------------------------------
 # Intent keys
 # ---------------------------------------------------------------------------
 
