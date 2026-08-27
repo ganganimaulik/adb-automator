@@ -220,6 +220,40 @@ to a time. Anything about money, work, or an emergency: don't reply at all.
 policy that reads well and works badly costs you a wrong line in a log instead of
 a wrong message in somebody's inbox. Drop the flag once the drafts look right.
 
+### A policy carries the goal it was written for
+
+Once there is more than one app there is more than one policy, and the goal is
+part of the policy rather than something typed beside it: the Hinge policy is
+only correct under "work through Discover and reply to matches", and starting it
+under the goal left over from the Instagram policy is a watch doing the wrong
+thing carefully. So the goal lives in the policy file, as front matter:
+
+```markdown
+---
+goal: work through the Hinge feed and reply to anyone new
+---
+
+# Hinge policy
+
+- Only ever like the first photo…
+```
+
+The front matter is a note *about* the policy and never reaches the prompt — the
+instructions below it are what goes in, verbatim, as before. A policy without
+front matter is a policy, unchanged; this is opt-in.
+
+With a goal saved, the goal argument becomes optional, and `--policy` takes a
+bare name meaning that policy in `watch.policies_dir`:
+
+```bash
+adbagent watch --policy hinge --draft
+```
+
+The Watch tab picks between them from a dropdown, and choosing one loads its
+instructions into the editor *and* puts its goal in the goal box. When the two
+drift apart — a one-off start under a different goal — the editor says so and
+offers both ways out rather than choosing for you.
+
 ### It cannot reply twice
 
 The failure that matters is not a wasted step, it is a second message to a real
@@ -666,8 +700,14 @@ something to stop.
 
 ### Watching from the browser
 
-The **Watch** tab starts a watch, edits its policy, and shows what has been sent.
-Three things about it are deliberate:
+The **Watch** tab starts a watch, picks and edits its policy, and shows what has
+been sent. Four things about it are deliberate:
+
+- **The policy picker sets the goal.** Every policy in `watch.policies_dir` is
+  offered with the goal it was written for, and choosing one fills that goal in.
+  **New…** writes a fresh policy there, starting from whatever goal is in the
+  box. A save always stores both halves — instructions and goal — because saving
+  one and not the other is how the pair comes apart.
 
 - **The mode banner is first and filled.** Green for draft, red for live. It is
   the one fact nobody should have to hunt for, and it is repeated in the header
@@ -733,7 +773,7 @@ Each kind of change is applied by the cheapest thing that would work:
 | what changed | what happens |
 | --- | --- |
 | `web/static/*` — the HTML, JS, CSS | the page reloads itself |
-| `config.json`, `skills/*.json`, the reply policy | that panel refetches, and nothing else moves |
+| `config.json`, `skills/*.json`, `policies/*.md` | that panel refetches, and nothing else moves |
 | any `.py` | the server restarts, and the page comes back on it |
 
 The distinction is worth the machinery: the server reads static files, config,

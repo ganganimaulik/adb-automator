@@ -358,6 +358,20 @@ def test_the_ui_watches_everything_the_page_is_made_of(tmp_path):
         "assets", "code", "config", "policy", "skills"]
 
 
+def test_a_policy_arriving_in_the_directory_is_a_policy_change(tmp_path):
+    """The picker lists every policy there is, so one appearing beside the open
+    one is news to the same panel."""
+    policies = tmp_path / "policies"
+    policies.mkdir()
+    reloader = for_ui(tmp_path / "adbagent", policies_dir=policies)
+    reloader.poll()                                   # prime: this is the tree
+    touch(policies / "hinge.md", "be brief")
+    assert [c.kind for c in reloader.poll()] == ["policy"]
+    # And nothing that is not a policy pulls the panel out from under anybody.
+    touch(policies / "notes.rtf")
+    assert reloader.poll() == []
+
+
 def test_a_restart_runs_the_same_command_again(monkeypatch):
     """Same port, same config, same artifacts directory: a server that came back
     on different terms would be a worse answer than not coming back."""

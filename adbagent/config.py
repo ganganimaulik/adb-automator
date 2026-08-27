@@ -369,7 +369,16 @@ class WatchConfig:
     #: File holding the reply instructions, injected verbatim into the prompt.
     #: Required by `adbagent watch` -- there is no default policy, because a
     #: default policy is one nobody wrote and everybody would be surprised by.
+    #:
+    #: One of possibly several: this is the one a bare `adbagent watch` uses and
+    #: the one the UI opens on. The rest live in `policies_dir`, and a policy
+    #: carries the goal it was written for in its own front matter -- see
+    #: `adbagent.policies`.
     policy: str = ""
+    #: Where the other policies live. Listed in the UI's policy picker, and what
+    #: a bare `--policy hinge` is resolved against. Only ever read: nothing here
+    #: decides which policy a watch uses -- `policy` above and `--policy` do.
+    policies_dir: str = "policies"
     #: Refuse to send when the conversation on screen cannot be identified.
     #: Leaving this on trades a missed reply for never sending blind; turning it
     #: off is only sensible while debugging an app whose thread title the parser
@@ -447,6 +456,7 @@ _ENV_MAP = {
     "ADBAGENT_SKILLS_DIR": "skills.skills_dir",
     "ADBAGENT_WATCH_INTERVAL": "watch.interval_s",
     "ADBAGENT_WATCH_POLICY": "watch.policy",
+    "ADBAGENT_WATCH_POLICIES_DIR": "watch.policies_dir",
     "ADBAGENT_WATCH_LEDGER": "watch.ledger",
     "ADBAGENT_WATCH_DRAFT": "watch.draft",
     "ADBAGENT_DISABLE_AUTO_ROTATE": "device.disable_auto_rotate",

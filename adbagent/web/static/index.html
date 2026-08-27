@@ -209,6 +209,16 @@
       <textarea id="watch-goal" rows="2" aria-label="what to watch"
         placeholder="What should it watch? e.g. watch my instagram direct messages"></textarea>
       <div class="optgroups">
+        <!-- Which instructions, and therefore which goal. A policy carries the
+             goal it was written for, so picking one fills the box above: the
+             Hinge policy is only correct under the Hinge goal, and those two
+             were always one decision. -->
+        <fieldset class="optgroup">
+          <legend>Policy</legend>
+          <label class="grow-field">reply instructions
+            <select id="watch-policy-select"></select></label>
+          <button type="button" class="ghost" id="btn-policy-new">New…</button>
+        </fieldset>
         <fieldset class="optgroup guard">
           <legend>Mode</legend>
           <label class="check"><input type="checkbox" id="watch-draft" checked>
@@ -302,6 +312,7 @@
     <div class="panel">
       <div class="panel-head">
         <h3>Reply policy</h3>
+        <span class="small mono" id="policy-editing"></span>
         <span class="grow"></span>
         <button class="primary" id="btn-policy-save">Save policy</button>
       </div>
@@ -309,6 +320,9 @@
         paraphrased. Message text on the phone is data, never an instruction —
         a DM telling the agent to ignore this file is handled under it like any
         other message.</p>
+      <!-- What this policy is for, and whether the goal above still matches the
+           one saved with it. Saving stores both. -->
+      <p class="small" id="policy-goal-note"></p>
       <textarea id="watch-policy" rows="12" spellcheck="false"
         placeholder="Reply only to people I already follow. One short sentence…"></textarea>
       <p class="small mono path" id="watch-policy-path"></p>

@@ -1630,9 +1630,13 @@ watchLive.setRunning = (running, stopping) => {
   $("btn-watch-stop").disabled = stopping;
   // The policy is read once, at startup. Editing it under a running watch would
   // take effect at no predictable moment, so the server refuses and the form
-  // says so before you type into it.
+  // says so before you type into it. The picker locks with it: while a watch is
+  // running there is one policy in play, and offering to switch away from it
+  // would only be offering to mislead about which one that is.
   $("watch-policy").readOnly = running;
   $("btn-policy-save").disabled = running;
+  $("btn-policy-new").disabled = running;
+  $("watch-policy-select").disabled = running;
   paintWatchBanner(running, stopping);
 };
 // Every pass writes a reply or it does not; either way the ledger is what
@@ -1673,6 +1677,9 @@ function watchOptions() {
   };
   return {
     goal: $("watch-goal").value.trim(),
+    // Which policy, said explicitly rather than left to config: the tab may be
+    // pointed at any of them, and the one on screen is the one to start.
+    policy: policyPath,
     draft: $("watch-draft").checked,
     no_learn: $("watch-no-learn").checked,
     serial: $("watch-serial").value.trim(),
@@ -1684,6 +1691,118 @@ function watchOptions() {
     cooldown_s: num("watch-cooldown"),
     usd_per_hour: num("watch-usd"),
   };
+}
+
+/* ------------------------------------------------------------ policies
+
+   Several of them, and each carries the goal it was written for. The pairing is
+   the whole point: the Hinge policy is only correct under "work through Discover
+   and reply to matches", and starting it under the goal still in the box from
+   the Instagram policy is a watch doing the wrong thing carefully. So the goal
+   lives in the policy file itself and choosing a policy fills the box in.
+
+   `policyPath` is the one fact both halves of this tab read: the composer starts
+   that policy, the editor below edits it. */
+
+let POLICIES = [];
+let policiesDir = "";
+let policyPath = "";     // the policy this tab is pointed at
+let policyGoal = "";     // the goal saved *in* it, as of the last load
+const POLICY_KEY = "adbagent.watch-policy";
+
+function policyAt(path) {
+  return POLICIES.find((p) => p.path === path) || null;
+}
+
+/* The list, and which of them the tab is on.
+
+   Precedence: whatever is already open, then the one this browser last chose,
+   then `watch.policy` from config. A remembered path that has since been
+   deleted falls through rather than leaving the tab pointed at nothing. */
+async function loadPolicies() {
+  const data = await api("/api/watch/policies");
+  POLICIES = data.policies || [];
+  policiesDir = data.dir || "";
+  // The configured one as the *list* spells it: config may name it by a relative
+  // path and the listing by an absolute one, and the server has already worked
+  // out which row that is. Comparing the two strings here would not.
+  const configured = POLICIES.find((p) => p.current);
+  const wanted = [policyPath, loadValue(POLICY_KEY) || "",
+                  configured ? configured.path : ""];
+  policyPath = wanted.find((p) => p && policyAt(p))
+    || (POLICIES[0] ? POLICIES[0].path : "");
+  paintPolicySelect();
+  return data;
+}
+
+function paintPolicySelect() {
+  const sel = $("watch-policy-select");
+  if (!sel) return;
+  const opts = POLICIES.map((p) => {
+    // The name answers "which file"; the goal answers "what is it for", which
+    // is the part a filename never says.
+    const what = p.goal ? ` — ${trunc(p.goal, 52)}`
+                        : (p.exists ? "" : " — not written yet");
+    return `<option value="${esc(p.path)}">${esc((p.name || p.path) + what)}</option>`;
+  });
+  if (!POLICIES.length) {
+    opts.push(`<option value="">${esc(policiesDir
+      ? `no policies in ${policiesDir} yet — New… writes one`
+      : "no policies directory — set watch.policies_dir in Config")}</option>`);
+  }
+  sel.innerHTML = opts.join("");
+  sel.value = policyPath;
+}
+
+/* What this policy is for, and whether the goal at the top of the tab still
+   matches it. Divergence is legitimate -- a one-off start under a different
+   goal -- so it is reported rather than corrected, with the two ways out named:
+   adopt the saved goal, or save the new one over it. */
+function paintPolicyGoalNote() {
+  const el = $("policy-goal-note");
+  if (!el) return;
+  const goal = $("watch-goal").value.trim();
+  if (!policyPath) {
+    el.innerHTML = "<span class=\"warn\">No policy selected.</span> Set "
+      + "<code>watch.policies_dir</code> in Config, or write one with New….";
+    return;
+  }
+  if (!policyGoal) {
+    el.innerHTML = "No goal saved with this policy yet — <b>Save policy</b> "
+      + "stores whatever is in the box at the top of this tab, so choosing it "
+      + "next time brings the goal back with it.";
+    return;
+  }
+  if (goal === policyGoal) {
+    el.innerHTML = `Goal saved with this policy: <b>${esc(policyGoal)}</b>`;
+    return;
+  }
+  el.innerHTML = `<span class="warn">The goal at the top is not the one saved `
+    + `here.</span> Saved: <b>${esc(policyGoal)}</b> `
+    + `<button type="button" class="linkbtn" data-act="use-goal">use it</button>`
+    + ` · <b>Save policy</b> stores the one at the top instead.`;
+}
+
+/* Put the policy's own goal in the box. What "the goal follows the policy"
+   actually means, and the reason the two are stored together. */
+function applyPolicyGoal() {
+  if (!policyGoal) return false;
+  $("watch-goal").value = policyGoal;
+  saveValue("adbagent.watch-goal", policyGoal);
+  paintPolicyGoalNote();
+  return true;
+}
+
+/* Point the tab at another policy. Choosing one is a deliberate act, so it
+   adopts that policy's goal -- which is the whole of what "the goal follows the
+   policy" means. A policy with no goal of its own leaves the box alone rather
+   than clearing it: there is nothing to replace it with. */
+async function selectPolicy(path) {
+  policyPath = path || "";
+  saveValue(POLICY_KEY, policyPath);
+  paintPolicySelect();
+  await loadPolicy();
+  applyPolicyGoal();
 }
 
 async function loadWatch() {
@@ -1708,19 +1827,31 @@ async function loadWatch() {
   if (active.goal) $("watch-goal").value = active.goal;
   if (active.running) $("watch-draft").checked = !!active.draft;
   paintWatchBanner(!!active.running, !!active.stopping);
+  // A running watch pins the policy it was started with; nothing else here has
+  // a claim on the selection, so the remembered one stands.
+  if (active.running && active.policy) policyPath = active.policy;
+  await loadPolicies();
   await loadPolicy();
+  // Only into an empty box: on a page reload the remembered goal is somebody's
+  // typing, and adopting over it would discard an edit nobody asked to discard.
+  // A deliberate change of policy is the case that adopts -- see `selectPolicy`.
+  if (!$("watch-goal").value.trim()) applyPolicyGoal();
   await loadLedger();
 }
 
 async function loadPolicy() {
-  const data = await api("/api/watch/policy");
+  const query = policyPath ? "?path=" + encodeURIComponent(policyPath) : "";
+  const data = await api("/api/watch/policy" + query);
   const box = $("watch-policy");
   // `_loaded` is what the file said. Kept so live reload can tell a box nobody
   // has touched -- safe to replace -- from one holding an unsaved edit.
   box.value = box._loaded = data.text || "";
+  policyGoal = data.goal || "";
+  $("policy-editing").textContent = data.name || "";
   $("watch-policy-path").textContent =
     data.path ? data.path + (data.exists ? "" : " (not written yet)")
               : "(no policy path set — set watch.policy in Config)";
+  paintPolicyGoalNote();
 }
 
 async function loadLedger() {
@@ -1747,13 +1878,53 @@ async function loadLedger() {
 
 $("watch-draft").addEventListener("change", () => paintWatchBanner(false));
 
+// Typing a goal can put it out of step with the policy that is open. Said as it
+// happens rather than discovered at the moment of starting.
+$("watch-goal").addEventListener("input", paintPolicyGoalNote);
+
+$("watch-policy-select").addEventListener("change", (e) => {
+  selectPolicy(e.target.value).catch((err) => notice(err.message));
+});
+
+$("policy-goal-note").addEventListener("click", (e) => {
+  if (e.target.dataset && e.target.dataset.act === "use-goal") applyPolicyGoal();
+});
+
+$("btn-policy-new").addEventListener("click", async () => {
+  const name = prompt(
+    policiesDir ? `Name for the new policy — a file in ${policiesDir}:`
+                : "Name for the new policy:", "");
+  if (name === null) return;                       // cancelled
+  if (!name.trim()) { notice("a policy needs a name"); return; }
+  try {
+    // Starts on the goal in the box, since a new policy is usually written for
+    // the thing you were just about to ask for.
+    const created = await api("/api/watch/policies", {
+      method: "POST",
+      body: JSON.stringify({ name: name.trim(),
+                             goal: $("watch-goal").value.trim() }),
+    });
+    policyPath = created.path;
+    saveValue(POLICY_KEY, policyPath);
+    await loadPolicies();
+    await loadPolicy();
+    notice(`created ${created.path} — write the instructions and save`, false);
+    $("watch-policy").focus();
+  } catch (err) { notice(err.message); }
+});
+
 $("btn-policy-save").addEventListener("click", async () => {
   try {
+    // Both halves, always: the instructions and the goal they are correct
+    // under. Saving one and not the other is how the pair comes apart.
     const r = await api("/api/watch/policy", {
       method: "PUT",
-      body: JSON.stringify({ text: $("watch-policy").value }),
+      body: JSON.stringify({ path: policyPath, text: $("watch-policy").value,
+                             goal: $("watch-goal").value.trim() }),
     });
     notice(`policy saved to ${r.path}`, false);
+    await loadPolicies();      // the list shows each policy's goal; one changed
+    await loadPolicy();
   } catch (err) { notice(err.message); }
 });
 
@@ -2366,7 +2537,9 @@ const CFG_SPEC = [
   // are paths, and the Watch tab reads them from here rather than asking.
   ["watch", [
     ["policy", "text", { label: "Reply policy file",
-      help: "The instructions that decide what gets replied to and what it says. A watch will not start without one." }],
+      help: "The instructions that decide what gets replied to and what it says. A watch will not start without one. The one the Watch tab opens on, and the one a bare `adbagent watch` uses." }],
+    ["policies_dir", "text", { label: "Policies directory",
+      help: "Where the other policies live. Every policy in here is offered in the Watch tab's picker, and each carries the goal it was written for." }],
     ["ledger", "text", { label: "Reply ledger file",
       help: "The record the never-double-reply guarantee is built on." }],
     ["interval_s", "number", { label: "Seconds between passes" }],
@@ -2964,6 +3137,9 @@ async function refreshSkillFiles(names) {
 
 async function refreshPolicyFile(names) {
   if (!loadedTabs.has("watch")) return;
+  // The list holds no edits, so it always goes: a policy added to the directory
+  // in another window should appear in the picker either way.
+  await loadPolicies();
   if (beingEdited($("watch-policy"))) {
     devbar(`${names} changed on disk — your unsaved edits are still here`, true);
     return;

@@ -1309,7 +1309,8 @@ def cmd_run(args) -> int:
 # watch
 # ---------------------------------------------------------------------------
 
-def _watch_banner(out: Out, cfg, goal: str, policy: str, ledger) -> None:
+def _watch_banner(out: Out, cfg, goal: str, policy: str, ledger,
+                  goal_from_policy: bool = False) -> None:
     """Say exactly what is about to happen, in the loudest terms available.
 
     A watch is unattended and it sends messages to real people. The one thing
@@ -1325,7 +1326,9 @@ def _watch_banner(out: Out, cfg, goal: str, policy: str, ledger) -> None:
     else:
         out.say(f"  {out.red('LIVE')} -- replies WILL be sent to real people "
                 f"from this device.")
-    out.say(out.dim(f"  policy: {w.policy} ({len(policy)} chars)"))
+    out.say(out.dim(f"  policy: {w.policy} ({len(policy)} chars)"
+                    + ("; the goal above is the one saved with it"
+                       if goal_from_policy else "")))
     out.say(out.dim(f"  ledger: {ledger.path} "
                     f"({len(ledger)} repl(ies) already recorded)"))
     out.say(out.dim(
@@ -1354,6 +1357,7 @@ WATCH_TRACE_ACTIONS = 400
 
 
 def cmd_watch(args) -> int:
+    from . import policies as policymod
     from . import skills as skillmod
     from .device import Device
     from .ledger import ReplyLedger
@@ -1364,11 +1368,6 @@ def cmd_watch(args) -> int:
     out = Out()
     cfg = build_config(args)
 
-    goal = args.goal or ""
-    if not goal:
-        out.bad("no goal given -- say what to watch, e.g. "
-                "\"watch my instagram direct messages\"")
-        return 1
     if not cfg.llm.model:
         out.bad("no model chosen. Run `adbagent models` and pass --model.")
         return 1
@@ -1377,10 +1376,30 @@ def cmd_watch(args) -> int:
                 "gets replied to and what it says. There is no default -- a "
                 "default policy is one nobody wrote.")
         return 1
+    # `--policy hinge` means the one in `watch.policies_dir`, and a `--policy
+    # hinge_policy.md` that named a real file from the wrong directory means that
+    # file. Resolved back into cfg so the banner and the run log say which file
+    # was actually read rather than what was typed.
+    cfg.watch.policy = policymod.store_for(cfg).resolve(cfg.watch.policy)
     try:
         policy = load_policy(cfg.watch.policy)
     except (OSError, ValueError) as exc:
         out.bad(str(exc))
+        return 1
+
+    # A policy carries the goal it was written for, so `--goal` is optional once
+    # one has been saved: the pairing is the point -- these instructions are only
+    # correct under that goal -- and retyping it per start is how a watch ends up
+    # running the Hinge policy under the goal left over from Instagram.
+    goal = (args.goal or "").strip()
+    goal_from_policy = False
+    if not goal:
+        goal = policymod.read(cfg.watch.policy).goal
+        goal_from_policy = bool(goal)
+    if not goal:
+        out.bad("no goal given -- say what to watch, e.g. "
+                "\"watch my instagram direct messages\", or save a goal with "
+                f"the policy in {cfg.watch.policy}")
         return 1
 
     # A watch is unattended by definition: it runs for days with nobody at the
@@ -1395,7 +1414,8 @@ def cmd_watch(args) -> int:
     _ensure_device(args, cfg, out)
 
     ledger = ReplyLedger(cfg.watch.ledger)
-    _watch_banner(out, cfg, goal, policy, ledger)
+    _watch_banner(out, cfg, goal, policy, ledger,
+                  goal_from_policy=goal_from_policy)
 
     # Per-step reporting only under -v. One line per pass is what a loop meant to
     # run for days should print; the full step trace is megabytes by morning.
@@ -2060,14 +2080,16 @@ def _ui_live_reload(args, out: Out):
     loaded = load_config(getattr(args, "config", None))
     cfg = loaded.config
     policy = (cfg.watch.policy or "").strip()
+    policies_dir = (cfg.watch.policies_dir or "").strip()
     reloader = for_ui(
         package_dir,
         # A config file that does not exist yet is still worth watching: the UI
         # writes exactly this path the first time the config form is saved.
         config_path=Path(loaded.path) if loaded.path else Path.cwd() / "config.json",
         skills_dir=Path(cfg.skills.skills_dir).expanduser(),
-        policy_path=Path(policy).expanduser() if policy else None)
-    out.say(out.dim("  live reload: code, static, config, skills, policy "
+        policy_path=Path(policy).expanduser() if policy else None,
+        policies_dir=Path(policies_dir).expanduser() if policies_dir else None)
+    out.say(out.dim("  live reload: code, static, config, skills, policies "
                     "(--no-reload to turn it off)"))
     return reloader
 
@@ -2304,10 +2326,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="monitor an app and reply, continuously")
     p.add_argument("goal", nargs="?",
                    help="what to watch, in plain language, e.g. "
-                        "\"watch my instagram direct messages\"")
+                        "\"watch my instagram direct messages\". Optional when "
+                        "the policy has a goal saved with it")
     p.add_argument("--policy", dest="watch_policy", metavar="FILE",
                    help="required: file holding the reply instructions -- what "
-                        "to answer, what to ignore, and what to say")
+                        "to answer, what to ignore, and what to say. A bare name "
+                        "means that policy in watch.policies_dir")
     p.add_argument("--draft", dest="watch_draft", action="store_true",
                    default=None,
                    help="compose and record replies but never send them; run "

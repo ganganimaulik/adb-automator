@@ -301,8 +301,17 @@ fieldset.optgroup > label.check {
 }
 .opts label.check { min-height: var(--field-h); }
 
+/* A field whose value is prose rather than a number -- a policy name and the
+   goal beside it -- needs the room the shared 210px basis denies it. */
+fieldset.optgroup > label.grow-field { flex: 3 1 240px; max-width: none; }
+
+/* A button among fields belongs on the inputs' line, not centred against the
+   captions above them. */
+fieldset.optgroup > button { align-self: flex-end; flex: 0 0 auto; }
+
 fieldset.optgroup input[type="number"],
-fieldset.optgroup input[type="text"] { width: 100%; }
+fieldset.optgroup input[type="text"],
+fieldset.optgroup select { width: 100%; }
 input[type="checkbox"] { accent-color: var(--accent); flex: 0 0 auto; }
 
 .opts {
@@ -382,6 +391,21 @@ button.danger { background: none; color: var(--red); border-color: var(--red); }
 button.danger:hover:not(:disabled) { background: #f8514915; }
 button.ghost { background: var(--bg-raise); color: var(--text); }
 button.ghost:hover { background: var(--bg-hover); }
+
+/* An action offered inside a sentence -- "use it", where "it" is the goal the
+   sentence just quoted. A real button, because it does something; shaped like
+   the text around it, because a padded control mid-paragraph reads as the end
+   of the paragraph. */
+button.linkbtn {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+}
+button.linkbtn:hover { color: #79b8ff; }
 
 /* Keyboard focus was the one state nothing on the page drew: inputs had a ring,
    every button and row had none. */

@@ -959,3 +959,63 @@ def test_the_ui_tells_the_app_the_moment_the_interrupt_lands(monkeypatch, tmp_pa
     assert made["app"].state.shutting_down.is_set()          # and the app was told
     # A shutdown that somehow misses the handler still cannot hang forever.
     assert made["kw"]["timeout_graceful_shutdown"] == 20
+
+
+# ---------------------------------------------------------------------------
+# watch: the policy names the file, and carries the goal it was written for
+# ---------------------------------------------------------------------------
+
+class _Banner(Exception):
+    """Stops `cmd_watch` where it would otherwise reach for a phone."""
+
+    def __init__(self, goal, policy, from_policy):
+        self.goal, self.policy, self.from_policy = goal, policy, from_policy
+
+
+def _watch_upto_banner(tmp_path, monkeypatch, argv):
+    """Run `cmd_watch` as far as the banner and report what it resolved."""
+    from adbagent import cli
+    from adbagent import policies
+
+    (tmp_path / "policies").mkdir(exist_ok=True)
+    (tmp_path / "policies" / "hinge.md").write_text(
+        policies.with_front_matter({"goal": "work through the feed"},
+                                   "- only like the first photo"),
+        encoding="utf-8")
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"watch": {"policies_dir": str(tmp_path / "policies")}}),
+        encoding="utf-8")
+
+    monkeypatch.setattr(cli, "_ensure_device", lambda args, cfg, out: None)
+    monkeypatch.setattr(cli, "_watch_banner",
+                        lambda out, cfg, goal, policy, ledger, **kw: (_ for _ in ()).throw(
+                            _Banner(goal, cfg.watch.policy,
+                                    kw.get("goal_from_policy", False))))
+    return cli.cmd_watch(parse(argv + ["-c", str(tmp_path / "config.json"),
+                                       "--model", "m"]))
+
+
+def test_watch_takes_its_goal_from_the_policy(tmp_path, monkeypatch):
+    """A bare name means that policy in the policies directory, and its own goal
+    is the one to run it under -- the two were always one decision."""
+    with pytest.raises(_Banner) as caught:
+        _watch_upto_banner(tmp_path, monkeypatch, ["watch", "--policy", "hinge"])
+    assert caught.value.goal == "work through the feed"
+    assert caught.value.from_policy is True
+    assert caught.value.policy.endswith("hinge.md")
+
+
+def test_an_explicit_goal_still_wins_over_the_policys(tmp_path, monkeypatch):
+    with pytest.raises(_Banner) as caught:
+        _watch_upto_banner(tmp_path, monkeypatch,
+                           ["watch", "something else", "--policy", "hinge"])
+    assert caught.value.goal == "something else"
+    assert caught.value.from_policy is False
+
+
+def test_watch_with_no_goal_anywhere_still_refuses(tmp_path, monkeypatch, capsys):
+    (tmp_path / "bare.md").write_text("be brief", encoding="utf-8")
+    code = _watch_upto_banner(tmp_path, monkeypatch,
+                              ["watch", "--policy", str(tmp_path / "bare.md")])
+    assert code == 1
+    assert "no goal given" in capsys.readouterr().out

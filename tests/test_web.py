@@ -74,7 +74,12 @@ def web(tmp_path, monkeypatch):
     skills = tmp_path / "skills"
     skills.mkdir()
     config = tmp_path / "config.json"
-    config.write_text("{}", encoding="utf-8")
+    # `watch.policies_dir` defaults to `policies`, which is a real directory in
+    # this checkout: left alone, the policy endpoints would list -- and be
+    # allowed to write -- the project's own policies from a test.
+    config.write_text(json.dumps(
+        {"watch": {"policies_dir": str(tmp_path / "policies")}}),
+        encoding="utf-8")
     monkeypatch.setenv("ADBAGENT_MODEL", "")  # keep env out of the way
     app = create_app(artifacts_dir=str(runs), skills_dir=str(skills),
                      config_path=str(config))
@@ -1575,8 +1580,141 @@ def test_policy_cannot_be_edited_under_a_running_watch(web, tmp_path, monkeypatc
 
 
 def test_policy_with_no_path_anywhere_is_a_bad_request(web, tmp_path):
-    _configure_watch(tmp_path, policy="")
+    _configure_watch(tmp_path, policy="", policies_dir="")
     assert web.put("/api/watch/policy", json={"text": "hi"}).status_code == 400
+
+
+# -- several policies, each with the goal it was written for -----------------
+
+def _write_policy(tmp_path, name, goal="", body="be brief") -> Path:
+    """A policy in the tmp policies directory, in the file format on disk."""
+    from adbagent import policies as policymod
+    d = tmp_path / "policies"
+    d.mkdir(exist_ok=True)
+    path = d / f"{name}.md"
+    path.write_text(policymod.with_front_matter({"goal": goal}, body),
+                    encoding="utf-8")
+    return path
+
+
+def test_policies_are_listed_with_the_goal_each_was_written_for(web, tmp_path):
+    """The goal travels with the row: it is what the picker shows, and what
+    choosing a policy fills the goal box in with."""
+    _write_policy(tmp_path, "hinge", goal="work through the feed")
+    _write_policy(tmp_path, "insta", goal="watch my dms")
+    _configure_watch(tmp_path, policy=str(tmp_path / "policies" / "hinge.md"))
+
+    body = web.get("/api/watch/policies").json()
+    rows = {p["name"]: p for p in body["policies"]}
+    assert set(rows) == {"hinge", "insta"}
+    assert rows["hinge"]["goal"] == "work through the feed"
+    assert rows["insta"]["goal"] == "watch my dms"
+    # Which one config names, said by the server: the two may be spelled
+    # differently (relative here, absolute there) and name one file.
+    assert rows["hinge"]["current"] is True and rows["insta"]["current"] is False
+
+
+def test_the_editor_gets_the_instructions_without_the_front_matter(web, tmp_path):
+    path = _write_policy(tmp_path, "hinge", goal="work the feed",
+                         body="# Hinge\n\n- be brief")
+    _configure_watch(tmp_path, policy=str(path))
+    body = web.get("/api/watch/policy").json()
+    assert body["goal"] == "work the feed"
+    assert body["text"] == "# Hinge\n\n- be brief"
+    assert "goal:" not in body["text"]
+
+
+def test_a_named_policy_can_be_read_and_written(web, tmp_path):
+    """Several policies means the browser sends which one, on every call."""
+    one = _write_policy(tmp_path, "one", goal="goal one")
+    two = _write_policy(tmp_path, "two", goal="goal two")
+    _configure_watch(tmp_path, policy=str(one))
+
+    assert web.get("/api/watch/policy",
+                   params={"path": str(two)}).json()["goal"] == "goal two"
+    res = web.put("/api/watch/policy",
+                  json={"path": str(two), "text": "say less",
+                        "goal": "goal two, revised"})
+    assert res.status_code == 200
+    from adbagent import policies as policymod
+    reread = policymod.read(two)
+    assert reread.goal == "goal two, revised" and reread.body == "say less"
+    # And the other one is untouched.
+    assert policymod.read(one).goal == "goal one"
+
+
+def test_saving_a_policy_outside_the_directory_is_refused(web, tmp_path):
+    """The browser sends a path now, so the endpoint cannot write to whatever
+    arrives: a save lands in the policies directory or on the configured file."""
+    _configure_watch(tmp_path, policy=str(_write_policy(tmp_path, "hinge")))
+    res = web.put("/api/watch/policy",
+                  json={"path": str(tmp_path / "elsewhere.md"), "text": "hi"})
+    assert res.status_code == 400
+    assert "outside the policies directory" in res.json()["detail"]
+    assert not (tmp_path / "elsewhere.md").exists()
+
+
+def test_a_new_policy_starts_from_the_goal_in_the_box(web, tmp_path):
+    _configure_watch(tmp_path)
+    res = web.post("/api/watch/policies",
+                   json={"name": "insta", "goal": "watch my dms"})
+    assert res.status_code == 200
+    created = res.json()
+    assert created["name"] == "insta" and created["goal"] == "watch my dms"
+    assert Path(created["path"]) == tmp_path / "policies" / "insta.md"
+    assert created["body"], "a new policy starts with something to fill in"
+    assert web.get("/api/watch/policy",
+                   params={"path": created["path"]}).json()["goal"] == "watch my dms"
+
+
+def test_a_new_policy_never_overwrites_one(web, tmp_path):
+    _write_policy(tmp_path, "hinge", goal="the original")
+    _configure_watch(tmp_path)
+    res = web.post("/api/watch/policies", json={"name": "hinge"})
+    assert res.status_code == 409
+    from adbagent import policies as policymod
+    assert policymod.read(tmp_path / "policies" / "hinge.md").goal == "the original"
+
+
+def test_a_new_policy_cannot_escape_the_directory(web, tmp_path):
+    _configure_watch(tmp_path)
+    res = web.post("/api/watch/policies", json={"name": "../escape"})
+    # Either the name is scrubbed into the directory or it is refused outright;
+    # what must not happen is a file above it.
+    if res.status_code == 200:
+        assert Path(res.json()["path"]).parent == tmp_path / "policies"
+    else:
+        assert res.status_code == 400
+    assert not (tmp_path / "escape.md").exists()
+
+
+def test_a_watch_started_with_no_goal_uses_the_policys_own(web, tmp_path,
+                                                            monkeypatch):
+    """The pairing, at the point it matters: these instructions are only correct
+    under that goal, so the goal comes from the policy rather than the box."""
+    path = _write_policy(tmp_path, "hinge", goal="work through the feed")
+    _configure_watch(tmp_path, policy=str(path))
+    spawned = []
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: spawned.append(
+                            FakeProc(argv, stay_running=True, **kw))
+                        or spawned[-1])
+    assert web.post("/api/watch", json={"goal": ""}).status_code == 200
+    assert "work through the feed" in spawned[0].argv
+
+
+def test_a_watch_can_name_the_policy_to_start(web, tmp_path, monkeypatch):
+    _configure_watch(tmp_path, policy=str(_write_policy(tmp_path, "hinge")))
+    other = _write_policy(tmp_path, "insta", goal="watch my dms")
+    spawned = []
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: spawned.append(
+                            FakeProc(argv, stay_running=True, **kw))
+                        or spawned[-1])
+    res = web.post("/api/watch", json={"goal": "", "policy": str(other)})
+    assert res.status_code == 200
+    assert str(other) in spawned[0].argv
+    assert "watch my dms" in spawned[0].argv
 
 
 # -- the reply ledger -------------------------------------------------------
