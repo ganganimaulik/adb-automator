@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from . import runlog
+from .plan import DEFAULT_STATUS, Step, normalise_status
 from .scratchpad import Entry, normalise_key
 
 log = logging.getLogger("adbagent.checkpoint")
@@ -103,7 +104,20 @@ def save(cfg: Any, state: Any) -> None:
             ],
             "evicted": state.scratchpad.evicted,
         },
-        "progress_log": state.progress_log,
+        # `credited` goes with the steps, and is the reason this is not just a
+        # list of statuses. Without it a resumed run could be paid a second time
+        # for every step it had already finished -- one free stall-ladder reset
+        # per completed step, handed over at exactly the point a run is most
+        # likely to be in trouble.
+        "plan": {
+            "steps": [
+                {"id": s.id, "text": s.text, "status": s.status,
+                 "first_step": s.first_step, "last_step": s.last_step}
+                for s in state.plan.entries.values()
+            ],
+            "credited": sorted(state.plan.credited),
+            "refused": state.plan.refused,
+        },
         "packages": sorted(state.packages),
         "package_steps": state.package_steps,
         # A whole item ledger used to be persisted here -- per-item captions,
@@ -183,7 +197,26 @@ def restore(state: Any, data: Dict[str, Any]) -> None:
     state.last_progress = str(data.get("last_progress") or "the run was resumed")
     state.strategy = str(data.get("strategy") or "")
     state.replanned_at = int(data.get("replanned_at") or 0)
-    state.progress_log = [str(line) for line in data.get("progress_log") or []]
+    plan = data.get("plan") or {}
+    for raw in plan.get("steps") or []:
+        sid = str(raw.get("id") or "")
+        if not sid:
+            continue
+        state.plan.entries[normalise_key(sid)] = Step(
+            id=sid, text=str(raw.get("text") or ""),
+            status=normalise_status(raw.get("status")) or DEFAULT_STATUS,
+            first_step=int(raw.get("first_step") or 0),
+            last_step=int(raw.get("last_step") or 0))
+    state.plan.credited = {normalise_key(c) for c in plan.get("credited") or []
+                           if str(c).strip()}
+    state.plan.refused = int(plan.get("refused") or 0)
+    # A checkpoint written before the plan existed carries `progress_log`, a
+    # one-element list of the free-text status. It restores the way a model
+    # writing prose does today -- into the one entry that is never credited --
+    # so resuming an older run keeps its working memory instead of dropping it.
+    if not state.plan.entries:
+        for line in data.get("progress_log") or []:
+            state.plan.update(str(line), 0)
     state.packages = set(data.get("packages") or [])
     state.package_steps = {str(k): int(v)
                            for k, v in (data.get("package_steps") or {}).items()}

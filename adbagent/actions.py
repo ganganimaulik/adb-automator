@@ -56,6 +56,12 @@ ScrollDir = Literal["down", "up", "left", "right"]
 PostKind = Literal["screen_changed", "element_state", "text_present",
                    "app_is", "noop_ok"]
 
+#: Where a sub-step of the goal has got to. Mirrors :data:`plan.STATUSES`; the
+#: aliases a model reaches for instead ("completed", "in progress") are folded
+#: into these by `plan.normalise_status` rather than being listed here, which
+#: would put four spellings of "done" in front of a constrained decoder.
+PlanStatus = Literal["pending", "active", "done", "blocked"]
+
 TERMINAL_ACTIONS = frozenset({"done", "fail", "ask_user"})
 #: Actions whose whole purpose is to move to a different screen.
 NAVIGATIONAL = frozenset({"tap", "tap_at", "long_press", "long_press_at",
@@ -145,6 +151,36 @@ class Note(BaseModel):
         description="The fact itself, e.g. \"chicken 425g (+1g vs menu 424g)\".")
 
 
+class PlanStep(BaseModel):
+    """One sub-step of the goal, and where the run has got to with it.
+
+    The same delta contract as `Note`, for the same reason: the model sends only
+    the steps that are new or whose status changed, and the harness maintains the
+    plan across turns (see :mod:`plan`). Reusing an id updates that step; an id
+    never sent again keeps the status it had.
+
+    Unlike `Note`, this one is *credited*: a step declared on an earlier turn and
+    later marked ``done`` resets the stall ladder, once. The rules that keep that
+    un-gameable live in :mod:`plan`, not here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(
+        description="Short stable identifier for this sub-step (e.g. \"1\", "
+                    "\"open app\", \"send\"). Reuse the SAME id to update a "
+                    "step you already declared.")
+    text: str = Field(
+        "",
+        description="What the sub-step is, in a few words. Send it once, when "
+                    "you first declare the step.")
+    status: Optional[PlanStatus] = Field(
+        None,
+        description="pending (still to do), active (doing it now), done "
+                    "(finished), blocked (cannot proceed). Omit to leave a "
+                    "step's status as it was.")
+
+
 class AgentAction(BaseModel):
     """One step. The model replies with exactly this object and nothing else."""
 
@@ -224,9 +260,12 @@ class AgentAction(BaseModel):
                     "harness keeps every record you have ever sent, so never "
                     "restate ones already listed under COLLECTED DATA. See DATA "
                     "COLLECTION above.")
-    progress: Optional[str] = Field(
+    progress: Optional[List[PlanStep]] = Field(
         None,
-        description="Multi-step progress tracker. See PROGRESS TRACKING above.")
+        description="NEW or CHANGED plan steps only, as {id, text, status}. The "
+                    "harness keeps the whole plan for you, so never restate a "
+                    "step whose status has not changed. See PROGRESS TRACKING "
+                    "above.")
 
     @field_validator("notes", mode="before")
     @classmethod
@@ -244,6 +283,39 @@ class AgentAction(BaseModel):
             return [{"key": key, "value": text}
                     for key, text in as_records(value)] or None
         return value
+
+    @field_validator("progress", mode="before")
+    @classmethod
+    def _accept_prose_progress(cls, value: object) -> object:
+        """Take a bare string where plan steps were asked for.
+
+        The same two callers `_accept_prose_notes` covers, and one extra
+        consequence. A model that writes ``"Done: opened app. Next: send"`` is
+        not rejected into a repair round-trip, and every action in a recording
+        made before the schema changed still loads.
+
+        The prose is *not* split into steps. "Done: opened app, found contact"
+        has real structure and no reliable delimiter -- the comma separates two
+        finished steps here and nothing at all in "chicken 425g, rice 290g" --
+        and a step list guessed wrong is worse than none, because the harness
+        credits step completions. So it lands whole in the one reserved entry
+        `plan.PROSE_ID`, which is overwritten each turn and can never be marked
+        done, and therefore never buys the stall ladder anything. That is
+        exactly the behaviour the field had before this change.
+
+        Every shape goes through `plan.as_steps`, not just the prose, so that a
+        model writing ``"completed"`` or ``"in progress"`` where the schema names
+        four exact strings is folded into one of them instead of failing
+        validation and buying a repair round-trip. A status that means nothing at
+        all becomes `None`, which the ledger reads as "no status change" -- the
+        safe reading, since demoting a step to ``pending`` because its status was
+        misspelt would undo real progress.
+        """
+        if value is None:
+            return None
+        from .plan import as_steps
+        return [{"id": sid, "text": text, "status": status or None}
+                for sid, text, status in as_steps(value)] or None
 
     @model_validator(mode="after")
     def _check_arguments(self) -> "AgentAction":

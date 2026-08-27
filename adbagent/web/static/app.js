@@ -342,6 +342,11 @@ const NOTE_LINES = {
   replan: (e) => `stalled ${e.stalled} steps — new approach: ${e.strategy || "?"}`,
   replan_failed: (e) => `replan produced nothing usable (${e.error || "?"})`,
   scratchpad: (e) => `collected: ${(e.keys || []).join(", ")} (${e.total} total)`,
+  // `completed` is called out on its own because it is the only part of a plan
+  // change that moved the stall ladder -- see `plan.py`.
+  plan: (e) => `plan: ${e.done}/${e.total} done` +
+    ((e.completed || []).length ? ` — finished ${e.completed.join(", ")}` : "") +
+    (e.refused ? ` (${e.refused} step(s) refused, plan at its cap)` : ""),
   dead_ends: (e) => `dead ends avoided: ${(e.remembered || []).join(", ")}`,
   // Was reaching the feed as the bare word `goal_check`, with the model's own
   // account of what was still missing thrown away.
@@ -419,6 +424,27 @@ function finalizeNotes(feed) {
     card.open = false;
     feed._notesCard = null;
   }
+}
+
+/* The plan, in the two shapes it arrives in.
+
+   `progress` on a `decide` action is a *delta* -- the steps that changed this
+   turn -- and a checklist is the wrong picture of it: `[ ] send the summary`
+   beside two steps means "these two changed", not "one of two is left". So a
+   delta renders as what changed, and only the `plan` event, which carries the
+   whole ledger, renders as a checklist. */
+const PLAN_MARK = {done: "[x]", active: "[>]", blocked: "[!]", pending: "[ ]"};
+
+function planDelta(steps) {
+  return (steps || [])
+    .map((s) => (s.status ? `${s.text || s.id}: ${s.status}` : (s.text || s.id)))
+    .filter(Boolean).join("; ");
+}
+
+function planText(steps) {
+  return (steps || [])
+    .map((s) => `${PLAN_MARK[s.status] || PLAN_MARK.pending} ${s.text || s.id}`)
+    .join("\n");
 }
 
 /* Fold a `scratchpad` event into the feed's union, and return the per-step
@@ -619,13 +645,14 @@ function foldEvent(ev, feed) {
       why.textContent = a.reasoning;
       node.more.appendChild(why);
     }
-    // The model's own plan for the goal, which it rewrites as it goes. Pinned
-    // above the feed as well, since the card carrying it is twenty steps back by
-    // the time anyone asks.
-    if (a.progress) {
+    // What this step changed about the plan. The plan itself is pinned above
+    // the feed, off the `plan` event -- the card carrying a change is twenty
+    // steps back by the time anyone asks what the run is up to.
+    const delta = planDelta(a.progress);
+    if (delta) {
       const plan = document.createElement("div");
       plan.className = "plan";
-      plan.textContent = a.progress;
+      plan.textContent = delta;
       node.more.appendChild(plan);
     }
     const meta = document.createElement("div");
@@ -762,8 +789,14 @@ function updateCountersFromEvent(ev, v) {
   if (ev.kind === "scratchpad" && typeof ev.total === "number") {
     v.records = ev.total;
   }
+  // The plan event carries the whole ledger, so the readout is a straight
+  // assignment rather than a union the client has to maintain -- the same
+  // arrangement as `scratchpad.total` above, and for the same reason: the
+  // harness owns how two spellings of one step become one entry.
+  if (ev.kind === "plan") {
+    v.progress = planText(ev.steps);
+  }
   if (ev.kind === "decide") {
-    if ((ev.action || {}).progress) v.progress = ev.action.progress;
     // The first of the three primary readouts: what it is doing, in the words
     // the action itself is written in.
     v.now = actionSummary(ev.action, ev.target_element) || v.now;

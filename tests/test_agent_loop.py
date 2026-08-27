@@ -936,23 +936,35 @@ def test_a_blind_decider_is_given_no_frame_of_its_own(cfg, mem, tmp_path):
     assert starts and all(r["shot"] == "" for r in starts)
 
 
-def test_progress_log_retains_only_latest():
+def test_the_plan_accumulates_instead_of_being_overwritten():
+    """A step the model stops mentioning is still in the plan.
+
+    This is the property the old field did not have. `progress` was one string
+    the model rewrote from scratch every turn and `progress_log` was assigned a
+    fresh one-element list from it, so a sub-step dropped from the rewrite was
+    gone -- the same failure `scratchpad` was rebuilt to make unrepresentable,
+    left in place for the one field nothing was checking.
+    """
     from adbagent.agent import RunState
     from adbagent.actions import AgentAction
 
     state = RunState(goal="multi step test", run_id="r1", intent_id="i1")
 
-    act1 = AgentAction(action="wait", observation="step 1", reasoning="r1", progress="Step 1 done")
-    act2 = AgentAction(action="wait", observation="step 2", reasoning="r2", progress="Step 2 done")
+    declare = AgentAction(action="wait", observation="s1", reasoning="r1",
+                          progress=[{"id": "1", "text": "open the app"},
+                                    {"id": "2", "text": "find the contact"},
+                                    {"id": "3", "text": "send the message"}])
+    # A turn that mentions one step and says nothing about the other two.
+    finish_one = AgentAction(action="wait", observation="s2", reasoning="r2",
+                             progress=[{"id": "1", "status": "done"}])
 
-    for act in [act1, act2]:
-        if getattr(act, "progress", None):
-            prog_text = act.progress.strip()
-            if prog_text:
-                state.progress_log = [prog_text]
-                state.progress_chars = len(prog_text)
+    state.plan.update(declare.progress, 1)
+    state.plan.update(finish_one.progress, 2)
 
-    assert state.progress_log == ["Step 2 done"]
+    assert state.plan.plain() == ("[x] open the app\n"
+                                 "[ ] find the contact\n"
+                                 "[ ] send the message")
+    assert state.plan.outstanding() == ["find the contact", "send the message"]
 
 
 def test_list_apps_in_agent_loop(cfg, mem):
@@ -1791,7 +1803,10 @@ def test_rewording_the_progress_note_does_not_buy_the_run_more_time(cfg, mem, tm
     def policy(screen, llm):
         action = inner(screen, llm)
         # Same two-cycle as ever, plus a fresh progress sentence every turn.
-        return action.model_copy(update={"progress": next(reworded)})
+        # Re-validated rather than `model_copy`d, so the prose goes through the
+        # same validator a model's reply would -- which is the thing under test.
+        return AgentAction.model_validate(
+            {**action.model_dump(), "progress": next(reworded)})
 
     outcome, state = Agent(dev, mem, llm := fake.FakeLLM(dev, policy), cfg).run(GOAL)
 
@@ -1799,8 +1814,59 @@ def test_rewording_the_progress_note_does_not_buy_the_run_more_time(cfg, mem, tm
     kinds = [e["kind"] for e in _events(tmp_path, state.run_id)]
     assert "stalled_out" in kinds, "rewording the progress note kept the run alive"
     assert state.step < 20, f"took {state.step} steps to notice"
-    # The note itself is still working memory and still reaches the model.
-    assert state.progress_log and "attempt number" in state.progress_log[0]
+    # The note itself is still working memory and still reaches the model. It
+    # lands in the one reserved entry prose goes to, which is overwritten rather
+    # than accumulated and can never be marked done -- so 15 rewrites are one
+    # line, and none of them is a step the ladder could be paid for.
+    assert "attempt number" in state.plan.plain()
+    assert len(state.plan) == 0 and state.plan.credited == set()
+
+
+def test_finishing_a_plan_step_resets_the_stall_ladder(cfg, mem, tmp_path):
+    """The other half of the change: a real milestone must count as progress.
+
+    Every signal `note_progress` listens to is about the device -- a screen not
+    seen before, content that moved, a setting that flipped -- or about data
+    collection. None is about the goal's own structure, so a run working
+    steadily through a plan in an app it has already mapped reads as a stall and
+    is stopped by the same ladder that exists to catch a two-cycle going nowhere.
+
+    So this is the two-cycle from the test above, unchanged and still learning
+    nothing about the device, except that it finishes one plan step every third
+    turn. It must outlive `stall_give_up_at`, which the bare two-cycle does not.
+    """
+    cfg.run.max_steps = 40
+    dev = fake.FakeDevice(cfg)
+    inner = _two_cycle_policy(dev)
+    turn = {"n": 0}
+
+    def policy(screen, llm):
+        turn["n"] += 1
+        action = inner(screen, llm)
+        if turn["n"] == 1:
+            progress = [{"id": str(n), "text": f"step {n}"} for n in range(1, 9)]
+        elif turn["n"] % 3 == 0:
+            progress = [{"id": str(turn["n"] // 3), "status": "done"}]
+        else:
+            return action
+        return AgentAction.model_validate(
+            {**action.model_dump(), "progress": progress})
+
+    outcome, state = Agent(dev, mem, llm := fake.FakeLLM(dev, policy), cfg).run(GOAL)
+
+    kinds = [e["kind"] for e in _events(tmp_path, state.run_id)]
+    assert "stalled_out" not in kinds, "a run finishing plan steps was stopped"
+    assert state.step > cfg.run.stall_give_up_at, \
+        f"gave up after {state.step} steps despite finishing plan steps"
+    assert state.plan.done_count >= 4
+    # Credited for what it finished, and only for that.
+    assert state.plan.credited == {s.id for s in state.plan.steps
+                                   if s.status == "done"}
+    # The turn that declared all eight is the one a model would use to buy time,
+    # and it bought none: the first plan event completes nothing.
+    plans = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "plan"]
+    assert plans[0]["total"] == 8 and plans[0]["completed"] == []
+    assert sum(len(e["completed"]) for e in plans) == state.plan.done_count
 
 
 def test_one_stall_episode_can_buy_more_than_one_replan(cfg, mem, tmp_path):

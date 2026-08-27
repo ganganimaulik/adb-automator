@@ -926,8 +926,9 @@ details.card summary:hover { color: var(--text); }
 
 .notes-note { margin-top: 6px; font-size: 11px; color: var(--yellow); }
 
-/* The model's note on where it is in the goal, above the feed rather than in it:
-   the card that carried it is twenty cards back by the time anyone asks. */
+/* The plan the run is working through, above the feed rather than in it: the
+   card that changed a step is twenty cards back by the time anyone asks. The
+   whole checklist, not the last change -- the feed carries the changes. */
 .progress-note {
   border: 1px solid var(--border);
   border-left: 3px solid var(--purple);
@@ -941,7 +942,7 @@ details.card summary:hover { color: var(--text); }
 }
 
 .progress-note::before {
-  content: "progress";
+  content: "plan";
   display: block;
   font-family: var(--mono);
   font-size: 10px;

@@ -523,9 +523,11 @@ def test_decide_messages_cache_friendly_structure(monkeypatch):
     assert "Device: 720x1600 px" in msgs[1]["content"]
     assert msgs[2]["content"] == "GOAL: test goal"
     assert msgs[3]["content"] == "HISTORY (oldest first):\n1. tap #1"
-    # The ledger renders its own header, so the block carries it through verbatim.
+    # Both ledgers render their own header, so the block carries them through
+    # verbatim -- `state_block` labels neither, because an instruction about a
+    # list belongs beside the list rather than in a wrapper one layer up.
     assert "collected notes" in msgs[4]["content"]
-    assert "YOUR PROGRESS" in msgs[4]["content"]
+    assert "step 1 done" in msgs[4]["content"]
     assert "CURRENT SCREEN:\nscreen 1" in msgs[5]["content"][0]["text"]
 
 
