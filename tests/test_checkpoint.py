@@ -62,7 +62,9 @@ def populated_state() -> RunState:
     state.scroll_warnings = 1
     state.scratchpad.update([{"key": "9:30", "value": "water 275g"}], step=3)
     state.scratchpad.update([{"key": "9:30", "value": "water 280g"}], step=5)
-    state.progress_log.append("read 3 of 5 items")
+    state.plan.update([{"id": "read", "text": "read 5 items"},
+                       {"id": "report", "text": "report the total"}], step=3)
+    state.plan.update([{"id": "read", "status": "done"}], step=5)
     state.packages.add("com.android.settings")
     state.package_steps["com.android.settings"] = 6
     state.sweep.start("swipe left")
@@ -111,7 +113,16 @@ def test_round_trip_preserves_everything_the_loop_needs(cfg):
     assert fresh.want_screenshot is True
     assert fresh.last_failure == state.last_failure
     assert fresh.scroll_warnings == 1
-    assert fresh.progress_log == ["read 3 of 5 items"]
+    assert fresh.plan.plain() == "[x] read 5 items\n[ ] report the total"
+    assert fresh.plan.done_count == 1 and len(fresh.plan) == 2
+    # The credits go with the steps. Without them a resumed run would be paid a
+    # second time for every step it had already finished -- one free stall-ladder
+    # reset each, handed over exactly where a run is most likely to be in
+    # trouble. Re-sending the completion after the resume must buy nothing.
+    assert fresh.plan.credited == {"read"}
+    fresh.plan.update([{"id": "read", "status": "pending"}], step=9)
+    assert fresh.plan.update([{"id": "read", "status": "done"}],
+                             step=10).completed == []
     assert fresh.packages == {"com.android.settings"}
     assert fresh.package_steps == {"com.android.settings": 6}
 

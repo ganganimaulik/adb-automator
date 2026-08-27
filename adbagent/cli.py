@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import __version__, runlog, scratchpad
+from . import __version__, plan, runlog, scratchpad
 
 try:
     from rich.console import Console
@@ -41,6 +41,18 @@ def _notes_text(notes: Any) -> str:
     pairs = scratchpad.as_records(notes)
     return "; ".join(f"{key}: {value}" if value else str(key)
                      for key, value in pairs) or ""
+
+
+def _progress_text(progress: Any) -> str:
+    """One line for the plan steps an action changed.
+
+    The same job `_notes_text` does, for the field that went the same way:
+    ``progress`` is a list of ``{id, text, status}`` now, from either a live
+    `PlanStep` or a recorded dict. A step whose status did not come through
+    prints as a bare title rather than as ``: None``.
+    """
+    return "; ".join(f"{text or sid}: {status}" if status else str(text or sid)
+                     for sid, text, status in plan.as_steps(progress)) or ""
 
 
 # ---------------------------------------------------------------------------
@@ -956,7 +968,8 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             if getattr(action, "reasoning", None):
                 out.say(out.dim(f"        Reasoning: {action.reasoning}"))
             if getattr(action, "progress", None):
-                out.say(out.dim(f"        Progress:  {action.progress}"))
+                out.say(out.dim(f"        Progress:  "
+                                f"{_progress_text(action.progress)}"))
             if getattr(action, "notes", None):
                 out.say(out.dim(f"        Notes:     {_notes_text(action.notes)}"))
 
@@ -1258,8 +1271,7 @@ def cmd_run(args) -> int:
             # Last, under the data it was drawn from, because this is the line
             # the person came for -- see `_result_block`.
             _result_block(out, outcome, state.result, state.evidence,
-                          progress=(state.progress_log or [""])[0]
-                                   or state.last_progress,
+                          progress=state.plan.plain() or state.last_progress,
                           problem=state.last_failure)
             out.say()
             out.say(f"  {colour(outcome.upper())}  "
@@ -1603,7 +1615,8 @@ def cmd_report(args) -> int:
             if action.get("reasoning"):
                 out.say(out.dim(f"        Reasoning: {action.get('reasoning')}"))
             if action.get("progress"):
-                out.say(out.dim(f"        Progress:  {action.get('progress')}"))
+                out.say(out.dim(f"        Progress:  "
+                                f"{_progress_text(action.get('progress'))}"))
             if action.get("notes"):
                 notes_text = _notes_text(action.get("notes"))
                 last_notes = notes_text
@@ -1660,12 +1673,15 @@ def _terminal_text(events: List[Dict[str, Any]]) -> str:
 
 
 def _last_progress(events: List[Dict[str, Any]]) -> str:
-    """The last note the model wrote about where it had got to."""
-    for event in reversed(events):
-        progress = (event.get("action") or {}).get("progress")
-        if isinstance(progress, str) and progress.strip():
-            return progress
-    return ""
+    """Where the run had got to, as its plan stood at the end.
+
+    It used to walk backwards for the last non-empty ``progress`` string, which
+    was the whole status because the model restated the whole status every turn.
+    That field is a delta now, so the last one is one step's change and not the
+    plan: reading a finished run means folding them all, which is what
+    `plan.replay` is for.
+    """
+    return plan.replay(events).plain()
 
 
 def _last_problem(events: List[Dict[str, Any]]) -> str:

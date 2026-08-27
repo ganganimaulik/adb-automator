@@ -36,6 +36,7 @@ from .fingerprint import crop_frac
 from .ledger import ReplyLedger
 from .llm import (BudgetExceeded, LLMClient, LLMError, Prefetch, ScreenAnalysis)
 from .memory import Memory, intent_key
+from .plan import TaskLedger
 from .pager import (SweepLog, can_repeat, content_box,
                     content_moved as pager_content_moved,
                     stop_repeating, sweep_summary, video_only_drift)
@@ -129,9 +130,16 @@ class RunState:
     #: corrected each turn (the ``notes`` field) and this keeps the union, so a
     #: record it stops mentioning cannot go missing -- see `scratchpad.py`.
     scratchpad: NoteLedger = field(default_factory=NoteLedger)
-    #: Progress tracker for multi-step goals.  The LLM writes into the
-    #: ``progress`` field; we keep the latest entry and feed it back.
-    progress_log: List[str] = field(default_factory=list)
+    #: The run's plan: which sub-steps of the goal are done and what remains.
+    #: The model sends only the steps that are new or whose status changed (the
+    #: ``progress`` field) and this keeps the union, exactly as `scratchpad`
+    #: does for data -- see `plan.py`.
+    #:
+    #: It used to be `progress_log`, a one-element list holding the whole
+    #: free-text status the model rewrote from scratch every turn. That is the
+    #: rewrite-every-turn contract `scratchpad` was built to remove, still in
+    #: place for the one field nothing was checking.
+    plan: TaskLedger = field(default_factory=TaskLedger)
     #: Distinct packages this run has been in. Two or more means it is a
     #: multi-app run, which is when the app-switching advice earns its tokens.
     packages: set = field(default_factory=set)
@@ -1312,7 +1320,7 @@ class Agent:
                 today=self._today,
                 screenshot=screenshot, note=notes,
                 scratchpad=scratch_text,
-                progress="\n".join(state.progress_log), skill=skill_note,
+                progress=state.plan.render(), skill=skill_note,
                 policy=self.policy,
                 # Where the run is against its ceilings. Nothing used to say --
                 # not one of the 105 decide prompts in ``runs/`` carries a step
@@ -1456,16 +1464,28 @@ class Agent:
             # restatement is where a figure gets rounded or paraphrased away. The
             # observation is what there is when the decider has its own eyes and
             # there was no separate pass.
-            # -- accumulate progress ----------------------------------------
-            # Kept as working memory and handed back next turn. It deliberately
-            # does NOT call `note_progress`: this is the model's report about
-            # itself, and letting a rewrite of it reset the stall ladder put the
-            # model in charge of the guard that is supposed to bound it. See
-            # `RunState.note_progress`.
+            # -- accumulate the plan ----------------------------------------
+            # Kept as working memory and handed back next turn, and -- unlike
+            # the free-text field this replaced -- allowed to reset the stall
+            # ladder, but only on `completed`.
+            #
+            # `RunState.note_progress` says why the old field was cut out of the
+            # ladder: it was a report the model wrote about itself, compared as
+            # a raw string, so any rewording bought another step and three of the
+            # four tiers never fired. What makes this different is not that the
+            # report is now structured -- it is that `TaskLedger.update` only
+            # reports a completion for a step that was declared on an *earlier*
+            # turn and has never been credited before. Neither condition is
+            # something the model can satisfy by restating anything, so the
+            # signal costs a turn of real elapsed run to produce.
+            plan_update = None
             if getattr(action, "progress", None):
-                prog_text = action.progress.strip()
-                if prog_text:
-                    state.progress_log = [prog_text]
+                plan_update = state.plan.update(action.progress, state.step)
+                if plan_update.completed:
+                    done = state.plan.done_count
+                    state.note_progress(
+                        f"it finished {len(plan_update.completed)} plan step(s) "
+                        f"({done} of {len(state.plan)} done)")
 
             rec.event("decide", step=state.step, source=source,
                       skeleton=screen.skeleton_id,
@@ -1498,6 +1518,17 @@ class Agent:
                 rec.event("scratchpad", step=state.step, keys=written,
                           total=len(state.scratchpad),
                           records=state.scratchpad.records(written))
+            # The same treatment for the plan, and for the same reason: the
+            # delta is in `decide.action.progress`, and a reader that wants the
+            # plan as it stood at step N should not have to fold every earlier
+            # one itself. `completed` is called out separately because it is the
+            # only part of a step's trace that moved the stall ladder.
+            if plan_update:
+                rec.event("plan", step=state.step, changed=plan_update.changed,
+                          completed=plan_update.completed,
+                          refused=plan_update.refused,
+                          done=state.plan.done_count, total=len(state.plan),
+                          steps=state.plan.records())
             self.on_event("step", state=state, screen=screen, action=action,
                           source=source, screenshot=bool(screenshot))
 
@@ -2092,7 +2123,7 @@ class Agent:
         rendered = render(screen)
         history = list(state.history)
         scratchpad = state.scratchpad.plain(self.cfg.run.scratchpad_max_chars)
-        progress = "\n".join(state.progress_log)
+        progress = state.plan.plain()
         step = state.step
         return Prefetch(lambda: self.llm.goal_check(
             goal=state.goal, history=history, rendered=rendered,
@@ -2143,7 +2174,7 @@ class Agent:
         # without this a caller would get the outcome word and no answer, which
         # is the hole `RunState.result` exists to close.
         state.result = (state.scratchpad.plain(self.cfg.run.scratchpad_max_chars)
-                        or "\n".join(state.progress_log)
+                        or state.plan.plain()
                         or verdict.evidence)
         state.remember(f"{state.step}. the harness stopped the run: the goal was "
                        f"already met ({verdict.evidence})")
@@ -2431,7 +2462,7 @@ class Agent:
         verdict = self.llm.judge(goal=state.goal, rendered=render(screen),  ### LLM ###
                                  history=state.history, screenshot=shot,
                                  scratchpad=collected,
-                                 progress="\n".join(state.progress_log),
+                                 progress=state.plan.plain(),
                                  done_text=action.text or "",
                                  step=state.step, recorder=rec,
                                  on_event=self.on_event)
@@ -2507,7 +2538,7 @@ class Agent:
                 tried=state.loops.tried_on(screen.skeleton_id),
                 stalled=stalled,
                 scratchpad=state.scratchpad.plain(self.cfg.run.scratchpad_max_chars),
-                progress="\n".join(state.progress_log),
+                progress=state.plan.plain(),
                 packages=sorted(state.packages), screenshot=shot,
                 step=state.step, recorder=rec, on_event=self.on_event)
         except LLMError as exc:
