@@ -24,9 +24,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__, checkpoint, conversation, prompts, runlog, safety
-from .actions import (_POINT_GUARD_MAX_AREA, POINT_ACTIONS, ActionError,
-                      AgentAction, Target,
-                      append_history, element_at_point, element_summary, execute,
+from .actions import (_POINT_GUARD_MAX_AREA, NAVIGATIONAL, POINT_ACTIONS,
+                      ActionError, AgentAction, Target,
+                      append_history, content_moved_in_pixels,
+                      element_at_point, element_summary, execute,
                       format_history_entry, input_target_is_container,
                       resolve_target, synthesise_postcondition, verify)
 from .config import Config
@@ -1836,6 +1837,17 @@ class Agent:
                     # Also the screenshot the *next* turn will show the model, if
                     # it wants one -- `_ensure_screenshot` will not re-take it.
                     self._ensure_screenshot(after)
+                elif (action.action in NAVIGATIONAL and screen.screenshot
+                        and after.exact_id == screen.exact_id):
+                    # One extra capture, in the only case where it decides
+                    # anything: the tree says this action did nothing, and the
+                    # frame it acted on has pixels to compare against. That is
+                    # the bitmap-feed case `verify` needs the pixels for, and
+                    # the grade it is about to hand out -- `no_change` -- is the
+                    # expensive one to get wrong, since it bans the action for
+                    # the run and for 24 hours after it. Costs a round trip on
+                    # the steps that look like failures and nothing on the rest.
+                    self._ensure_screenshot(after)
             except (DeviceTimeout, DeviceLost) as exc:
                 if not self._recover_device(state, exc):
                     state.finished = "aborted"
@@ -1953,6 +1965,19 @@ class Agent:
                     moved = after.exact_id != screen.exact_id
                 if moved:
                     state.note_progress("a gesture revealed new content")
+            elif (action.action in NAVIGATIONAL
+                    and after.exact_id == screen.exact_id
+                    and content_moved_in_pixels(screen, after)):
+                # The same signal, for the action that is not a gesture. Tapping
+                # through a bitmap feed -- a like button that advances the card,
+                # a "next" arrow on a photo -- reveals content that was not on
+                # screen before, and leaves the tree exactly as it was. Read off
+                # `exact_id` alone that is a stalled run, and the stall tiers
+                # respond by nudging, blocking, replanning and finally giving up
+                # on an agent that is doing the goal. Cheap: the hashes are
+                # memoised on the frames and only asked for when the tree
+                # already said nothing happened.
+                state.note_progress("a tap advanced the app's content")
             elif outcome.ok and (action.action == "input_text"
                                  or (element is not None and element.checkable)):
                 state.note_progress("it changed something on the device")

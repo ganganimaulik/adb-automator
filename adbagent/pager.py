@@ -93,14 +93,27 @@ def content_box(screen: Screen) -> Optional[Tuple[float, float, float, float]]:
 
 
 def content_hash(screen: Screen) -> Optional[int]:
-    """Perceptual hash of the app's content. ``None`` without a screenshot."""
+    """Perceptual hash of the app's content. ``None`` without a screenshot.
+
+    Memoised on the frame. The answer is asked for several times per step now
+    -- grading the action, deciding whether the step was progress, and deciding
+    whether a sweep may continue -- and it is a JPEG decode each time on pixels
+    that are fixed once captured. The memo is only taken when there *is* a
+    screenshot, because one can be attached to a frame after the first ask.
+    """
     if not screen.screenshot:
         return None
+    if screen.content_dhash_done:
+        return screen.content_dhash
     box = content_box(screen)
     if box is None:
-        return None
-    from .fingerprint import compute_dhash
-    return compute_dhash(screen.screenshot, box_frac=box)
+        value = None
+    else:
+        from .fingerprint import compute_dhash
+        value = compute_dhash(screen.screenshot, box_frac=box)
+    screen.content_dhash = value
+    screen.content_dhash_done = True
+    return value
 
 
 def content_moved(before: Screen, after: Screen) -> Optional[bool]:
