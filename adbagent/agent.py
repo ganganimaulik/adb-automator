@@ -121,6 +121,11 @@ class RunState:
     #: five minutes -- without this, resuming a paused run is how you would find
     #: out it had been killed while you were looking at it.
     paused_s: float = 0.0
+    #: Whether a person took the phone during this run, at any point. What it
+    #: costs is the skill: an app skill is written from what the *agent* did,
+    #: and a trace with somebody else's taps in it would teach the next run a
+    #: workflow this one never found. See `skills.learn_from_run`.
+    took_over: bool = False
     finished: Optional[Outcome] = None
     #: What the run answered: the text of the terminal action that ended it --
     #: `done`'s summary, `fail`'s reason, `ask_user`'s question. The one thing a
@@ -652,6 +657,13 @@ class Agent:
         #: `run()`, because it is scoped to the run's own directory -- see
         #: `control.py` for why that is the right place for it.
         self.control: Optional[control.Control] = None
+        #: Whether the phone is currently the person's rather than this run's.
+        #: The device session's business, so it lives here; whether a takeover
+        #: *happened* is the run's, and lives on `RunState`.
+        self._released = False
+        #: Set when the phone comes back, cleared by the loop once it has thrown
+        #: away the screen it was carrying.
+        self._reobserve = False
 
     # -- perception helpers ------------------------------------------------
 
@@ -1023,8 +1035,16 @@ class Agent:
             # which is the only state a pause can hold without stopping the
             # loop between an observation and the action it was made for.
             if self.control is not None:
-                self.control.wait(state, lambda mode: rec.event(
-                    "control", step=state.step, mode=mode))
+                self.control.wait(
+                    state, lambda mode: self._on_control(state, rec, mode))
+                if self._reobserve:
+                    # Somebody has had the phone. Whatever is in front of it now
+                    # is theirs, not the last action's, so the screen carried
+                    # over from the previous turn is worthless -- and worse than
+                    # worthless, because every judgement below is about what
+                    # *this* run did.
+                    self._reobserve = False
+                    screen = None
             state.step += 1
             # Counted up here, at the top, and reset wherever progress is found
             # below. Every `continue` in this loop is a step that learned nothing
@@ -2695,6 +2715,60 @@ class Agent:
             self.on_event("replan", step=state.step,
                           assessment=plan.assessment, strategy=state.strategy)
         return True
+
+    def _on_control(self, state: RunState, rec: Recorder, mode: str) -> None:
+        """React to being told something, and put it in the trace.
+
+        Every mode but `release` reclaims: `_reclaim_phone` does nothing unless
+        the phone is out, so the handler does not have to know which of `run`,
+        `step` or `pause` it is coming back from -- only that it is not
+        `release`, which is the one mode that means the phone is not ours.
+        """
+        rec.event("control", step=state.step, mode=mode)
+        if mode == "release":
+            self._release_phone(state, rec)
+        else:
+            self._reclaim_phone(state, rec)
+
+    def _release_phone(self, state: RunState, rec: Recorder) -> None:
+        """Give the phone back for as long as somebody wants it.
+
+        Closing the session is the whole of it, and it is not a detail: `open`
+        zeroed the animation scales, locked the rotation, selected the agent's
+        own IME and set a 30-minute screen timeout, and `close` is what puts all
+        four back. Handing over a phone in that state -- no keyboard the person
+        recognises, no rotation -- would be handing over something they cannot
+        use, which is precisely what they took it back to do.
+        """
+        if self._released:
+            return
+        log.warning("releasing the phone: closing the device session")
+        self.dev.close()
+        self._released = True
+        state.took_over = True
+        rec.event("released", step=state.step)
+
+    def _reclaim_phone(self, state: RunState, rec: Recorder) -> None:
+        """Take the phone back and stop trusting anything we knew about it."""
+        if not self._released:
+            return
+        log.warning("reclaiming the phone: reopening the device session")
+        self.dev.open()
+        self._released = False
+        self._reobserve = True
+        # Into the history the model reads, because the alternative is that it
+        # attributes the change to its own last action. It did not scroll the
+        # list; somebody else did, and a run that thinks its swipe worked when a
+        # person did the work will draw exactly the wrong conclusion from it.
+        state.remember(f"{state.step}. the person took the phone and used it "
+                       f"directly; the screen may be anywhere now")
+        # The stall ladder counts steps since the run last learned anything, and
+        # the harness escalates on it -- refusing actions, replanning, giving up.
+        # Somebody intervening is the single most likely thing to have unstuck a
+        # run, and letting it come back to a tier-four ladder would have the
+        # harness break the loop it was just rescued from.
+        state.note_progress("the person intervened and handed the phone back")
+        rec.event("reclaimed", step=state.step)
 
     def _hand_over(self, state: RunState, reason: str) -> None:
         """Stop and give the phone back to the person."""

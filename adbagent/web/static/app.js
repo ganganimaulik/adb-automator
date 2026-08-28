@@ -775,9 +775,19 @@ function foldEvent(ev, feed) {
     // that was held for four minutes read identically without it.
     const said = { pause: ["needs_user", "<b>held</b> — the run is waiting; " +
                            "it still has the phone"],
+                   release: ["needs_user", "<b>the phone is yours</b> — the " +
+                             "agent has closed its session, so the keyboard, " +
+                             "the animations and the rotation are back"],
                    run: ["", "<b>let go</b> — carrying on"],
                    step: ["", "<b>one step</b> — then holding again"] }[ev.mode];
     if (said) banner(feed, said[0], said[1]);
+
+  } else if (kind === "reclaimed") {
+    // What the run has to un-assume, said where the steps after it are read:
+    // the screen it comes back to is not the one its last action produced.
+    banner(feed, "needs_user",
+      "<b>phone handed back</b> — re-reading the screen from scratch; this " +
+      "run will not be learned from");
 
   } else if (kind === "run_end") {
     // The answer has its own block above the feed -- large, first, and once. In
@@ -1117,6 +1127,11 @@ function appendExitLine(feed, line) {
 //: Remembered like the feed's density: it is a way of reading the panel rather
 //: than a property of any one run.
 const ELEMENTS_KEY = "adbagent.phone-elements";
+
+//: The modes in which the loop is not advancing. `release` is one of them by
+//: construction: the phone is the person's, and a run that took a step while
+//: somebody was typing on it would be reading their taps as its own.
+const HELD = new Set(["pause", "release"]);
 
 function boxCss(b, w, h) {
   const [l, t, r, bot] = (b || []).map(Number);
@@ -1483,9 +1498,14 @@ function markScreen(rec, v) {
    event stream, long after whatever set the other three. */
 function paintStatus(v) {
   const stopping = v.running && v.stopping;
-  const held = v.running && v.mode === "pause";
+  const held = v.running && HELD.has(v.mode);
   v.els.state.textContent = stopping ? "stopping…"
-    : (v.running ? (held ? "held" : "running") : "idle");
+    : (v.running
+        // "yours" rather than "released": the question somebody glancing at
+        // this line is asking is whose phone it is, and the answer is the
+        // whole point of the state.
+        ? (v.mode === "release" ? "yours" : (held ? "held" : "running"))
+        : "idle");
   // A held run gets the same yellow as a stopping one: both are states where
   // the phone is still taken and nothing is happening to it, which is what
   // somebody glancing at the page needs the colour to say.
@@ -1655,9 +1675,12 @@ live.setRunning = (running, stopping) => {
   // slow a run down that is going somewhere wrong -- and making it a two-click
   // job behind Pause would be worse for the one case it is wanted in.
   $("btn-step").disabled = stopping;
+  $("btn-take").disabled = stopping;
+  if (!running) $("btn-take").hidden = true;
   // A run that is over has been told nothing; one that is going keeps whatever
   // it was told, which the replayed `control` events put back.
   if (!running) paintHold(live, "run", "run");
+  else paintHold(live);          // `btn-take` follows the mode, not the run
   // What to do next is only offered once there is no next iteration coming.
   $("run-actions").hidden = running;
 };
@@ -1940,13 +1963,26 @@ function paintHold(v, mode, asked) {
   const now = v.mode || "run";
   const want = v.asked || now;
   const btn = $("btn-hold");
-  const pending = want !== now;
+  // Only crossing between held and going is pending *here*. Asking for the
+  // phone moves between two ways of being held, and a Resume button that read
+  // "pausing…" for it would be reporting a change to something that has not
+  // changed -- the run was already stopped and stays stopped.
+  const heldNow = HELD.has(now), heldWant = HELD.has(want);
+  const pending = heldNow !== heldWant;
   btn.textContent = pending
-    ? (want === "pause" ? "pausing…" : "resuming…")
-    : (now === "pause" ? "Resume" : "Pause");
-  const held = now === "pause" && !pending;
+    ? (heldWant ? "pausing…" : "resuming…")
+    : (heldNow ? "Resume" : "Pause");
+  const held = heldNow && !pending;
   btn.classList.toggle("primary", held);
   btn.classList.toggle("ghost", !held);
+  // Handing the phone over is a thing to do *while* holding, so it appears only
+  // then -- and stops appearing once the phone is already theirs, because
+  // Resume and Step both take it back and a third button that also took it
+  // back would be a third way to do one thing.
+  const take = $("btn-take");
+  take.hidden = !held || now === "release";
+  take.textContent = (want === "release" && now !== "release")
+    ? "handing over…" : "Take the phone";
 }
 
 async function askControl(cmd) {
@@ -1961,8 +1997,9 @@ async function askControl(cmd) {
 }
 
 $("btn-hold").addEventListener("click", () =>
-  askControl(live.mode === "pause" ? "run" : "pause"));
+  askControl(HELD.has(live.mode) ? "run" : "pause"));
 $("btn-step").addEventListener("click", () => askControl("step"));
+$("btn-take").addEventListener("click", () => askControl("release"));
 
 $("btn-stop").addEventListener("click", async () => {
   setStopping(live);

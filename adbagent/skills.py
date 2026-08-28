@@ -828,6 +828,11 @@ class AppTrace:
     screenshots: List[bytes] = field(default_factory=list)
     #: The run's collected-data ledger -- the explorer's own findings.
     notes: str = ""
+    #: Whether a person drove the phone during this run. A skill is a record of
+    #: what the *agent* worked out, and a trace with somebody else's taps in it
+    #: is not that: the steps around a takeover describe a path the agent never
+    #: found, attributed to it, and the next run would be told to follow it.
+    took_over: bool = False
     #: How the app was picked: "named", "tasks" or "foreground". Reported,
     #: because two of the three are the harness guessing.
     chosen_by: str = ""
@@ -986,6 +991,7 @@ class TraceCollector:
         self.trace.steps = getattr(state, "step", 0)
         self.trace.llm_calls = getattr(state, "llm_calls", 0)
         self.trace.run_id = getattr(state, "run_id", "")
+        self.trace.took_over = bool(getattr(state, "took_over", False))
         scratchpad = getattr(state, "scratchpad", None)
         if scratchpad is not None:
             self.trace.notes = scratchpad.plain()
@@ -1021,7 +1027,12 @@ class TraceCollector:
                          outcome=self.trace.outcome,
                          steps=self.steps_in.get(pkg, 0),
                          llm_calls=self.trace.llm_calls,
-                         run_id=self.trace.run_id)
+                         run_id=self.trace.run_id,
+                         # Every app the run touched, not just the one it was
+                         # in when the phone changed hands: the person may have
+                         # opened one app to unblock another, and neither trace
+                         # can say which of its steps were theirs.
+                         took_over=self.trace.took_over)
                 for pkg in packages]
 
 
@@ -1353,6 +1364,17 @@ def learn_from_run(trace: AppTrace, llm: Any, registry: SkillRegistry, *,
     """
     if not is_app_package(trace.package):
         log.info("nothing to learn: %r is not an app", trace.package)
+        return None
+    # A run somebody else drove part of teaches nothing, and refusing is not
+    # caution -- it is the only correct answer. The trace records every step as
+    # the agent's, so the steps around a takeover describe a path the agent
+    # never found: the screen the person navigated to appears as the result of
+    # whatever action came before it, and the workflow written from that would
+    # send the next run down a route that does not exist. A failed run still
+    # teaches, because its dead ends are real; this one's are not.
+    if trace.took_over:
+        log.info("nothing to learn from %s: a person drove part of this run",
+                 trace.package)
         return None
     if trace.steps < MIN_LEARNABLE_STEPS or not trace.looked_around:
         log.info("nothing to learn from %s: %d step(s), %d screen(s)",

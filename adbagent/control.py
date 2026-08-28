@@ -50,7 +50,17 @@ NAME = "control.json"
 #: `pause` and `run` are a mode; `step` is a mode too -- "run one step, then be
 #: paused" -- rather than an event, so that a `step` arriving while the loop is
 #: between polls is not lost the way a queued one-shot would be.
-COMMANDS = ("pause", "run", "step")
+#:
+#: `release` is `pause` plus giving the phone back: the agent closes its device
+#: session, which puts the keyboard, the animations, the rotation and the screen
+#: timeout back the way the person left them, so the phone is usable by hand.
+#: Held here rather than as a separate switch because the two cannot disagree --
+#: a released phone is a held run by definition, and a run that carried on while
+#: somebody was typing on the phone would be reading their taps as its own.
+COMMANDS = ("pause", "run", "step", "release")
+
+#: Modes in which the loop does not advance.
+HELD = frozenset({"pause", "release"})
 
 #: How often a paused loop looks for what to do next. Short enough that resuming
 #: feels like a button and not a request, long enough that a run left paused
@@ -189,20 +199,29 @@ class Control:
         if self.mode == "step":
             spend_step()
             return
-        if self.mode != "pause":
+        if self.mode not in HELD:
             say("run")
             return
 
         held_from = time.monotonic()
         try:
-            say("pause")
-            while self.mode == "pause":
+            # Said before the wait, not after it: the caller's handler is what
+            # gives the phone back on `release`, and it has to have happened by
+            # the time this blocks. A person told the phone is theirs, looking
+            # at one that still has the agent's keyboard on it, has been lied to.
+            say(self.mode)
+            while self.mode in HELD:
                 self._sleep(POLL_S)
+                was = self.mode
                 self._poll()
                 if self.mode == "step":
                     spend_step()
                     return
-            say(self.mode)          # let go
+                if self.mode != was:
+                    # Let go, or moved between the two ways of being held. The
+                    # loop's only exit is this change, so nothing needs saying
+                    # after it: every mode this leaves in has been announced.
+                    say(self.mode)
         finally:
             # In a `finally` so that a run interrupted mid-pause still hands the
             # time back before it unwinds -- `run_end` is written on the way out

@@ -645,6 +645,28 @@ minutes by the person reading it has not worked for five minutes. Each hold and
 each step goes into the trace, because a step that took four minutes and a step
 that was held for four minutes read identically without it.
 
+*Taking the phone.* While it is holding, **Take the phone** closes the agent's
+device session and hands the phone back — which is the whole of it, because the
+session is what zeroed the animation scales, locked the rotation, selected the
+agent's own keyboard and set a 30-minute screen timeout. A phone handed over in
+that state is one you cannot type on. Do the 2FA, the biometric, the thing only
+you can do, then **Resume**: the session reopens, the screen is read from
+scratch rather than assumed, and the run is told in as many words that a person
+had the phone — otherwise the model reads the new screen as the result of its
+own last action and concludes that whatever it did worked. The stall ladder
+resets too, since somebody intervening is the most likely thing to have unstuck
+a run, and coming back to tier four would have the harness break the loop it was
+just rescued from.
+
+**A run somebody drove is never learned from.** An app skill is a record of what
+the *agent* worked out, and the trace records every step as the agent's — so the
+steps around a takeover describe a path it never found, attributed to it, and
+the next run would be sent down a route that does not exist. Every app the run
+touched is excluded, not just the one it was in when the phone changed hands: a
+person may open one app to unblock another, and no trace can say which of its
+steps were theirs. A *failed* run still teaches, because its dead ends are real.
+This one's are not.
+
 *The phone.* A panel beside the feed showing the screen as it is, polled every
 couple of seconds while a run is going. It is a read-only `exec-out screencap`
 taken alongside the agent rather than through it: opening a device session zeroes

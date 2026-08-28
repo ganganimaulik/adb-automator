@@ -312,6 +312,151 @@ def test_the_run_reports_how_long_it_was_held(cfg, mem, tmp_path):
     assert end["paused_s"] == 0.0
 
 
+# ---------------------------------------------------------------------------
+# Giving the phone back
+# ---------------------------------------------------------------------------
+
+def test_release_is_a_way_of_being_held(tmp_path):
+    """A run that carried on while somebody was typing on the phone would be
+    reading their taps as its own, so the two cannot come apart."""
+    assert "release" in control.COMMANDS
+    assert control.HELD == {"pause", "release"}
+
+    state = RunState(goal=GOAL, run_id="r1", intent_id="i1")
+    said = []
+
+    def release_then_resume(total):
+        control.send(tmp_path, "run", 3) if total >= 1.0 else None
+
+    ctl = control.Control(tmp_path, sleep=Clock(on_sleep=release_then_resume).sleep)
+    control.send(tmp_path, "release", 2)
+    ctl.wait(state, said.append)
+    assert said == ["release", "run"]
+    assert state.paused_s > 0        # the time it was theirs is not the run's
+
+
+def test_moving_between_the_two_holds_is_said_out_loud(tmp_path):
+    """Taking the phone back without letting the run go is a real state change:
+    the session reopens, and the handler that reopens it runs off this."""
+    state = RunState(goal=GOAL, run_id="r1", intent_id="i1")
+    said = []
+    seq = {"n": 2}
+
+    def script(_total):
+        seq["n"] += 1
+        control.send(tmp_path, "pause" if seq["n"] == 3 else "run", seq["n"])
+
+    ctl = control.Control(tmp_path, sleep=Clock(on_sleep=script).sleep)
+    control.send(tmp_path, "release", 2)
+    ctl.wait(state, said.append)
+    assert said == ["release", "pause", "run"]
+
+
+def test_the_loop_closes_and_reopens_the_session_around_a_takeover(cfg, mem,
+                                                                   tmp_path):
+    dev = fake.FakeDevice(cfg)
+    run_dir = tmp_path / "runs"
+
+    def policy(screen, llm):
+        if llm.calls == 1:
+            for d in run_dir.iterdir():
+                control.send(d, "release", 1)
+        return fake.reach_state(dev, "wifi", ["Wi-Fi"])(screen, llm)
+
+    def give_it_back(_seconds):
+        for d in run_dir.iterdir():
+            control.send(d, "run", 2)
+
+    original = control.Control.__init__
+
+    def patched(self, directory, sleep=None):
+        original(self, directory, sleep=give_it_back)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(control.Control, "__init__", patched)
+        outcome, state = Agent(dev, mem, fake.FakeLLM(dev, policy), cfg).run(GOAL)
+
+    assert outcome == "success"
+    # Closed to hand it over -- which is what puts the keyboard, the animations
+    # and the rotation back -- and reopened to take it on again.
+    assert dev.closes >= 1 and dev.opens >= 1
+    # And it ends holding the phone rather than having given it away: the run
+    # carried on for a step after the handback, which it could not have done
+    # without the session. (Closing it for good is the caller's `with Device`,
+    # which this test does not go through.)
+    assert dev.session_open is True
+    kinds = [e["kind"] for e in _events(tmp_path, state.run_id)]
+    assert "released" in kinds and "reclaimed" in kinds
+    # And the run knows it cannot be learned from.
+    assert state.took_over is True
+
+
+def test_a_takeover_tells_the_model_it_happened(cfg, mem, tmp_path):
+    """Otherwise the model reads the new screen as the result of its own last
+    action, and concludes that whatever it did worked."""
+    state = RunState(goal=GOAL, run_id="r1", intent_id="i1")
+    state.step = 4
+    state.steps_since_progress = 6
+    dev = fake.FakeDevice(cfg)
+    agent = Agent(dev, mem, fake.FakeLLM(dev, lambda s, l: None), cfg)
+
+    class Rec:
+        def __init__(self): self.events = []
+        def event(self, kind, **kw): self.events.append((kind, kw))
+
+    rec = Rec()
+    agent._released = True
+    agent._reclaim_phone(state, rec)
+
+    assert any("took the phone" in line for line in state.history)
+    # And the stall ladder resets: somebody intervening is the most likely thing
+    # to have unstuck a run, and coming back to tier four would have the harness
+    # break the loop it was just rescued from.
+    assert state.steps_since_progress == 0
+    assert agent._reobserve is True
+
+
+def test_a_run_somebody_drove_teaches_the_skill_nothing(cfg, mem, tmp_path):
+    """The trace records every step as the agent's, so the steps around a
+    takeover describe a path the agent never found."""
+    from adbagent.skills import AppTrace, SkillRegistry, learn_from_run
+
+    trace = AppTrace(package="com.example.app", steps=20,
+                     screens=["a", "b", "c"], actions=["tap #1", "tap #2"],
+                     took_over=True)
+    registry = SkillRegistry(str(tmp_path / "skills"))
+
+    def explode(*a, **kw):
+        raise AssertionError("the synthesis must not be reached")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("adbagent.skills.SkillGenerator.generate_from_exploration",
+                   explode)
+        assert learn_from_run(trace, object(), registry, goal=GOAL) is None
+
+
+def test_the_takeover_flag_reaches_every_app_the_run_touched(cfg):
+    """The person may have opened one app to unblock another, and neither
+    trace can say which of its steps were theirs."""
+    from adbagent.skills import AppTrace, TraceCollector
+
+    collector = TraceCollector(None)
+    collector.trace = AppTrace(took_over=True)
+    collector.steps_in = {"com.one.app": 5, "com.two.app": 3}
+    collector.screens_in = {"com.one.app": ["a"], "com.two.app": ["b"]}
+    collector.actions_in = {"com.one.app": ["x"], "com.two.app": ["y"]}
+    collector.shots_in = {}
+    assert [t.took_over for t in collector.app_traces()] == [True, True]
+
+
+def test_an_ordinary_run_still_teaches(cfg, mem, tmp_path):
+    """The guard must be about takeovers and nothing else."""
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    assert state.took_over is False
+
+
 def test_a_terminal_action_is_not_a_step_the_loop_can_be_held_before(cfg, mem,
                                                                      tmp_path):
     """The read happens at the top of a step, so a run that ends on its first
