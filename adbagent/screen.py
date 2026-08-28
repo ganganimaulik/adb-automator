@@ -232,6 +232,13 @@ class Screen:
     tokens: Tuple[str, ...] = ()
     screenshot: Optional[bytes] = None
     dhash: Optional[int] = None
+    #: Memo for `pager.content_hash` -- the perceptual hash of the app's content
+    #: with the overlay bands cropped off. Verification, the progress signal and
+    #: the sweep all ask the same frame for it, and a JPEG decode per ask is
+    #: waste on pixels that cannot change. `content_dhash_done` is what tells
+    #: "not computed yet" from "computed, and there is no answer": both are None.
+    content_dhash: Optional[int] = None
+    content_dhash_done: bool = False
     # A screen used to carry `is_pager`, `item_label`, `item_key`,
     # `item_position` and `item_total`, filled in by the pager module. They are
     # gone because none of them were properties of a screen: whether a gesture
