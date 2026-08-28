@@ -43,6 +43,19 @@ NAME = "checkpoint.json"
 #: looking at rather than guessing from the keys.
 VERSION = 1
 
+#: An answer to the run's `ask_user`, put here by whoever was asked.
+#:
+#: `save` never writes this key -- it is not part of `RunState`, and the run that
+#: asked the question has already ended by the time there is anything to answer.
+#: `set_answer` adds it to the file afterwards, and `restore` folds it into the
+#: resumed run's history and leaves it behind. The next step's `save` rewrites
+#: the whole file, so a consumed answer disappears on its own rather than being
+#: re-injected into a second `ask_user` that meant something else.
+#:
+#: Which is also why VERSION does not move: what `save` produces is unchanged,
+#: and a checkpoint carrying this key is one an outside hand has written on.
+ANSWER = "user_answer"
+
 
 def _path(cfg: Any, run_id: str) -> Path:
     return runlog.run_dir(cfg, run_id) / NAME
@@ -154,6 +167,30 @@ def load(run_dir: Any) -> Optional[Dict[str, Any]]:
     return data
 
 
+def set_answer(run_dir: Any, text: str) -> bool:
+    """Record the answer to a run's `ask_user`, for its resume to pick up.
+
+    False when there is no checkpoint to write on, which is the whole of "this
+    run cannot be answered": a run that succeeded has had its checkpoint cleared,
+    and one that never wrote one has nothing to continue from either. An
+    unreadable or malformed file is the same answer -- `load` has already
+    logged why.
+
+    Not guarded against a live run rewriting the file underneath: the only run
+    that can be answered is one that has already stopped to ask, and it stopped
+    by ending. A `save` racing this could only come from a *resumed* sitting, by
+    which point the answer being overwritten has already been read.
+    """
+    path = Path(run_dir).expanduser() / NAME
+    data = load(path.parent)
+    if data is None:
+        return False
+    data[ANSWER] = " ".join(str(text).split())
+    path.write_text(json.dumps(data, indent=1, ensure_ascii=False),
+                    encoding="utf-8")
+    return True
+
+
 def clear(cfg: Any, run_id: str) -> None:
     """Drop a run's checkpoint. Success means there is nothing left to resume."""
     try:
@@ -262,3 +299,19 @@ def restore(state: Any, data: Dict[str, Any]) -> None:
     state.sweep.gesture = str(sweep.get("gesture") or "")
     state.sweep.readings = [str(r) for r in sweep.get("readings") or []]
     state.sweep.repeats = int(sweep.get("repeats") or 0)
+
+    # The answer to whatever the run stopped to ask, as the last thing that
+    # happened -- which is what it is. It enters as history rather than through
+    # a prompt of its own because history is already the block the model reads
+    # to know what has gone on, and an answer needs no special pleading to be
+    # read there. Appended last so it lands after the step that asked.
+    #
+    # It is a *window*, not a permanent fact: `prompts.HISTORY_KEEP` shows the
+    # last two dozen lines, so an answer goes out of view once the resumed run
+    # has run that far past it. That suits what these answers are -- a code, a
+    # choice, a confirmation, all of them wanted on the next step or not at all
+    # -- and anything the run must not forget belongs in the scratchpad.
+    answer = str(data.get(ANSWER) or "").strip()
+    if answer:
+        state.remember(f"{state.step}. the person was asked for something and "
+                       f"answered: {answer}")

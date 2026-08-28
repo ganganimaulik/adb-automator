@@ -441,6 +441,13 @@ def element_summary(element: Optional[Element]) -> Optional[Dict[str, Any]]:
         "text": " ".join(element.best_text.split()),
         "resource_id": element.resource_id,
         "center": list(element.center),
+        # The rectangle, next to the point inside it. `center` is where the tap
+        # lands and is the whole of what the run needs; this is what a reader
+        # needs, because a point cannot be drawn over a screenshot as the thing
+        # that was tapped -- it can only be drawn as a dot near it. Device
+        # pixels, like `center`, against the `screen_w`/`screen_h` the `decide`
+        # event carries.
+        "bounds": list(element.bounds),
         "checkable": element.checkable,
         "checked": element.checked,
         "selected": element.selected,

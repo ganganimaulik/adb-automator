@@ -86,6 +86,12 @@ class RunRequest(BaseModel):
     resume: str = ""
 
 
+class AnswerRequest(BaseModel):
+    #: What to tell a run that stopped on `ask_user`. Written into its
+    #: checkpoint, where the resume reads it -- see `checkpoint.ANSWER`.
+    text: str = ""
+
+
 class WatchRequest(BaseModel):
     goal: str = ""
     #: Path to the reply policy. Required -- there is no default policy, for the
@@ -703,6 +709,41 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         if not manager.stop():
             raise HTTPException(status_code=409, detail="no run in progress")
         return {"stopping": True}
+
+    @app.post("/api/runs/{run_id}/answer")
+    def answer_run(run_id: str, req: AnswerRequest) -> Dict[str, Any]:
+        """Tell a run that stopped on `ask_user` what it wanted to know.
+
+        Not a resume: this only writes the answer where the resume will find it,
+        and the browser follows with the ordinary `POST /api/runs {resume}`. Two
+        calls rather than one because they fail for different reasons and want
+        different words -- there is nothing to answer, versus the phone is busy
+        -- and because an answer typed against a phone that is in use is still
+        worth keeping until it is free.
+
+        The text is never echoed back. `ask_user` is what the agent does instead
+        of typing a password or a one-time code, so what comes back through here
+        is usually the credential; it goes to the one file that has to have it
+        and no further.
+        """
+        from .. import checkpoint as ckpt
+
+        text = req.text.strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="an answer is required")
+        path = runparse.find_run(runs_dir, run_id)
+        if path is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        try:
+            written = ckpt.set_answer(path, text)
+        except OSError as exc:
+            raise HTTPException(status_code=500,
+                                detail=f"could not save the answer: {exc}")
+        if not written:
+            raise HTTPException(
+                status_code=409,
+                detail=f"run {run_id} has no checkpoint to answer into")
+        return {"answered": True, "run_id": run_id}
 
     @app.get("/api/runs/{run_id}")
     def run_detail(run_id: str) -> Dict[str, Any]:

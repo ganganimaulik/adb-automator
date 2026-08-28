@@ -104,6 +104,23 @@
          machinery that produced it, not at the bottom of it. -->
     <div id="work-result" hidden>
       <div class="result-box" id="result-box"></div>
+      <!-- Only for a run that stopped on `ask_user` -- the question is the
+           answer line in the box above, and this is the reply to it. The other
+           halt that reads `needs_user` is a sensitive screen, where the reply
+           is to do it on the phone and press Resume; this form stays hidden
+           there rather than inviting a password into a browser field. -->
+      <form id="run-answer" hidden autocomplete="off">
+        <div class="answer-row">
+          <input type="text" id="answer-text" autocomplete="off"
+                 spellcheck="false" placeholder="your answer">
+          <button type="submit" class="primary" id="btn-answer">Answer &amp; resume</button>
+        </div>
+        <p class="small">The run picks this up as the last thing that happened
+          and carries on from its checkpoint. It is written to the run's
+          checkpoint file and sent to the model, which is how the agent gets to
+          act on it — so put a one-time code here if that is what was asked
+          for, and never a password.</p>
+      </form>
       <!-- Hidden while the session is still going: under `--repeat` an
            iteration ends and the next begins, and a Start button that 409s is
            worse than no button. -->

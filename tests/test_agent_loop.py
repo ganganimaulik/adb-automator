@@ -1184,6 +1184,35 @@ def test_a_decision_records_the_element_its_ordinal_resolved_to(cfg, mem, tmp_pa
     assert target["kind"] and target["center"]
 
 
+def test_a_decision_records_the_geometry_needed_to_draw_it(cfg, mem, tmp_path):
+    """The rectangle, and the screen it was measured against.
+
+    `center` is the point the tap lands on and is all the run needs; a reader
+    drawing what was tapped over a picture of the screen needs the box, and the
+    size of the screen it came off -- everything showing that picture is showing
+    a scaled copy of it.
+    """
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
+    assert decides
+    # On every decision, not only the ones that resolved a target: a box is
+    # useless without the scale, so the scale cannot be conditional on it.
+    assert all(e["screen_w"] > 0 and e["screen_h"] > 0 for e in decides)
+
+    tap = next(e for e in decides if e["action"]["action"] == "tap")
+    left, top, right, bottom = tap["target_element"]["bounds"]
+    assert right > left and bottom > top
+    # Inside the screen it is measured against, and containing the point the
+    # gesture is aimed at -- the two facts that make it drawable.
+    assert 0 <= left and right <= tap["screen_w"]
+    assert 0 <= top and bottom <= tap["screen_h"]
+    cx, cy = tap["target_element"]["center"]
+    assert left <= cx <= right and top <= cy <= bottom
+
+
 def test_an_action_without_a_target_records_no_element(cfg, mem, tmp_path):
     """The field is absent rather than null, so a reader can tell "nothing to
     resolve" from "resolved to nothing" -- which for a tap is the reason the

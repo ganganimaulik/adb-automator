@@ -186,6 +186,100 @@ def test_latest_resumable_picks_the_newest_checkpoint(cfg, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Answering an `ask_user`
+# ---------------------------------------------------------------------------
+
+def test_set_answer_writes_where_the_resume_will_read_it(cfg, tmp_path):
+    run = tmp_path / "runs" / "r1"
+    run.mkdir(parents=True)
+    (run / checkpoint.NAME).write_text(
+        json.dumps({"goal": GOAL, "run_id": "r1", "step": 4}), encoding="utf-8")
+
+    assert checkpoint.set_answer(run, "  428 913 ") is True
+    data = checkpoint.load(run)
+    # Whitespace-collapsed like every other string the run records, so a code
+    # pasted with a stray newline is the code and not the code plus a newline.
+    assert data[checkpoint.ANSWER] == "428 913"
+    # Everything already in the file is still in it.
+    assert data["goal"] == GOAL and data["step"] == 4
+
+
+def test_set_answer_refuses_a_run_with_nothing_to_resume(cfg, tmp_path):
+    """No checkpoint is the whole of "this run cannot be answered": a run that
+    succeeded has had its cleared, and one that never wrote one has nothing to
+    continue from either."""
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    assert checkpoint.set_answer(bare, "yes") is False
+    (bare / checkpoint.NAME).write_text("{not json", encoding="utf-8")
+    assert checkpoint.set_answer(bare, "yes") is False
+
+
+def test_restore_folds_the_answer_into_the_history_the_model_reads(cfg):
+    state = RunState(goal=GOAL, run_id="r1", intent_id="i1")
+    checkpoint.restore(state, {"goal": GOAL, "step": 4,
+                               "history": ["4. tapped 'Sign in'"],
+                               checkpoint.ANSWER: "428913"})
+    # After the step that asked, not before it: an answer is the last thing
+    # that happened.
+    assert state.history[-1] == ("4. the person was asked for something and "
+                                 "answered: 428913")
+    assert state.history[0] == "4. tapped 'Sign in'"
+
+
+def test_an_empty_answer_leaves_the_history_alone(cfg):
+    state = RunState(goal=GOAL, run_id="r1", intent_id="i1")
+    checkpoint.restore(state, {"goal": GOAL, "step": 4, checkpoint.ANSWER: "   "})
+    assert state.history == []
+
+
+def test_a_consumed_answer_does_not_outlive_the_step_that_used_it(cfg):
+    """`save` rewrites the whole file and never writes this key, so an answer
+    disappears once it has been read -- rather than being handed to a second
+    `ask_user` that meant something else entirely."""
+    state = RunState(goal=GOAL, run_id="abc123def456", intent_id="i1")
+    checkpoint.restore(state, {"goal": GOAL, "step": 4,
+                               checkpoint.ANSWER: "428913"})
+    checkpoint.save(cfg, state)
+
+    data = checkpoint.load(runlog.run_dir(cfg, state.run_id))
+    assert checkpoint.ANSWER not in data
+    # But what it told the run survives, because history does.
+    assert any("428913" in line for line in data["history"])
+
+
+def test_an_answered_run_resumes_with_the_answer_in_hand(cfg, mem):
+    """End to end: the run stops to ask, the answer goes into the checkpoint
+    from outside, and the resumed sitting shows the model what it was told."""
+    dev = fake.FakeDevice(cfg)
+
+    def asks(screen, llm):
+        return AgentAction(observation="a code is wanted", reasoning="cannot know",
+                           action="ask_user", text="what is the code texted to you?")
+
+    outcome, state = Agent(dev, mem, fake.FakeLLM(dev, asks), cfg).run(GOAL)
+    assert outcome == "needs_user"
+
+    run_dir = runlog.run_dir(cfg, state.run_id)
+    assert checkpoint.set_answer(run_dir, "428913") is True
+
+    data = checkpoint.load(run_dir)
+    _, resumed = Agent(
+        dev, mem, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
+        cfg).run(GOAL, run_id=state.run_id, resume=data)
+    assert any("428913" in line for line in resumed.history)
+
+    events = [json.loads(line) for line in
+              (run_dir / "events.jsonl").read_text().splitlines() if line.strip()]
+    resume_event = [e for e in events if e["kind"] == "run_resume"][-1]
+    # That it was answered, never what the answer said: `ask_user` is what the
+    # agent does instead of typing a credential, and this file is the one the
+    # web UI streams and `report` prints.
+    assert resume_event["answered"] is True
+    assert "428913" not in (run_dir / "events.jsonl").read_text()
+
+
+# ---------------------------------------------------------------------------
 # The loop, end to end
 # ---------------------------------------------------------------------------
 
