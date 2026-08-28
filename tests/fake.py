@@ -102,6 +102,29 @@ class FakeDevice:
         #: not re-bought every turn.
         self.date = TODAY
         self.date_reads = 0
+        #: The session, which the agent closes to hand the phone to a person and
+        #: reopens to take it back. Counted rather than merely flagged: the real
+        #: `open` zeroes the animation scales, locks rotation and selects the
+        #: agent's IME, and `close` puts all four back, so how many times each
+        #: happened is the whole of whether a takeover left the phone usable.
+        self.opens = 0
+        self.closes = 0
+        self.session_open = True
+
+    # -- session -----------------------------------------------------------
+
+    def open(self) -> "FakeDevice":
+        self.opens += 1
+        self.session_open = True
+        return self
+
+    def close(self) -> None:
+        """Safe to call twice, like the real one: the run's own teardown calls
+        it after a takeover has already closed the session."""
+        if not self.session_open:
+            return
+        self.closes += 1
+        self.session_open = False
 
     # -- observation -------------------------------------------------------
 
@@ -221,9 +244,6 @@ class FakeDevice:
     def recover(self, tier: int = 1) -> bool:
         self.actions.append(f"recover({tier})")
         return True
-
-    def close(self) -> None:
-        pass
 
 
 Policy = Callable[[Screen, "FakeLLM"], AgentAction]
