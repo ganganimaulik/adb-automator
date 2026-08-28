@@ -38,6 +38,18 @@ LOG_NAME = "run.log"
 #: the web UI tails to show the model thinking live.
 STREAM_NAME = "stream.jsonl"
 
+#: Where each step's elements were, inside `runs/<id>/`: one line per decided
+#: step, carrying the screen's size and the rectangle of every element the model
+#: was shown. What it is for is drawing them -- the trace can say `tap #12` and
+#: the picture beside it cannot say which thing #12 was, and matching the two was
+#: done by eye.
+#:
+#: Kept out of `events.jsonl` for the same reason as the stream above: eighty
+#: rectangles is a few kilobytes a step, and that file is the one `report`,
+#: `replay`, the history list and the run detail all parse in full. A run
+#: recorded before this file existed simply has no boxes to draw.
+SCREENS_NAME = "screens.jsonl"
+
 #: A frame a run actually showed a model, inside `runs/<id>/`. Only the
 #: submitted ones are kept: the web UI shows the screenshot beside the call that
 #: saw it, which is the difference between reading a vision read and checking it.

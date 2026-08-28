@@ -625,7 +625,14 @@ def render_element(el: Element, width: int = 0, height: int = 0) -> str:
     return "  ".join(parts)
 
 
-def render(screen: Screen, limit: int = 80) -> str:
+#: How many elements a rendered screen shows before it says how many it did not.
+#: Named because the number has a second reader: the run records the geometry of
+#: the elements it showed, and a box drawn for an element the model never saw
+#: would be describing a different list from the one it chose `#N` out of.
+RENDER_LIMIT = 80
+
+
+def render(screen: Screen, limit: int = RENDER_LIMIT) -> str:
     """The exact text handed to the model."""
     header = (f"screen {screen.width}x{screen.height} rot={screen.rotation} "
               f"app={screen.package or '?'}")

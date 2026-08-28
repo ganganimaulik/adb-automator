@@ -577,7 +577,14 @@
 </main>
 
 <!-- A submitted screenshot at full size. Click anywhere, or Escape, to close. -->
-<div class="lightbox" id="lightbox" hidden><img id="lightbox-img" alt=""></div>
+<!-- The stage shrink-wraps the image so the overlay, which is `inset: 0` over
+     it, covers the picture rather than the letterboxing around it. -->
+<div class="lightbox" id="lightbox" hidden>
+  <div class="lightbox-stage">
+    <img id="lightbox-img" alt="">
+    <div class="phone-shade" id="lightbox-shade" hidden></div>
+  </div>
+</div>
 
 <!-- What live reload just did, when the server is watching its own source.
      Out of the page's own corner: it is the harness talking about itself, not

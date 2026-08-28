@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from .. import policies as policymod
 from ..config import Config, _set_path, find_config_file, load_config
 from ..policies import same_file as _same_file
-from ..runlog import SHOT_RE, STREAM_NAME
+from ..runlog import SCREENS_NAME, SHOT_RE, STREAM_NAME
 from ..skills import Skill, SkillRegistry
 from . import runparse
 from .reload import LiveReload
@@ -1126,12 +1126,13 @@ def _event_stream(child: ChildProcess,
     tour behind a `skills generate`. Both write the same files, so both are
     watched with the same frames -- and the browser renders them with one view.
 
-    Two files, two frame types: `events.jsonl` (what was decided) arrives as
-    `event`, and `stream.jsonl` (the model's raw thinking and response as they
-    happen) arrives as `llm`. A run recorded before the stream file existed
-    just yields the first.
+    Three files, three frame types: `events.jsonl` (what was decided) arrives as
+    `event`, `stream.jsonl` (the model's raw thinking and response as they
+    happen) arrives as `llm`, and `screens.jsonl` (where the elements it was
+    choosing between were) arrives as `screen`. A run recorded before either of
+    the later two existed just yields the ones it has.
 
-    A third arrives only while the child is stopping: `output`, one frame per
+    A fourth arrives only while the child is stopping: `output`, one frame per
     line of its stdout. Both files go quiet the moment the loop ends, and for a
     watch that is where the work starts -- every pass it made is folded into the
     app's skill by one model call that can take a minute. None of that is written
@@ -1163,7 +1164,8 @@ def _event_stream(child: ChildProcess,
 
     def tails_for(path: Path):
         return [(path / runparse.EVENTS_NAME, "event"),
-                (path / STREAM_NAME, "llm")]
+                (path / STREAM_NAME, "llm"),
+                (path / SCREENS_NAME, "screen")]
 
     yield sse({"run_id": run_dir.name,
                "iteration": child.state()["iteration"] or 1}, "run")

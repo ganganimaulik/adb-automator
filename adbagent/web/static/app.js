@@ -878,15 +878,41 @@ function llmSummary(start, end) {
   return s;
 }
 
-function openLightbox(src, alt) {
+/* The frame at the size of the window -- with, when the caller has it, the
+   geometry that was drawn over the small copy.
+
+   This is where the element list is actually legible. Eighty numbered boxes
+   over a 236px panel is a texture; over the full window it is the list the
+   model was choosing `#N` out of, which is the thing a decision that went to
+   the wrong control is always argued about. */
+function openLightbox(src, alt, geo) {
   $("lightbox-img").src = src;
   $("lightbox-img").alt = alt || "";
+  const shade = $("lightbox-shade");
+  const target = geo && boxCss(geo.target && geo.target.bounds, geo.w, geo.h);
+  shade.innerHTML =
+    (geo ? elementBoxes(geo.els, geo.w, geo.h) : "") +
+    (target ? `<div class="phone-box" style="${target}">` +
+              `<span class="phone-tag">${geo.target.index == null ? ""
+                : esc("#" + geo.target.index)}</span></div>` : "");
+  shade.hidden = !shade.innerHTML;
+  // The stage only takes the screen's shape when there is something to draw
+  // over it; see `.lightbox-stage.fitted`.
+  const stage = document.querySelector(".lightbox-stage");
+  const fitted = !shade.hidden && geo.w > 0 && geo.h > 0;
+  stage.classList.toggle("fitted", fitted);
+  if (fitted) stage.style.setProperty("--shot-ratio", `${geo.w} / ${geo.h}`);
+  else stage.style.removeProperty("--shot-ratio");
   $("lightbox").hidden = false;
 }
 
 function closeLightbox() {
   $("lightbox").hidden = true;
   $("lightbox-img").removeAttribute("src");  // stop holding the decoded frame
+  const shade = $("lightbox-shade");
+  shade.innerHTML = "";
+  shade.hidden = true;
+  document.querySelector(".lightbox-stage").classList.remove("fitted");
 }
 
 $("lightbox").addEventListener("click", closeLightbox);
@@ -1069,6 +1095,44 @@ function appendExitLine(feed, line) {
    Every state says which it is. A frame is stamped with how old it is, a phone
    that cannot be read says why, and nothing is ever shown unlabelled. */
 
+/* ------------------------------------------------- element geometry
+
+   Where the run said its elements were, drawn over a picture of the screen
+   they were measured on. Percentages, never pixels: every picture here is a
+   scaled copy -- a 236px panel, a full-screen lightbox, and every width the
+   column takes in between -- and a box placed as a fraction of its own screen
+   needs no recomputing when the scale changes under it. */
+
+//: Whether the whole element list is drawn, or only what the step is aiming at.
+//: Remembered like the feed's density: it is a way of reading the panel rather
+//: than a property of any one run.
+const ELEMENTS_KEY = "adbagent.phone-elements";
+
+function boxCss(b, w, h) {
+  const [l, t, r, bot] = (b || []).map(Number);
+  if (!(w > 0) || !(h > 0) || !(r > l) || !(bot > t)) return "";
+  const pct = (n, d) => `${(100 * n / d).toFixed(3)}%`;
+  return `left:${pct(l, w)};top:${pct(t, h)};` +
+         `width:${pct(r - l, w)};height:${pct(bot - t, h)}`;
+}
+
+/* Every element the model was shown, outlined and numbered.
+
+   `#12` is a position in this list, so the list is the difference between
+   reading the number and seeing what it picked out of — which is the question
+   a decision that went to the wrong control always raises. */
+function elementBoxes(els, w, h) {
+  let html = "";
+  for (const el of els || []) {
+    const css = boxCss(el.b, w, h);
+    if (!css) continue;
+    html += `<div class="phone-el" style="${css}" ` +
+            `title="${esc(`#${el.i} ` + (targetTitle(el) || ""))}">` +
+            `<span class="phone-num">${esc(String(el.i))}</span></div>`;
+  }
+  return html;
+}
+
 const FRAME_POLL_MS = 2000;
 //: A phone that cannot be read will not start being readable in two seconds, so
 //: back right off rather than asking sixteen hundred times an hour. Still a
@@ -1080,6 +1144,7 @@ function phoneView(box, { live = false, edge = 720 } = {}) {
     `<div class="phone-head"><span class="lbl">the phone</span>` +
     `<span class="grow"></span>` +
     `<button type="button" class="pause" hidden>pause</button>` +
+    `<button type="button" class="els" hidden>elements</button>` +
     `<button type="button" class="shot">refresh</button></div>` +
     `<div class="phone-frame"><div class="phone-empty">—</div></div>` +
     `<div class="phone-note"></div>`;
@@ -1087,20 +1152,28 @@ function phoneView(box, { live = false, edge = 720 } = {}) {
   const note = box.querySelector(".phone-note");
   const lbl = box.querySelector(".lbl");
   const pause = box.querySelector(".pause");
+  const elsBtn = box.querySelector(".els");
   const v = {
     timer: null, url: "", busy: false, paused: false, at: 0, ticker: null,
     running: false, every: FRAME_POLL_MS,
+    //: The last step's geometry, kept so the toggle below can redraw it
+    //: without waiting for another step to arrive.
+    geo: null,
+    showEls: loadValue(ELEMENTS_KEY) === "1",
   };
 
-  /* The element the agent is about to act on, drawn over the frame.
+  /* What the run says is on the screen, drawn over the picture of it.
 
      Built once and re-attached rather than rendered with the frame: everything
      below replaces the frame's contents wholesale -- a new image, an error
-     state -- and this has to survive both. */
+     state -- and this has to survive both. The target sits after the element
+     list in the DOM so it paints over its own outline rather than under it. */
   const shade = document.createElement("div");
   shade.className = "phone-shade";
   shade.hidden = true;
-  shade.innerHTML = `<div class="phone-box"><span class="phone-tag"></span></div>`;
+  shade.innerHTML = `<div class="phone-els"></div>` +
+                    `<div class="phone-box"><span class="phone-tag"></span></div>`;
+  const others = shade.querySelector(".phone-els");
   const mark = shade.querySelector(".phone-box");
   const tag = shade.querySelector(".phone-tag");
   frame.appendChild(shade);
@@ -1117,35 +1190,33 @@ function phoneView(box, { live = false, edge = 720 } = {}) {
     unmark();          // nothing to be over
   }
 
-  function unmark() { shade.hidden = true; }
+  function unmark() { v.geo = null; paint(); }
 
-  /* Show `target` -- a `decide` event's `target_element` -- over the frame,
-     measured against the screen size that event carried.
+  /* Draw one step's geometry: `{w, h, target, els}`, any part of it missing.
 
-     Percentages, not pixels. The frame holds a scaled copy of the screen
-     (`max_long_edge`) inside a column that is itself responsive, so a box
-     placed as a fraction of the screen it was measured on needs no recomputing
-     when the window resizes, when the next frame arrives at another size, or
-     when the phone rotates between the two. */
-  function marking(target, w, h) {
-    const b = (target && target.bounds) || [];
-    const [l, t, r, bot] = b.map(Number);
-    if (b.length !== 4 || !(w > 0) || !(h > 0)
-        || !(r > l) || !(bot > t) || !frame.querySelector("img")) {
-      unmark();
-      return;
+     The two halves arrive from two files and nothing orders them, so this is
+     called again with whichever turned up -- and draws whatever it has. */
+  function paint(geo) {
+    if (geo !== undefined) v.geo = geo;
+    const g = v.geo;
+    if (!g || !frame.querySelector("img")) { shade.hidden = true; return; }
+    const css = boxCss(g.target && g.target.bounds, g.w, g.h);
+    mark.style.cssText = css;
+    mark.hidden = !css;
+    if (css) {
+      tag.textContent = g.target.index == null ? "" : `#${g.target.index}`;
+      tag.hidden = g.target.index == null;
+      // The label the trace uses for the same element, so hovering the box and
+      // reading the step row are the same identification.
+      mark.title = targetTitle(g.target) || "";
     }
-    const pct = (n, d) => `${(100 * n / d).toFixed(3)}%`;
-    mark.style.left = pct(l, w);
-    mark.style.top = pct(t, h);
-    mark.style.width = pct(r - l, w);
-    mark.style.height = pct(bot - t, h);
-    tag.textContent = target.index == null ? "" : `#${target.index}`;
-    tag.hidden = target.index == null;
-    // The label the trace uses for the same element, so hovering the box and
-    // reading the step row are the same identification.
-    mark.title = targetTitle(target) || "";
-    shade.hidden = false;
+    others.innerHTML = v.showEls ? elementBoxes(g.els, g.w, g.h) : "";
+    shade.hidden = !css && !others.innerHTML;
+  }
+
+  function syncEls() {
+    elsBtn.textContent = v.showEls ? "hide elements" : "elements";
+    elsBtn.classList.toggle("on", v.showEls);
   }
 
   function stamp() {
@@ -1182,7 +1253,10 @@ function phoneView(box, { live = false, edge = 720 } = {}) {
         img = document.createElement("img");
         img.alt = "the phone's screen right now";
         img.title = "click to enlarge";
-        img.addEventListener("click", () => openLightbox(img.src, img.alt));
+        // Enlarged with whatever is drawn over it: eighty numbered boxes are
+        // unreadable at the width of this column and are the whole point at
+        // the width of the window.
+        img.addEventListener("click", () => openLightbox(img.src, img.alt, v.geo));
         frame.appendChild(img);
         frame.appendChild(shade);   // kept on top of whatever replaced it
       }
@@ -1218,8 +1292,15 @@ function phoneView(box, { live = false, edge = 720 } = {}) {
     pause.textContent = v.paused ? "resume" : "pause";
     schedule();
   });
+  elsBtn.addEventListener("click", () => {
+    v.showEls = !v.showEls;
+    saveValue(ELEMENTS_KEY, v.showEls ? "1" : "0");
+    syncEls();
+    paint();
+  });
   box.querySelector(".shot").addEventListener("click", grab);
 
+  syncEls();
   clearInterval(v.ticker);
   v.ticker = setInterval(stamp, 1000);
 
@@ -1229,6 +1310,9 @@ function phoneView(box, { live = false, edge = 720 } = {}) {
       v.running = true;
       v.every = FRAME_POLL_MS;   // a new run gets a fresh benefit of the doubt
       pause.hidden = !live;
+      // Offered only where there is something to draw: geometry arrives from a
+      // run, so on the Setup screenshot the button would never do anything.
+      elsBtn.hidden = !live;
       grab();
       schedule();
     },
@@ -1236,6 +1320,7 @@ function phoneView(box, { live = false, edge = 720 } = {}) {
     stop() {
       v.running = false;
       pause.hidden = true;
+      elsBtn.hidden = true;
       clearInterval(v.timer);
       stamp();
       say("");
@@ -1243,8 +1328,9 @@ function phoneView(box, { live = false, edge = 720 } = {}) {
     },
     /* One frame, now. */
     refresh: grab,
-    /* The element a decision is about to act on, and taking it away again. */
-    mark: marking,
+    /* One step's geometry -- what it is aiming at, and what it chose out of --
+       and taking it away again. */
+    mark: paint,
     unmark,
     idle(text) { empty(text); say(""); lbl.textContent = "the phone"; v.at = 0; },
   };
@@ -1283,6 +1369,8 @@ function makeLive(prefix, boxId, feedId) {
            ledger: el("ledger") },
     phone: null,             // the live device panel, when the surface has one
     marked: null,            // the step whose target the panel is drawing
+    geo: null,               // what it is drawing: target, element list, scale
+    screen: null,            // the newest `screens.jsonl` line seen
     passLabel: "iteration",  // a watch calls its own "pass"
     setRunning: () => {},   // what else on the page follows this surface
     onEvent: () => {},
@@ -1305,6 +1393,8 @@ function resetCounters(v) {
   v.budget = 0;
   v.now = "";
   v.marked = null;
+  v.geo = null;
+  v.screen = null;
   if (v.els.ledger) v.els.ledger.hidden = true;
   if (v.phone && v.phone.unmark) v.phone.unmark();
 }
@@ -1328,13 +1418,36 @@ function markTarget(ev, v) {
     v.marked = ev.step;
     // A decision with nothing to aim at -- `back`, `done`, a scroll with no
     // element -- clears the last one rather than leaving it up over a screen
-    // it has stopped describing.
-    phone.mark(ev.target_element, ev.screen_w, ev.screen_h);
+    // it has stopped describing. The element list may already be here or may
+    // be a frame behind; either way `markScreen` finishes the job.
+    v.geo = { w: ev.screen_w, h: ev.screen_h, target: ev.target_element,
+              els: v.screen && v.screen.step === ev.step ? v.screen.els : null };
+    phone.mark(v.geo);
   } else if (ev.kind === "verify" || ev.kind === "run_end"
              || (v.marked != null && ev.step != null && ev.step !== v.marked)) {
     v.marked = null;
+    v.geo = null;
     phone.unmark();
   }
+}
+
+/* One line of `screens.jsonl`: where every element the model was shown was.
+
+   Its own SSE channel because it is its own file, and the two are read in one
+   pass with the decision first -- so the list usually lands just after the
+   target it belongs to, and joins it rather than replacing it. Only the newest
+   is kept: the panel draws the step in flight and nothing else. */
+function markScreen(rec, v) {
+  const phone = v.phone;
+  if (!phone || !phone.mark) return;
+  v.screen = rec;
+  if (v.marked !== rec.step || !v.geo) return;
+  v.geo.els = rec.els;
+  // The screen's own size, when the decision did not carry one -- which is
+  // every run recorded before it did.
+  v.geo.w = v.geo.w || rec.w;
+  v.geo.h = v.geo.h || rec.h;
+  phone.mark(v.geo);
 }
 
 /* Keep a surface's clock and status telling the truth.
@@ -1404,6 +1517,10 @@ function openStream(v) {
       feed._steps = null;
       feed._curStep = null;
       feed._asked = "";      // the last pass's question is not this one's
+      v.marked = null;
+      v.geo = null;
+      v.screen = null;
+      if (v.phone && v.phone.unmark) v.phone.unmark();
       finalizeNotes(feed);   // the last pass's ledger is not this one's
       feed._notes = null;
       if (v.els.ledger) v.els.ledger.hidden = true;
@@ -1424,6 +1541,11 @@ function openStream(v) {
       markTarget(ev, v);
       v.onEvent(ev);
     });
+  });
+  // Geometry lays nothing out: it is drawn over the phone panel, which is not
+  // in the feed's flow, so it needs no `holdPlace`.
+  source.addEventListener("screen", (e) => {
+    markScreen(JSON.parse(e.data), v);
   });
   source.addEventListener("llm", (e) => {
     const ev = JSON.parse(e.data);
