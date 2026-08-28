@@ -209,6 +209,13 @@ class Watch:
         #: counts from its own per-package tally rather than from this, so a
         #: week's watch is not judged on the three steps its last pass took.
         self.last_state: Optional[Any] = None
+        #: Whether a person took the phone during *any* pass. Sticky, and here
+        #: rather than on a `RunState`, because that is per pass and this is not:
+        #: a takeover in pass 3 of forty is still a takeover when the watch stops
+        #: and the trace is closed off. Read by `cli` when it decides whether the
+        #: app's skill may be written from what this watch saw -- and reading it
+        #: off `last_state` would have asked the fortieth pass about the third.
+        self.took_over = False
         #: (finished_at, usd) per pass, for the rolling spend ceiling.
         self._spend: List[Tuple[float, float]] = []
         #: When the last pass finished, for the sweep. None until one has.
@@ -348,6 +355,9 @@ class Watch:
         try:
             outcome, state = agent.run(full_goal)
             self.last_state = state
+            # Latches on and never clears. Every later pass would report False,
+            # and the one that closes the trace is the one that gets asked.
+            self.took_over = self.took_over or state.took_over
         except (BudgetExceeded, LLMError) as exc:
             # The session budget is a run-level guard; for a watch it is one more
             # thing to back off from rather than a reason to stop watching.
