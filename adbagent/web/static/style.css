@@ -745,6 +745,10 @@ aside.phone.standalone { position: static; margin-top: 0; border: none; padding:
 
 .phone-head button:hover { color: var(--text); }
 
+/* The element overlay is a mode, not an action: the button says which it is in
+   the same colour the boxes are drawn in. */
+.phone-head button.on { color: var(--accent); }
+
 .phone-frame {
   background: #000;
   border: 1px solid var(--border);
@@ -782,6 +786,28 @@ aside.phone.standalone { position: static; margin-top: 0; border: none; padding:
   /* Dark ring first so the accent stays visible against a pale screen, then
      the glow: a 2px line over a screenshot is easy to lose. */
   box-shadow: 0 0 0 1px #000000a6, 0 0 14px #58a6ff59;
+}
+
+/* The rest of the list the target was chosen out of, behind it. Quiet on
+   purpose: these are context for the one box that matters, and eighty of them
+   drawn as loudly as the target would bury it. */
+.phone-el {
+  position: absolute;
+  border: 1px solid #58a6ff4d;
+  border-radius: 2px;
+}
+
+.phone-num {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 1;
+  padding: 1px 2px;
+  color: var(--text);
+  background: #0d1117cc;
+  border-radius: 2px 0 2px 0;
 }
 
 /* Inside the box, not above it: the frame clips its overflow, and an element
@@ -1234,12 +1260,59 @@ details.card summary:hover { color: var(--text); }
   cursor: zoom-out;
 }
 
+/* Wraps the image so the overlay lands on the picture and not on the padding
+   the flex centring leaves around it.
+
+   `align-items: center` is load-bearing, not decoration: a flex container
+   stretches its items by default, and a stretched `<img>` is one with its
+   aspect ratio thrown away -- a 1080x2400 phone rendered 1080x672. The centring
+   on `.lightbox` did that job while the image was its direct child. */
+.lightbox-stage {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  max-width: 100%;
+  max-height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* With nothing to draw, the wrapper gets out of the way entirely.
+
+   Not tidiness: a wrapper cannot both shrink-wrap its image and give that image
+   a height to take `max-height: 100%` of. The percentage has nothing definite
+   to resolve against, so the picture renders at its natural height and runs off
+   the bottom of the window -- which is what a trace screenshot did the moment
+   it was nested. `display: contents` makes the stage generate no box at all, so
+   the image is a direct flex child of `.lightbox` again and sizes exactly as it
+   did before any of this. The overlay is hidden in this state and generates no
+   box either. */
+.lightbox-stage:not(.fitted) { display: contents; }
+
+/* And when there *is* geometry, the caller knows the screen's shape and says
+   so: the stage takes that shape within the room it has, and the image fills
+   the stage exactly -- which is what lets a box positioned against the stage
+   land on the picture. */
+.lightbox-stage.fitted {
+  aspect-ratio: var(--shot-ratio);
+  width: auto;
+  height: auto;
+}
+
+.lightbox-stage.fitted > img { width: 100%; height: 100%; }
+
 .lightbox img {
+  display: block;
   max-width: 100%;
   max-height: 100%;
   border-radius: 8px;
   box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
 }
+
+/* At this size the numbers are the point, so they get the room they need. */
+.lightbox .phone-num { font-size: 11px; padding: 2px 4px; }
+.lightbox .phone-el { border-color: #58a6ff80; }
 
 .pulse {
   display: inline-block;

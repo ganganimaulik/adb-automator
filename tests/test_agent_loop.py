@@ -11,7 +11,7 @@ import json
 import pytest
 
 from adbagent.actions import AgentAction
-from adbagent.agent import Agent, Oracle, RunState, needs_screenshot
+from adbagent.agent import Agent, Oracle, Recorder, RunState, needs_screenshot
 from adbagent.config import Config
 from adbagent.device import DeviceTimeout
 from adbagent.memory import Memory
@@ -1182,6 +1182,83 @@ def test_a_decision_records_the_element_its_ordinal_resolved_to(cfg, mem, tmp_pa
     assert target["index"] == taps[0]["action"]["target"]["index"]
     assert target["text"] == "Wi-Fi"
     assert target["kind"] and target["center"]
+
+
+def _screens(tmp_path, run_id):
+    from adbagent.runlog import SCREENS_NAME
+    path = tmp_path / "runs" / run_id / SCREENS_NAME
+    return [json.loads(line) for line in path.read_text().splitlines()
+            if line.strip()]
+
+
+def test_each_step_records_where_its_elements_were(cfg, mem, tmp_path):
+    """The list `#N` is a position in, so a reader can draw it.
+
+    Its own file, not `events.jsonl`: that one is parsed in full by the history,
+    the report and the replay, and eighty rectangles a step would be paid for by
+    all three to be read by none of them.
+    """
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    screens = _screens(tmp_path, state.run_id)
+    decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
+    # One line per decided step, and the steps line up with the decisions.
+    assert [s["step"] for s in screens] == [d["step"] for d in decides]
+
+    first = screens[0]
+    assert first["w"] > 0 and first["h"] > 0
+    assert first["els"], "the screen had no elements to record"
+    for el in first["els"]:
+        left, top, right, bottom = el["b"]
+        assert right > left and bottom > top
+        assert 0 <= left and right <= first["w"]
+        assert 0 <= top and bottom <= first["h"]
+    # Indices are the ones the model was told to aim at, so the target of a
+    # decision is findable in the list its own step recorded.
+    tap = next(d for d in decides if d["action"]["action"] == "tap")
+    geometry = next(s for s in screens if s["step"] == tap["step"])
+    match = [el for el in geometry["els"]
+             if el["i"] == tap["target_element"]["index"]]
+    assert len(match) == 1
+    assert match[0]["b"] == tap["target_element"]["bounds"]
+
+
+def test_the_geometry_stops_where_the_rendered_screen_does(cfg, mem, tmp_path):
+    """`render` shows the model the first `RENDER_LIMIT` elements and says how
+    many it left out. Recording past that point would number a longer list than
+    the one the model picked out of."""
+    from adbagent.screen import RENDER_LIMIT
+
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    for line in _screens(tmp_path, state.run_id):
+        assert len(line["els"]) <= RENDER_LIMIT
+
+
+def test_a_screens_file_that_cannot_be_written_does_not_end_the_run(cfg, mem,
+                                                                    tmp_path):
+    """A side channel, like the LLM stream: the run is the events file, and a
+    disk that will not take the drawing aid is not a reason to stop driving."""
+    dev = fake.FakeDevice(cfg)
+    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+
+    real_init = Recorder.__init__
+
+    def break_screens(self, *a, **kw):
+        real_init(self, *a, **kw)
+        self.screens.close()          # every write from here raises
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Recorder, "__init__", break_screens)
+        outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+
+    assert outcome == "success"
+    # And the run's own record is untouched by the channel that failed.
+    assert [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
 
 
 def test_a_decision_records_the_geometry_needed_to_draw_it(cfg, mem, tmp_path):

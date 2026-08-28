@@ -43,7 +43,7 @@ from .pager import (SweepLog, can_repeat, content_box,
                     stop_repeating, sweep_summary, video_only_drift)
 from .safety import Aborted, LoopDetector
 from .scratchpad import NoteLedger
-from .screen import Screen, render
+from .screen import RENDER_LIMIT, Screen, render
 from .skills import Skill, SkillRegistry, goal_app_candidates
 
 log = logging.getLogger("adbagent.agent")
@@ -270,6 +270,9 @@ class Recorder:
         # The live LLM stream, for the web UI to tail. Append mode for the same
         # reason as events.jsonl: a resumed run continues its own directory.
         self.stream = (self.dir / runlog.STREAM_NAME).open("a", encoding="utf-8")
+        # Where each step's elements were, for anything drawing them over a
+        # picture of the screen. Its own file for the same reason as the stream.
+        self.screens = (self.dir / runlog.SCREENS_NAME).open("a", encoding="utf-8")
         # Opened here rather than by the caller, so that every entry point which
         # runs an agent -- `run`, `skills generate`, an embedding program -- gets
         # a debuggable log without having to remember to ask for one.
@@ -283,22 +286,57 @@ class Recorder:
         # next to the adb traffic, the retries and the warnings around it.
         runlog.event(kind, fields)
 
-    def stream_event(self, kind: str, **fields: Any) -> None:
-        """One line of the raw LLM stream. A best-effort side channel: a disk
-        that cannot take it must not kill the run over the live view."""
-        if self.stream is None:
-            return
-        record = {"t": round(time.time(), 3), "kind": kind, **fields}
+    def _side_channel(self, handle: Any, what: str,
+                      record: Dict[str, Any]) -> Any:
+        """Write one line to a file that is not the run, and say what is left.
+
+        Neither of the two is the record of what happened: one is the model
+        thinking, for the live view to show as it arrives, and the other is where
+        the elements were, for anything drawing them. A disk that will not take
+        either is not a reason to end a run that is otherwise working, so the
+        channel is closed and the caller carries on without it -- which is what
+        the returned handle, or `None`, says.
+        """
+        if handle is None:
+            return None
         try:
-            self.stream.write(json.dumps(record, default=str) + "\n")
-            self.stream.flush()
+            handle.write(json.dumps(record, default=str) + "\n")
+            handle.flush()
+            return handle
         except (OSError, ValueError) as exc:
-            log.warning("stream log failed (%s); dropping it", exc)
+            log.warning("the %s file failed (%s); dropping it", what, exc)
             try:
-                self.stream.close()
+                handle.close()
             except Exception:  # noqa: BLE001
                 pass
-            self.stream = None
+            return None
+
+    def stream_event(self, kind: str, **fields: Any) -> None:
+        """One line of the raw LLM stream."""
+        self.stream = self._side_channel(
+            self.stream, "stream",
+            {"t": round(time.time(), 3), "kind": kind, **fields})
+
+    def screen(self, step: int, screen: Screen) -> None:
+        """Where every element the model was shown on this step is.
+
+        The elements, not the nodes, and only as far as `render` went: `#12` is
+        a position in the list the model was given, so a box drawn for something
+        further down that list than the model could see would be numbering a
+        different screen from the one it chose out of.
+
+        Text is carried so a box can label itself, and capped: an element can be
+        a paragraph, and eighty paragraphs a step is a different kind of file
+        from the one this is meant to be.
+        """
+        self.screens = self._side_channel(
+            self.screens, "screens",
+            {"t": round(time.time(), 3), "step": step,
+             "w": screen.width, "h": screen.height,
+             "els": [{"i": el.index, "b": list(el.bounds),
+                      "text": " ".join(el.best_text.split())[:80],
+                      "kind": el.kind()}
+                     for el in screen.elements[:RENDER_LIMIT]]})
 
     def blob(self, name: str, data: bytes) -> str:
         path = self.dir / name
@@ -1498,6 +1536,13 @@ class Agent:
                     state.note_progress(
                         f"it finished {len(plan_update.completed)} plan step(s) "
                         f"({done} of {len(state.plan)} done)")
+
+            # Where the elements were, before the decision that names one of
+            # them. Two files, so nothing guarantees which the browser reads
+            # first -- but written in the order a reader of the directory wants
+            # them, and the order that lets a live view draw the list the moment
+            # it has both halves.
+            rec.screen(state.step, screen)
 
             rec.event("decide", step=state.step, source=source,
                       skeleton=screen.skeleton_id,

@@ -483,7 +483,10 @@ structured line per step), `run.log` (what it did, in full detail),
 `stream.jsonl` (the raw LLM stream — every `llm_start`/chunk/`llm_end`, which
 the web UI tails to show the model thinking live; a reasoning model writes tens
 of thousands of chunks a run, so opening a *finished* run joins each run of them
-into one record before it leaves the server), the exact messages sent
+into one record before it leaves the server), `screens.jsonl` (where the
+elements were — one line per decided step, carrying the screen's size and the
+rectangle of everything the model was shown, which is what lets a `#12` be drawn
+rather than looked for), the exact messages sent
 at each step, and the screenshots that were *submitted* to a model —
 `step_004_analyze_image_9f3c1a20.jpg`, named by the step, the call that was shown
 it, and a digest of the bytes, so one frame shown twice is one file. Only
@@ -640,6 +643,15 @@ the gesture landing — in that window the agent has observed and not yet acted,
 so the screen being polled is the screen the rectangle was measured on, and it
 comes down again on the verify. A decision with nothing to aim at takes the last
 one down rather than leaving it over a screen it has stopped describing.
+
+An **elements** toggle beside it draws the whole list that target was chosen out
+of, each one outlined and numbered — which is the question a step that went to
+the wrong control always raises, and the one the trace cannot answer, since `#N`
+is a position in a list nobody reading it afterwards can see. Eighty boxes at the
+width of that column is a texture rather than a list, so clicking the frame
+enlarges it with the overlay intact, and that is where the numbers are legible.
+The setting is remembered, like the feed's density: it is a way of reading the
+panel rather than a property of any one run.
 
 *Story and trace.* The feed defaults to **story**: one row per step — the action,
 what the model observed, the outcome chip, and a `stalled N` chip once the run

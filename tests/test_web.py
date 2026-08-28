@@ -183,6 +183,13 @@ def write_stream(d: Path, records) -> None:
             fh.write(json.dumps(record) + "\n")
 
 
+def write_screens(d: Path, records) -> None:
+    from adbagent.runlog import SCREENS_NAME
+    with (d / SCREENS_NAME).open("w", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record) + "\n")
+
+
 def test_run_detail_merges_the_llm_stream(tmp_path):
     d = make_run_dir(tmp_path)
     write_stream(d, [
@@ -612,6 +619,52 @@ def test_stream_includes_llm_frames(web, tmp_path, monkeypatch):
     # The frame that call was shown, named so the page can fetch it while the
     # run is still going.
     assert "step_001_analyze_image_00c0ffee.jpg" in body
+
+
+def test_stream_includes_screen_geometry(web, tmp_path, monkeypatch):
+    """Where the elements were, as its own frame type off its own file.
+
+    A third channel rather than a fatter `decide`: eighty rectangles a step is
+    kilobytes, and `events.jsonl` is what the history, the report and the replay
+    all parse in full.
+    """
+    runs = tmp_path / "runs"
+
+    def fake_popen(argv, **kwargs):
+        def on_spawn(_argv):
+            d = make_run_dir(runs, run_id="live3")
+            write_screens(d, [
+                {"t": 1000.4, "step": 1, "w": 1080, "h": 2400,
+                 "els": [{"i": 3, "b": [54, 600, 1026, 750],
+                          "text": "Wi-Fi", "kind": "switch"}]},
+            ])
+        return FakeProc(argv, on_spawn=on_spawn, **kwargs)
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", fake_popen)
+    assert web.post("/api/runs", json={"goal": "turn on wifi"}).status_code == 200
+
+    body = web.get("/api/runs/stream").text
+    assert "event: screen" in body
+    assert '"w": 1080' in body
+    assert "Wi-Fi" in body
+
+
+def test_a_run_without_screen_geometry_still_streams(web, tmp_path, monkeypatch):
+    """Every run recorded before the file existed has no boxes to draw, which
+    is not the same as a stream that will not open."""
+    runs = tmp_path / "runs"
+
+    def fake_popen(argv, **kwargs):
+        return FakeProc(argv, on_spawn=lambda _a: make_run_dir(runs, run_id="old1"),
+                        **kwargs)
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", fake_popen)
+    assert web.post("/api/runs", json={"goal": "turn on wifi"}).status_code == 200
+
+    body = web.get("/api/runs/stream").text
+    assert "event: screen" not in body
+    assert "event: event" in body
+    assert "event: end" in body
     assert "event: end" in body
 
 
