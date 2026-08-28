@@ -626,6 +626,25 @@ last changed them. The ledger is the whole of it rather than the delta, with the
 records that the newest step wrote or corrected marked, and a re-read that
 disagreed with an earlier reading shown next to the value that replaced it.
 
+*Holding it.* **Pause** stops the loop between steps and **Step** lets it take
+exactly one. Neither is a stop: the child keeps the phone, its device session
+and everything it has learned, and carries on from where it was — stopping is
+still the way out, because stopping is what puts the keyboard, the animations
+and the rotation back. Watching an agent walk into a wall and having no way to
+say "wait" was the gap; until this the entire vocabulary from outside a running
+run was a SIGINT.
+
+The command is read at the top of the next step, which is the only moment the
+run is between things rather than in the middle of one — the last step complete,
+the next not begun, the phone where the last action left it. So a request sent
+into the middle of a forty-second step takes effect at the end of it, and the
+button says `pausing…` until the loop itself reports back rather than claiming
+something that has not happened yet. Time spent held is given back: the
+wall-clock budget bounds how long a run may *work*, and a run held for five
+minutes by the person reading it has not worked for five minutes. Each hold and
+each step goes into the trace, because a step that took four minutes and a step
+that was held for four minutes read identically without it.
+
 *The phone.* A panel beside the feed showing the screen as it is, polled every
 couple of seconds while a run is going. It is a read-only `exec-out screencap`
 taken alongside the agent rather than through it: opening a device session zeroes

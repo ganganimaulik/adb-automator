@@ -769,6 +769,16 @@ function foldEvent(ev, feed) {
     banner(feed, "", `<b>resumed from step ${esc(ev.resumed_at_step || 0)}</b>` +
       `<br><span class="small">${esc(ev.model || "")}</span>`);
 
+  } else if (kind === "control") {
+    // Somebody reached into the run. In the trace rather than only on the
+    // button, because a step that took four minutes of wall clock and a step
+    // that was held for four minutes read identically without it.
+    const said = { pause: ["needs_user", "<b>held</b> — the run is waiting; " +
+                           "it still has the phone"],
+                   run: ["", "<b>let go</b> — carrying on"],
+                   step: ["", "<b>one step</b> — then holding again"] }[ev.mode];
+    if (said) banner(feed, said[0], said[1]);
+
   } else if (kind === "run_end") {
     // The answer has its own block above the feed -- large, first, and once. In
     // the trace it stays where it always was, because the trace is the record.
@@ -1367,6 +1377,15 @@ function makeLive(prefix, boxId, feedId) {
            state: el("state"), skill: el("skill"), iterWrap: el("iter-wrap"),
            iter: el("iter"), records: el("records"), progress: el("progress"),
            ledger: el("ledger") },
+    running: false,          // what the status word and the buttons follow
+    mode: "run",             // what the loop says it is doing: run or pause
+    asked: "run",            // what it was last told to do, which may not be it
+    //: Whether this surface owns the hold controls. Only Work does: a watch is
+    //: a standing job with its own lifecycle, and the generator's tour is short
+    //: enough that holding it is a stop with extra steps. Every surface still
+    //: gets `state` frames, so without this a watch's would paint Work's
+    //: buttons.
+    holds: false,
     phone: null,             // the live device panel, when the surface has one
     marked: null,            // the step whose target the panel is drawing
     geo: null,               // what it is drawing: target, element list, scale
@@ -1395,6 +1414,9 @@ function resetCounters(v) {
   v.marked = null;
   v.geo = null;
   v.screen = null;
+  // A fresh run has not been told anything. The stream replays from the top of
+  // the events file, so any `control` this run really did get comes back.
+  paintHold(v, "run", "run");
   if (v.els.ledger) v.els.ledger.hidden = true;
   if (v.phone && v.phone.unmark) v.phone.unmark();
 }
@@ -1456,12 +1478,26 @@ function markScreen(rec, v) {
    -- still holding the phone, still spending -- for as long as its shutdown
    takes, which for a watch is a model call that writes the app's skill. The
    clock keeps going through it, because that time is still being spent. */
+/* The status word, which four things can change: starting, stopping, finishing,
+   and being held. Its own function because the last of those arrives on the
+   event stream, long after whatever set the other three. */
+function paintStatus(v) {
+  const stopping = v.running && v.stopping;
+  const held = v.running && v.mode === "pause";
+  v.els.state.textContent = stopping ? "stopping…"
+    : (v.running ? (held ? "held" : "running") : "idle");
+  // A held run gets the same yellow as a stopping one: both are states where
+  // the phone is still taken and nothing is happening to it, which is what
+  // somebody glancing at the page needs the colour to say.
+  v.els.state.style.color = (stopping || held) ? "var(--yellow)"
+    : (v.running ? "var(--green)" : "var(--text-dim)");
+}
+
 function setLiveRunning(v, running) {
+  v.running = running;
   const stopping = running && v.stopping;
   if (!running) v.stopping = false;
-  v.els.state.textContent = stopping ? "stopping…" : (running ? "running" : "idle");
-  v.els.state.style.color = stopping ? "var(--yellow)"
-    : (running ? "var(--green)" : "var(--text-dim)");
+  paintStatus(v);
   clearInterval(v.timer);
   if (running) {
     v.timer = setInterval(() => {
@@ -1563,6 +1599,11 @@ function openStream(v) {
     const st = JSON.parse(e.data);
     if (st.started_at) v.startedAt = st.started_at;
     if (st.stopping) v.stopping = true;
+    // What it was last told, for a page that has just opened on a run already
+    // in progress: the `control` events that said so are replayed from the
+    // events file below, but the buttons should not read "Pause" in the
+    // meantime for a run that is already holding.
+    if (st.mode) paintHold(v, undefined, st.mode);
     setLiveRunning(v, !!st.running);
     if (!st.running && st.returncode != null) {
       v.els.state.textContent = "exited (" + st.returncode + ")";
@@ -1594,6 +1635,7 @@ function openStream(v) {
 
 const live = makeLive("c-", "live", "feed");
 live.url = "/api/runs/stream";
+live.holds = true;      // the only surface with Pause and Step
 live.phone = phoneView($("live-phone"), { live: true });
 live.setRunning = (running, stopping) => {
   $("btn-start").disabled = running;
@@ -1602,10 +1644,28 @@ live.setRunning = (running, stopping) => {
   // -- and takes down the work it is doing there.
   $("btn-stop").hidden = !running;
   $("btn-stop").disabled = stopping;
+  // Holding is offered for as long as there is a loop to hold. Not while it is
+  // stopping: a child on its way out is past the point where it reads these,
+  // and the phone it is restoring is not waiting on anybody's decision.
+  $("btn-hold").hidden = !running;
+  $("btn-step").hidden = !running;
+  $("btn-hold").disabled = stopping;
+  // Available whenever there is a loop to step, held or not. From a running
+  // loop it means "finish this one, then hold", which is the natural way to
+  // slow a run down that is going somewhere wrong -- and making it a two-click
+  // job behind Pause would be worse for the one case it is wanted in.
+  $("btn-step").disabled = stopping;
+  // A run that is over has been told nothing; one that is going keeps whatever
+  // it was told, which the replayed `control` events put back.
+  if (!running) paintHold(live, "run", "run");
   // What to do next is only offered once there is no next iteration coming.
   $("run-actions").hidden = running;
 };
 live.onEvent = (ev) => {
+  // What the loop is actually doing, from the loop. This is the only honest
+  // source: the request went into a file the run reads at the top of its next
+  // step, and until it has, nothing has changed.
+  if (ev.kind === "control") paintHold(live, ev.mode, ev.mode);
   // The answer, the moment it exists, in the block that leads the surface.
   if (ev.kind === "run_end") showResult(ev, live.feed._runId, live.feed._asked);
 };
@@ -1859,6 +1919,50 @@ $("run-answer").addEventListener("submit", async (e) => {
   if (await resumeRun(id)) $("run-answer").hidden = true;
   else btn.disabled = false;
 });
+
+/* What the run is doing with itself, on the button that changes it.
+
+   Two facts, not one. What was *asked for* is the answer to the click; what the
+   loop is *doing* arrives as a `control` event, from the loop, once it has read
+   the command at the top of its next step. Those are seconds apart -- a command
+   sent into the middle of a forty-second step waits for the end of it -- so the
+   button leads with what is true and shows the request as a pending state,
+   rather than claiming the run stopped the moment it was asked to. */
+function paintHold(v, mode, asked) {
+  if (!v.holds) return;
+  // A `step` is a held run taking one: the loop says so on the way past and is
+  // holding again immediately after, so both the state and the request fold
+  // into `pause` here rather than flickering the button through a third label
+  // for the length of one step. The feed still shows the step for what it is.
+  const norm = (m) => (m === "step" ? "pause" : m);
+  if (mode !== undefined) { v.mode = norm(mode); paintStatus(v); }
+  if (asked !== undefined) v.asked = norm(asked);
+  const now = v.mode || "run";
+  const want = v.asked || now;
+  const btn = $("btn-hold");
+  const pending = want !== now;
+  btn.textContent = pending
+    ? (want === "pause" ? "pausing…" : "resuming…")
+    : (now === "pause" ? "Resume" : "Pause");
+  const held = now === "pause" && !pending;
+  btn.classList.toggle("primary", held);
+  btn.classList.toggle("ghost", !held);
+}
+
+async function askControl(cmd) {
+  paintHold(live, undefined, cmd);
+  try {
+    await api("/api/runs/control",
+              { method: "POST", body: JSON.stringify({ cmd }) });
+  } catch (err) {
+    notice(err.message);
+    paintHold(live, undefined, live.mode || "run");   // the request did not land
+  }
+}
+
+$("btn-hold").addEventListener("click", () =>
+  askControl(live.mode === "pause" ? "run" : "pause"));
+$("btn-step").addEventListener("click", () => askControl("step"));
 
 $("btn-stop").addEventListener("click", async () => {
   setStopping(live);
