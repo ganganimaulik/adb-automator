@@ -641,6 +641,13 @@ function foldEvent(ev, feed) {
 
   if (kind === "decide") {
     const a = ev.action || {};
+    // Whether this run stopped by *asking* something, which is the one halt an
+    // answer can restart. `needs_user` is also what a sensitive screen produces
+    // -- a password field the agent will not type into -- and there the answer
+    // is to do it on the phone, never to type a credential into this page. Both
+    // end the same way in `run_end`, so the difference has to be caught here,
+    // on the action that made it.
+    if (a.action === "ask_user") feed._asked = a.text || "";
     const node = stepFor(feed, ev);
     if (!node) return;
     setAct(node, actionSummary(a, ev.target_element) || "—",
@@ -1085,6 +1092,19 @@ function phoneView(box, { live = false, edge = 720 } = {}) {
     running: false, every: FRAME_POLL_MS,
   };
 
+  /* The element the agent is about to act on, drawn over the frame.
+
+     Built once and re-attached rather than rendered with the frame: everything
+     below replaces the frame's contents wholesale -- a new image, an error
+     state -- and this has to survive both. */
+  const shade = document.createElement("div");
+  shade.className = "phone-shade";
+  shade.hidden = true;
+  shade.innerHTML = `<div class="phone-box"><span class="phone-tag"></span></div>`;
+  const mark = shade.querySelector(".phone-box");
+  const tag = shade.querySelector(".phone-tag");
+  frame.appendChild(shade);
+
   function say(text, warn) {
     note.textContent = text || "";
     note.className = "phone-note" + (warn ? " warn" : "");
@@ -1093,6 +1113,39 @@ function phoneView(box, { live = false, edge = 720 } = {}) {
   function empty(text) {
     if (v.url) { URL.revokeObjectURL(v.url); v.url = ""; }
     frame.innerHTML = `<div class="phone-empty">${esc(text)}</div>`;
+    frame.appendChild(shade);
+    unmark();          // nothing to be over
+  }
+
+  function unmark() { shade.hidden = true; }
+
+  /* Show `target` -- a `decide` event's `target_element` -- over the frame,
+     measured against the screen size that event carried.
+
+     Percentages, not pixels. The frame holds a scaled copy of the screen
+     (`max_long_edge`) inside a column that is itself responsive, so a box
+     placed as a fraction of the screen it was measured on needs no recomputing
+     when the window resizes, when the next frame arrives at another size, or
+     when the phone rotates between the two. */
+  function marking(target, w, h) {
+    const b = (target && target.bounds) || [];
+    const [l, t, r, bot] = b.map(Number);
+    if (b.length !== 4 || !(w > 0) || !(h > 0)
+        || !(r > l) || !(bot > t) || !frame.querySelector("img")) {
+      unmark();
+      return;
+    }
+    const pct = (n, d) => `${(100 * n / d).toFixed(3)}%`;
+    mark.style.left = pct(l, w);
+    mark.style.top = pct(t, h);
+    mark.style.width = pct(r - l, w);
+    mark.style.height = pct(bot - t, h);
+    tag.textContent = target.index == null ? "" : `#${target.index}`;
+    tag.hidden = target.index == null;
+    // The label the trace uses for the same element, so hovering the box and
+    // reading the step row are the same identification.
+    mark.title = targetTitle(target) || "";
+    shade.hidden = false;
   }
 
   function stamp() {
@@ -1131,6 +1184,7 @@ function phoneView(box, { live = false, edge = 720 } = {}) {
         img.title = "click to enlarge";
         img.addEventListener("click", () => openLightbox(img.src, img.alt));
         frame.appendChild(img);
+        frame.appendChild(shade);   // kept on top of whatever replaced it
       }
       const old = v.url;
       img.src = next;
@@ -1185,9 +1239,13 @@ function phoneView(box, { live = false, edge = 720 } = {}) {
       clearInterval(v.timer);
       stamp();
       say("");
+      unmark();   // the last frame is kept; what it was about to do is not
     },
     /* One frame, now. */
     refresh: grab,
+    /* The element a decision is about to act on, and taking it away again. */
+    mark: marking,
+    unmark,
     idle(text) { empty(text); say(""); lbl.textContent = "the phone"; v.at = 0; },
   };
 }
@@ -1224,6 +1282,7 @@ function makeLive(prefix, boxId, feedId) {
            iter: el("iter"), records: el("records"), progress: el("progress"),
            ledger: el("ledger") },
     phone: null,             // the live device panel, when the surface has one
+    marked: null,            // the step whose target the panel is drawing
     passLabel: "iteration",  // a watch calls its own "pass"
     setRunning: () => {},   // what else on the page follows this surface
     onEvent: () => {},
@@ -1245,7 +1304,37 @@ function resetCounters(v) {
   v.maxSteps = 0;
   v.budget = 0;
   v.now = "";
+  v.marked = null;
   if (v.els.ledger) v.els.ledger.hidden = true;
+  if (v.phone && v.phone.unmark) v.phone.unmark();
+}
+
+/* Keep the phone panel's element box in step with the run.
+
+   The box is only honest inside one window: after a `decide` has named an
+   element and before the action lands on it. In there the agent has observed
+   and not yet acted, so the screen the panel is polling *is* the screen the
+   geometry was measured on -- and it is also the moment the box is worth
+   having, since it says what is about to be touched.
+
+   `verify` closes the window: by then the gesture has gone in and the screen
+   has settled somewhere else. So does any event belonging to a later step,
+   which is what covers the steps that never reach a verify -- a refused
+   action, a dismissed nag, a terminal one. */
+function markTarget(ev, v) {
+  const phone = v.phone;
+  if (!phone || !phone.mark) return;
+  if (ev.kind === "decide") {
+    v.marked = ev.step;
+    // A decision with nothing to aim at -- `back`, `done`, a scroll with no
+    // element -- clears the last one rather than leaving it up over a screen
+    // it has stopped describing.
+    phone.mark(ev.target_element, ev.screen_w, ev.screen_h);
+  } else if (ev.kind === "verify" || ev.kind === "run_end"
+             || (v.marked != null && ev.step != null && ev.step !== v.marked)) {
+    v.marked = null;
+    phone.unmark();
+  }
 }
 
 /* Keep a surface's clock and status telling the truth.
@@ -1314,6 +1403,7 @@ function openStream(v) {
       feed._skill = "";
       feed._steps = null;
       feed._curStep = null;
+      feed._asked = "";      // the last pass's question is not this one's
       finalizeNotes(feed);   // the last pass's ledger is not this one's
       feed._notes = null;
       if (v.els.ledger) v.els.ledger.hidden = true;
@@ -1331,6 +1421,7 @@ function openStream(v) {
     holdPlace(feed, () => {
       foldEvent(ev, feed);
       updateCountersFromEvent(ev, v);
+      markTarget(ev, v);
       v.onEvent(ev);
     });
   });
@@ -1394,7 +1485,7 @@ live.setRunning = (running, stopping) => {
 };
 live.onEvent = (ev) => {
   // The answer, the moment it exists, in the block that leads the surface.
-  if (ev.kind === "run_end") showResult(ev, live.feed._runId);
+  if (ev.kind === "run_end") showResult(ev, live.feed._runId, live.feed._asked);
 };
 // The hint is about something in progress -- stopping, resuming -- and none of
 // it is still true once the run is over.
@@ -1413,7 +1504,7 @@ function workPhase(phase) {
   if (phase !== "done") $("work-result").hidden = true;
 }
 
-function showResult(ev, runId) {
+function showResult(ev, runId, asked) {
   const box = $("result-box");
   const outcome = ev.outcome || "unknown";
   box.className = "result-box " + esc(outcome);
@@ -1431,6 +1522,16 @@ function showResult(ev, runId) {
   box.dataset.runId = runId || "";
   $("work-result").hidden = false;
   $("btn-resume-live").hidden = true;   // until the run list says otherwise
+  // Answerable only when the run asked. `syncResumeButton` runs a moment later
+  // off the refreshed history and takes the checkpoint into account, which is
+  // the other half of the condition: an answer with nothing to resume into has
+  // nowhere to go.
+  const form = $("run-answer");
+  form.hidden = !(outcome === "needs_user" && asked && runId);
+  if (!form.hidden) {
+    $("answer-text").value = "";
+    $("btn-answer").disabled = false;
+  }
 }
 
 /* Whether the run just finished left a checkpoint. Read off the history list
@@ -1584,7 +1685,10 @@ $("btn-run-again").addEventListener("click", () => {
   startRun({ goal, ...runOptions() });
 });
 
-/* Continue a failed run from its checkpoint, watched on the work surface. */
+/* Continue a failed run from its checkpoint, watched on the work surface.
+
+   Answers whether the resume actually started, because one caller has already
+   saved something by the time it asks -- see the answer form below. */
 async function resumeRun(id) {
   try {
     await api("/api/runs", {
@@ -1593,7 +1697,7 @@ async function resumeRun(id) {
     });
   } catch (err) {
     notice(err.message);
-    return;
+    return false;
   }
   document.querySelector('button[data-tab="work"]').click();
   $("runs-list-view").hidden = false;
@@ -1601,7 +1705,38 @@ async function resumeRun(id) {
   workPhase("live");
   beginLive(live);
   $("run-hint").textContent = `resuming ${id} from its checkpoint`;
+  return true;
 }
+
+/* Answer an `ask_user`, then continue.
+
+   Two requests rather than one. They fail for different reasons and want
+   different words -- there is nothing to answer, versus the phone is busy --
+   and separating them means an answer typed against a busy phone is still
+   saved: the Resume button beside this form picks it up whenever the phone is
+   free, with nothing to type again. */
+$("run-answer").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const id = $("result-box").dataset.runId;
+  const text = $("answer-text").value.trim();
+  if (!id || !text) return;
+  const btn = $("btn-answer");
+  btn.disabled = true;
+  try {
+    await api(`/api/runs/${encodeURIComponent(id)}/answer`,
+              { method: "POST", body: JSON.stringify({ text }) });
+  } catch (err) {
+    notice(err.message);
+    btn.disabled = false;
+    return;
+  }
+  // Cleared the moment it is saved rather than when the resume lands: what gets
+  // typed here is usually the one-time code the agent stopped rather than
+  // invent, and it has no business sitting in the page after the run has it.
+  $("answer-text").value = "";
+  if (await resumeRun(id)) $("run-answer").hidden = true;
+  else btn.disabled = false;
+});
 
 $("btn-stop").addEventListener("click", async () => {
   setStopping(live);

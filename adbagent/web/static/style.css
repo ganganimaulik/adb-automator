@@ -754,9 +754,52 @@ aside.phone.standalone { position: static; margin-top: 0; border: none; padding:
   align-items: center;
   justify-content: center;
   min-height: 120px;
+  /* The anchor for the element box below. The image fills this box exactly --
+     `width: 100%; height: auto` with nothing else in the row -- so a fraction
+     of the frame is the same fraction of the screen. */
+  position: relative;
 }
 
 .phone-frame img { display: block; width: 100%; height: auto; cursor: zoom-in; }
+
+/* What the agent is about to act on, over the screen it is about to act on.
+
+   The run says "tap #12" and left what #12 *is* to the reader's imagination;
+   this is the same identification the step row makes, in the one place where
+   it needs no imagination at all. `pointer-events: none` so the frame under it
+   is still the click target for the lightbox. */
+.phone-shade {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.phone-box {
+  position: absolute;
+  border: 2px solid var(--accent);
+  border-radius: 3px;
+  background: #58a6ff1f;
+  /* Dark ring first so the accent stays visible against a pale screen, then
+     the glow: a 2px line over a screenshot is easy to lose. */
+  box-shadow: 0 0 0 1px #000000a6, 0 0 14px #58a6ff59;
+}
+
+/* Inside the box, not above it: the frame clips its overflow, and an element
+   at the very top of the screen would have its label cut off. */
+.phone-tag {
+  position: absolute;
+  top: 0;
+  left: 0;
+  background: var(--accent);
+  color: #0d1117;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 3px 4px;
+  border-radius: 2px 0 3px 0;
+  white-space: nowrap;
+}
 .phone-note { font-size: 11px; color: var(--text-faint); margin-top: 8px; }
 .phone-note.warn { color: var(--yellow); }
 .phone-empty { padding: 22px 14px; font-size: 12px; color: var(--text-faint); text-align: center; }
@@ -951,6 +994,25 @@ body[data-density="story"] .trace-only { display: none; }
   font-size: 13px;
   overflow-wrap: anywhere;
 }
+
+/* The reply to an `ask_user`. Directly under the box carrying the question,
+   above the actions, because answering *is* the action there -- the Resume
+   button beside it continues without one, which is the rarer thing to want. */
+#run-answer { margin: 12px 0 0; }
+
+.answer-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* The input takes the row and the button keeps its own width, down to the
+   width where they stop fitting and the flex-wrap above stacks them. */
+.answer-row input[type="text"] { flex: 1 1 220px; }
+.answer-row button { flex: 0 0 auto; }
+
+#run-answer .small { margin: 8px 0 0; max-width: 62ch; }
 
 /* The watch's mode banner. Filled rather than merely outlined, because unlike
    the outcome banners above this one is a statement about what is *about* to

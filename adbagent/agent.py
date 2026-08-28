@@ -786,7 +786,18 @@ class Agent:
             # appended to the failed one's, with this event where they join.
             recorder.event("run_resume", goal=goal,
                            model=getattr(self.llm, "model", ""),
-                           resumed_at_step=state.step, **limits)
+                           resumed_at_step=state.step,
+                           # *That* an answer was supplied, never what it said.
+                           # `ask_user` is what the agent does instead of typing
+                           # a password or a one-time code, so these answers are
+                           # most often exactly the credential `safety` keeps out
+                           # of the artifacts -- and this file is the one the web
+                           # UI streams to every open tab and `report` prints.
+                           # It reaches the model through the history block and
+                           # the prompt dump that carries it, which is the least
+                           # a run that has to type it can do with it.
+                           answered=bool(resume.get(checkpoint.ANSWER)),
+                           **limits)
         else:
             recorder.event("run_start", goal=goal,
                            model=getattr(self.llm, "model", ""), **limits)
@@ -1494,6 +1505,15 @@ class Agent:
                       # that records only one of the two cannot answer "did the
                       # screen really repeat" after the fact.
                       exact=screen.exact_id,
+                      # What `target_element.bounds` are measured against. The
+                      # rectangle is in device pixels and everything that draws
+                      # it -- the live phone panel, a step's own screenshot --
+                      # is showing a scaled copy, so the scale factor has to
+                      # come from the same event as the rectangle. Taken from
+                      # the screen the decision was made from rather than read
+                      # off the phone later: a rotation between the two would
+                      # otherwise put every box in the wrong place.
+                      screen_w=screen.width, screen_h=screen.height,
                       stalled=stalled, action=action.model_dump(),
                       # What `#3` actually is on this screen. The action records
                       # the ordinal the model wrote, which is a position in a

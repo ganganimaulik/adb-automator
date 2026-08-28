@@ -631,6 +631,16 @@ why every other device call here is refused while something is driving the phone
 Each frame is stamped with how old it is, and a phone that cannot be read says
 why rather than leaving the last frame up unlabelled.
 
+The panel also draws **what the next action is aimed at**: once a step has
+decided, the element it resolved to is outlined on the frame with its `#12`
+badge, carrying the same label the step row does. The feed could say `tap #12
+"Airplane mode"` and the picture beside it could not say which thing that was;
+matching the two was done by eye. The box is up only between the decision and
+the gesture landing — in that window the agent has observed and not yet acted,
+so the screen being polled is the screen the rectangle was measured on, and it
+comes down again on the verify. A decision with nothing to aim at takes the last
+one down rather than leaving it over a screen it has stopped describing.
+
 *Story and trace.* The feed defaults to **story**: one row per step — the action,
 what the model observed, the outcome chip, and a `stalled N` chip once the run
 has gone N steps without learning anything, which is the number the harness
@@ -658,6 +668,17 @@ carousel is most of the run's vision calls.
 *Result.* The answer, large and first, in its own block above the machinery that
 produced it — then a new run, the same goal again, or a resume from the
 checkpoint if there is one.
+
+A run that stopped by *asking* — `ask_user`, the action the agent takes instead
+of inventing a code or a choice only you can make — gets a field to answer in,
+under the question. Answering saves the reply into the run's checkpoint and
+resumes, and the resumed sitting reads it as the last thing that happened. Only
+that halt is offered a field: stopping on a **sensitive screen** reads as
+`needs_user` too, and there the reply is to do it on the phone and press resume,
+never to type a password into a browser. The answer reaches the model, since a
+run that has to type it must be given it, but it is kept out of `events.jsonl` —
+the file the browser streams and `report` prints records that a run was answered
+and not what the answer said.
 
 *History*, on the same surface, below. Every row carries **the answer**, not just
 the outcome, steps, cost and duration: a list that makes the one interesting

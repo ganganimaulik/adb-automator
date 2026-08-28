@@ -491,6 +491,42 @@ def test_resume_requires_a_checkpoint(web, tmp_path):
     assert web.post("/api/runs", json={"resume": "nope"}).status_code == 404
 
 
+def test_answering_a_run_puts_it_in_the_checkpoint(web, tmp_path):
+    from adbagent import checkpoint
+
+    d = make_run_dir(tmp_path / "runs", run_id=RUN_ID, with_checkpoint=True)
+    res = web.post(f"/api/runs/{RUN_ID}/answer", json={"text": "428913"})
+    assert res.status_code == 200
+    assert res.json() == {"answered": True, "run_id": RUN_ID}
+    assert checkpoint.load(d)[checkpoint.ANSWER] == "428913"
+
+    # Never echoed back: what comes through here is usually the credential the
+    # agent stopped rather than invent.
+    assert "428913" not in res.text
+
+
+def test_answering_says_which_thing_is_wrong(web, tmp_path):
+    make_run_dir(tmp_path / "runs", run_id=RUN_ID)          # no checkpoint
+    assert web.post("/api/runs/nope/answer",
+                    json={"text": "yes"}).status_code == 404
+    assert web.post(f"/api/runs/{RUN_ID}/answer",
+                    json={"text": "  "}).status_code == 400
+    # A run with nothing to resume into has nowhere to put an answer, which is
+    # a different failure from a run that does not exist.
+    res = web.post(f"/api/runs/{RUN_ID}/answer", json={"text": "yes"})
+    assert res.status_code == 409
+    assert "no checkpoint" in res.json()["detail"]
+
+
+def test_answering_does_not_start_the_run(web, tmp_path):
+    """Two calls, not one: an answer typed against a busy phone is still worth
+    keeping, and the browser follows with the ordinary resume."""
+    make_run_dir(tmp_path / "runs", run_id=RUN_ID, with_checkpoint=True)
+    assert web.post(f"/api/runs/{RUN_ID}/answer",
+                    json={"text": "428913"}).status_code == 200
+    assert web.get("/api/status").json()["run"]["running"] is False
+
+
 def test_resume_spawns_the_cli_with_resume_and_its_own_dir(web, tmp_path,
                                                            monkeypatch):
     make_run_dir(tmp_path / "runs", run_id=RUN_ID, with_checkpoint=True)
