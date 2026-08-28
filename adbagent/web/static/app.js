@@ -1655,8 +1655,9 @@ function openStream(v) {
 
 const live = makeLive("c-", "live", "feed");
 live.url = "/api/runs/stream";
-live.holds = true;      // the only surface with Pause and Step
 live.phone = phoneView($("live-phone"), { live: true });
+bindHold(live, { hold: "btn-hold", step: "btn-step", take: "btn-take" },
+         "/api/runs/control");
 live.setRunning = (running, stopping) => {
   $("btn-start").disabled = running;
   // Shown only while there is something to stop. One SIGINT is all it takes: a
@@ -1667,20 +1668,7 @@ live.setRunning = (running, stopping) => {
   // Holding is offered for as long as there is a loop to hold. Not while it is
   // stopping: a child on its way out is past the point where it reads these,
   // and the phone it is restoring is not waiting on anybody's decision.
-  $("btn-hold").hidden = !running;
-  $("btn-step").hidden = !running;
-  $("btn-hold").disabled = stopping;
-  // Available whenever there is a loop to step, held or not. From a running
-  // loop it means "finish this one, then hold", which is the natural way to
-  // slow a run down that is going somewhere wrong -- and making it a two-click
-  // job behind Pause would be worse for the one case it is wanted in.
-  $("btn-step").disabled = stopping;
-  $("btn-take").disabled = stopping;
-  if (!running) $("btn-take").hidden = true;
-  // A run that is over has been told nothing; one that is going keeps whatever
-  // it was told, which the replayed `control` events put back.
-  if (!running) paintHold(live, "run", "run");
-  else paintHold(live);          // `btn-take` follows the mode, not the run
+  paintHoldButtons(live, running, stopping);
   // What to do next is only offered once there is no next iteration coming.
   $("run-actions").hidden = running;
 };
@@ -1962,7 +1950,7 @@ function paintHold(v, mode, asked) {
   if (asked !== undefined) v.asked = norm(asked);
   const now = v.mode || "run";
   const want = v.asked || now;
-  const btn = $("btn-hold");
+  const btn = v.holdEls.hold;
   // Only crossing between held and going is pending *here*. Asking for the
   // phone moves between two ways of being held, and a Resume button that read
   // "pausing…" for it would be reporting a change to something that has not
@@ -1979,27 +1967,59 @@ function paintHold(v, mode, asked) {
   // then -- and stops appearing once the phone is already theirs, because
   // Resume and Step both take it back and a third button that also took it
   // back would be a third way to do one thing.
-  const take = $("btn-take");
+  const take = v.holdEls.take;
   take.hidden = !held || now === "release";
   take.textContent = (want === "release" && now !== "release")
     ? "handing over…" : "Take the phone";
 }
 
-async function askControl(cmd) {
-  paintHold(live, undefined, cmd);
-  try {
-    await api("/api/runs/control",
-              { method: "POST", body: JSON.stringify({ cmd }) });
-  } catch (err) {
-    notice(err.message);
-    paintHold(live, undefined, live.mode || "run");   // the request did not land
+/* Show or hide a surface's hold controls with the child they belong to. */
+function paintHoldButtons(v, running, stopping) {
+  if (!v.holds) return;
+  const e = v.holdEls;
+  e.hold.hidden = !running;
+  e.step.hidden = !running;
+  e.hold.disabled = stopping;
+  // Available whenever there is a loop to step, held or not. From a running
+  // loop it means "finish this one, then hold", which is the natural way to
+  // slow down something going wrong -- and making it a two-click job behind
+  // Pause would be worse for the one case it is wanted in.
+  e.step.disabled = stopping;
+  e.take.disabled = stopping;
+  if (!running) {
+    e.take.hidden = true;
+    // Nothing is holding anything any more; the replayed `control` events put
+    // back whatever a *running* child was last told.
+    paintHold(v, "run", "run");
+  } else {
+    paintHold(v);              // Take the phone follows the mode, not the child
   }
 }
 
-$("btn-hold").addEventListener("click", () =>
-  askControl(HELD.has(live.mode) ? "run" : "pause"));
-$("btn-step").addEventListener("click", () => askControl("step"));
-$("btn-take").addEventListener("click", () => askControl("release"));
+async function askControl(v, cmd) {
+  paintHold(v, undefined, cmd);
+  try {
+    await api(v.controlUrl, { method: "POST", body: JSON.stringify({ cmd }) });
+  } catch (err) {
+    notice(err.message);
+    paintHold(v, undefined, v.mode || "run");   // the request did not land
+  }
+}
+
+/* Give a surface the three controls, its buttons and the endpoint they reach.
+
+   Per surface rather than global because there are two children that can be
+   held -- the goal run and the watch -- and each has its own buttons, its own
+   endpoint and its own idea of what it is currently doing. */
+function bindHold(v, ids, url) {
+  v.holds = true;
+  v.controlUrl = url;
+  v.holdEls = { hold: $(ids.hold), step: $(ids.step), take: $(ids.take) };
+  v.holdEls.hold.addEventListener("click", () =>
+    askControl(v, HELD.has(v.mode) ? "run" : "pause"));
+  v.holdEls.step.addEventListener("click", () => askControl(v, "step"));
+  v.holdEls.take.addEventListener("click", () => askControl(v, "release"));
+}
 
 $("btn-stop").addEventListener("click", async () => {
   setStopping(live);
@@ -2139,6 +2159,13 @@ const watchLive = makeLive("w-", "watch-live", "watch-feed");
 watchLive.url = "/api/watch/stream";
 watchLive.passLabel = "pass";
 watchLive.phone = phoneView($("watch-phone"), { live: true });
+// A watch is where holding earns its keep: it owns the phone for hours, and
+// wanting it back for two minutes should not mean throwing away the pass in
+// flight along with the ledger's place in it.
+bindHold(watchLive,
+         { hold: "btn-watch-hold", step: "btn-watch-step",
+           take: "btn-watch-take" },
+         "/api/watch/control");
 watchLive.setRunning = (running, stopping) => {
   $("btn-watch-start").disabled = running;
   // Not clickable twice. The second SIGINT arrives while the first is being
@@ -2146,6 +2173,7 @@ watchLive.setRunning = (running, stopping) => {
   // interrupt handler -- and losing that is losing everything the watch learned.
   $("btn-watch-stop").hidden = !running;
   $("btn-watch-stop").disabled = stopping;
+  paintHoldButtons(watchLive, running, stopping);
   // The policy is read once, at startup. Editing it under a running watch would
   // take effect at no predictable moment, so the server refuses and the form
   // says so before you type into it. The picker locks with it: while a watch is
@@ -2160,6 +2188,10 @@ watchLive.setRunning = (running, stopping) => {
 // Every pass writes a reply or it does not; either way the ledger is what
 // changed, so refresh it when one ends rather than making the reader ask.
 watchLive.onEvent = (ev) => {
+  // What the pass is actually doing, from the pass. Same source as the Work
+  // tab's: the request went into a file the loop reads at the top of its next
+  // step, and until it has, nothing has changed.
+  if (ev.kind === "control") paintHold(watchLive, ev.mode, ev.mode);
   if (ev.kind === "reply_attempt" || ev.kind === "reply_confirmed"
       || ev.kind === "run_end") loadLedger().catch(() => {});
 };
@@ -2228,6 +2260,16 @@ let policyPath = "";     // the policy this tab is pointed at
 let policyGoal = "";     // the goal saved *in* it, as of the last load
 const POLICY_KEY = "adbagent.watch-policy";
 
+/* An unsaved goal, remembered under the policy it was typed for.
+
+   The box is a view of the selected policy's goal, so what is typed over it is a
+   draft of *that* policy's goal and belongs to it. One shared key for all of them
+   -- which is what this was -- is precisely how the Schmooze goal comes back
+   after a reload with the Hinge policy selected and starts it. */
+const GOAL_DRAFT = "adbagent.watch-goal:";
+
+function goalDraftKey() { return GOAL_DRAFT + (policyPath || ""); }
+
 function policyAt(path) {
   return POLICIES.find((p) => p.path === path) || null;
 }
@@ -2286,9 +2328,16 @@ function paintPolicyGoalNote() {
     return;
   }
   if (!policyGoal) {
-    el.innerHTML = "No goal saved with this policy yet — <b>Save policy</b> "
-      + "stores whatever is in the box at the top of this tab, so choosing it "
-      + "next time brings the goal back with it.";
+    // The dangerous half of this case is a box that is *not* empty: these
+    // instructions have no goal of their own, so whatever is up there was
+    // written for something else and is what a start would run them under.
+    el.innerHTML = goal
+      ? "<span class=\"warn\">This policy has no goal of its own.</span> The one "
+        + "at the top is yours to check — <b>Save policy</b> stores it here, and "
+        + "choosing this policy brings it back next time."
+      : "No goal saved with this policy yet — <b>Save policy</b> "
+        + "stores whatever is in the box at the top of this tab, so choosing it "
+        + "next time brings the goal back with it.";
     return;
   }
   if (goal === policyGoal) {
@@ -2301,20 +2350,42 @@ function paintPolicyGoalNote() {
     + ` · <b>Save policy</b> stores the one at the top instead.`;
 }
 
-/* Put the policy's own goal in the box. What "the goal follows the policy"
-   actually means, and the reason the two are stored together. */
+/* Put the selected policy's goal in the box: its saved one, or the unsaved draft
+   somebody left against this same policy. What "the goal follows the policy"
+   actually means, and the reason the two are stored together.
+
+   Empty is a value here. A policy with no goal used to leave the box alone,
+   which reads as harmless and is the one case that matters: the previous
+   policy's goal stayed up, and starting from there runs these instructions
+   under a goal written for another app -- carefully, and at real people. So the
+   box is cleared and the note says the goal is missing, which is a question
+   somebody can answer rather than a wrong answer already filled in. */
 function applyPolicyGoal() {
-  if (!policyGoal) return false;
-  $("watch-goal").value = policyGoal;
-  saveValue("adbagent.watch-goal", policyGoal);
+  const draft = loadValue(goalDraftKey());
+  $("watch-goal").value = draft !== null ? draft : policyGoal;
   paintPolicyGoalNote();
-  return true;
+  return !!$("watch-goal").value.trim();
+}
+
+/* Keep an unsaved goal against the policy it was typed for -- and only while it
+   is unsaved. A draft equal to what the file says is not a draft, and one left
+   behind would mask the file the next time somebody edits it elsewhere. */
+function rememberGoal(goal) {
+  if (goal.trim() === policyGoal) dropValue(goalDraftKey());
+  else saveValue(goalDraftKey(), goal);
+}
+
+/* Drop the draft and take what the file says. The "use it" link offers exactly
+   that, so it has to outrank the draft -- the draft is the thing being discarded. */
+function useSavedGoal() {
+  dropValue(goalDraftKey());
+  applyPolicyGoal();
 }
 
 /* Point the tab at another policy. Choosing one is a deliberate act, so it
    adopts that policy's goal -- which is the whole of what "the goal follows the
-   policy" means. A policy with no goal of its own leaves the box alone rather
-   than clearing it: there is nothing to replace it with. */
+   policy" means. Nothing typed is lost by the switch: a draft is remembered
+   against the policy it was typed for, so switching away and back returns it. */
 async function selectPolicy(path) {
   policyPath = path || "";
   saveValue(POLICY_KEY, policyPath);
@@ -2340,9 +2411,6 @@ async function loadWatch() {
   ph("watch-rpc", watchDefaults.max_replies_per_thread_per_hour);
   ph("watch-cooldown", watchDefaults.thread_cooldown_s);
   const active = data.active || {};
-  // An active watch's goal is the last prompt that actually ran; show it over
-  // the remembered one. With no active watch, the remembered goal stays.
-  if (active.goal) $("watch-goal").value = active.goal;
   if (active.running) $("watch-draft").checked = !!active.draft;
   paintWatchBanner(!!active.running, !!active.stopping);
   // A running watch pins the policy it was started with; nothing else here has
@@ -2350,10 +2418,16 @@ async function loadWatch() {
   if (active.running && active.policy) policyPath = active.policy;
   await loadPolicies();
   await loadPolicy();
-  // Only into an empty box: on a page reload the remembered goal is somebody's
-  // typing, and adopting over it would discard an edit nobody asked to discard.
-  // A deliberate change of policy is the case that adopts -- see `selectPolicy`.
-  if (!$("watch-goal").value.trim()) applyPolicyGoal();
+  // Unconditionally, including over an empty box: the goal belongs to the policy
+  // now, and anything typed against this policy and not saved came back with it.
+  // Nothing is discarded that was not already recoverable by switching back.
+  applyPolicyGoal();
+  // An active watch's goal is the last prompt that actually ran, so it wins over
+  // both -- what is on screen should be what the phone is doing.
+  if (active.goal) {
+    $("watch-goal").value = active.goal;
+    paintPolicyGoalNote();
+  }
   await loadLedger();
 }
 
@@ -2397,15 +2471,19 @@ async function loadLedger() {
 $("watch-draft").addEventListener("change", () => paintWatchBanner(false));
 
 // Typing a goal can put it out of step with the policy that is open. Said as it
-// happens rather than discovered at the moment of starting.
-$("watch-goal").addEventListener("input", paintPolicyGoalNote);
+// happens rather than discovered at the moment of starting, and kept against
+// that policy rather than against the tab, so a reload cannot hand it to another.
+$("watch-goal").addEventListener("input", () => {
+  rememberGoal($("watch-goal").value);
+  paintPolicyGoalNote();
+});
 
 $("watch-policy-select").addEventListener("change", (e) => {
   selectPolicy(e.target.value).catch((err) => notice(err.message));
 });
 
 $("policy-goal-note").addEventListener("click", (e) => {
-  if (e.target.dataset && e.target.dataset.act === "use-goal") applyPolicyGoal();
+  if (e.target.dataset && e.target.dataset.act === "use-goal") useSavedGoal();
 });
 
 $("btn-policy-new").addEventListener("click", async () => {
@@ -2424,8 +2502,12 @@ $("btn-policy-new").addEventListener("click", async () => {
     });
     policyPath = created.path;
     saveValue(POLICY_KEY, policyPath);
+    // A file by this name may have been drafted against before. It is gone; the
+    // goal that was just written into the new one is the truth about it.
+    dropValue(goalDraftKey());
     await loadPolicies();
     await loadPolicy();
+    applyPolicyGoal();
     notice(`created ${created.path} — write the instructions and save`, false);
     $("watch-policy").focus();
   } catch (err) { notice(err.message); }
@@ -2441,8 +2523,13 @@ $("btn-policy-save").addEventListener("click", async () => {
                              goal: $("watch-goal").value.trim() }),
     });
     notice(`policy saved to ${r.path}`, false);
+    // The draft was the difference between the box and the file. There is none
+    // now, and a draft that outlived its save is one that comes back as an edit
+    // nobody has.
+    dropValue(goalDraftKey());
     await loadPolicies();      // the list shows each policy's goal; one changed
     await loadPolicy();
+    applyPolicyGoal();
   } catch (err) { notice(err.message); }
 });
 
@@ -2453,7 +2540,7 @@ $("watch-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const body = watchOptions();
   if (!body.goal) { notice("say what to watch"); return; }
-  saveGoal("adbagent.watch-goal", body.goal);
+  rememberGoal(body.goal);
   if (!body.draft &&
       !confirm("This will send real replies from this device.\n\n" +
                "Have you read what it drafts first?")) return;
@@ -3779,6 +3866,10 @@ async function refreshPolicyFile(names) {
     return;
   }
   await loadPolicy();
+  // The goal is part of the file, so a file that changed may have changed it.
+  // Not while it is being typed into: `applyPolicyGoal` would restore the same
+  // text and send the caret to the end of it.
+  if (document.activeElement !== $("watch-goal")) applyPolicyGoal();
   devbar(`${names} reloaded`);
 }
 
@@ -3813,8 +3904,9 @@ const PERSIST_FIELDS = [
   { id: "opt-assert-equals", key: "adbagent.opt-assert-equals", type: "text" },
   { id: "opt-assert-text", key: "adbagent.opt-assert-text", type: "text" },
 
-  // Watch fields
-  { id: "watch-goal", key: "adbagent.watch-goal", type: "text" },
+  // Watch fields. Not the goal: it belongs to the selected policy, is remembered
+  // under that policy's path, and is put in the box by `applyPolicyGoal`. One
+  // key shared by every policy is how the last one's goal starts the next one.
   { id: "watch-draft", key: "adbagent.watch-draft", type: "checkbox" },
   { id: "watch-no-learn", key: "adbagent.watch-no-learn", type: "checkbox" },
   { id: "watch-interval", key: "adbagent.watch-interval", type: "text" },
@@ -3833,6 +3925,10 @@ function saveValue(key, value) {
 
 function loadValue(key) {
   try { return localStorage.getItem(key); } catch { return null; }
+}
+
+function dropValue(key) {
+  try { localStorage.removeItem(key); } catch {}
 }
 
 function bindPersistence() {

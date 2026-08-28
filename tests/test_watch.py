@@ -75,21 +75,27 @@ class StubDevice:
 
 
 class StubState:
-    """Just the field `TraceCollector.finish` reads off a finished pass."""
+    """Just the fields a finished pass is asked for: what
+    `TraceCollector.finish` reads, and whether a person took the phone during
+    it -- which the watch latches across passes."""
 
-    def __init__(self, step):
+    def __init__(self, step, took_over=False):
         self.step = step
         self.scratchpad = None
+        self.took_over = took_over
 
 
 class StubAgent:
     """Returns scripted outcomes; records the goals it was given."""
 
-    def __init__(self, outcomes, seen_goals, spend=0.0, llm=None):
+    def __init__(self, outcomes, seen_goals, spend=0.0, llm=None,
+                 takeovers=()):
         self.outcomes = outcomes
         self.seen_goals = seen_goals
         self.spend = spend
         self.llm = llm
+        #: Which pass numbers (1-based) hand the phone to a person.
+        self.takeovers = set(takeovers)
 
     def run(self, goal, run_id="", resume=None):
         self.seen_goals.append(goal)
@@ -100,7 +106,8 @@ class StubAgent:
         # and testing that Ctrl-C escapes the loop depends on raising it here.
         if isinstance(outcome, BaseException):
             raise outcome
-        return outcome, StubState(len(self.seen_goals))
+        n = len(self.seen_goals)
+        return outcome, StubState(n, took_over=n in self.takeovers)
 
 
 def distinct(n: int):
@@ -117,11 +124,13 @@ def cfg():
     return c
 
 
-def build(cfg, frames, outcomes=(), spend=0.0, ledger_path=None, tmp_path=None):
+def build(cfg, frames, outcomes=(), spend=0.0, ledger_path=None, tmp_path=None,
+          takeovers=()):
     """A Watch wired to stubs, plus the lists that record what it did."""
     llm = StubLLM()
     clock, goals = FakeClock(), []
-    agent = StubAgent(list(outcomes), goals, spend=spend, llm=llm)
+    agent = StubAgent(list(outcomes), goals, spend=spend, llm=llm,
+                      takeovers=takeovers)
     watch = Watch(StubDevice(frames), None, llm, cfg,
                   policy="be brief",
                   ledger=ReplyLedger(ledger_path or (tmp_path / "l.jsonl")),
@@ -472,3 +481,54 @@ def test_no_cap_by_default_so_runs_are_unchanged():
     for i in range(30):
         trace(kind="step", step=i, screen=screen, action=act)
     assert len(trace.trace.actions) == 30
+
+
+# -- a person taking the phone, across passes --------------------------------
+
+def test_a_takeover_in_one_pass_is_remembered_by_the_watch(cfg, tmp_path):
+    """A watch has one `RunState` per pass and one trace across all of them.
+
+    So the flag cannot live on the state the way it does for a goal run: asking
+    the last pass whether a person took the phone asks the wrong pass. Here the
+    takeover is in pass 1 and three more passes run after it.
+    """
+    frames = [chat(messages=[f"m{i}"]) for i in range(8)]
+    watch, _slept, goals = build(cfg, frames, ["success"] * 4,
+                                 tmp_path=tmp_path, takeovers=[1])
+    watch.run("watch instagram dms", max_passes=4)
+    assert len(goals) >= 2, "the watch never ran a pass after the takeover"
+    assert watch.took_over is True
+
+
+def test_a_watch_nobody_touched_stays_learnable(cfg, tmp_path):
+    frames = [chat(messages=[f"m{i}"]) for i in range(8)]
+    watch, _slept, _goals = build(cfg, frames, ["success"] * 4,
+                                  tmp_path=tmp_path)
+    watch.run("watch instagram dms", max_passes=4)
+    assert watch.took_over is False
+
+
+def test_the_trace_takes_the_watchs_word_over_the_last_passs(cfg, tmp_path):
+    """`finish` is given both, and the watch's is the one that spans the run."""
+    from adbagent.skills import AppTrace, TraceCollector
+
+    class Dev:
+        def screenshot(self):
+            return b""
+
+    collector = TraceCollector(Dev(), AppTrace(package="com.instagram.android"))
+    last_pass = StubState(40, took_over=False)      # forty passes later
+
+    collector.finish("stopped", last_pass, took_over=True)
+    assert collector.trace.took_over is True
+    # And every app the watch worked in inherits it.
+    collector.steps_in = {"com.instagram.android": 30, "com.whatsapp": 5}
+    collector.screens_in = {"com.instagram.android": ["a"], "com.whatsapp": ["b"]}
+    collector.actions_in = {"com.instagram.android": ["x"], "com.whatsapp": ["y"]}
+    collector.shots_in = {}
+    assert [t.took_over for t in collector.app_traces()] == [True, True]
+
+    # Without it, an untouched watch is still learnable.
+    clean = TraceCollector(Dev(), AppTrace(package="com.instagram.android"))
+    clean.finish("stopped", StubState(40))
+    assert clean.trace.took_over is False

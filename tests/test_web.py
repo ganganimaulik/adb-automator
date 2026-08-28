@@ -1354,6 +1354,45 @@ def test_watch_needs_a_goal(web, tmp_path):
     assert web.post("/api/watch", json={"goal": ""}).status_code == 400
 
 
+def test_a_watch_can_be_held_and_handed_the_phone(web, tmp_path, monkeypatch):
+    """The case holding was built for: a watch owns the phone for hours, and
+    wanting it back for two minutes should not cost the pass in flight."""
+    from adbagent import control
+
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    runs = tmp_path / "runs"
+
+    def fake_popen(argv, **kwargs):
+        return FakeProc(argv, on_spawn=lambda _a: make_run_dir(runs, run_id="pass1"),
+                        stay_running=True, **kwargs)
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", fake_popen)
+    assert web.post("/api/watch", json={"goal": "watch dms"}).status_code == 200
+
+    for cmd in ("pause", "release", "step", "run"):
+        res = web.post("/api/watch/control", json={"cmd": cmd})
+        assert res.status_code == 200, cmd
+        assert res.json() == {"asked": cmd}
+        assert control.read(runs / "pass1").cmd == cmd
+
+    # Its own channel: holding the watch must not touch the goal run's, which
+    # is a different child with a different phone claim.
+    assert web.post("/api/runs/control", json={"cmd": "pause"}).status_code == 409
+    assert web.get("/api/watch").json()["active"]["mode"] == "run"
+
+
+def test_holding_a_watch_that_is_not_running_is_a_conflict(web, tmp_path):
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    res = web.post("/api/watch/control", json={"cmd": "pause"})
+    assert res.status_code == 409
+    # About a watch, not about a run. The browser prints this verbatim, and an
+    # answer about the wrong thing reads as a bug in the page.
+    assert res.json()["detail"] == "no watch in progress"
+    assert web.post("/api/runs/control",
+                    json={"cmd": "pause"}).json()["detail"] == "no run in progress"
+    assert web.post("/api/watch/control", json={"cmd": "nope"}).status_code == 400
+
+
 def test_watch_needs_a_policy_file(web, tmp_path):
     _configure_watch(tmp_path, policy="")
     res = web.post("/api/watch", json={"goal": "watch dms"})
@@ -1839,6 +1878,21 @@ def test_the_editor_gets_the_instructions_without_the_front_matter(web, tmp_path
     assert body["goal"] == "work the feed"
     assert body["text"] == "# Hinge\n\n- be brief"
     assert "goal:" not in body["text"]
+
+
+def test_a_policy_with_no_goal_says_so_rather_than_saying_nothing(web, tmp_path):
+    """An empty goal is an answer, and the page acts on it: choosing a policy
+    with no goal of its own *clears* the goal box. Leaving the last policy's goal
+    up is how the Hinge policy gets started under the goal written for Instagram
+    -- carefully, and at real people. So the field is always present."""
+    old = _write_policy(tmp_path, "insta", goal="watch my dms")
+    bare = _write_policy(tmp_path, "hinge", goal="")
+    _configure_watch(tmp_path, policy=str(old))
+
+    body = web.get("/api/watch/policy", params={"path": str(bare)}).json()
+    assert body["goal"] == "" and body["exists"] is True
+    rows = {p["name"]: p for p in web.get("/api/watch/policies").json()["policies"]}
+    assert rows["hinge"]["goal"] == ""
 
 
 def test_a_named_policy_can_be_read_and_written(web, tmp_path):

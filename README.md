@@ -667,6 +667,18 @@ person may open one app to unblock another, and no trace can say which of its
 steps were theirs. A *failed* run still teaches, because its dead ends are real.
 This one's are not.
 
+**The Watch tab has the same three buttons**, and it is where they earn their
+keep: a watch owns the phone for hours, and wanting it back for two minutes
+should not mean throwing away the pass in flight along with the reply ledger's
+place in it. A standing pause carries into each new pass, because it is a mode
+somebody switched on rather than an instruction to whichever pass happened to be
+running. The takeover flag is the watch's own and sticks for as long as it runs:
+one run has one state that can answer for itself, but a watch has one per pass
+and a single trace across all of them, so asking the last pass whether somebody
+took the phone would be asking the wrong pass — a takeover three hours and forty
+passes ago still means the app's skill must not be written from what this watch
+saw.
+
 *The phone.* A panel beside the feed showing the screen as it is, polled every
 couple of seconds while a run is going. It is a read-only `exec-out screencap`
 taken alongside the agent rather than through it: opening a device session zeroes
@@ -820,11 +832,16 @@ buttons cost — and Stop appears only when there is something to stop.
 The **Watch** tab starts a watch, picks and edits its policy, and shows what has
 been sent. Four things about it are deliberate:
 
-- **The policy picker sets the goal.** Every policy in `watch.policies_dir` is
-  offered with the goal it was written for, and choosing one fills that goal in.
-  **New…** writes a fresh policy there, starting from whatever goal is in the
-  box. A save always stores both halves — instructions and goal — because saving
-  one and not the other is how the pair comes apart.
+- **The goal box is a view of the selected policy.** Every policy in
+  `watch.policies_dir` is offered with the goal it was written for, and choosing
+  one puts that goal in the box — including an empty one, when the policy has no
+  goal saved yet. That last case is the one that matters: leaving the previous
+  policy's goal up is how the Hinge policy gets started under the goal written
+  for Instagram. A goal you type over it is kept against *that* policy, so
+  switching away and back returns it and a reload never hands it to another
+  policy. **New…** writes a fresh policy there, starting from whatever goal is in
+  the box. A save always stores both halves — instructions and goal — because
+  saving one and not the other is how the pair comes apart.
 
 - **The mode banner is first and filled.** Green for draft, red for live. It is
   the one fact nobody should have to hunt for, and it is repeated in the header

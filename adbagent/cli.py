@@ -1445,7 +1445,11 @@ def cmd_watch(args) -> int:
         if cfg.skills.enabled and cfg.skills.learn_after_run:
             # After the status line, because it spends a call and can take a
             # minute: the numbers should already be on screen when it starts.
-            trace.finish("stopped", watch.last_state)
+            # The watch's own flag, not the last pass's: a person who took the
+            # phone during pass 3 of forty took it during this watch, and the
+            # trace being closed off here is the whole watch's.
+            trace.finish("stopped", watch.last_state,
+                         took_over=watch.took_over)
             _learn(out, trace.app_traces(), llm, cfg, goal)
     return 0
 

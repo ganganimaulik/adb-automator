@@ -715,19 +715,22 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             raise HTTPException(status_code=409, detail="no run in progress")
         return {"stopping": True}
 
-    @app.post("/api/runs/control")
-    def control_run(req: ControlRequest) -> Dict[str, Any]:
-        """Hold the run, let it go on, or let it take one more step.
+    def _control(child: ChildProcess, req: ControlRequest) -> Dict[str, Any]:
+        """Hold a child, let it go on, or let it take one more step.
 
         Not a stop: the child keeps the phone, its device session and everything
         it has learned, and picks up where it was. Stopping is still the way out
         -- it is what puts the keyboard, the animations and the rotation back --
         and this deliberately cannot do that.
 
-        The command lands in the run's directory and is read at the top of the
-        next step, so the answer here means "asked for", not "done". What the
-        run is actually doing arrives on the event stream as `control`, from the
-        loop itself.
+        The command lands in the directory the child is writing now and is read
+        at the top of its next step, so the answer here means "asked for", not
+        "done". What it is actually doing arrives on that child's event stream
+        as `control`, from the loop itself.
+
+        Shared by a goal run and a watch because they are the same thing
+        underneath: `ChildProcess` owns the command file, and a watch's pass is
+        an agent loop with the same step boundary to be held at.
         """
         from .. import control as controlmod
 
@@ -737,12 +740,16 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
                 status_code=400,
                 detail=f"cmd must be one of {', '.join(controlmod.COMMANDS)}")
         try:
-            return {"asked": manager.control(cmd)}
+            return {"asked": child.control(cmd)}
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except OSError as exc:
             raise HTTPException(status_code=500,
                                 detail=f"could not send the command: {exc}")
+
+    @app.post("/api/runs/control")
+    def control_run(req: ControlRequest) -> Dict[str, Any]:
+        return _control(manager, req)
 
     @app.post("/api/runs/{run_id}/answer")
     def answer_run(run_id: str, req: AnswerRequest) -> Dict[str, Any]:
@@ -1023,6 +1030,18 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         if not watcher.stop():
             raise HTTPException(status_code=409, detail="no watch is running")
         return {"stopping": True}
+
+    @app.post("/api/watch/control")
+    def control_watch(req: ControlRequest) -> Dict[str, Any]:
+        """The same three things, for the watch.
+
+        A watch is where holding earns its keep: it owns the phone for hours,
+        and wanting it back for two minutes should not mean throwing away the
+        pass in flight and the anti-double-reply ledger's place in it. The
+        command applies to the pass that is running and, because a standing mode
+        follows each new run directory, to the passes after it.
+        """
+        return _control(watcher, req)
 
     # -- skills ----------------------------------------------------------
 

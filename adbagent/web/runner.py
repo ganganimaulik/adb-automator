@@ -47,6 +47,12 @@ class ChildProcess:
     show the same feed, counters and screenshots as a goal run.
     """
 
+    #: What this child is called when something has to be said about it. A watch
+    #: refused a pause because it is not running should not be answered with a
+    #: sentence about a run -- the browser shows that text verbatim, and a
+    #: message about the wrong thing reads as a bug in the page.
+    NOUN = "run"
+
     def __init__(self, artifacts_dir: Path | str):
         self.artifacts_dir = Path(artifacts_dir)
         # Re-entrant: a subclass's `start` holds it across the check-and-spawn,
@@ -120,11 +126,12 @@ class ChildProcess:
 
         with self._lock:
             if not (self._proc is not None and self._proc.poll() is None):
-                raise RuntimeError("no run in progress")
+                raise RuntimeError(f"no {self.NOUN} in progress")
             if self._stopping:
-                raise RuntimeError("the run is stopping")
+                raise RuntimeError(f"the {self.NOUN} is stopping")
             if not self._run_dirs:
-                raise RuntimeError("the run has not written a directory yet")
+                raise RuntimeError(
+                    f"the {self.NOUN} has not written a directory yet")
             self._mode = cmd
             self._mode_seq += 1
             controlmod.send(self._run_dirs[-1], cmd, self._mode_seq)
@@ -458,6 +465,8 @@ class WatchManager(ChildProcess):
     two must be able to *refuse* each other: one phone, and a watch that has been
     quietly displaced by a goal run is a watch that is no longer watching.
     """
+
+    NOUN = "watch"
 
     def __init__(self, artifacts_dir: Path | str, *, config_path: str = ""):
         super().__init__(artifacts_dir)

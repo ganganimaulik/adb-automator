@@ -985,13 +985,21 @@ class TraceCollector:
             return ""
         return max(app_steps.items(), key=lambda kv: kv[1])[0]
 
-    def finish(self, outcome: str, state: Any) -> AppTrace:
-        """Close the trace off with what the finished run knows."""
+    def finish(self, outcome: str, state: Any, *,
+               took_over: bool = False) -> AppTrace:
+        """Close the trace off with what the finished run knows.
+
+        `took_over` is for the caller that knows something `state` cannot. One
+        run has one `RunState` and it answers for itself; a *watch* has one per
+        pass and this collector spans all of them, so the pass that happens to
+        be last would be asked about a takeover three hours and forty passes
+        ago. The watch keeps its own sticky flag and passes it in here.
+        """
         self.trace.outcome = outcome
         self.trace.steps = getattr(state, "step", 0)
         self.trace.llm_calls = getattr(state, "llm_calls", 0)
         self.trace.run_id = getattr(state, "run_id", "")
-        self.trace.took_over = bool(getattr(state, "took_over", False))
+        self.trace.took_over = bool(getattr(state, "took_over", False)) or took_over
         scratchpad = getattr(state, "scratchpad", None)
         if scratchpad is not None:
             self.trace.notes = scratchpad.plain()
