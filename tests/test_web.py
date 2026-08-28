@@ -498,6 +498,102 @@ def test_resume_requires_a_checkpoint(web, tmp_path):
     assert web.post("/api/runs", json={"resume": "nope"}).status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# holding a run from the UI
+# ---------------------------------------------------------------------------
+
+def test_control_writes_where_the_run_will_read_it(web, tmp_path, monkeypatch):
+    from adbagent import control
+
+    runs = tmp_path / "runs"
+
+    def fake_popen(argv, **kwargs):
+        return FakeProc(argv, on_spawn=lambda _a: make_run_dir(runs, run_id="hold1"),
+                        stay_running=True, **kwargs)
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", fake_popen)
+    assert web.post("/api/runs", json={"goal": "turn on wifi"}).status_code == 200
+
+    res = web.post("/api/runs/control", json={"cmd": "pause"})
+    assert res.status_code == 200
+    assert res.json() == {"asked": "pause"}
+    assert control.read(runs / "hold1").cmd == "pause"
+    # And the status line carries the mode, for a page opening on a held run.
+    assert web.get("/api/status").json()["run"]["mode"] == "pause"
+
+    # Each command out-ranks the last, so the run can tell them apart.
+    first = control.read(runs / "hold1").seq
+    assert web.post("/api/runs/control", json={"cmd": "run"}).status_code == 200
+    assert control.read(runs / "hold1").seq > first
+
+
+def test_control_refuses_what_it_cannot_do(web, tmp_path, monkeypatch):
+    # Nothing running.
+    res = web.post("/api/runs/control", json={"cmd": "pause"})
+    assert res.status_code == 409
+    assert "no run in progress" in res.json()["detail"]
+    # Not a command.
+    assert web.post("/api/runs/control", json={"cmd": "stop"}).status_code == 400
+    assert web.post("/api/runs/control", json={"cmd": ""}).status_code == 400
+
+
+def test_a_stopping_run_is_past_being_held(web, tmp_path, monkeypatch):
+    """A child on its way out is restoring the phone's keyboard, animations and
+    rotation. It is not reading commands and nothing is waiting on a decision.
+
+    `WindingDownProc` rather than the plain fake: a child that vanishes the
+    instant it is signalled never occupies the stopping phase at all, and the
+    refusal under test is the one that happens while it still holds the phone.
+    """
+    runs = tmp_path / "runs"
+    procs = []
+
+    def fake_popen(argv, **kwargs):
+        proc = WindingDownProc(
+            argv, on_spawn=lambda _a: make_run_dir(runs, run_id="hold2"), **kwargs)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", fake_popen)
+    assert web.post("/api/runs", json={"goal": "turn on wifi"}).status_code == 200
+    assert web.post("/api/runs/stop").status_code == 200
+
+    active = web.get("/api/status").json()["run"]
+    assert active["running"] is True and active["stopping"] is True
+
+    res = web.post("/api/runs/control", json={"cmd": "pause"})
+    assert res.status_code == 409
+    assert "stopping" in res.json()["detail"]
+    procs[0].wait()
+
+
+def test_a_standing_pause_follows_a_repeat_into_its_next_iteration(web, tmp_path,
+                                                                   monkeypatch):
+    """The control file lives in one run directory and `--repeat` writes a new
+    one per iteration. A pause is a mode somebody switched on, not an
+    instruction to whichever iteration happened to be going at the time."""
+    from adbagent import control
+
+    runs = tmp_path / "runs"
+
+    def fake_popen(argv, **kwargs):
+        return FakeProc(argv, on_spawn=lambda _a: make_run_dir(runs, run_id="iter1"),
+                        stay_running=True, **kwargs)
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", fake_popen)
+    assert web.post("/api/runs",
+                    json={"goal": "turn on wifi", "repeat": "2"}).status_code == 200
+    assert web.post("/api/runs/control", json={"cmd": "pause"}).status_code == 200
+
+    # The next iteration's directory appears; the manager notices and re-applies.
+    make_run_dir(runs, run_id="iter2")
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and control.read(runs / "iter2") is None:
+        time.sleep(0.05)
+    got = control.read(runs / "iter2")
+    assert got is not None and got.cmd == "pause"
+
+
 def test_answering_a_run_puts_it_in_the_checkpoint(web, tmp_path):
     from adbagent import checkpoint
 

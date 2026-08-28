@@ -72,6 +72,15 @@ class ChildProcess:
         #: shutdown from its first line rather than from wherever it happened to
         #: look next.
         self._stop_seq = 0
+        #: What this child has been told to do with itself: `run`, `pause` or
+        #: `step`. Held here as well as on disk because it is a mode somebody
+        #: switched on, and the file that carries it lives in one run directory
+        #: -- so under `--repeat` it has to be re-applied to each new one, or a
+        #: pause would quietly lapse at an iteration boundary.
+        self._mode = "run"
+        #: Counts commands rather than timestamping them, so the child can tell
+        #: a new instruction from the same one read again a moment later.
+        self._mode_seq = 0
 
     # -- state -------------------------------------------------------------
 
@@ -93,7 +102,50 @@ class ChildProcess:
                 "started_at": self._started_at if running else 0.0,
                 "returncode": None if running else self._returncode,
                 "output_tail": list(self._output[-50:]),
+                # What it has been asked to do with itself. Only meaningful
+                # while it is going: a finished child is not paused, it is over.
+                "mode": self._mode if running else "run",
             }
+
+    def control(self, cmd: str) -> str:
+        """Tell the child to hold, carry on, or take one more step.
+
+        Writes into the directory it is writing now. A `step` leaves the mode at
+        `step` here while the child spends it and returns to `pause` on its own
+        -- the two answer different questions ("what was it last told" against
+        "what is it doing"), and the child's own `control` events are what the
+        page follows for the second.
+        """
+        from .. import control as controlmod
+
+        with self._lock:
+            if not (self._proc is not None and self._proc.poll() is None):
+                raise RuntimeError("no run in progress")
+            if self._stopping:
+                raise RuntimeError("the run is stopping")
+            if not self._run_dirs:
+                raise RuntimeError("the run has not written a directory yet")
+            self._mode = cmd
+            self._mode_seq += 1
+            controlmod.send(self._run_dirs[-1], cmd, self._mode_seq)
+            return cmd
+
+    def _apply_mode(self, run_dir: Path) -> None:
+        """Carry a standing pause into a directory that has just appeared.
+
+        Under `--repeat` each iteration writes its own, and the control file
+        lives in one of them. Without this, pausing during iteration 3 would be
+        forgotten the moment iteration 4 started -- which reads as a pause that
+        was ignored rather than one that was scoped.
+        """
+        from .. import control as controlmod
+
+        if self._mode == "run":
+            return
+        try:
+            controlmod.send(run_dir, self._mode, self._mode_seq)
+        except OSError:
+            pass
 
     def stop_mark(self) -> int:
         """The output position the stop was asked for at."""
@@ -145,6 +197,11 @@ class ChildProcess:
             self._output_seq = 0
             self._stopping = False
             self._stop_seq = 0
+            # A new child starts running. The sequence deliberately does not
+            # reset: the agent clears its own control file on the way in, but a
+            # counter that restarted could still have a stale file out-rank a
+            # fresh command if anything ever raced the two.
+            self._mode = "run"
             self._started_at = time.time()
             # Unbuffered because stdout is a pipe: Python block-buffers those, so
             # a child's lines would otherwise sit in an 8KB buffer until it
@@ -222,7 +279,10 @@ class ChildProcess:
             return
         with self._lock:
             known = {d.name for d in self._run_dirs} | self._dirs_before
-            self._run_dirs.extend(d for _, d in found if d.name not in known)
+            fresh = [d for _, d in found if d.name not in known]
+            self._run_dirs.extend(fresh)
+            for d in fresh:
+                self._apply_mode(d)
 
     def stop(self, timeout_s: float = 10.0) -> bool:
         """SIGINT the child so the agent restores the phone, then escalate.

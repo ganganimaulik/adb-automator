@@ -23,7 +23,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import __version__, checkpoint, conversation, prompts, runlog, safety
+from . import (__version__, checkpoint, control, conversation, prompts, runlog,
+               safety)
 from .actions import (_POINT_GUARD_MAX_AREA, NAVIGATIONAL, POINT_ACTIONS,
                       ActionError, AgentAction, Target,
                       append_history, content_moved_in_pixels,
@@ -114,6 +115,12 @@ class RunState:
     last_failure: str = ""
     scroll_warnings: int = 0
     started_at: float = field(default_factory=time.monotonic)
+    #: Seconds this run has spent held at somebody's request, which `elapsed`
+    #: gives back. The wall-clock budget bounds how long the run may *work*, and
+    #: a run paused for five minutes by the person reading it has not worked for
+    #: five minutes -- without this, resuming a paused run is how you would find
+    #: out it had been killed while you were looking at it.
+    paused_s: float = 0.0
     finished: Optional[Outcome] = None
     #: What the run answered: the text of the terminal action that ended it --
     #: `done`'s summary, `fail`'s reason, `ask_user`'s question. The one thing a
@@ -215,7 +222,7 @@ class RunState:
 
     @property
     def elapsed(self) -> float:
-        return time.monotonic() - self.started_at
+        return time.monotonic() - self.started_at - self.paused_s
 
     def note_progress(self, reason: str) -> None:
         """Record that the run just learned something; reset the stall ladder.
@@ -641,6 +648,10 @@ class Agent:
         self.ledger = ledger
         #: The operator's reply instructions, verbatim. Empty for a run.
         self.policy = policy
+        #: The channel anything outside uses to hold this run. Made per run, in
+        #: `run()`, because it is scoped to the run's own directory -- see
+        #: `control.py` for why that is the right place for it.
+        self.control: Optional[control.Control] = None
 
     # -- perception helpers ------------------------------------------------
 
@@ -810,6 +821,12 @@ class Agent:
         # person who typed "today" meant it. "" if the phone would not say.
         self._today: str = self.dev.today()
         recorder = Recorder(self.cfg, run_id)
+        # Opened on the directory the recorder just made, and emptied on the way
+        # in: a resumed run reuses its directory, and the command that was
+        # sitting there when the last sitting stopped is not one this one was
+        # given.
+        self.control = control.Control(recorder.dir)
+        control.clear(recorder.dir)
         self._log_header(goal, recorder, resumed_from=state.step if resume else 0)
         self.mem.begin_run(run_id, goal, state.intent_id)
         # The ceilings this sitting runs under. Recorded because they are not
@@ -887,11 +904,22 @@ class Agent:
                 checkpoint.clear(self.cfg, run_id)
             else:
                 checkpoint.save(self.cfg, state)
+            # Nothing is asking this run for anything any more, and the next one
+            # to use this directory -- a resume -- must not find what this one
+            # was told. Cleared here rather than on the way in alone, so that a
+            # run stopped while paused does not leave a `pause` on disk.
+            control.clear(recorder.dir)
             usd = self.llm.ledger.total_usd if self.llm else 0.0
             self.mem.end_run(run_id, outcome, state.step, state.llm_calls, usd)
             recorder.event("run_end", outcome=outcome, steps=state.step,
                            llm_calls=state.llm_calls,
                            usd=round(usd, 6),
+                           # Time the run was held rather than working, which
+                           # `elapsed` has already given back. Recorded because
+                           # otherwise the wall-clock in this event and the one
+                           # a reader watched on the page disagree, with nothing
+                           # in the file to say why.
+                           paused_s=round(state.paused_s, 3),
                            # The answer, in the one event a reader of this file
                            # is guaranteed to look at. `report` and the web UI
                            # both reconstruct the run from here, and neither
@@ -989,6 +1017,14 @@ class Agent:
             # a run that dies mid-step -- a hang, a kill, a crash -- still
             # leaves something `--resume` can pick up.
             checkpoint.save(cfg, state)
+            # And the only place anything outside gets a word in. The same
+            # moment for the same reason: the last step is done, the next has
+            # not started, and the phone is where the last action left it --
+            # which is the only state a pause can hold without stopping the
+            # loop between an observation and the action it was made for.
+            if self.control is not None:
+                self.control.wait(state, lambda mode: rec.event(
+                    "control", step=state.step, mode=mode))
             state.step += 1
             # Counted up here, at the top, and reset wherever progress is found
             # below. Every `continue` in this loop is a step that learned nothing

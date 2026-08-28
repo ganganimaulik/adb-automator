@@ -86,6 +86,11 @@ class RunRequest(BaseModel):
     resume: str = ""
 
 
+class ControlRequest(BaseModel):
+    #: `pause`, `run` or `step` -- see `control.COMMANDS`.
+    cmd: str = ""
+
+
 class AnswerRequest(BaseModel):
     #: What to tell a run that stopped on `ask_user`. Written into its
     #: checkpoint, where the resume reads it -- see `checkpoint.ANSWER`.
@@ -709,6 +714,35 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         if not manager.stop():
             raise HTTPException(status_code=409, detail="no run in progress")
         return {"stopping": True}
+
+    @app.post("/api/runs/control")
+    def control_run(req: ControlRequest) -> Dict[str, Any]:
+        """Hold the run, let it go on, or let it take one more step.
+
+        Not a stop: the child keeps the phone, its device session and everything
+        it has learned, and picks up where it was. Stopping is still the way out
+        -- it is what puts the keyboard, the animations and the rotation back --
+        and this deliberately cannot do that.
+
+        The command lands in the run's directory and is read at the top of the
+        next step, so the answer here means "asked for", not "done". What the
+        run is actually doing arrives on the event stream as `control`, from the
+        loop itself.
+        """
+        from .. import control as controlmod
+
+        cmd = req.cmd.strip()
+        if cmd not in controlmod.COMMANDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"cmd must be one of {', '.join(controlmod.COMMANDS)}")
+        try:
+            return {"asked": manager.control(cmd)}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except OSError as exc:
+            raise HTTPException(status_code=500,
+                                detail=f"could not send the command: {exc}")
 
     @app.post("/api/runs/{run_id}/answer")
     def answer_run(run_id: str, req: AnswerRequest) -> Dict[str, Any]:
