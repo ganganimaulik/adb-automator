@@ -1033,6 +1033,15 @@ def check_postcondition(post: Postcondition, before: Screen,
     if post.kind == "screen_changed":
         if after.exact_id != before.exact_id:
             return True, ""
+        # The tree is byte-identical, which is not the same thing as the screen
+        # being unchanged. A feed whose content is a bitmap the accessibility
+        # tree does not describe -- a meme card, a photo, a card stack -- swaps
+        # one item for the next without moving a single node, so the hash cannot
+        # tell "the tap advanced the feed" from "the tap hit nothing". The
+        # pixels can, and they are what `_scroll_changed` has always asked for a
+        # scroll; this asks the same question for a tap.
+        if content_moved_in_pixels(before, after):
+            return True, ""
         return False, "the screen did not change"
 
     if post.kind == "app_is":
@@ -1089,6 +1098,28 @@ def _scroller_texts(screen: Screen) -> frozenset:
     )
 
 
+def content_moved_in_pixels(before: Screen, after: Screen) -> Optional[bool]:
+    """Did the app's own content change, judged on the bitmap alone?
+
+    ``None`` when there is no evidence either way -- one of the frames has no
+    screenshot, or the hash could not be computed. Callers must read ``None``
+    as "unknown", never as "no": it is the answer on every step that did not
+    take a picture, which is most of them.
+
+    Cropped to `pager.content_box`, so a toolbar fading in over the content is
+    not mistaken for the content changing, and vetoed by
+    `pager.video_only_drift`, so a video repainting inside an otherwise static
+    frame is not either.
+    """
+    from .pager import content_moved, video_only_drift
+    moved = content_moved(before, after)
+    if moved is None:
+        return None
+    if moved and video_only_drift(before, after):
+        return False
+    return moved
+
+
 def _scroll_changed(before: Screen, after: Screen,
                     action: Optional[AgentAction] = None) -> bool:
     """Multi-signal check for whether a scroll actually revealed new content.
@@ -1125,19 +1156,14 @@ def _scroll_changed(before: Screen, after: Screen,
     # `pager.same_item`, which preferred the app's caption over the pixels and
     # so inherited every way a caption could be wrong -- including reading the
     # status-bar clock, which made two frames "different items" once a minute.
-    from .pager import content_moved, video_only_drift
-    moved = content_moved(before, after)
+    moved = content_moved_in_pixels(before, after)
     if moved is not None:
-        # A video playing inside the frame moves the bitmap whether or not the
-        # gesture did anything -- the scroll that hit the end of the list and
-        # the one that revealed a new page are pixel-identical while it plays.
-        if moved and video_only_drift(before, after):
-            return False
         return moved
 
     # Signal 0b: Perceptual Image Fingerprinting
     if before.dhash is not None and after.dhash is not None:
         from .fingerprint import dhash_distance
+        from .pager import video_only_drift
         dist = dhash_distance(before.dhash, after.dhash)
         if dist is not None:
             if dist >= 4:
@@ -1249,8 +1275,43 @@ def verify(action: AgentAction, before: Screen, after: Screen,
     # all" is both the most common silent failure and a more actionable
     # diagnosis than a bare condition failure -- it is what feeds the per-run
     # ban list, so the same dud tap is not retried forever.
+    #
+    # Which is also why an identical tree is not on its own enough to say it.
+    # `exact_id` describes the accessibility tree, and a surface whose content is
+    # a bitmap the tree does not describe -- a meme feed, a gallery, a card stack
+    # -- replaces one item with the next without moving a node. On such a screen
+    # the *working* tap and the tap that hit nothing are byte-identical here, and
+    # this branch condemned both: `no_change` is the one grade that bans the
+    # action for the rest of the run AND writes it to the 24-hour cross-run
+    # dead-end store, so a correct control was struck off and every later pass
+    # started with it already forbidden.
+    #
+    # Measured on ``runs/7640105057d7`` (Schmooze, a bitmap meme feed with no
+    # accessibility node for its like button, so `tap_at` was the only way in):
+    # step 11's tap missed the thumbs-up by ~50px and step 12's landed on it and
+    # advanced the feed. Both were graded "nothing on screen changed" and both
+    # were banned. Cropped-content dhash distance between the frames: 0 for the
+    # miss, 30 for the hit, against a threshold of 6 -- so the pixels separate
+    # the two cleanly, and they were never consulted. The run then spent its
+    # remaining steps bouncing off the bottom navigation under escalating
+    # "NO PROGRESS" pressure. The pass before it succeeded in 25 steps for $0.10
+    # by choosing `swipe` over `tap` on the same screen -- and a swipe is graded
+    # by `_scroll_changed`, which does look at the pixels. That asymmetry, not
+    # the app and not the model, is what decided the two outcomes.
     if action.action in NAVIGATIONAL and after.exact_id == before.exact_id:
-        return VerifyOutcome(grade="no_change", reason="nothing on screen changed")
+        # `None` -- no screenshot on one side -- leaves the tree as the only
+        # evidence there is, which is the behaviour this always had.
+        if not content_moved_in_pixels(before, after):
+            return VerifyOutcome(grade="no_change",
+                                 reason="nothing on screen changed")
+        if condition.kind == "screen_changed":
+            return VerifyOutcome(
+                grade="success",
+                reason="the app's content changed, though no element did")
+        # A condition of the model's own (`expect_text`) or one about a named
+        # element judges this better than a whole-screen hash can, so fall
+        # through to it. It can still fail -- as a `hard_fail`, which states
+        # something about that condition and does not ban the action.
 
     # The typing half of the check above. A dump that is byte-identical after
     # an input_text means the tap that was meant to focus the field landed on

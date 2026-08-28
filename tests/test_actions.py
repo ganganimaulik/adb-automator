@@ -495,6 +495,145 @@ def test_swipe_or_horizontal_scroll_on_identical_exact_id_is_not_no_change():
     assert outcome_vscroll.grade == "no_change"
 
 
+# ---------------------------------------------------------------------------
+# A tap on a surface the accessibility tree does not describe
+# ---------------------------------------------------------------------------
+#
+# `runs/7640105057d7`, a Schmooze meme feed. The like/dislike buttons have no
+# node in the dump, so `tap_at` was the only way to press one -- and the card
+# itself is a bitmap, so pressing it swaps one meme for the next without moving
+# a single element. Step 11's tap missed the thumbs-up by ~50px, step 12's
+# landed on it and advanced the feed, and `verify` called both "nothing on
+# screen changed" because it read `exact_id` alone. `no_change` is the grade
+# that bans an action for the rest of the run and writes it to the 24-hour
+# cross-run dead-end store, so the working coordinate was struck off and every
+# later pass began with it forbidden. The run then bounced off the bottom
+# navigation until it stalled out.
+#
+# Cropped-content dhash distance on the real frames: 0 for the miss, 30 for the
+# hit, against `pager._PIXEL_DISTANCE` = 6. The pixels separated them cleanly
+# and nothing asked. `runs/` is not tracked, so these build their own frames.
+
+#: A meme feed's card fills the middle of the frame; the reaction rail and the
+#: bottom navigation sit in the bands `pager.content_box` crops away.
+_FEED_XML = """
+<hierarchy rotation="0">
+  <node index="0" text="" content-desc="" resource-id="" class="android.widget.FrameLayout" package="com.schmoozeapps.schmooze" bounds="[0,0][1080,1920]" enabled="true" clickable="true" scrollable="false" />
+</hierarchy>
+"""
+
+
+def _frame(content: int, chrome: int = 40) -> bytes:
+    """A JPEG whose content band and chrome bands are set independently.
+
+    `content` seeds the middle 64% of the frame -- what `pager.content_box`
+    keeps -- and `chrome` the top and bottom bands it crops off, so a test can
+    move one without the other.
+    """
+    import io
+
+    from PIL import Image
+
+    img = Image.new("RGB", (270, 480), (chrome, chrome, chrome))
+    for y in range(int(480 * 0.18), int(480 * 0.82)):
+        for x in range(270):
+            # A coarse checker whose cell size follows `content`, which moves
+            # every one of the 64 dhash bits rather than a corner of them.
+            on = ((x // (4 + content % 7)) + (y // (4 + content % 5))) % 2
+            img.putpixel((x, y), (255, 255, 255) if on else (0, 0, 0))
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=90)
+    return out.getvalue()
+
+
+def _feed_frame(content: int = 0, chrome: int = 40, shot: bool = True):
+    screen = s(_FEED_XML)
+    if shot:
+        screen.screenshot = _frame(content, chrome)
+    return screen
+
+
+def test_tap_that_advances_a_bitmap_feed_is_not_no_change():
+    """The regression. A tap the tree cannot see the effect of, but the pixels can."""
+    before, after = _feed_frame(content=1), _feed_frame(content=2)
+    assert before.exact_id == after.exact_id
+    outcome = verify(act(action="tap_at", x=0.61, y=0.90), before, after)
+    assert outcome.grade == "success" and outcome.ok
+    assert "content changed" in outcome.reason
+
+
+def test_tap_on_a_bitmap_feed_that_hits_nothing_is_still_no_change():
+    """The other half: the miss must keep earning its ban.
+
+    Without this the fix would be a blanket amnesty for taps on any screen
+    whose tree does not move, which is most of the screens where a dud tap
+    needs catching.
+    """
+    before, after = _feed_frame(content=1), _feed_frame(content=1)
+    outcome = verify(act(action="tap_at", x=0.68, y=0.90), before, after)
+    assert outcome.grade == "no_change" and not outcome.ok
+
+
+def test_tap_that_moves_only_the_chrome_bands_is_still_no_change():
+    """A toolbar fading in over the content is not the content changing."""
+    before = _feed_frame(content=1, chrome=0)
+    after = _feed_frame(content=1, chrome=255)
+    outcome = verify(act(action="tap_at", x=0.5, y=0.5), before, after)
+    assert outcome.grade == "no_change"
+
+
+def test_tap_with_no_screenshot_is_graded_on_the_tree_alone():
+    """`None` evidence is not permission -- the tree stays the only witness."""
+    before = _feed_frame(shot=False)
+    after = _feed_frame(shot=False)
+    outcome = verify(act(action="tap", target=Target(index=1)), before, after)
+    assert outcome.grade == "no_change"
+
+
+def test_expect_text_still_judges_a_tap_whose_content_moved():
+    """The model's own condition outranks the pixels, and hard_fail is not a ban.
+
+    `no_change` is the grade with the ban and the dead-end row attached; a
+    postcondition that did not hold is a statement about that condition, so a
+    tap that demonstrably did *something* must land on `hard_fail` instead.
+    """
+    before, after = _feed_frame(content=1), _feed_frame(content=2)
+    action = act(action="tap_at", x=0.61, y=0.90, expect_text="Schmoozed!")
+    outcome = verify(action, before, after,
+                     synthesise_postcondition(action, None))
+    assert outcome.grade == "hard_fail"
+
+
+def test_screen_changed_postcondition_reads_the_pixels_too():
+    before, after = _feed_frame(content=1), _feed_frame(content=2)
+    post = Postcondition(kind="screen_changed")
+    assert check_postcondition(post, before, after)[0]
+    assert not check_postcondition(post, before, _feed_frame(content=1))[0]
+
+
+def test_content_hash_is_memoised_per_frame():
+    """Several callers ask the same frame now; it must decode once."""
+    from adbagent import fingerprint, pager
+
+    screen = _feed_frame(content=3)
+    calls = []
+    # `pager.content_hash` imports it lazily, so the source module is what to patch.
+    original = fingerprint.compute_dhash
+
+    def counting(*a, **kw):
+        calls.append(1)
+        return original(*a, **kw)
+
+    fingerprint.compute_dhash = counting
+    try:
+        first = pager.content_hash(screen)
+        second = pager.content_hash(screen)
+    finally:
+        fingerprint.compute_dhash = original
+    assert first == second and first is not None
+    assert len(calls) == 1
+
+
 def test_perceptual_dhash_signal_0_in_scroll_changed():
     """Signal 0: If dHash perceptual distance >= 4, verify visual change even if exact_id is identical."""
     from adbagent.actions import _scroll_changed
