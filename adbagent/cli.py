@@ -784,6 +784,7 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
         "console": None,
         "using_rich": False,
         "rich_broken": False,
+        "rich_unsupported": False,
         "last_frame": 0.0,
     }
 
@@ -844,7 +845,19 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
                 return
 
             use_rich_live = (_HAS_RICH and sys.stdout.isatty() and not out.quiet
-                             and not stream_state.get("rich_broken"))
+                             and not stream_state.get("rich_broken")
+                             and not stream_state.get("rich_unsupported"))
+            # `isatty()` alone is not enough: TERM=dumb and an explicitly
+            # non-interactive TTY both make Rich's Live accept updates while
+            # drawing nothing. Detect that once and use the plain stream, where
+            # silently losing all model output is impossible.
+            if use_rich_live and stream_state["console"] is None:
+                console = Console()
+                if console.is_interactive:
+                    stream_state["console"] = console
+                else:
+                    stream_state["rich_unsupported"] = True
+                    use_rich_live = False
 
             if use_rich_live:
                 if stream_type == "thinking":
@@ -861,8 +874,7 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
                 now = time.monotonic()
                 try:
                     if stream_state["live"] is None:
-                        console = Console()
-                        stream_state["console"] = console
+                        console = stream_state["console"]
                         stream_state["live"] = Live(
                             _render_live_panel(),
                             console=console,

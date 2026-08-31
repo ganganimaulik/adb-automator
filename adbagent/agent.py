@@ -2747,6 +2747,11 @@ class Agent:
         self._released = True
         state.took_over = True
         rec.event("released", step=state.step)
+        # Unlike the recorder, the callback reaches supervisors in-process.
+        # A watch must latch this before the pass returns: Stop interrupts a
+        # released or reclaimed pass with KeyboardInterrupt, so there may be no
+        # returned RunState from which to recover the takeover afterwards.
+        self.on_event("released", step=state.step)
 
     def _reclaim_phone(self, state: RunState, rec: Recorder) -> None:
         """Take the phone back and stop trusting anything we knew about it."""

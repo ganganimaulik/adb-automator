@@ -240,11 +240,21 @@ class Watch:
         passes over an inbox and its threads tour the app far more thoroughly
         than any one of them does.
         """
-        kw = {}
-        if self.on_event is not None:
-            kw["on_event"] = self.on_event
         return Agent(self.dev, self.mem, self.llm, self.cfg,
-                     ledger=self.ledger, policy=self.policy, **kw)
+                     ledger=self.ledger, policy=self.policy,
+                     on_event=self._pass_event)
+
+    def _pass_event(self, kind: str, **kw: Any) -> None:
+        """Latch watch-wide facts before forwarding one pass's event.
+
+        `released` is emitted at the moment the device session closes. Waiting
+        for `Agent.run()` to return is too late when Stop interrupts that pass,
+        and can let a trace influenced by a person's intervention be learned.
+        """
+        if kind == "released":
+            self.took_over = True
+        if self.on_event is not None:
+            self.on_event(kind, **kw)
 
     # -- the loop ----------------------------------------------------------
 
