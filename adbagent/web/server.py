@@ -160,7 +160,7 @@ def _static(name: str, no_store: bool = False) -> Response:
     return Response(content=path.read_bytes(), media_type=media, headers=headers)
 
 
-def attached_serials() -> List[str]:
+def attached_serials(preferred: str = "") -> List[str]:
     """Serials adb can actually see, or [] when it cannot be asked.
 
     Separate from `/api/devices`, which also reads a model name and an Android
@@ -171,7 +171,11 @@ def attached_serials() -> List[str]:
     """
     from .. import device as devmod
     try:
-        return [d.serial for d in devmod.list_devices()]
+        # Some desktop emulators (notably BlueStacks) only open a loopback adb
+        # port; they do not appear in `adb devices` until a client connects.
+        # Discovery belongs here so the status poll, not a trip to the CLI,
+        # makes such a target available to the UI.
+        return [d.serial for d in devmod.auto_connect_devices(preferred)]
     except Exception:  # noqa: BLE001 - adb absent or its server down
         return []
 
@@ -348,9 +352,12 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
     #: line, and none of them needs its own `adb devices`.
     attached: Dict[str, Any] = {"at": 0.0, "serials": []}
 
-    def attached_now() -> List[str]:
+    def attached_now(preferred: str = "") -> List[str]:
         if time.monotonic() - attached["at"] > ATTACHED_TTL_S:
-            attached.update(at=time.monotonic(), serials=attached_serials())
+            serials = (attached_serials(preferred) if preferred
+                       else attached_serials())
+            attached.update(at=time.monotonic(),
+                            serials=serials)
         return list(attached["serials"])
 
     @app.get("/api/status")
@@ -365,7 +372,14 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         # the header used to report the first as though it were the second: a
         # serial left in config.json read as "device 192.168.1.23:41207" with
         # nothing on the other end. Both travel, so the page can say which.
-        serials = attached_now()
+        serials = attached_now(cfg.device.serial)
+        # A sole reachable device is unambiguous. Make it the durable default,
+        # including when a dead wireless/emulator serial was left in config,
+        # so every run and every pane uses the device the UI just discovered.
+        if len(serials) == 1 and cfg.device.serial != serials[0]:
+            from ..config import save_device_serial
+            cfg.device.serial = serials[0]
+            save_device_serial(serials[0], config_path or None)
         return {
             "config_path": str(loaded.path) if loaded.path else "",
             "model": cfg.llm.model,
@@ -395,6 +409,9 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
     def devices() -> Dict[str, Any]:
         from .. import device as devmod
         try:
+            # Populate adb's device table first. This is normally already warm
+            # from the header's status poll, and is cached by `attached_now`.
+            attached_now()
             found = [{"serial": d.serial,
                       "model": getattr(d.prop, "model", ""),
                       "android": d.getprop("ro.build.version.release") or ""}

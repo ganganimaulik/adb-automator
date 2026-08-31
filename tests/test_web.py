@@ -829,6 +829,8 @@ def test_devices_lists_and_handles_adb_failure(web, monkeypatch):
             return "15"
 
     monkeypatch.setattr(devmod, "list_devices", lambda: [FakeDevice()])
+    monkeypatch.setattr(devmod, "auto_connect_devices",
+                        lambda preferred="": [FakeDevice()])
     monkeypatch.setattr(devmod, "mdns_candidates", lambda: ["1.2.3.4:5555"])
     d = web.get("/api/devices").json()
     assert d["devices"] == [{"serial": "emulator-5554", "model": "Pixel 8",
@@ -885,7 +887,8 @@ def test_screenshot_returns_jpeg(web, monkeypatch):
 def _attach(monkeypatch, *serials):
     """Pretend adb sees these, with no TTL in the way."""
     monkeypatch.setattr("adbagent.web.server.ATTACHED_TTL_S", 0.0)
-    monkeypatch.setattr("adbagent.web.server.attached_serials", lambda: list(serials))
+    monkeypatch.setattr("adbagent.web.server.attached_serials",
+                        lambda preferred="": list(serials))
 
 
 def test_a_frame_says_when_there_is_no_phone(web, monkeypatch):
@@ -1017,15 +1020,30 @@ def test_status_separates_a_configured_serial_from_an_attached_one(
 
 
 def test_status_calls_one_unnamed_phone_attached(web, monkeypatch):
-    """No serial configured and exactly one device is the everyday case, and it
-    is the one adb resolves on its own."""
+    """One unambiguous attached device becomes the durable default."""
     _attach(monkeypatch, "emulator-5554")
     st = web.get("/api/status").json()
-    assert st["device_serial"] == ""
+    assert st["device_serial"] == "emulator-5554"
     assert st["device_attached"] is True
 
+    # Once a default exists, adding a second target does not silently switch it.
     _attach(monkeypatch, "emulator-5554", "emulator-5556")
-    assert web.get("/api/status").json()["device_attached"] is False
+    assert web.get("/api/status").json()["device_attached"] is True
+
+
+def test_status_replaces_a_stale_default_when_one_device_is_reachable(
+        web, tmp_path, monkeypatch):
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"device": {"serial": "127.0.0.1:5556"}}),
+                   encoding="utf-8")
+    _attach(monkeypatch, "127.0.0.1:5555")
+
+    st = web.get("/api/status").json()
+
+    assert st["device_serial"] == "127.0.0.1:5555"
+    assert st["device_attached"] is True
+    assert json.loads(cfg.read_text(encoding="utf-8"))["device"]["serial"] \
+        == "127.0.0.1:5555"
 
 
 # ---------------------------------------------------------------------------
@@ -1391,6 +1409,28 @@ def test_holding_a_watch_that_is_not_running_is_a_conflict(web, tmp_path):
     assert web.post("/api/runs/control",
                     json={"cmd": "pause"}).json()["detail"] == "no run in progress"
     assert web.post("/api/watch/control", json={"cmd": "nope"}).status_code == 400
+
+
+def test_step_is_carried_to_the_next_pass_as_pause(tmp_path):
+    """Step is one instruction, not a standing mode that spends another step
+    in every future watch pass."""
+    from adbagent import control
+    from adbagent.web.runner import ChildProcess
+
+    first = tmp_path / "pass1"
+    second = tmp_path / "pass2"
+    first.mkdir()
+    second.mkdir()
+    child = ChildProcess(tmp_path)
+    child._proc = FakeProc([], stay_running=True)
+    child._run_dirs = [first]
+
+    assert child.control("step") == "step"
+    assert control.read(first).cmd == "step"
+    assert child.state()["mode"] == "pause"
+
+    child._apply_mode(second)
+    assert control.read(second).cmd == "pause"
 
 
 def test_watch_needs_a_policy_file(web, tmp_path):

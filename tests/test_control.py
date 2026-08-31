@@ -356,6 +356,7 @@ def test_the_loop_closes_and_reopens_the_session_around_a_takeover(cfg, mem,
                                                                    tmp_path):
     dev = fake.FakeDevice(cfg)
     run_dir = tmp_path / "runs"
+    emitted = []
 
     def policy(screen, llm):
         if llm.calls == 1:
@@ -374,7 +375,9 @@ def test_the_loop_closes_and_reopens_the_session_around_a_takeover(cfg, mem,
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(control.Control, "__init__", patched)
-        outcome, state = Agent(dev, mem, fake.FakeLLM(dev, policy), cfg).run(GOAL)
+        outcome, state = Agent(
+            dev, mem, fake.FakeLLM(dev, policy), cfg,
+            on_event=lambda kind, **kw: emitted.append(kind)).run(GOAL)
 
     assert outcome == "success"
     # Closed to hand it over -- which is what puts the keyboard, the animations
@@ -387,6 +390,7 @@ def test_the_loop_closes_and_reopens_the_session_around_a_takeover(cfg, mem,
     assert dev.session_open is True
     kinds = [e["kind"] for e in _events(tmp_path, state.run_id)]
     assert "released" in kinds and "reclaimed" in kinds
+    assert "released" in emitted  # supervisors latch this before run() returns
     # And the run knows it cannot be learned from.
     assert state.took_over is True
 

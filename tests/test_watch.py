@@ -500,6 +500,22 @@ def test_a_takeover_in_one_pass_is_remembered_by_the_watch(cfg, tmp_path):
     assert watch.took_over is True
 
 
+def test_an_interrupted_pass_cannot_lose_its_takeover(cfg, tmp_path):
+    """Stop raises before Agent.run can return its state, so the release event
+    has to latch the watch-wide guard at the moment the phone changes hands."""
+    watch, _slept, _goals = build(cfg, distinct(2), tmp_path=tmp_path)
+
+    class InterruptedAfterRelease:
+        def run(self, _goal):
+            watch._pass_event("released", step=1)
+            raise KeyboardInterrupt
+
+    watch._make_agent = InterruptedAfterRelease
+    with pytest.raises(KeyboardInterrupt):
+        watch.run("watch instagram dms", max_passes=1)
+    assert watch.took_over is True
+
+
 def test_a_watch_nobody_touched_stays_learnable(cfg, tmp_path):
     frames = [chat(messages=[f"m{i}"]) for i in range(8)]
     watch, _slept, _goals = build(cfg, frames, ["success"] * 4,

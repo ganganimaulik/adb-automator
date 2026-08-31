@@ -116,11 +116,10 @@ class ChildProcess:
     def control(self, cmd: str) -> str:
         """Tell the child to hold, carry on, or take one more step.
 
-        Writes into the directory it is writing now. A `step` leaves the mode at
-        `step` here while the child spends it and returns to `pause` on its own
-        -- the two answer different questions ("what was it last told" against
-        "what is it doing"), and the child's own `control` events are what the
-        page follows for the second.
+        Writes into the directory it is writing now. A `step` is dispatched to
+        that directory but leaves the standing mode at `pause`, matching what
+        the child does after spending it. Otherwise a watch whose current pass
+        ends on that step would send another step into every later pass.
         """
         from .. import control as controlmod
 
@@ -132,7 +131,7 @@ class ChildProcess:
             if not self._run_dirs:
                 raise RuntimeError(
                     f"the {self.NOUN} has not written a directory yet")
-            self._mode = cmd
+            self._mode = "pause" if cmd == "step" else cmd
             self._mode_seq += 1
             controlmod.send(self._run_dirs[-1], cmd, self._mode_seq)
             return cmd

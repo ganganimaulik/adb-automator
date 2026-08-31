@@ -19,6 +19,7 @@ import base64
 import io
 import logging
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -309,6 +310,68 @@ def mdns_candidates() -> List[str]:
             if m:
                 found.append(m.group(1))
     return found
+
+
+#: Local Android emulators expose adb on loopback, but unlike a USB phone they
+#: do not necessarily register themselves with the adb server. 5555 is used by
+#: BlueStacks, LDPlayer and several others; the additional ports cover their
+#: common multi-instance/default layouts without sweeping arbitrary services on
+#: the machine.
+LOCAL_ADB_PORTS: Tuple[int, ...] = tuple(dict.fromkeys(
+    list(range(5555, 5586, 2)) + [7555, 16384, 16416, 21503, 62001, 62025]
+))
+
+
+def local_adb_candidates(timeout: float = 0.04) -> List[str]:
+    """Return listening loopback endpoints commonly used by emulators.
+
+    A listening port is only a candidate. :func:`auto_connect_devices` still
+    asks adb to connect, which performs the real protocol check. Probing first
+    keeps the normal no-emulator path fast and avoids sending adb handshakes to
+    closed ports.
+    """
+    found: List[str] = []
+    for port in LOCAL_ADB_PORTS:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout):
+                found.append(f"127.0.0.1:{port}")
+        except OSError:
+            pass
+    return found
+
+
+def auto_connect_devices(preferred: str = "") -> List[adbutils.AdbDevice]:
+    """Find reachable adb targets and register them with the adb server.
+
+    Existing devices stay in the result while discovery looks for more. A saved
+    TCP serial is retried first, followed by Android's mDNS advertisements and
+    listening local-emulator endpoints. Discovery is deliberately
+    non-interactive; pairing a new physical phone still requires the explicit
+    pairing flow.
+    """
+    devices = list_devices()
+    attached = {d.serial for d in devices}
+
+    candidates: List[Tuple[str, float]] = []
+    preferred = (preferred or "").strip()
+    if ":" in preferred:
+        candidates.append((preferred, 1.0))
+    candidates.extend((addr, 2.0) for addr in mdns_candidates())
+    candidates.extend((addr, 1.0) for addr in local_adb_candidates())
+
+    tried = set()
+    attempted = False
+    for addr, timeout in candidates:
+        if addr in tried or addr in attached:
+            continue
+        tried.add(addr)
+        attempted = True
+        try:
+            connect_wireless(addr, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - discovery is best effort
+            log.debug("adb auto-connect candidate %s failed: %s", addr, exc)
+
+    return list_devices() if attempted else devices
 
 
 # ---------------------------------------------------------------------------

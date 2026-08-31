@@ -943,3 +943,48 @@ def test_the_panel_names_press_accepts_are_not_keycodes():
     lookup, so they must not be in the set that lookup validates against."""
     assert "notifications" not in PRESS_KEYS
     assert "quick_settings" not in PRESS_KEYS
+
+
+def test_auto_connect_registers_a_listening_local_emulator(monkeypatch):
+    from adbagent import device as devmod
+
+    class Dev:
+        serial = "127.0.0.1:5555"
+
+    answers = iter([[], [Dev()]])
+    connected = []
+    monkeypatch.setattr(devmod, "list_devices", lambda: next(answers))
+    monkeypatch.setattr(devmod, "mdns_candidates", lambda: [])
+    monkeypatch.setattr(devmod, "local_adb_candidates",
+                        lambda: ["127.0.0.1:5555"])
+    monkeypatch.setattr(devmod, "connect_wireless",
+                        lambda addr, timeout=5.0: connected.append((addr, timeout)))
+
+    found = devmod.auto_connect_devices()
+
+    assert [d.serial for d in found] == ["127.0.0.1:5555"]
+    assert connected == [("127.0.0.1:5555", 1.0)]
+
+
+def test_auto_connect_merges_existing_and_new_devices(monkeypatch):
+    from adbagent import device as devmod
+
+    class Dev:
+        def __init__(self, serial):
+            self.serial = serial
+
+    answers = iter([
+        [Dev("usb-phone")],
+        [Dev("usb-phone"), Dev("127.0.0.1:5555")],
+    ])
+    connected = []
+    monkeypatch.setattr(devmod, "list_devices", lambda: next(answers))
+    monkeypatch.setattr(devmod, "mdns_candidates", lambda: [])
+    monkeypatch.setattr(devmod, "local_adb_candidates",
+                        lambda: ["127.0.0.1:5555"])
+    monkeypatch.setattr(devmod, "connect_wireless",
+                        lambda addr, timeout=5.0: connected.append(addr))
+
+    assert [d.serial for d in devmod.auto_connect_devices()] \
+        == ["usb-phone", "127.0.0.1:5555"]
+    assert connected == ["127.0.0.1:5555"]
