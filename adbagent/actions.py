@@ -20,7 +20,8 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal,
+                    Optional, Tuple)
 
 from pydantic import (BaseModel, ConfigDict, Field, field_validator,
                       model_validator)
@@ -70,6 +71,27 @@ NAVIGATIONAL = frozenset({"tap", "tap_at", "long_press", "long_press_at",
 #: Actions that take a point rather than an element, and so are quantised into
 #: their loop-detection signature the same way.
 POINT_ACTIONS = frozenset({"tap_at", "long_press_at", "double_tap"})
+#: Actions that name an element from the list and are meaningless without one.
+#: A module constant rather than a set built inside the validator because
+#: `_salvage_target` has to agree with `_check_arguments` about exactly which
+#: actions it is rescuing, and two literals drift.
+NEEDS_TARGET = frozenset({"tap", "long_press", "input_text"})
+#: Actions aimed at one specific control, whether it is named from the list or
+#: placed at a point. What they have in common is the failure mode the tap_at
+#: and stuck hatches are an answer to: the run knows what it wants to press and
+#: cannot press it. A scroll is not one of these -- it moves a surface, and its
+#: failing says nothing about whether controls can be hit.
+CONTROL_ACTIONS = NEEDS_TARGET | POINT_ACTIONS
+
+#: How a model refers to a listed control in prose, in the three shapes seen in
+#: ``runs/``: a bare ``#2``, ``#2 'Like photo'``, and the element list's own
+#: ``#3 [Button "Darshana Oh 1 day ago. Reply?"]`` echoed back. The role and the
+#: label are both optional, so the ordinal alone still matches. See
+#: `AgentAction._salvage_target`.
+_PROSE_TARGET = re.compile(
+    r"#(\d+)"                                   # the ordinal
+    r"(?:\s*\[[A-Za-z]+\]?)?"                   # an optional "[Button"
+    r"(?:\s*[\"']([^\"'\n]{1,80})[\"'])?")      # an optional quoted label
 
 
 class Target(BaseModel):
@@ -186,12 +208,30 @@ class AgentAction(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    #: Properties `harden_schema` names in `required` even though pydantic
+    #: defaults them. "tap needs a target" is a rule between two fields, and a
+    #: flat schema cannot say it -- the alternative that could, a discriminated
+    #: union keyed on `action`, is the `oneOf` this module's docstring rules
+    #: out. So the schema says the weaker thing it *can* say: the key is always
+    #: present, and the model has to write something in it rather than skipping
+    #: past it. Skipping past it is not hypothetical: on 2026-09-01 five
+    #: consecutive `glm-5p3-flash` runs died on a `tap` whose target key was
+    #: never emitted at all, four of them on the run's first tap, while the
+    #: reasoning beside it named the control. Only `target` is listed. Forcing
+    #: the rest would put `x`/`y` on every action, which is the guessed
+    #: coordinate `LOCATE_SYSTEM` exists to prevent.
+    always_required: ClassVar[Tuple[str, ...]] = ("target",)
+
     observation: str = Field(description="One sentence: what screen is this?")
     reasoning: str = Field(
         description="One sentence: why this action advances the goal.")
     action: ActionName
     target: Optional[Target] = Field(
-        None, description="For tap, long_press, input_text and element scrolls.")
+        None, description="Which element to act on, as {index, key}. REQUIRED "
+                          "for tap, long_press and input_text -- those actions "
+                          "are rejected without it, so never send null for "
+                          "them. Also takes element scrolls. Send null only "
+                          "when the action does not name an element.")
     x: Optional[float] = Field(
         None, description="For tap_at, long_press_at, double_tap and the start "
                           "of a drag: horizontal position as a fraction of "
@@ -317,10 +357,52 @@ class AgentAction(BaseModel):
         return [{"id": sid, "text": text, "status": status or None}
                 for sid, text, status in as_steps(value)] or None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _salvage_target(cls, data: object) -> object:
+        """Rebuild a dropped `target` from the ``#N`` the reasoning already names.
+
+        A model that writes ``"action": "tap"`` and then, one field later,
+        "I tap the topmost like button (#2 'Like photo')" has decided which
+        element it wants and merely failed to fill the key. Rejecting that costs
+        a repair round-trip at best and the whole run at worst, and the answer
+        was sitting in the same object.
+
+        Read out of `reasoning` only. `observation` describes the screen rather
+        than the intent, so the ordinals in it are as often the things being
+        ruled out as the thing being chosen -- at the bottom of a Hinge profile
+        it names both hearts, and the one the run wanted was neither.
+
+        Conservative on purpose: it wants exactly one distinct ordinal in that
+        sentence. Two means the model was comparing candidates and the right
+        answer is a repair, not a coin toss. A quoted label next to the ordinal
+        is carried along when there is one, because `resolve_target` cross-checks
+        it against the element actually at that index and falls back to a text
+        search when they disagree -- so a stale ordinal lands on the named
+        control instead of on whatever inherited its position.
+        """
+        if not isinstance(data, dict):
+            return data
+        if data.get("action") not in NEEDS_TARGET or data.get("target"):
+            return data
+        reasoning = data.get("reasoning")
+        if not isinstance(reasoning, str):
+            return data
+        found = _PROSE_TARGET.findall(reasoning)
+        if len({index for index, _label in found}) != 1:
+            return data
+        index, label = found[0]
+        target: Dict[str, Any] = {"index": int(index)}
+        if label.strip():
+            target["text"] = label.strip()
+        log.warning("%s arrived with no target; recovered %s from the "
+                    "reasoning %r", data.get("action"),
+                    Target(**target).describe(), reasoning)
+        return {**data, "target": target}
+
     @model_validator(mode="after")
     def _check_arguments(self) -> "AgentAction":
-        need_target = {"tap", "long_press", "input_text"}
-        if self.action in need_target and self.target is None:
+        if self.action in NEEDS_TARGET and self.target is None:
             raise ValueError(f"{self.action} requires a target")
         if self.action in POINT_ACTIONS and (self.x is None or self.y is None) \
                 and not (self.text or "").strip():

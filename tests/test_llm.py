@@ -2301,10 +2301,27 @@ def test_the_vision_schema_requires_every_field(monkeypatch):
 
 
 def test_the_action_schema_keeps_its_optional_fields_optional():
-    """The opposite treatment, and deliberately: 20 properties, 3 required. Force
-    the rest and every action carries an `x`/`y` the model had to invent."""
+    """The opposite treatment, and deliberately: force every property and each
+    action carries an `x`/`y` the model had to invent."""
     schema = harden_schema(AgentAction)
-    assert schema["required"] == ["observation", "reasoning", "action"]
+    assert schema["required"] == [
+        "observation", "reasoning", "action", "target"]
+    assert "x" not in schema["required"] and "y" not in schema["required"]
+
+
+def test_the_action_schema_makes_the_decoder_answer_on_target():
+    """`target` is named in `required` despite defaulting to None.
+
+    "tap requires a target" is a rule between two fields that a flat schema
+    cannot state, so the schema states the weaker thing it can: the key is
+    always emitted. Five `glm-5p3-flash` runs died on a `tap` that skipped
+    straight past it.
+    """
+    schema = harden_schema(AgentAction)
+    assert "target" in schema["required"]
+    # Required, but still nullable -- every action that names no element has to
+    # be able to answer the key without inventing one.
+    assert {"type": "null"} in schema["properties"]["target"]["anyOf"]
 
 
 def test_an_empty_object_is_refused_and_repaired(monkeypatch):
@@ -2328,6 +2345,79 @@ def test_an_empty_object_is_refused_and_repaired(monkeypatch):
     repair = sent[1][-1]["content"]
     assert "left out" in repair
     assert "not valid against the schema" not in repair
+
+
+def test_the_repair_loop_does_not_re_ask_at_the_same_temperature(monkeypatch):
+    """At `temperature: 0` all three attempts came back byte-identical.
+
+    Five runs on 2026-09-01 spent three calls each to be told the same thing
+    three times. The first try still samples at the configured setting -- the
+    answer the harness executes should be the model's most likely one -- and
+    only the retries, which exist because that answer was rejected, get heat.
+    """
+    client = _client(monkeypatch)
+    client.cfg.llm.temperature = 0
+    temperatures = []
+
+    def post(messages, *, model, schema, max_tokens, purpose, temperature=None,
+             **kw):
+        temperatures.append(temperature)
+        if len(temperatures) < 3:
+            return "{}", Call(model=model)
+        return ('{"reading":"r","item_label":"S","blocking_dialog":"",'
+                '"notable":"n"}'), Call(model=model)
+
+    monkeypatch.setattr(client, "_post", post)
+    assert client.analyze_image(b"jpeg", goal="send a like").notable == "n"
+    assert temperatures == [0.0, 0.4, 0.8]
+
+
+def test_a_caller_already_sampling_hot_is_not_cooled_by_the_repair_floor(
+        monkeypatch):
+    client = _client(monkeypatch)
+    client.cfg.llm.temperature = 0.9
+    temperatures = []
+
+    def post(messages, *, model, schema, max_tokens, purpose, temperature=None,
+             **kw):
+        temperatures.append(temperature)
+        return "{}", Call(model=model)
+
+    monkeypatch.setattr(client, "_post", post)
+    client.analyze_image(b"jpeg", goal="send a like")
+    assert temperatures == [0.9, 0.9, 0.9]
+
+
+def test_a_missing_target_is_repaired_with_an_instruction_not_just_the_error(
+        monkeypatch):
+    """The pydantic message describes the rejected object; the hint says what to
+    write, and points the model back at the control its own reasoning named."""
+    client = _client(monkeypatch)
+    sent = []
+
+    def post(messages, *, model, schema, max_tokens, purpose, **kw):
+        sent.append(messages)
+        if len(sent) == 1:
+            return ('{"observation":"the matches list","reasoning":"open it",'
+                    '"action":"tap"}'), Call(model=model)
+        return ('{"observation":"the matches list","reasoning":"open it",'
+                '"action":"tap","target":{"index":3,"key":"6edc"}}'), Call(model=model)
+
+    monkeypatch.setattr(client, "_post", post)
+    action = client.structured([{"role": "user", "content": "go"}], AgentAction)
+
+    assert action.target.index == 3
+    repair = sent[1][-1]["content"]
+    assert "tap requires a target" in repair          # the error itself
+    assert "Fix: Add the `target` key" in repair      # and what to do about it
+    assert "your own `reasoning`" in repair
+
+
+def test_an_unrecognised_error_gets_no_invented_hint():
+    """A wrong instruction is worse than the bare pydantic message."""
+    from adbagent.prompts import repair_hint
+    assert repair_hint("tap requires a target").startswith("\nFix:")
+    assert repair_hint("some error nobody has seen before") == ""
 
 
 def test_a_blank_reply_after_long_thinking_is_refused(monkeypatch):

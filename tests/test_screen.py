@@ -103,6 +103,135 @@ def test_a_card_described_by_content_desc_does_not_relist_its_children():
             f"field{i} was listed again under a card that already says it"
 
 
+def _thread(*messages: tuple) -> str:
+    """A chat thread: a scrollable list of non-interactive bubbles.
+
+    Shaped like the real one -- each row is a plain ``LinearLayout`` holding the
+    message text and, one level deeper, its timestamp. The depth difference is
+    the point: it is what a breadth-first walk reorders.
+    """
+    rows = []
+    for i, (text, stamp) in enumerate(messages):
+        top = 520 + i * 160
+        rows.append(X.N("android.widget.LinearLayout", (0, top, X.W, top + 150),
+                        rid=f"row{i}", children=[
+            X.N("android.widget.TextView", (40, top + 10, X.W - 40, top + 90),
+                rid=f"msg{i}", text=text),
+            X.N("android.widget.FrameLayout", (40, top + 95, X.W - 40, top + 145),
+                rid=f"stampbox{i}", children=[
+                    X.N("android.widget.TextView", (40, top + 100, 400, top + 140),
+                        rid=f"stamp{i}", text=stamp)]),
+        ]))
+    return X.dump(X.N("android.widget.FrameLayout", (0, 0, X.W, X.H), rid="content",
+                      children=[
+        X.N("androidx.recyclerview.widget.RecyclerView", (0, 500, X.W, X.H - 200),
+            rid="thread", scrollable=True, children=rows),
+        X.N("android.widget.EditText", (0, X.H - 190, X.W, X.H - 40),
+            rid="composer", hint="Send a message"),
+    ]))
+
+
+def test_a_scroller_does_not_swallow_the_list_it_holds():
+    """The screen a run works from must survive being handed to the model.
+
+    `_absorb_labels` used to fire on anything `interactive`, which includes
+    `scrollable` -- so a RecyclerView, which has no text of its own, was given
+    the whole subtree joined with spaces, and `_absorbed_by_ancestor` then
+    dropped every child because each one's text is a substring of the string
+    built from it. A thread arrived as one line with its structure gone.
+
+    That is not one app's markup. Android sends no text on those nodes; the
+    parser invented it, on every app in ``runs/`` -- Hinge threads, Schmooze
+    profile cards -- at 237 of 3,018 rendered `[Scroller]` lines against 4 of
+    29,432 `[Button]` lines. ``runs/e8d6aa742852`` step 3 spent 193 seconds and
+    35,924 characters of thinking working out an order this destroyed, to
+    decide "tap Back".
+    """
+    scr = s(_thread(("Hi.", "Fri, Aug 28 9:45AM"),
+                    ("Up for movie at my place?", "Sat, Aug 29 10:02AM"),
+                    ("Oh.", "Yesterday 12:59AM")))
+
+    thread = [e for e in scr.elements if e.resource_id == "thread"]
+    assert thread, "the scroller itself is still addressable"
+    assert thread[0].best_text == "", \
+        f"the scroller was given its children's text: {thread[0].best_text!r}"
+
+    # Every message and every timestamp is its own line, so the model can see
+    # which stamp belongs to which message instead of inferring it.
+    shown = [e.best_text for e in scr.elements]
+    for piece in ("Hi.", "Up for movie at my place?", "Oh.",
+                  "Fri, Aug 28 9:45AM", "Yesterday 12:59AM"):
+        assert piece in shown, f"{piece!r} was absorbed away"
+
+
+def test_a_message_is_rendered_next_to_its_own_timestamp():
+    """Document order, not nesting order -- see `_describing_text`.
+
+    The bubbles sit one level above their timestamps, so a breadth-first walk
+    emitted all three messages and *then* all three stamps. That is the clump
+    of detached timestamps at the head of every flattened thread in ``runs/``.
+    """
+    scr = s(_thread(("Hi.", "Fri, Aug 28 9:45AM"),
+                    ("Up for movie at my place?", "Sat, Aug 29 10:02AM"),
+                    ("Oh.", "Yesterday 12:59AM")))
+    order = [e.best_text for e in scr.elements if e.best_text]
+    assert order.index("Hi.") < order.index("Fri, Aug 28 9:45AM") \
+        < order.index("Up for movie at my place?"), \
+        f"messages and stamps are not interleaved in reading order: {order}"
+
+
+def test_an_absorbed_label_reads_in_document_order():
+    """The same ordering rule where absorption still applies: a tappable card."""
+    card = X.N("android.widget.Button", (0, 600, X.W, 900), rid="card",
+               clickable=True, children=[
+        X.N("android.widget.TextView", (10, 610, 700, 650), rid="a", text="Title"),
+        X.N("android.widget.FrameLayout", (10, 660, 700, 740), rid="box", children=[
+            X.N("android.widget.TextView", (10, 670, 700, 730), rid="b",
+                text="Subtitle")]),
+        X.N("android.widget.TextView", (10, 750, 700, 800), rid="c", text="Trailing"),
+    ])
+    scr = s(X.settings_screen(extra_roots=[card]))
+    got = [e for e in scr.elements if e.resource_id == "card"][0].best_text
+    # Breadth-first gave "Title Trailing Subtitle": both depth-1 nodes, then the
+    # depth-2 one. The card reads top to bottom on screen, so the label must too.
+    assert got == "Title Subtitle Trailing", got
+
+
+def test_a_label_stops_at_a_readable_length():
+    """A label names a thing. Past a couple of lines it has stopped naming one.
+
+    The guard behind the scroller fix: a tappable card with a large subtree
+    should not turn into a paragraph either.
+    """
+    from adbagent.screen import LABEL_LIMIT
+
+    kids = [X.N("android.widget.TextView", (10, 610 + i * 8, 700, 615 + i * 8),
+                rid=f"f{i}", text=f"field number {i} with some words in it")
+            for i in range(40)]
+    scr = s(X.settings_screen(extra_roots=[
+        X.N("android.widget.Button", (0, 600, X.W, 960), rid="big",
+            clickable=True, children=kids)]))
+    got = [e for e in scr.elements if e.resource_id == "big"][0].best_text
+    assert len(got) <= LABEL_LIMIT + len(" ..."), len(got)
+    assert got.startswith("field number 0"), got
+    assert got.endswith("..."), "truncation must be visible, not silent"
+
+
+def test_one_overlong_child_is_cut_rather_than_dropped():
+    """A label of "..." names less than a truncated sentence does."""
+    from adbagent.screen import LABEL_LIMIT
+
+    long_text = "Everyone can see your account name and photo. " * 12
+    scr = s(X.settings_screen(extra_roots=[
+        X.N("android.widget.Button", (0, 600, X.W, 760), rid="notice",
+            clickable=True, children=[
+                X.N("android.widget.TextView", (10, 610, 700, 750),
+                    rid="body", text=long_text)])]))
+    got = [e for e in scr.elements if e.resource_id == "notice"][0].best_text
+    assert got.startswith("Everyone can see your account name"), got
+    assert got.endswith("...") and len(got) <= LABEL_LIMIT + 3, len(got)
+
+
 # ---------------------------------------------------------------------------
 # Element keys
 #

@@ -365,11 +365,15 @@ def harden_schema(model: Type[BaseModel]) -> Dict[str, Any]:
 
     Not a blanket rule: `AgentAction` has 20 properties and 3 required ones,
     and forcing the rest would make the model emit `x`/`y` on every action --
-    the guessed coordinate that `LOCATE_SYSTEM` exists to prevent.
+    the guessed coordinate that `LOCATE_SYSTEM` exists to prevent. It uses the
+    narrower `always_required` instead, which names the few properties a
+    constrained decoder must be made to stop and consider without conscripting
+    the other seventeen. See `actions.AgentAction.always_required`.
     """
     schema = model.model_json_schema()
     defs = schema.pop("$defs", {})
     require_all = bool(getattr(model, "answer_every_field", False))
+    always = tuple(getattr(model, "always_required", ()) or ())
 
     def resolve(node: Any) -> Any:
         if isinstance(node, dict):
@@ -388,9 +392,41 @@ def harden_schema(model: Type[BaseModel]) -> Dict[str, Any]:
 
     hardened = resolve(schema)
     hardened.pop("$id", None)
-    if require_all and "properties" in hardened:
-        hardened["required"] = list(hardened["properties"])
+    properties = hardened.get("properties", {})
+    if require_all and properties:
+        hardened["required"] = list(properties)
+    elif always and properties:
+        required = list(hardened.get("required", []))
+        required += [name for name in always
+                     if name in properties and name not in required]
+        hardened["required"] = required
     return hardened
+
+
+#: What each attempt of the repair loop samples at, as a floor under the
+#: configured temperature.
+#:
+#: The first try is the caller's own setting and nothing else -- a decision the
+#: harness is going to execute should be the most likely one the model has. The
+#: retries are not that. A retry only happens because the previous answer was
+#: rejected, and at ``temperature: 0`` re-asking tends to buy the same answer
+#: back: on 2026-09-01 all five aborted runs sent their three attempts inside a
+#: ten-second window and got byte-identical replies, whitespace included,
+#: despite the error being appended each time -- three calls to be told the same
+#: thing three times.
+#:
+#: Not because the provider is deterministic. It is not: the same prompt at the
+#: same temperature, replayed hours later, answers differently. It is stable
+#: enough *within* one repair loop to make the loop useless, which is the case
+#: this exists for. A floor, not an override, so a caller already sampling
+#: hotter than this is left alone.
+_REPAIR_TEMPERATURES = (0.0, 0.4, 0.8)
+
+
+def _repair_temperature(attempt: int, configured: float) -> float:
+    """Temperature for `structured`'s nth attempt (0-based)."""
+    floor = _REPAIR_TEMPERATURES[min(attempt, len(_REPAIR_TEMPERATURES) - 1)]
+    return max(configured, floor)
 
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.S)
@@ -993,7 +1029,7 @@ class LLMClient:
 
     def _post(self, messages: List[Dict[str, Any]], *, model: str,
               schema: Optional[Dict[str, Any]], max_tokens: int,
-              purpose: str, effort: str = "",
+              purpose: str, effort: str = "", temperature: Optional[float] = None,
               on_event: Optional[Callable[..., None]] = None) -> Tuple[str, Call]:
         from openai import APIStatusError, APIConnectionError, APITimeoutError
 
@@ -1005,7 +1041,8 @@ class LLMClient:
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "temperature": self.cfg.llm.temperature,
+            "temperature": (self.cfg.llm.temperature if temperature is None
+                            else temperature),
             "max_tokens": max_tokens,
             "stream": True,
         }
@@ -1261,7 +1298,7 @@ class LLMClient:
         takes the same repair path as a validation error, deeper thinking and
         all.
         """
-        from .prompts import REPAIR, REPAIR_UNUSABLE
+        from .prompts import REPAIR, REPAIR_UNUSABLE, repair_hint
 
         schema = harden_schema(model_cls)
         target = model or self.model
@@ -1277,7 +1314,10 @@ class LLMClient:
             try:
                 raw, call = self._post(conversation, model=target, schema=schema,
                                        max_tokens=budget, purpose=purpose,
-                                       effort=effort, **kw)
+                                       effort=effort,
+                                       temperature=_repair_temperature(
+                                           attempt, self.cfg.llm.temperature),
+                                       **kw)
             except TruncatedResponse as exc:
                 # Asking again with the same ceiling would truncate again. Give
                 # the model more room instead, once.
@@ -1304,9 +1344,12 @@ class LLMClient:
                 # model its JSON was malformed when it was well-formed and
                 # merely blank buys another well-formed blank.
                 repair = REPAIR_UNUSABLE if unusable else REPAIR
+                complaint = (repair.format(error=last_error) if unusable else
+                             repair.format(error=last_error,
+                                           hint=repair_hint(last_error)))
                 conversation = conversation + [
                     {"role": "assistant", "content": raw[:2000]},
-                    {"role": "user", "content": repair.format(error=last_error)},
+                    {"role": "user", "content": complaint},
                 ]
                 # A reply that missed the schema is the clearest evidence there
                 # is that this turn was harder than the caller assumed, so the

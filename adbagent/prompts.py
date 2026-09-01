@@ -776,8 +776,19 @@ def situational_notes(*, scrolls: int = 0, packages_seen: int = 1,
 
     Gated purely on what the run has *done*: the scrolling block once it has
     scrolled, the app-switching block once it has crossed apps, the tap_at
-    block once something has failed or the run has stopped getting anywhere
-    (`struggle` is the loop's stall and consecutive-failure counts, summed).
+    block once the run cannot hit a control or has properly stopped getting
+    anywhere.
+
+    `struggle` is that last condition, and it is deliberately narrower than "the
+    run had a bad step". Both blocks open by telling the model that tapping is
+    not working here, which is a claim about the screen the model will act on --
+    so it has to be earned by targeting failing, not by any failure at all. It
+    was not: the count was every stall plus every failure of any kind, and one
+    of either was enough. In ``runs/e59baa3570d2`` a scroll sweep that ran out
+    of content put both blocks on step 18 of a run whose eleven taps had all
+    landed, and the reply that came back was a `tap` with no target in it. See
+    `agent.RunState.targeting_failures` for the counter and `run.stall_nudge_at`
+    for the threshold the stall half now has to clear.
 
     `scrolls > 0` alone was not enough for the scrolling block. It is a fact
     about the whole run, so one scroll on step 3 pinned a page of list-searching
@@ -1198,8 +1209,55 @@ REPAIR = """\
 Your previous reply was not valid against the schema.
 
 Error: {error}
+{hint}
+Keep everything else you wrote. Reply again with ONLY the corrected JSON \
+object. No explanation, no fences."""
 
-Reply again with ONLY the corrected JSON object. No explanation, no fences."""
+
+#: The complaints `actions.AgentAction._check_arguments` can raise, and the
+#: instruction that actually fixes each one, keyed on the field the error names.
+#:
+#: A pydantic error is a description of a rejected object, not a repair: "tap
+#: requires a target" tells a model its answer was wrong and leaves it to work
+#: out what a target looks like from a schema it has already once read past. The
+#: rejected reply is almost always *nearly* right -- the run that died on
+#: 2026-09-01 had "#2 'Like photo'" sitting in its own `reasoning` -- so the
+#: instruction points the model back at what it already decided rather than
+#: asking it to decide again.
+_REPAIR_HINTS = (
+    ("requires a target",
+     "Add the `target` key: {\"index\": N, \"key\": \"XXXX\"}, taking the #N "
+     "and k=XXXX of the control you named in your own `reasoning` from the "
+     "CURRENT SCREEN element list. Do not change the action."),
+    ("requires x and y",
+     "Either give `x` and `y` as fractions of the screen (0.0 to 1.0), or "
+     "leave them out and name the control in `text` so it can be located for "
+     "you. If the control IS in the element list, use `tap` with a `target` "
+     "instead."),
+    ("requires direction",
+     "Add `direction`: one of \"down\", \"up\", \"left\", \"right\"."),
+    ("requires text",
+     "Add `text` with the string to type."),
+    ("requires key",
+     "Add `key`: one of the key names in the schema, e.g. \"back\"."),
+    ("requires the package name",
+     "Add `text` with the package name, e.g. \"com.android.settings\"."),
+    ("target needs index",
+     "The `target` object needs at least one of `index` (the #N), `key` (the "
+     "k=XXXX), `resource_id` or `text`, taken from the element list."),
+)
+
+
+def repair_hint(error: str) -> str:
+    """A concrete instruction for a known validation error, or nothing.
+
+    Nothing, and not a guess, when the error is unrecognised: a wrong hint is
+    worse than the bare pydantic message, which is at least accurate.
+    """
+    for needle, hint in _REPAIR_HINTS:
+        if needle in error:
+            return f"\nFix: {hint}\n"
+    return ""
 
 
 #: For a reply that parsed but said nothing. Naming the schema here would be a

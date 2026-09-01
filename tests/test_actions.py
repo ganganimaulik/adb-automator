@@ -57,6 +57,88 @@ def test_required_arguments_are_enforced():
         Target()                                # nothing to locate by
 
 
+# ---------------------------------------------------------------------------
+# Salvaging a target the model decided on and then did not write
+# ---------------------------------------------------------------------------
+
+def test_a_tap_recovers_its_target_from_the_ordinal_in_the_reasoning():
+    """The verbatim reply that ended runs/e59baa3570d2 at step 18.
+
+    `glm-5p3-flash` named the control it wanted in `reasoning` and then skipped
+    the `target` key, three times running.
+    """
+    action = act(action="tap", reasoning=(
+        "The mandatory top check passed, so I tap the topmost like button "
+        "(#2 'Like photo' @mid-right, above the @bottom-right prompt heart) "
+        "to open the comment composer for the first photo."))
+    assert action.target is not None
+    assert action.target.index == 2
+    # The label rides along so `resolve_target` can cross-check the ordinal.
+    assert action.target.text == "Like photo"
+
+
+@pytest.mark.parametrize("reasoning, index", [
+    ("tap #7 to open it", 7),
+    ("tap #3 [Button \"Darshana Oh 1 day ago. Reply?\"] to read the thread", 3),
+    ("type into #10 [Input] 'Send a message'", 10),
+    ("the same control, named twice: #4 and #4 again", 4),
+])
+def test_the_shapes_a_model_names_a_control_in(reasoning, index):
+    assert act(action="tap", reasoning=reasoning).target.index == index
+
+
+def test_an_ambiguous_reasoning_is_not_guessed_at():
+    """Two ordinals means it was comparing candidates. A repair round-trip beats
+    a coin toss between two controls the harness is about to press."""
+    with pytest.raises(ValidationError):
+        act(action="tap",
+            reasoning="either #2 or #3 is the first photo's heart")
+
+
+def test_prose_with_no_ordinal_still_fails():
+    """The four step-1 aborts of 2026-09-01 named the control in words only
+    ("Darshana's chat"). Nothing to salvage: this one belongs to the repair."""
+    with pytest.raises(ValidationError):
+        act(action="tap", reasoning="I will open Darshana's chat and read it")
+
+
+def test_the_observation_is_not_salvaged_from():
+    """It describes the screen, not the intent -- the ordinals in it are as often
+    the candidates being ruled out as the one being chosen."""
+    with pytest.raises(ValidationError):
+        act(action="tap", observation="the list shows #2 and #3 as hearts",
+            reasoning="tap the first photo's heart")
+
+
+def test_salvage_leaves_an_explicit_target_alone():
+    action = act(action="tap", target=Target(index=9),
+                 reasoning="tap #2, the one I want")
+    assert action.target.index == 9
+
+
+def test_salvage_does_not_fire_for_actions_that_take_no_target():
+    action = act(action="scroll", direction="down",
+                 reasoning="scroll past #2 to reach the bottom")
+    assert action.target is None
+
+
+def test_a_salvaged_target_resolves_against_the_screen():
+    action = act(action="tap",
+                 reasoning="tap #5 'Network & internet' to open it")
+    element = resolve_target(action.target, BASE)
+    assert element is not None
+    assert element.best_text == "Network & internet"
+
+
+def test_a_salvaged_target_whose_ordinal_moved_lands_on_the_named_control():
+    """Index plus label is what makes a stale ordinal recoverable: the label
+    disagrees with whatever now sits at #5, so the text search settles it."""
+    action = act(action="tap", reasoning="tap #5 'Devices' to open it")
+    element = resolve_target(action.target, BASE)
+    assert element is not None
+    assert element.best_text == "Devices"
+
+
 def test_unknown_fields_are_rejected():
     with pytest.raises(ValidationError):
         act(action="press_key", key="back", coordinates=[10, 20])

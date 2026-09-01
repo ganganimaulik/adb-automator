@@ -21,12 +21,12 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sized, Tuple
 
 from . import (__version__, checkpoint, control, conversation, prompts, runlog,
                safety)
-from .actions import (_POINT_GUARD_MAX_AREA, NAVIGATIONAL, POINT_ACTIONS,
-                      ActionError, AgentAction, Target,
+from .actions import (_POINT_GUARD_MAX_AREA, CONTROL_ACTIONS, NAVIGATIONAL,
+                      POINT_ACTIONS, ActionError, AgentAction, Target,
                       append_history, content_moved_in_pixels,
                       element_at_point, element_summary, execute,
                       format_history_entry, input_target_is_container,
@@ -103,6 +103,17 @@ class RunState:
     step: int = 0
     llm_calls: int = 0
     consecutive_failures: int = 0
+    #: Of those, the consecutive ones that were an attempt to hit a specific
+    #: control (see `actions.CONTROL_ACTIONS`). Separate from
+    #: `consecutive_failures` because the two answer different questions. That
+    #: one asks whether the run is failing; this one asks whether *targeting* is
+    #: what is failing, which is the only thing the tap_at and stuck hatches are
+    #: an answer to. Handing them out on the general counter meant a scroll that
+    #: stopped advancing unlocked a block asserting "element targeting is not
+    #: working here" -- in ``runs/e59baa3570d2`` it rode step 18 of a run whose
+    #: eleven taps had all succeeded, one step after the last graded success,
+    #: and the reply it drew back was a `tap` with no target at all.
+    targeting_failures: int = 0
     #: Every step, oldest first. Kept in full rather than truncated: the prompt
     #: is bounded by how much of this `history_only_block` *renders*, and the one
     #: call that wants the long view -- the completion judge -- used to be handed
@@ -261,6 +272,25 @@ class RunState:
         """
         self.steps_since_progress = 0
         self.last_progress = reason
+
+    def note_failure(self, action: Optional[AgentAction], reason: str) -> None:
+        """Record a failed step against both failure counters.
+
+        `action` is what was attempted, which is the only thing that separates
+        "this run is failing" from "this run cannot hit the control it wants" --
+        see `targeting_failures`. It is optional because one caller rejects a
+        gesture before there is anything to attribute the failure to.
+        """
+        self.last_failure = reason
+        self.consecutive_failures += 1
+        if action is not None and action.action in CONTROL_ACTIONS:
+            self.targeting_failures += 1
+
+    def note_success(self) -> None:
+        """Record a step that worked; clear both failure counters."""
+        self.consecutive_failures = 0
+        self.targeting_failures = 0
+        self.last_failure = ""
 
     def remember(self, entry: str) -> None:
         """Add a history line, folding it into the previous one if it repeats it.
@@ -476,6 +506,31 @@ def step_metrics(calls: List[Any], detail: bool = True) -> Dict[str, Any]:
     }
 
 
+#: How many *remembered* dead ends make a screen worth thinking harder about.
+#: See `blocked_here`.
+REMEMBERED_DEAD_ENDS_FOR_HARD = 2
+
+
+def blocked_here(banned: Sized, remembered: Sized) -> bool:
+    """Whether this screen's known dead ends are worth thinking harder about.
+
+    The two inputs are not the same kind of evidence. A ban is live: *this run*
+    tried that action on this screen and nothing moved, so the way forward is
+    unclear right now. A remembered dead end is a fact about one action from up
+    to 24 hours ago, and one of them is a note about a single control -- not a
+    claim that the screen is a maze.
+
+    Treating them alike made every Hinge chat a hard turn. ``runs/e8d6aa742852``
+    carried exactly one remembered row, `input_text/k=f4c3` ("the field never
+    took focus"), recorded an hour earlier against the chat skeleton; both chats
+    the run opened escalated to `high` on it, and steps 3 and 5 spent 193s and
+    35,924 characters, then 57,470 characters and never finished. Step 1, also
+    `high`, took 26s and 2,674 -- the depth was not what made those turns long,
+    but it is what gave them room to be.
+    """
+    return bool(banned) or len(remembered) >= REMEMBERED_DEAD_ENDS_FOR_HARD
+
+
 def needs_reasoning(state: RunState, cfg: Config, *, visit: int,
                     blocked: bool, hint: str) -> Tuple[str, str]:
     """How hard to think about this turn, and why.
@@ -534,6 +589,9 @@ def needs_reasoning(state: RunState, cfg: Config, *, visit: int,
         # for 56 other turns to do it.
         reason = "this is the first step, which chooses the approach"
     elif blocked:
+        # Live bans, or a screen with several remembered dead ends -- see
+        # `REMEMBERED_DEAD_ENDS_FOR_HARD` at the call site for why one is not
+        # enough.
         reason = "actions here are already known to lead nowhere"
     elif hint:
         reason = "the loop detector has something to say"
@@ -1359,9 +1417,19 @@ class Agent:
                 collecting=bool(scratch_text.strip()),
                 packages_seen=len(state.packages),
                 # tap_at is revealed only once ordinary targeting has failed
-                # somehow: a stall, or an action that did not work. On a
-                # healthy turn the model never hears the hatch exists.
-                struggle=stalled + state.consecutive_failures,
+                # somehow: a run that has stopped getting anywhere, or an
+                # attempt to hit a control that did not work. On a healthy turn
+                # the model never hears the hatch exists.
+                #
+                # Neither half used to be that narrow. It was `stalled +
+                # consecutive_failures`, so *one* step of either -- a scroll
+                # that stopped advancing, a rejected `done` -- put "element
+                # targeting is not working here" in front of a model whose
+                # every tap had landed. `stall_nudge_at` is the harness's own
+                # threshold for "this run is stalling"; below it, one flat step
+                # is ordinary.
+                struggle=(state.targeting_failures
+                          + (stalled if stalled >= limits.stall_nudge_at else 0)),
                 # ...and its x/y form exists only for a decider that can see:
                 # a blind one's fractions are guesses, so it is told to name
                 # the control and let the locate place it.
@@ -1406,7 +1474,7 @@ class Agent:
                                              stall_text, state.last_failure)))
             effort, hard_because = needs_reasoning(
                 state, cfg, visit=visit,
-                blocked=bool(banned_actions or remembered), hint=hint)
+                blocked=blocked_here(banned_actions, remembered), hint=hint)
             if hard_because:
                 log.info("step %d: thinking harder (%s) because %s",
                          state.step, effort, hard_because)
@@ -1420,27 +1488,63 @@ class Agent:
                           screenshot=bool(screenshot), shot=shot, effort=effort,
                           hard_because=hard_because)
             t0_llm = time.monotonic()
-            action = self.llm.decide(                      ### LLM ###
-                goal=state.goal, rendered=render(screen), history=state.history,
-                width=screen.width, height=screen.height, package=screen.package,
-                today=self._today,
-                screenshot=screenshot, note=notes,
-                scratchpad=scratch_text,
-                progress=state.plan.render(), skill=skill_note,
-                policy=self.policy,
-                # Where the run is against its ceilings. Nothing used to say --
-                # not one of the 105 decide prompts in ``runs/`` carries a step
-                # number or an elapsed time, while SYSTEM tells the model not to
-                # search "indefinitely". See `prompts.budget_line`.
-                budget=prompts.budget_line(state.step, cfg.run.max_steps,
-                                           state.elapsed),
-                # `is not None`, not truthiness: a pydantic model is always truthy
-                # so this happened to be right, but the distinction it relies on
-                # is between "the pass ran" and "it did not". `decide` reads "" as
-                # the former and would buy a second look for the latter.
-                image_analysis=analysis.render() if analysis is not None else None,
-                step=state.step, recorder=rec, effort=effort,
-                on_event=self.on_event)
+            try:
+                action = self.llm.decide(                  ### LLM ###
+                    goal=state.goal, rendered=render(screen),
+                    history=state.history,
+                    width=screen.width, height=screen.height,
+                    package=screen.package,
+                    today=self._today,
+                    screenshot=screenshot, note=notes,
+                    scratchpad=scratch_text,
+                    progress=state.plan.render(), skill=skill_note,
+                    policy=self.policy,
+                    # Where the run is against its ceilings. Nothing used to
+                    # say -- not one of the 105 decide prompts in ``runs/``
+                    # carries a step number or an elapsed time, while SYSTEM
+                    # tells the model not to search "indefinitely". See
+                    # `prompts.budget_line`.
+                    budget=prompts.budget_line(state.step, cfg.run.max_steps,
+                                               state.elapsed),
+                    # `is not None`, not truthiness: a pydantic model is always
+                    # truthy so this happened to be right, but the distinction
+                    # it relies on is between "the pass ran" and "it did not".
+                    # `decide` reads "" as the former and would buy a second
+                    # look for the latter.
+                    image_analysis=(analysis.render()
+                                    if analysis is not None else None),
+                    step=state.step, recorder=rec, effort=effort,
+                    on_event=self.on_event)
+            except BudgetExceeded:
+                # The one LLM failure that is genuinely terminal: there is no
+                # money left to try again with.
+                raise
+            except LLMError as exc:
+                # A reply the schema would not take, three times over. That is a
+                # step that did not work, and the loop already knows what to do
+                # with one of those -- count it, tell the next turn what
+                # happened, and stop at `max_consecutive_failures` like any
+                # other persistent failure.
+                #
+                # It used to end the run outright, from `run`'s handler. On
+                # 2026-09-01 that threw away seventeen good steps of
+                # ``runs/e59baa3570d2`` -- both Matches conversations handled,
+                # the profile scrolled and checked -- over one `tap` whose
+                # target key was missing, and the watch loop then restarted the
+                # whole pass from the beginning. Nothing about the screen had
+                # gone wrong, and the next turn re-reads it anyway.
+                log.warning("step %d: %s", state.step, exc)
+                self.on_event("llm_end", step=state.step, purpose="decide",
+                              elapsed=time.monotonic() - t0_llm, call=None)
+                rec.event("decide_failed", step=state.step, error=str(exc))
+                state.llm_calls += 1
+                state.note_failure(None, (
+                    "your last reply was rejected by the schema three times "
+                    f"({exc}). Answer with a complete, valid action object."))
+                state.remember(f"{state.step}. the model's reply could not be "
+                               f"read as an action -> skipped")
+                self._maybe_give_up(state)
+                continue
             t_llm = time.monotonic() - t0_llm            # the decision alone
             t_step_llm = time.monotonic() - t0_step_llm  # + any vision pass
             step_calls = self.llm.ledger.since(ledger_mark) if self.llm else []
@@ -1522,12 +1626,11 @@ class Agent:
                     self.on_event("loop_warning", message=f"step {state.step}: scroller stuck; rejecting scroll action")
                     rec.event("scroll_rejected", step=state.step,
                               action=action.describe())
-                    state.last_failure = (
+                    state.note_failure(action, (
                         "scrolling was blocked because you have been "
                         "alternating directions or reversing despite being "
                         "told to stop. Commit to one direction, do something "
-                        "else, or report done/fail.")
-                    state.consecutive_failures += 1
+                        "else, or report done/fail."))
                     state.remember(
                         format_history_entry(
                             state.step, action, screen=screen,
@@ -1844,10 +1947,9 @@ class Agent:
                 where = self._locate_cached(state, rec, screen,
                                             action.text.strip())
                 if where is None:
-                    state.last_failure = (
+                    state.note_failure(action, (
                         f"could not locate {action.text.strip()!r} on the "
-                        f"screen; it may not be visible, or name it differently")
-                    state.consecutive_failures += 1
+                        f"screen; it may not be visible, or name it differently"))
                     state.remember(format_history_entry(
                         state.step, action, screen=screen, grade="failed",
                         reason=state.last_failure))
@@ -1863,14 +1965,13 @@ class Agent:
                     log.info("step %d: locate %r landed on ruled-out point "
                              "(%.2f, %.2f); treating as a miss", state.step,
                              action.text.strip(), action.x, action.y)
-                    state.last_failure = (
+                    state.note_failure(action, (
                         f"the vision model keeps placing "
                         f"{action.text.strip()!r} at ({action.x:.2f}, "
                         f"{action.y:.2f}), where a tap already changed "
                         f"nothing; it cannot be placed there. Name it "
                         f"differently, or find another control for the same "
-                        f"job.")
-                    state.consecutive_failures += 1
+                        f"job."))
                     state.remember(format_history_entry(
                         state.step, action, screen=screen, grade="failed",
                         reason=state.last_failure))
@@ -1894,10 +1995,9 @@ class Agent:
                                    .strip() or "the text input field")
                     where = self._locate_cached(state, rec, screen, description)
                     if where is None:
-                        state.last_failure = (
+                        state.note_failure(action, (
                             f"could not locate {description!r} on the screen; "
-                            f"it may not be visible, or name it differently")
-                        state.consecutive_failures += 1
+                            f"it may not be visible, or name it differently"))
                         state.remember(format_history_entry(
                             state.step, action, screen=screen, grade="failed",
                             reason=state.last_failure))
@@ -1917,8 +2017,7 @@ class Agent:
                 # worth telling the model in the same breath as a bad target:
                 # it can pick a different link, or navigate by hand instead.
                 log.warning("step %d: %s", state.step, exc)
-                state.last_failure = str(exc)
-                state.consecutive_failures += 1
+                state.note_failure(action, str(exc))
                 state.remember(
                     format_history_entry(
                         state.step, action, screen=screen,
@@ -2119,8 +2218,8 @@ class Agent:
             passive_noop = (action.action in ("wait", "sleep")
                             and outcome.grade == "no_change")
             if not outcome.ok and not passive_noop:
-                state.consecutive_failures += 1
-                state.last_failure = f"{action.describe()} failed: {outcome.reason}"
+                state.note_failure(
+                    action, f"{action.describe()} failed: {outcome.reason}")
                 state.want_screenshot = True
                 # Only `no_change` earns a cross-run dead end. It is the one
                 # grade that means "this control did nothing"; a `hard_fail` is a
@@ -2152,8 +2251,7 @@ class Agent:
                         self.mem.forget_locate(screen, described)
 
             if outcome.ok and not passive_noop:
-                state.consecutive_failures = 0
-                state.last_failure = ""
+                state.note_success()
                 state.loops.consecutive_backs = 0
             if outcome.grade == "no_change":
                 # The ban still applies to a no-op wait. Waiting once on a screen
@@ -2520,8 +2618,7 @@ class Agent:
         # The sweep is browsing, not thrashing, so it is deliberately kept out of
         # the loop detector: twelve flings on one `skeleton_id` is exactly the
         # shape that makes `should_force_back` press back and eject the agent.
-        state.last_failure = ""
-        state.consecutive_failures = 0
+        state.note_success()
         if read:
             state.note_progress(f"a sweep read {read} item(s)")
         self._maybe_give_up(state)
@@ -2642,8 +2739,10 @@ class Agent:
         `state.finished`, which the terminal path is about to overwrite with
         this function's return value.
         """
-        state.consecutive_failures += 1
-        state.last_failure = f"your 'done' was rejected: {why}"
+        # `None` for the action: a rejected completion is a failed step, but it
+        # is not a control the run could not hit, so it must not unlock the
+        # targeting hatches.
+        state.note_failure(None, f"your 'done' was rejected: {why}")
         # The rejection is the closest thing to an explanation this run will
         # have if it never recovers, so it is kept where the summary can find
         # it -- replaced by the next rejection, or by a completion that stands.

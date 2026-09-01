@@ -151,9 +151,22 @@ class Element:
         return self.cls.endswith(_EDIT_SUFFIXES) or self.password
 
     @property
-    def interactive(self) -> bool:
+    def actionable(self) -> bool:
+        """Interactive for some reason other than scrolling.
+
+        The distinction matters wherever a container's own text is taken to
+        stand for its children's. A tap target, a checkbox or a field is a
+        *thing*: a label on it says what acting on it does, and repeating that
+        label on its children is noise. A scroller is not a thing, it is the
+        room its children are in -- so text collected onto it does not describe
+        it, it replaces them. See `_absorb_labels`.
+        """
         return (self.clickable or self.long_clickable or self.checkable
-                or self.scrollable or self.editable)
+                or self.editable)
+
+    @property
+    def interactive(self) -> bool:
+        return self.actionable or self.scrollable
 
     @property
     def best_text(self) -> str:
@@ -432,32 +445,84 @@ def _dominant_package(nodes: Sequence[Element]) -> str:
     return max(pool.items(), key=lambda kv: kv[1])[0]
 
 
+#: Longest label `_absorb_labels` will build. A label names a tappable thing so
+#: the model can say which one it means, and past a couple of lines it has
+#: stopped naming anything -- the Play Store's longest genuine single-node
+#: caption in ``runs/`` is 213 characters, so this clears real text and cuts
+#: only accumulations.
+LABEL_LIMIT = 240
+
+
+def _describing_text(el: Element) -> Iterable[str]:
+    """Text of the non-interactive descendants, in document order.
+
+    An interactive child is skipped along with its whole subtree: that text
+    belongs to the child, which is rendered in its own right.
+
+    Document order is the point. This walk used to be a FIFO queue -- pop the
+    front, append the children -- which is breadth-first, so it emitted every
+    depth-1 node, then every depth-2 node, and a label read in order of
+    *nesting* rather than in the order the pixels do. On a chat thread whose
+    bubbles and timestamps sit at different depths that is not a cosmetic
+    difference: ``runs/e8d6aa742852`` step 3 rendered three timestamps in a
+    clump ahead of the messages they belong to, and the model spent 193 seconds
+    and 35,924 characters of thinking trying to work out which went with which.
+    """
+    for child in el.children:
+        if child.interactive:
+            continue
+        piece = (child.text or child.content_desc).strip()
+        if piece:
+            yield piece
+        yield from _describing_text(child)
+
+
 def _absorb_labels(nodes: Sequence[Element]) -> None:
-    """Give interactive containers the text of their non-interactive children.
+    """Give actionable containers the text of their non-interactive children.
 
     A tappable row is very often a clickable ``LinearLayout`` whose only text
     lives in a child ``TextView``. Without this the model sees an unlabelled
     tappable box next to a piece of text it cannot tap.
+
+    **Actionable, not interactive.** `interactive` includes `scrollable`, and a
+    scroller has no text of its own -- so this walked the entire subtree of
+    every RecyclerView, ListView and ScrollView on the screen and joined it into
+    one string. `_absorbed_by_ancestor` then deleted every child it had just
+    read, because each one's text is a substring of the string built from it.
+    The whole list arrived as a single line with its structure gone.
+
+    Nothing about that is one app's markup: Android sends no text on those
+    nodes, this function invents it. Measured across the 4,050 decide screens in
+    ``runs/``, 237 of 3,018 rendered `[Scroller]` lines carried more than 150
+    characters of flattened text against 4 of 29,432 `[Button]` lines -- a rate
+    570 times higher -- and it lands the same way on every app in the corpus:
+    a Hinge thread reading "Yesterday 11:12AM Sun, Aug 30 11:52PM Drash__: Oops.
+    You: Bodakdev, far! ...", a Schmooze profile reading "76.6% 76.6% 76.6% ...
+    Vibe match Taurus Go with the flow Lives in Ahmedabad".
     """
     for el in nodes:
-        if not el.interactive or el.text or el.content_desc:
+        if not el.actionable or el.text or el.content_desc:
             continue
         parts: List[str] = []
-        stack = list(el.children)
-        while stack:
-            child = stack.pop(0)
-            if child.interactive:
-                continue  # belongs to that child, not to us
-            piece = (child.text or child.content_desc).strip()
-            if piece:
-                parts.append(piece)
-            stack.extend(child.children)
+        budget = LABEL_LIMIT
+        for piece in _describing_text(el):
+            # Whole pieces where possible: a label cut mid-word names nothing,
+            # and the marker is what tells the model the rest is on the screen
+            # rather than absent from it. One piece longer than the entire
+            # budget is the exception -- dropping it would leave a label of
+            # "...", which names less than a truncated sentence does.
+            if len(piece) > budget:
+                parts.append((piece[:budget].rstrip() + "...") if not parts
+                             else "...")
+                break
+            parts.append(piece)
+            budget -= len(piece) + 1
         if parts:
             el.label = " ".join(parts)
 
 
 def _absorbed_by_ancestor(el: Element) -> bool:
-    """True when an interactive ancestor already presents this node's text.
+    """True when an actionable ancestor already presents this node's text.
 
     Tested against `best_text`, not `label`. `label` is only ever filled in by
     `_absorb_labels`, which skips any interactive node that already has `text` or
@@ -473,12 +538,20 @@ def _absorbed_by_ancestor(el: Element) -> bool:
     elements -- and the truncated tail held the navigation bar, which is fixed
     system chrome and cannot be scrolled to, so the "(scroll to reach them)"
     the render appended was false. All three truncations in the corpus are this.
+
+    **Actionable ancestors only**, for the reason given in `_absorb_labels`: a
+    card's description stands in for its fields, whereas a scroller's stands in
+    for nothing -- it is a room, not a thing, and dropping its children loses
+    the only copy of them. That fix removes the labels this function was reading
+    on scrollers, so this clause is belt-and-braces for the rarer app that sets
+    a real `content-desc` on a list. Duplicating a line costs a few tokens;
+    deleting one costs the information.
     """
     piece = (el.text or el.content_desc).strip()
     if not piece:
         return False
     for anc in el.ancestors():
-        if anc.interactive and piece in anc.best_text:
+        if anc.actionable and piece in anc.best_text:
             return True
     return False
 

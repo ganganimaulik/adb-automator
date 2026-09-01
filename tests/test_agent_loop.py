@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from adbagent.actions import AgentAction
+from adbagent.actions import AgentAction, Target
 from adbagent.agent import Agent, Oracle, Recorder, RunState, needs_screenshot
 from adbagent.config import Config
 from adbagent.device import DeviceTimeout
@@ -741,6 +741,136 @@ def test_dry_run_touches_nothing(cfg, mem):
 # ---------------------------------------------------------------------------
 # Screenshot policy
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# A reply the schema will not take is a failed step, not a dead run
+# ---------------------------------------------------------------------------
+
+def test_an_unreadable_reply_costs_a_step_and_the_run_carries_on(cfg, mem):
+    """It used to end the run from `Agent.run`'s handler.
+
+    On 2026-09-01 that discarded seventeen good steps of runs/e59baa3570d2 --
+    both conversations handled, the profile scrolled and checked -- over one
+    `tap` with no target, and the watch loop restarted the pass from scratch.
+    Nothing had gone wrong with the screen, and the next turn re-reads it.
+    """
+    from adbagent.llm import LLMError
+
+    dev = fake.FakeDevice(cfg)
+    reach = fake.reach_state(dev, "wifi", ["Wi-Fi"])
+    calls = []
+
+    def policy(screen, llm):
+        calls.append(1)
+        if len(calls) == 1:
+            raise LLMError("model never produced a valid AgentAction: "
+                           "tap requires a target")
+        return reach(screen, llm)
+
+    outcome, state, _ = run(dev, mem, cfg, policy)
+
+    assert outcome == "success"
+    assert dev.state == "wifi"
+    assert len(calls) > 1                 # it asked again instead of giving up
+    assert state.step > 1
+
+
+def test_a_model_that_never_answers_valid_json_still_ends_the_run(cfg, mem):
+    """Carrying on must not mean carrying on forever: the same strike count as
+    any other persistent failure, with the history intact."""
+    from adbagent.llm import LLMError
+
+    dev = fake.FakeDevice(cfg)
+
+    def policy(screen, llm):
+        raise LLMError("model never produced a valid AgentAction")
+
+    outcome, state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "failed"
+    assert llm.calls == cfg.run.max_consecutive_failures
+
+
+def test_running_out_of_budget_still_aborts_immediately(cfg, mem):
+    """The one LLM failure with nothing to retry with."""
+    from adbagent.llm import BudgetExceeded
+
+    dev = fake.FakeDevice(cfg)
+
+    def policy(screen, llm):
+        raise BudgetExceeded("spent $20.01, budget is $20.00")
+
+    outcome, _state, llm = run(dev, mem, cfg, policy)
+
+    assert outcome == "aborted"
+    assert llm.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Which failures count as "targeting is not working"
+# ---------------------------------------------------------------------------
+
+def _state():
+    return RunState(goal="g", run_id="r", intent_id="i")
+
+
+def test_a_failed_tap_counts_against_targeting():
+    state = _state()
+    state.note_failure(AgentAction(observation="o", reasoning="r", action="tap",
+                                   target=Target(index=1)), "nothing happened")
+    assert state.consecutive_failures == 1
+    assert state.targeting_failures == 1
+
+
+@pytest.mark.parametrize("kw", [
+    {"action": "scroll", "direction": "down"},
+    {"action": "press_key", "key": "back"},
+    {"action": "wait"},
+])
+def test_a_failure_that_is_not_about_hitting_a_control_does_not(kw):
+    """Both hatches open by telling the model that tapping is not working here.
+    A scroll that ran out of content is not evidence of that -- in
+    runs/e59baa3570d2 it put the claim in front of a run whose eleven taps had
+    all landed, and the reply was a `tap` with no target."""
+    state = _state()
+    state.note_failure(AgentAction(observation="o", reasoning="r", **kw), "no")
+    assert state.consecutive_failures == 1
+    assert state.targeting_failures == 0
+
+
+def test_a_rejected_done_is_a_failure_but_not_a_targeting_one():
+    state = _state()
+    state.note_failure(None, "your 'done' was rejected")
+    assert state.consecutive_failures == 1
+    assert state.targeting_failures == 0
+
+
+def test_a_step_that_works_clears_both_counters():
+    state = _state()
+    state.note_failure(AgentAction(observation="o", reasoning="r", action="tap",
+                                   target=Target(index=1)), "nothing happened")
+    state.note_success()
+    assert state.consecutive_failures == 0
+    assert state.targeting_failures == 0
+    assert state.last_failure == ""
+
+
+def test_one_flat_step_does_not_open_the_hatches(cfg):
+    """The stall half of `struggle` has to clear `stall_nudge_at`. One step that
+    changed nothing is ordinary; three is the harness's own definition of a run
+    that has stopped getting anywhere."""
+    from adbagent.prompts import situational_notes
+
+    def struggle(stalled: int, targeting: int = 0) -> int:
+        return targeting + (stalled if stalled >= cfg.run.stall_nudge_at else 0)
+
+    assert cfg.run.stall_nudge_at == 3
+    assert "tap_at" not in situational_notes(struggle=struggle(1))
+    assert "tap_at" not in situational_notes(struggle=struggle(2))
+    assert "tap_at" in situational_notes(struggle=struggle(3))
+    # A control that could not be hit opens them immediately, stall or no stall.
+    assert "tap_at" in situational_notes(struggle=struggle(0, targeting=1))
+
 
 def test_xml_first_no_screenshot_on_a_normal_screen(cfg):
     from adbagent.fingerprint import attach
@@ -1501,6 +1631,39 @@ def test_a_failure_buys_deeper_thinking(cfg):
     chosen, why = effort(deep(cfg), consecutive_failures=1)
     assert chosen == "high"
     assert "did not work" in why
+
+
+def test_one_remembered_dead_end_is_not_a_maze(cfg):
+    """A note about one control must not make every visit to a screen hard.
+
+    ``runs/e8d6aa742852`` carried a single remembered row against the Hinge chat
+    skeleton -- `input_text/k=f4c3`, "the field never took focus" -- recorded an
+    hour before the run. Both chats it opened escalated to `high` on it. Steps 3
+    and 5 then spent 193 seconds and 35,924 characters of thinking, and 57,470
+    characters without finishing at all.
+    """
+    from adbagent.agent import blocked_here
+
+    assert not blocked_here(set(), {"input_text/k=f4c3": "never took focus"})
+    assert effort(deep(cfg), blocked=False) == ("none", "")
+
+
+def test_a_live_ban_still_buys_deeper_thinking(cfg):
+    """A ban is this run, this screen, just now: the way forward *is* unclear."""
+    from adbagent.agent import blocked_here
+
+    assert blocked_here({"tap/k=1234"}, {})
+    chosen, why = effort(deep(cfg), blocked=True)
+    assert chosen == "high"
+    assert "lead nowhere" in why
+
+
+def test_several_remembered_dead_ends_still_count(cfg):
+    """The clause keeps the case it was written for: a screen that is a maze."""
+    from adbagent.agent import blocked_here
+
+    assert blocked_here(set(), {"tap/k=1": "nothing changed",
+                                "swipe/k=2/up": "revealed nothing"})
 
 
 def test_a_new_screen_does_not_buy_deeper_thinking(cfg):

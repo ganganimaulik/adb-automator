@@ -48,13 +48,19 @@ def test_reads_title_and_messages():
 
 
 def test_messages_come_from_raw_nodes_not_the_pruned_view():
-    """Pruning folds the whole thread into one label on the scroller."""
+    """The extractor reads the tree, so it does not move when the render does.
+
+    This used to assert the opposite of its first check: pruning folded the whole
+    thread onto the scroller as one label, and reading raw nodes was the way
+    around that. `_absorb_labels` no longer fires on a scroller, so the thread
+    survives pruning -- but the extractor still must not depend on the pruned
+    view, which collapses repeated messages and truncates at `RENDER_LIMIT`.
+    """
     s = screen(messages=["one", "two", "three"])
     scroller = message_scroller(s)
     assert scroller is not None and scroller.scrollable
-    # The pruned view really does collapse it -- this is what we must not read.
-    assert "one" in scroller.label and "three" in scroller.label
-    # ...and the extractor gets them separately anyway.
+    assert scroller.label == "", \
+        f"the scroller swallowed the thread again: {scroller.label!r}"
     assert read_conversation(s).messages[:3] == ["one", "two", "three"]
 
 
