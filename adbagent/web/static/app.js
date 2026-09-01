@@ -361,6 +361,9 @@ const NOTE_LINES = {
     `refused ${e.action} — tried ${e.tries}× here, nothing new for ${e.stalled} steps`,
   replan: (e) => `stalled ${e.stalled} steps — new approach: ${e.strategy || "?"}`,
   replan_failed: (e) => `replan produced nothing usable (${e.error || "?"})`,
+  // Not the end of the run any more — a step that cost a turn and nothing else.
+  decide_failed: (e) =>
+    `the reply could not be read as an action (${e.error || "?"}) — asking again`,
   scratchpad: (e) => `collected: ${(e.keys || []).join(", ")} (${e.total} total)`,
   // `completed` is called out on its own because it is the only part of a plan
   // change that moved the stall ladder -- see `plan.py`.

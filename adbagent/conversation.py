@@ -106,12 +106,19 @@ def app_nodes(screen: Screen) -> List[Element]:
     """Every visible node the *app* drew, before pruning.
 
     `screen.elements` is unusable here, and the reason is worth stating because
-    it is not obvious: `screen._absorb_labels` folds a non-interactive subtree's
-    text into its interactive ancestor, so on a chat screen the whole
-    conversation arrives as one string on the message scroller
-    (``label='hey you around? 2m'``) and the individual bubbles are pruned away.
-    A digest built from that would be blind to anything past the first few
-    messages and would move whenever the scroller's summary changed.
+    it is not obvious. It used to be the sharpest one: `_absorb_labels` folded a
+    non-interactive subtree's text into any *interactive* ancestor, and a
+    scroller counts as interactive, so the whole conversation arrived as one
+    string on the message scroller (``label='hey you around? 2m'``) with the
+    bubbles pruned away. That is fixed -- absorption is limited to actionable
+    ancestors, and a thread now renders bubble by bubble.
+
+    The rest of the reasoning stands, so this still reads raw nodes. `prune`
+    legitimately drops a bubble whose text its *tappable* row already carries;
+    `_collapse_identical_siblings` folds a repeated message into one entry with
+    a count, which is right for a render and wrong for a digest; and
+    `RENDER_LIMIT` truncates at 80 elements. A digest built on any of those
+    would move when the render did, which is not what it is measuring.
 
     System chrome is dropped on the same reasoning as `Screen.content_elements`:
     the status bar clock is not part of the conversation. Unless the system UI
