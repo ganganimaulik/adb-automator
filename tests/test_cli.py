@@ -980,7 +980,7 @@ def _watch_upto_banner(tmp_path, monkeypatch, argv):
     (tmp_path / "policies").mkdir(exist_ok=True)
     (tmp_path / "policies" / "whatsapp.md").write_text(
         policies.with_front_matter({"goal": "work through the feed"},
-                                   "- only like the first photo"),
+                                   "- only reply to unread chats"),
         encoding="utf-8")
     (tmp_path / "config.json").write_text(json.dumps(
         {"watch": {"policies_dir": str(tmp_path / "policies")}}),

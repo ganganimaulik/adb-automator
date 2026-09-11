@@ -370,7 +370,7 @@ class AgentAction(BaseModel):
 
         Read out of `reasoning` only. `observation` describes the screen rather
         than the intent, so the ordinals in it are as often the things being
-        ruled out as the thing being chosen -- at the bottom of a WhatsApp profile
+        ruled out as the thing being chosen -- at the bottom of an Instagram profile
         it names both hearts, and the one the run wanted was neither.
 
         Conservative on purpose: it wants exactly one distinct ordinal in that

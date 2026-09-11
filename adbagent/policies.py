@@ -4,7 +4,7 @@ A policy is the operator's reply instructions, injected into the prompt verbatim
 (`prompts.policy_block`). For most of this project's life there was exactly one,
 named by `watch.policy`, and the goal was typed in beside it -- which is fine
 until there are two apps. Then the pairing matters: the WhatsApp policy is only
-correct under "work through Discover and reply to matches", and starting it under
+correct under "work through unread chats and reply", and starting it under
 the goal that was still in the box from the Instagram policy is a watch doing the
 wrong thing carefully. The two were always one decision and nothing held them
 together.
@@ -12,11 +12,11 @@ together.
 So the goal lives *in* the policy file, as front matter:
 
     ---
-    goal: work through the WhatsApp feed and reply to anyone new
+    goal: work through unread chats and reply to anyone new
     ---
 
     # WhatsApp policy
-    - Only ever like the first photo...
+    - Never reply in a group chat...
 
 One file, portable, still a plain markdown document anyone can read. The front
 matter is metadata about the policy, not part of it, so `instructions()` strips

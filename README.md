@@ -224,18 +224,18 @@ a wrong message in somebody's inbox. Drop the flag once the drafts look right.
 
 Once there is more than one app there is more than one policy, and the goal is
 part of the policy rather than something typed beside it: the WhatsApp policy is
-only correct under "work through Discover and reply to matches", and starting it
+only correct under "work through unread chats and reply", and starting it
 under the goal left over from the Instagram policy is a watch doing the wrong
 thing carefully. So the goal lives in the policy file, as front matter:
 
 ```markdown
 ---
-goal: work through the WhatsApp feed and reply to anyone new
+goal: work through unread chats and reply to anyone new
 ---
 
 # WhatsApp policy
 
-- Only ever like the first photo…
+- Never reply in a group chat…
 ```
 
 The front matter is a note *about* the policy and never reaches the prompt — the
@@ -758,8 +758,8 @@ a goal is worth running again, and a group that has never had one says so instea
 of a price.
 
 **The same goal with a number changed is the same goal.** Folding on the exact
-string is what a history looks like to a machine: "send likes on 3 new profiles"
-and "…on 7 new profiles" are one thing tried twice, and filing them apart split
+string is what a history looks like to a machine: "reply to 3 new chats"
+and "…to 7 new chats" are one thing tried twice, and filing them apart split
 165 of one real history's 169 runs five ways, each group reporting its own
 success rate for what was one practice. So the key folds every run of digits to
 a single mark and leaves every word alone — a goal that differs by a count is

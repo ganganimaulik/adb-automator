@@ -497,8 +497,8 @@ def _absorb_labels(nodes: Sequence[Element]) -> None:
     characters of flattened text against 4 of 29,432 `[Button]` lines -- a rate
     570 times higher -- and it lands the same way on every app in the corpus:
     a WhatsApp thread reading "Yesterday 11:12AM Sun, Aug 30 11:52PM Alex: Oops.
-    You: Riverside, far! ...", a Imgur profile reading "76.6% 76.6% 76.6% ...
-    Elevation 340 m Distance 12.4 km Moving time 1 h 02".
+    You: running late, sorry! ...", a Strava activity reading "76.6% 76.6% 76.6%
+    ... Elevation 340 m Distance 12.4 km Moving time 1 h 02".
     """
     for el in nodes:
         if not el.actionable or el.text or el.content_desc:

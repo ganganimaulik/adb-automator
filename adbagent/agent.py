@@ -1528,7 +1528,7 @@ class Agent:
                 #
                 # It used to end the run outright, from `run`'s handler. On
                 # 2026-09-01 that threw away seventeen good steps of
-                # ``runs/e59baa3570d2`` -- both Matches conversations handled,
+                # ``runs/e59baa3570d2`` -- both unread conversations handled,
                 # the profile scrolled and checked -- over one `tap` whose
                 # target key was missing, and the watch loop then restarted the
                 # whole pass from the beginning. Nothing about the screen had

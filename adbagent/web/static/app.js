@@ -96,8 +96,8 @@ function goalRest(goal) {
 
 /* Two goals are the same goal when they differ only by a number.
    Grouping on the exact string is what a history looks like to a machine, not
-   what one looks like to the person who made it: "send likes on 3 new
-   profiles" and "…on 7 new profiles" are one thing tried twice, and filing
+   what one looks like to the person who made it: "reply to 3 new
+   chats" and "…to 7 new chats" are one thing tried twice, and filing
    them apart split 165 of these 169 runs five ways, each group reporting its
    own success rate for what was really one practice. So the key folds every
    run of digits to a single mark and leaves every word alone — a goal that
@@ -2249,8 +2249,8 @@ function watchOptions() {
 /* ------------------------------------------------------------ policies
 
    Several of them, and each carries the goal it was written for. The pairing is
-   the whole point: the WhatsApp policy is only correct under "work through Discover
-   and reply to matches", and starting it under the goal still in the box from
+   the whole point: the WhatsApp policy is only correct under "work through unread
+   chats and reply", and starting it under the goal still in the box from
    the Instagram policy is a watch doing the wrong thing carefully. So the goal
    lives in the policy file itself and choosing a policy fills the box in.
 
@@ -2745,7 +2745,7 @@ document.querySelector("#runs-list-view .seg").addEventListener("click", (e) => 
    textarea was a cold start on a page whose whole history is retries.
 
    Distinct by intent, not by string. Keyed on the exact goal these came back
-   as five chips reading "First go to Discover tab in WhatsApp and send likes
+   as five chips reading "First go to the Unread filter in WhatsApp and reply
    with 'Hey…" — the same truncation five times, twice for literally the same
    text, because what told them apart was a number thirty characters past
    where the chip ended. One chip per intent, and each chip says how that

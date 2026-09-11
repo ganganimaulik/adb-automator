@@ -366,7 +366,7 @@ def stop_repeating(after: Screen, *, package: str = "",
 #
 # `stop_repeating` says *why* the gesture handed back. That is not the same as
 # where it left the content, and the difference cost a run: in
-# ``runs/9b9c69095095`` a `scroll down` sweep ran a WhatsApp profile to its last
+# ``runs/9b9c69095095`` a `scroll down` sweep ran an Instagram profile to its last
 # photo, and the next step tapped the like button there while observing "profile
 # S at the first photo". Nothing in the prompt contradicted it -- the sweep had
 # `read_each=false`, so `SweepLog.render` returned "", and the history line said

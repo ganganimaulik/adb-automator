@@ -138,7 +138,7 @@ def test_find_for_run_falls_back_to_the_foreground_app():
     """A vague goal makes the open app the likely subject, so its skill loads."""
     strava = Skill(name="Strava", packages=["com.strava.app"], aliases=["strava"])
     registry = _registry_with(strava)
-    assert registry.find_for_run("com.strava.app", "read my matches").name == "Strava"
+    assert registry.find_for_run("com.strava.app", "read my activity feed").name == "Strava"
 
 
 def test_find_for_run_no_fallback_when_the_goal_named_other_apps():

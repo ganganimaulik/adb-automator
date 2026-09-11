@@ -23,7 +23,7 @@ title: WhatsApp
 
 # WhatsApp policy
 
-- Only ever like the first photo.
+- Never ever reply in a group chat.
 """
 
 
@@ -158,14 +158,14 @@ def test_list_reads_every_policy_with_its_goal(tmp_path):
     make(tmp_path / "policies", "insta", goal="watch my dms")
     found = PolicyStore(str(tmp_path / "policies")).list()
     assert [(p.name, p.goal) for p in found] == [
-        ("whatsapp", "work the feed"), ("insta", "watch my dms")]
+        ("insta", "watch my dms"), ("whatsapp", "work the feed")]
 
 
 def test_list_includes_the_configured_policy_from_outside_the_directory(tmp_path):
     make(tmp_path / "policies", "whatsapp")
     outside = make(tmp_path, "legacy")
     found = PolicyStore(str(tmp_path / "policies"), str(outside)).list()
-    assert sorted(p.name for p in found) == ["whatsapp", "legacy"]
+    assert sorted(p.name for p in found) == ["legacy", "whatsapp"]
 
 
 def test_list_includes_a_configured_policy_that_is_not_written_yet(tmp_path):

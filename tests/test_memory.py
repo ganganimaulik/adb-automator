@@ -161,7 +161,7 @@ def test_recall_misses_when_nothing_was_stored(mem):
 
 def test_the_name_is_matched_on_case_and_spacing_only(mem):
     mem.record_locate(BASE, "send message", 0.7, 0.68)
-    assert mem.recall_locate(BASE, "send   priority like") == (0.7, 0.68)
+    assert mem.recall_locate(BASE, "send   message") == (0.7, 0.68)
     # Two genuinely different wordings get their own rows rather than one
     # answering for the other: they may well be two different controls.
     assert mem.recall_locate(BASE, "the send button") is None
