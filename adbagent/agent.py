@@ -34,10 +34,8 @@ from .actions import (_POINT_GUARD_MAX_AREA, CONTROL_ACTIONS, NAVIGATIONAL,
 from .config import Config
 from .device import (Device, DeviceTimeout, DeviceLost, IntentRefused,
                      ShellDenied)
-from .fingerprint import crop_frac
-from .ledger import ReplyLedger
+from .fingerprint import crop_frac, intent_key
 from .llm import (BudgetExceeded, LLMClient, LLMError, Prefetch, ScreenAnalysis)
-from .memory import Memory, intent_key
 from .plan import TaskLedger
 from .pager import (SweepLog, can_repeat, content_box,
                     content_moved as pager_content_moved,
@@ -177,9 +175,24 @@ class RunState:
     #: Controls placed by a locate on *this* step, as (description, point).
     #: Cleared at the top of every turn, and read only when the step turns out
     #: to have changed nothing -- at which point whatever placed the point was
-    #: wrong and `Memory.forget_locate` has to drop it, or the cache would serve
-    #: the same dud point for the rest of the day.
+    #: wrong and `locates` has to drop it, or the cache would serve the same dud
+    #: point for the rest of the run.
     located: List[Tuple[str, Tuple[float, float]]] = field(default_factory=list)
+    #: Where a named control was found, keyed by (skeleton_id, description).
+    #: What is left of the cross-run locate cache: a locate is the most
+    #: expensive thing a turn can do short of a decide -- a screenshot off the
+    #: device, then a vision call on it -- and it is asked the same question over
+    #: and over. Across the 169 runs in ``runs/``, 577 `tap_at` actions named a
+    #: control and 211 of them (37%) repeated a pair already located earlier *in
+    #: the same run*, which is the share this still saves. The other 84% that
+    #: repeated a pair from some *earlier* run went with `memory.db`.
+    #:
+    #: `skeleton_id` is the content-free hash and already digests the package and
+    #: the rotation, so every profile in a feed shares one entry -- which is what
+    #: makes it worth having, since the Send pill sits in the same place whoever
+    #: is on screen. No expiry: a run is minutes, and an app cannot update
+    #: underneath one.
+    locates: Dict[Tuple[str, str], Tuple[float, float]] = field(default_factory=dict)
     #: What verification concluded about the last gesture: True the app's content
     #: moved, False it did not, None not observable (no screenshot).
     content_moved: Optional[bool] = None
@@ -506,29 +519,28 @@ def step_metrics(calls: List[Any], detail: bool = True) -> Dict[str, Any]:
     }
 
 
-#: How many *remembered* dead ends make a screen worth thinking harder about.
-#: See `blocked_here`.
-REMEMBERED_DEAD_ENDS_FOR_HARD = 2
-
-
-def blocked_here(banned: Sized, remembered: Sized) -> bool:
+def blocked_here(banned: Sized) -> bool:
     """Whether this screen's known dead ends are worth thinking harder about.
 
-    The two inputs are not the same kind of evidence. A ban is live: *this run*
-    tried that action on this screen and nothing moved, so the way forward is
-    unclear right now. A remembered dead end is a fact about one action from up
-    to 24 hours ago, and one of them is a note about a single control -- not a
-    claim that the screen is a maze.
+    One input now, and it is the live one: *this run* tried that action on this
+    screen and nothing moved, so the way forward is unclear right now.
 
-    Treating them alike made every WhatsApp chat a hard turn. ``runs/e8d6aa742852``
-    carried exactly one remembered row, `input_text/k=f4c3` ("the field never
-    took focus"), recorded an hour earlier against the chat skeleton; both chats
-    the run opened escalated to `high` on it, and steps 3 and 5 spent 193s and
-    35,924 characters, then 57,470 characters and never finished. Step 1, also
-    `high`, took 26s and 2,674 -- the depth was not what made those turns long,
-    but it is what gave them room to be.
+    There used to be a second -- the count of `memory.db` rows remembered for
+    this screen and goal -- and it needed two before it counted, because one
+    remembered row is a note about a single control rather than a claim that the
+    screen is a maze. Treating one as evidence made every WhatsApp chat a hard
+    turn: ``runs/e8d6aa742852`` carried exactly one row, `input_text/k=f4c3`
+    ("the field never took focus"), recorded an hour earlier against the chat
+    skeleton; both chats the run opened escalated to `high` on it, and steps 3
+    and 5 spent 193s and 35,924 characters, then 57,470 characters and never
+    finished. Step 1, also `high`, took 26s and 2,674 -- the depth was not what
+    made those turns long, but it is what gave them room to be.
+
+    That input is gone with the database, so the threshold it needed is gone
+    too. A live ban is one screen's worth of evidence about right now, and one
+    of them has always been enough.
     """
-    return bool(banned) or len(remembered) >= REMEMBERED_DEAD_ENDS_FOR_HARD
+    return bool(banned)
 
 
 def needs_reasoning(state: RunState, cfg: Config, *, visit: int,
@@ -589,9 +601,7 @@ def needs_reasoning(state: RunState, cfg: Config, *, visit: int,
         # for 56 other turns to do it.
         reason = "this is the first step, which chooses the approach"
     elif blocked:
-        # Live bans, or a screen with several remembered dead ends -- see
-        # `REMEMBERED_DEAD_ENDS_FOR_HARD` at the call site for why one is not
-        # enough.
+        # Actions banned on this screen in this run -- see `blocked_here`.
         reason = "actions here are already known to lead nowhere"
     elif hint:
         reason = "the loop detector has something to say"
@@ -671,6 +681,17 @@ def needs_screenshot(state: RunState, screen: Screen, cfg: Config) -> Tuple[bool
 # ---------------------------------------------------------------------------
 
 
+def _locate_key(screen: Screen, description: str) -> Tuple[str, str]:
+    """Cache key for "where is this control on this screen".
+
+    The description is normalised the way the model's spellings of one control
+    vary -- case and surrounding space -- and no further: "the send pill" and
+    "send" are two different requests to a vision model and may well come back
+    with two different points.
+    """
+    return (screen.skeleton_id, " ".join(description.lower().split()))
+
+
 def _banned_tap_points(state: RunState, screen: Screen
                        ) -> List[Tuple[float, float]]:
     """The tap_at points already tapped on this screen that changed nothing.
@@ -695,20 +716,15 @@ def _banned_tap_points(state: RunState, screen: Screen
 
 
 class Agent:
-    def __init__(self, dev: Device, mem: Memory, llm: Optional[LLMClient],
+    def __init__(self, dev: Device, llm: Optional[LLMClient],
                  cfg: Config, *, oracle: Optional[Oracle] = None,
-                 on_event=None, ledger: Optional[ReplyLedger] = None,
-                 policy: str = ""):
+                 on_event=None, policy: str = ""):
         self.dev = dev
-        self.mem = mem
         self.llm = llm
         self.cfg = cfg
         self.oracle = oracle or Oracle()
         self.on_event = on_event or (lambda *a, **k: None)
         self.skills = SkillRegistry(cfg.skills.skills_dir)
-        #: Set by `watch`, left None by `run`. When None no send is gated and no
-        #: reply is recorded, so an ordinary run behaves exactly as it always did.
-        self.ledger = ledger
         #: The operator's reply instructions, verbatim. Empty for a run.
         self.policy = policy
         #: The channel anything outside uses to hold this run. Made per run, in
@@ -749,46 +765,35 @@ class Agent:
 
     def _locate_cached(self, state: RunState, rec: Recorder, screen: Screen,
                        description: str) -> Optional[Tuple[float, float]]:
-        """Where `description` is on this screen, from memory or from vision.
+        """Where `description` is on this screen, from this run or from vision.
 
-        A locate is the most expensive thing a turn can do that is not a decide:
-        a screenshot off the device, then a vision call on it. And it is asked
-        the same question over and over. Across the 169 runs in ``runs/``, 577
-        `tap_at` actions named a control and they resolve to 94 distinct
-        (skeleton, name) pairs -- 211 of them (37%) repeat a pair already
-        located earlier in the same run, and 483 (84%) repeat one located in
-        some earlier run. "send message" on one WhatsApp composer skeleton
-        was located 134 separate times.
-
-        The cache is keyed on `skeleton_id`, which is the content-free hash, so
-        every profile in a feed shares one entry -- which is what makes it worth
-        having, since the Send pill sits in the same place whoever is on screen.
-        The risk that buys is a layout where the point *does* move with the
-        content; `forget_locate` is what limits it, and a wrong point costs the
-        one turn it takes to notice.
+        The cache is `RunState.locates`, which says what it keys on and what it
+        is worth. The risk keying on the skeleton buys is a layout where the
+        point *does* move with the content; dropping the entry when a step
+        changes nothing is what limits it, and a wrong point costs the one turn
+        it takes to notice.
 
         A cached point that is already on this screen's ban list is dropped
         rather than used: something has tapped there since and nothing happened.
         Falling through to a real locate is the whole reason to check.
         """
-        if self.mem is not None:
-            remembered = self.mem.recall_locate(screen, description)
-            if remembered is not None:
-                signature = f"tap_at/{remembered[0]:.2f},{remembered[1]:.2f}"
-                if signature in state.loops.bans_for(screen.skeleton_id):
-                    log.info("step %d: cached point for %r is banned here; "
-                             "forgetting it and locating again",
-                             state.step, description)
-                    self.mem.forget_locate(screen, description)
-                else:
-                    log.info("step %d: %r is remembered at (%.2f, %.2f); "
-                             "no vision call", state.step, description,
-                             *remembered)
-                    rec.event("locate_cache", step=state.step, hit=True,
-                              description=description, x=remembered[0],
-                              y=remembered[1])
-                    state.located.append((description, remembered))
-                    return remembered
+        key = _locate_key(screen, description)
+        remembered = state.locates.get(key)
+        if remembered is not None:
+            signature = f"tap_at/{remembered[0]:.2f},{remembered[1]:.2f}"
+            if signature in state.loops.bans_for(screen.skeleton_id):
+                log.info("step %d: cached point for %r is banned here; "
+                         "forgetting it and locating again",
+                         state.step, description)
+                state.locates.pop(key, None)
+            else:
+                log.info("step %d: %r is remembered at (%.2f, %.2f); "
+                         "no vision call", state.step, description, *remembered)
+                rec.event("locate_cache", step=state.step, hit=True,
+                          description=description, x=remembered[0],
+                          y=remembered[1])
+                state.located.append((description, remembered))
+                return remembered
 
         where = self.llm.locate(self._ensure_screenshot(screen), description,
                                 goal=state.goal, step=state.step, recorder=rec,
@@ -799,8 +804,7 @@ class Agent:
                   x=where[0] if where else None,
                   y=where[1] if where else None)
         if where is not None:
-            if self.mem is not None:
-                self.mem.record_locate(screen, description, *where)
+            state.locates[key] = where
             state.located.append((description, where))
         return where
 
@@ -898,7 +902,6 @@ class Agent:
         self.control = control.Control(recorder.dir)
         control.clear(recorder.dir)
         self._log_header(goal, recorder, resumed_from=state.step if resume else 0)
-        self.mem.begin_run(run_id, goal, state.intent_id)
         # The ceilings this sitting runs under. Recorded because they are not
         # recoverable afterwards -- they live in a config file that changes, and
         # `--max-steps` on one invocation leaves no other trace -- and because a
@@ -980,7 +983,6 @@ class Agent:
             # run stopped while paused does not leave a `pause` on disk.
             control.clear(recorder.dir)
             usd = self.llm.ledger.total_usd if self.llm else 0.0
-            self.mem.end_run(run_id, outcome, state.step, state.llm_calls, usd)
             recorder.event("run_end", outcome=outcome, steps=state.step,
                            llm_calls=state.llm_calls,
                            usd=round(usd, 6),
@@ -1351,32 +1353,21 @@ class Agent:
             if pager_note:
                 state.sweep.start(state.sweep.gesture)  # handed over; clear it
 
-            # Two sources, one note. `loops` remembers what failed in this run;
-            # `mem.dead_ends` remembers what failed in *earlier* runs on this
-            # screen for this goal, which is the only knowledge here that outlives
-            # the process. Recording those and never reading them back meant
-            # rediscovering the same dud control on every run.
+            # What failed on this screen *in this run*. There used to be a second
+            # source beside it -- `memory.db`'s `dead_end` rows, what failed on
+            # this screen for this goal in runs up to 24 hours old -- and it went
+            # with the database. What it bought was not rediscovering a dud
+            # control on every run; what it cost was replaying a stale claim into
+            # the prompt, and half of the rows it had accumulated were provably
+            # false (see the note on `no_change` in `_note_outcome`).
             banned_actions = set(state.loops.bans_for(screen.skeleton_id))
-            remembered = self.mem.dead_ends(screen, state.intent_id)
             ban_note = ""
-            if banned_actions or remembered:
-                lines = []
-                if banned_actions:
-                    lines.append(
-                        "BANNED ACTIONS on this screen (these produced NO change "
-                        f"- DO NOT REPEAT): {', '.join(sorted(banned_actions))}.")
-                fresh = {sig: why for sig, why in remembered.items()
-                         if sig not in banned_actions}
-                if fresh:
-                    lines.append(
-                        "KNOWN DEAD ENDS here from earlier runs (do not repeat "
-                        "them): " + "; ".join(
-                            f"{sig} ({why})" for sig, why in sorted(fresh.items()))
-                        + ".")
-                ban_note = "\n".join(lines)
+            if banned_actions:
+                ban_note = ("BANNED ACTIONS on this screen (these produced NO "
+                            "change - DO NOT REPEAT): "
+                            f"{', '.join(sorted(banned_actions))}.")
                 rec.event("dead_ends", step=state.step,
-                          this_run=sorted(banned_actions),
-                          remembered=sorted(remembered))
+                          this_run=sorted(banned_actions))
             # Check for active app skill guidance
             skill_note = ""
             if cfg.skills.enabled:
@@ -1474,7 +1465,7 @@ class Agent:
                                              stall_text, state.last_failure)))
             effort, hard_because = needs_reasoning(
                 state, cfg, visit=visit,
-                blocked=blocked_here(banned_actions, remembered), hint=hint)
+                blocked=blocked_here(banned_actions), hint=hint)
             if hard_because:
                 log.info("step %d: thinking harder (%s) because %s",
                          state.step, effort, hard_because)
@@ -1824,51 +1815,36 @@ class Agent:
                 )
                 continue
 
-            # ---- 5b. the never-double-reply gate ------------------------
-            # The harness half of the guarantee. The prompt also lists what has
-            # been handled, but a prompt is advice; this runs on the very screen
-            # the gesture is about to land on, and it is what a model that has
-            # talked itself into answering the same message twice runs into.
+            # ---- 5b. draft mode -----------------------------------------
+            # The only refusal left in front of a send. It is not about
+            # duplicates -- whether a reply is owed is decided by the model, from
+            # the thread `prompts.conversation_block` puts in front of it -- it
+            # is the switch that means "compose, never send", and it holds
+            # whatever the model concluded.
             #
-            # Placed here rather than beside the other guards so that the two
-            # things between -- the stall block and the dry-run short circuit --
-            # cannot leave an attempt recorded for a gesture that never went out.
-            # `self.ledger` is None for an ordinary run, which is what leaves
-            # `adbagent run` behaving exactly as it did.
-            pending_reply: Optional[conversation.Conversation] = None
-            if self.ledger is not None:
-                verdict = conversation.reply_gate(action, screen, self.ledger, cfg)
-                if not verdict:
-                    log.warning("step %d: not sending -- %s",
-                                state.step, verdict.reason)
-                    self.on_event("safety_warning",
-                                  message=f"step {state.step}: send refused -- "
-                                          f"{verdict.reason}")
-                    rec.event("send_refused", step=state.step,
-                              reason=verdict.reason)
-                    state.last_failure = (
-                        f"the reply was not sent: {verdict.reason}. Do not try to "
-                        f"send it again -- leave this conversation and deal with "
-                        f"another one, or report done.")
-                    state.remember(format_history_entry(
-                        state.step, action, screen=screen, grade="refused",
-                        reason=verdict.reason))
-                    continue
-                if conversation.send_label(action, screen):
-                    convo = conversation.read_conversation(screen)
-                    if convo.readable:
-                        # Written *before* the gesture, on purpose: a record made
-                        # afterwards is one a crash between the tap and the write
-                        # can lose, and a lost record is a second reply. The price
-                        # of this ordering is that a send which never lands leaves
-                        # the thread in doubt, which is what the ledger's long
-                        # cooldown exists to absorb.
-                        self.ledger.record_attempt(convo.key, convo.digest,
-                                                   convo.preview())
-                        pending_reply = convo
-                        rec.event("reply_attempt", step=state.step,
-                                  thread=convo.key, digest=convo.digest,
-                                  preview=convo.preview())
+            # A reply ledger used to stand here: an fsynced record of every
+            # thread's tail, consulted on the very screen the gesture was about
+            # to land on, and the thing a model that had talked itself into
+            # answering the same message twice ran into. It is gone, and with it
+            # the guarantee -- see `conversation.py` for what that trade gives
+            # up. This is still placed after the stall block and the dry-run
+            # short circuit for the reason the ledger needed: nothing between
+            # here and the gesture may decide not to send it.
+            refusal = conversation.draft_refusal(action, screen, cfg)
+            if refusal:
+                log.warning("step %d: not sending -- %s", state.step, refusal)
+                self.on_event("safety_warning",
+                              message=f"step {state.step}: send refused -- "
+                                      f"{refusal}")
+                rec.event("send_refused", step=state.step, reason=refusal)
+                state.last_failure = (
+                    f"the reply was not sent: {refusal}. Do not try to send it "
+                    f"again -- leave this conversation and deal with another "
+                    f"one, or report done.")
+                state.remember(format_history_entry(
+                    state.step, action, screen=screen, grade="refused",
+                    reason=refusal))
+                continue
 
             # ---- 6. act -------------------------------------------------
             t0_act = time.monotonic()
@@ -2136,34 +2112,14 @@ class Agent:
             rec.event("verify", step=state.step, grade=outcome.grade,
                       reason=outcome.reason, after=after.skeleton_id)
 
-            # The post-send tail, now that our own message has joined it. Two
-            # jobs: it is what stops the next poll from reading our own reply as
-            # new incoming content, and it lifts the thread out of the doubt that
-            # `record_attempt` deliberately left it in.
-            #
-            # A reply that cannot be confirmed on the screen it landed on is left
-            # in doubt rather than assumed sent -- the long cooldown then keeps
-            # anything else out of that conversation until a human has looked.
-            if pending_reply is not None:
-                landed = conversation.read_conversation(after)
-                digest = (landed.digest
-                          if landed.readable and landed.key == pending_reply.key
-                          else "")
-                if digest:
-                    self.ledger.record_confirmed(pending_reply.key, digest,
-                                                 landed.preview())
-                    rec.event("reply_confirmed", step=state.step,
-                              thread=pending_reply.key, digest=digest)
-                else:
-                    log.warning("step %d: the reply to %r could not be confirmed "
-                                "on the screen after it -- that conversation now "
-                                "gets the long cooldown",
-                                state.step, pending_reply.title)
-                    self.on_event("safety_warning",
-                                  message=f"step {state.step}: reply to "
-                                          f"{pending_reply.title!r} unconfirmed")
-                    rec.event("reply_unconfirmed", step=state.step,
-                              thread=pending_reply.key)
+            # A send used to be followed here by a second read of the thread, to
+            # record the tail with our own message in it: that was what stopped
+            # the next poll reading our own reply as new incoming content, and
+            # what lifted the thread out of the doubt the pre-send record left it
+            # in. Both jobs belonged to the ledger and went with it. The screen
+            # itself now carries the evidence -- our message is in the thread, on
+            # the sent side -- and `conversation_block` reads it back off the
+            # screen on the next turn that lands on this conversation.
 
             # ---- 8. learn (no LLM) --------------------------------------
             # Two more ways a step can count as progress, both about the device
@@ -2221,34 +2177,27 @@ class Agent:
                 state.note_failure(
                     action, f"{action.describe()} failed: {outcome.reason}")
                 state.want_screenshot = True
-                # Only `no_change` earns a cross-run dead end. It is the one
-                # grade that means "this control did nothing"; a `hard_fail` is a
-                # statement about a postcondition, and this ledger is read back
-                # for 24 hours as "do not repeat them" on every future run
-                # against this screen and intent.
-                #
-                # It was writing both, and half of what it had learned was wrong.
-                # Of the six rows in `memory.db`, two are provably false and both
-                # are `input_text` postconditions comparing what was typed to
-                # what the accessibility tree renders: `'Hey hottie ...'` against
-                # `'Hey hottie ..'`, because the dumper renders the emoji as two
-                # dots, and `'tugain eva price'` against
+                # `no_change` is the one grade that means "this control did
+                # nothing", and it used to buy a cross-run `dead_end` row as well
+                # as the ban below. That table is gone, and it is not much missed:
+                # of the six rows `memory.db` had accumulated, two were provably
+                # false and both were `input_text` postconditions comparing what
+                # was typed to what the accessibility tree renders --
+                # `'Hey hottie ...'` against `'Hey hottie ..'`, because the dumper
+                # renders the emoji as two dots, and `'tugain eva price'` against
                 # `'google.com/search?q=tugain+eva+price'`, because Chrome had
-                # already accepted the text and navigated. Both actions worked.
-                # In ``runs/c1d57cc79d9c`` the false entry was then replayed into
+                # already accepted the text and navigated. Both actions worked,
+                # and in ``runs/c1d57cc79d9c`` the false entry was replayed into
                 # the prompt on steps 18, 20 and 22 of the same run.
                 if outcome.grade == "no_change":
-                    self.mem.record_dead_end(screen, state.intent_id,
-                                             action.signature(), outcome.reason)
                     # Whatever placed the point was wrong -- a tap there did
-                    # nothing. Drop it, or the cache would keep answering with
-                    # it for the rest of its TTL and turn one bad vision call
-                    # into a bad answer on every future turn that named the
-                    # same control. The dead-end row above stops *this* point
-                    # being retried; this is what lets the next locate find a
-                    # different one.
+                    # nothing. Drop it, or the cache would keep answering with it
+                    # for the rest of the run and turn one bad vision call into a
+                    # bad answer on every later turn that named the same control.
+                    # The ban below stops *this* point being retried; this is what
+                    # lets the next locate find a different one.
                     for described, _point in state.located:
-                        self.mem.forget_locate(screen, described)
+                        state.locates.pop(_locate_key(screen, described), None)
 
             if outcome.ok and not passive_noop:
                 state.note_success()

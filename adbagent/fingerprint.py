@@ -192,6 +192,24 @@ def normalize_verb_polarity(goal: str) -> str:
     return ""
 
 
+def intent_key(goal: str) -> str:
+    """Normalised goal, so trivial rewording still names the same intent.
+
+    Incorporates verb polarity so that opposite-intent goals ("turn on WiFi" vs
+    "turn off WiFi") produce different keys.
+
+    It lived in `memory`, where it keyed the cross-run `dead_end` rows. That
+    table is gone and nothing caches against this any more -- what remains is
+    `RunState.intent_id`, stamped into the run's events and its checkpoint so a
+    reader can tell two sittings at one goal from two different goals. It sits
+    here now because this is where the masking it is built from lives.
+    """
+    polarity = normalize_verb_polarity(goal)
+    normalised = " ".join(mask_goal(goal).split())
+    combined = f"{polarity}\x1f{normalised}" if polarity else normalised
+    return hashlib.blake2b(combined.encode("utf-8"), digest_size=8).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------

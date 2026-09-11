@@ -464,19 +464,64 @@ def policy_block(policy: str) -> str:
             f"{policy.strip()}\n\n{_POLICY_BOUNDARY}")
 
 
-def handled_block(handled: Sequence[str]) -> str:
-    """Conversations already answered, so the model does not try them again.
+#: Messages from the end of the thread the block carries. Six was the reply
+#: ledger's digest window and is too few to answer "was this already dealt
+#: with": a thread where the last three lines are ours reads the same as one
+#: where all twelve are. Twelve covers the exchange a reply pass is about
+#: without carrying a morning of scrollback into every turn.
+CONVERSATION_MESSAGES = 12
 
-    Advisory, and deliberately so -- the guarantee is `conversation.reply_gate`,
-    which cannot be talked out of it. This block exists to stop the model wasting
-    a whole iteration walking into a refusal it could have predicted, not to be
-    the thing that prevents the double reply.
+#: Characters per message. A pasted wall of text is not more informative than
+#: its first two lines for deciding whether to answer it, and one of them would
+#: otherwise be most of the block.
+CONVERSATION_TEXT_CHARS = 240
+
+
+def conversation_block(convo) -> str:
+    """The thread on screen, newest last, marked by who said what.
+
+    This is what replaced the reply ledger and its gate. The ledger answered
+    "has this been replied to" from disk and refused the send itself; this
+    answers it from the screen and hands the answer to the model on the turn it
+    decides. See `conversation.py` for what that trade gives up -- the short
+    version is that nothing here survives the process, and nothing here can
+    refuse.
+
+    So the block is written to be acted on rather than merely read. The
+    speaker labels are the evidence, and the line after them is the reading:
+    a model shown twelve lines of dialogue and left to infer whose turn it is
+    will sometimes infer wrong, and "you have already replied" is the one
+    sentence that decides the pass.
+
+    Nothing is rendered for a screen that is not a conversation, or for one
+    whose header could not be read -- an unlabelled thread is one where "who is
+    this" is unanswered, and a block that opened with the wrong name would be
+    worse than none.
     """
-    if not handled:
+    if convo is None or not convo.readable:
         return ""
-    lines = ["ALREADY ANSWERED (do not reply to these again unless there is a "
-             "genuinely new message in them):"]
-    lines.extend(f"  - {h}" for h in handled)
+    lines = [f"THIS CONVERSATION ({convo.title}) — newest last:"]
+    shown = convo.messages[-CONVERSATION_MESSAGES:]
+    dropped = len(convo.messages) - len(shown)
+    if dropped > 0:
+        lines.append(f"  (... {dropped} earlier message(s) above, scrolled out "
+                     f"of this block)")
+    for message in shown:
+        text = " ".join(message.text.split())[:CONVERSATION_TEXT_CHARS]
+        # An unattributed line -- a date separator, an unread divider, a
+        # security notice -- is shown as what it is. Labelling it `them:` would
+        # invent a message, and dropping it would close a gap the thread has.
+        who = f"{message.side}:" if message.side else "     ·"
+        lines.append(f"  {who:<6} {text}")
+    if convo.last_is_ours:
+        lines.append(
+            "-> the last message in this thread is YOURS: you have already "
+            "replied here. Do NOT reply again. Leave this conversation and "
+            "deal with another one, or report done.")
+    else:
+        lines.append(
+            "-> the last message in this thread is THEIRS and has no reply "
+            "under it yet.")
     return "\n".join(lines)
 
 
