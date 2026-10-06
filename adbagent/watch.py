@@ -47,10 +47,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import conversation
 from .agent import Agent, Outcome
@@ -148,6 +149,83 @@ class Anchor:
         return cls(package=screen.package, digest=screen_digest(screen))
 
 
+@dataclass(frozen=True)
+class Snooze:
+    """Words on screen that mean "nothing to do here for a while", and how long.
+
+    From the policy's `snooze` front matter: ``You've seen everyone for now =
+    15m``. Some screens say outright that the work has run dry -- a feed with
+    nobody left in it, a daily limit reached -- and the novelty probe cannot
+    tell that apart from "nothing new yet": the screen will not change on its
+    own, so a reactive watch would never look again, and a sweep would spend a
+    pass every `sweep_s` being told the same thing.
+    """
+
+    phrase: str
+    seconds: float
+
+
+_SNOOZE_DURATION = re.compile(
+    r"^\s*(\d+(?:\.\d+)?)\s*(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\s*$",
+    re.I)
+_SNOOZE_UNIT = {"s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def parse_snooze(text: str) -> List[Snooze]:
+    """``phrase = 15m`` rules, one per line or `;`. Raises ValueError.
+
+    Strict for the reason `conversation.parse_send_limits` is: a rule that is
+    silently misread is a watch that never rests, found out about hours later.
+    """
+    rules: List[Snooze] = []
+    for part in re.split(r"[;\n]", text or ""):
+        part = part.strip()
+        if not part:
+            continue
+        phrase, sep, duration = part.rpartition("=")
+        phrase = phrase.strip()
+        if len(phrase) >= 2 and phrase[0] == phrase[-1] and phrase[0] in "\"'":
+            phrase = phrase[1:-1].strip()
+        found = _SNOOZE_DURATION.match(duration)
+        if not sep or not phrase or not found:
+            raise ValueError(f"{part!r} is not a snooze rule -- write it as "
+                             f"words on screen = 15m")
+        unit = _SNOOZE_UNIT[found.group(2)[0].lower()]
+        rules.append(Snooze(phrase=phrase, seconds=float(found.group(1)) * unit))
+    return rules
+
+
+def _fold(text: str) -> str:
+    """Case, curly quotes and runs of whitespace folded away, for matching.
+
+    The phrase is typed with a straight apostrophe and an app may draw a curly
+    one; neither should decide whether the watch rests.
+    """
+    text = (text.replace("‘", "'").replace("’", "'")
+                .replace("“", '"').replace("”", '"'))
+    return " ".join(text.casefold().split())
+
+
+def snooze_for(screen: Screen, rules: Sequence[Snooze]) -> Optional[Snooze]:
+    """The first rule whose phrase the app has on this screen, or None."""
+    if not rules:
+        return None
+    texts = [_fold(e.best_text) for e in screen.content_elements if e.best_text]
+    for rule in rules:
+        wanted = _fold(rule.phrase)
+        if any(wanted in t for t in texts):
+            return rule
+    return None
+
+
+def _duration(seconds: float) -> str:
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds / 3600:g}h"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds / 60:g}m"
+    return f"{seconds:g}s"
+
+
 @dataclass
 class Stats:
     """What the watch has done, for the periodic status line."""
@@ -158,6 +236,9 @@ class Stats:
     #: Counted separately from `skipped` because they are the opposite situation:
     #: there *was* something to do.
     paused: int = 0
+    #: Passes that ended on a screen a `snooze` rule names, and so were followed
+    #: by that rule's rest rather than the usual interval.
+    snoozed: int = 0
     failures: int = 0
     usd: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
@@ -173,6 +254,7 @@ class Watch:
     def __init__(self, dev: Device, llm: LLMClient, cfg: Config,
                  *, policy: str,
                  send_limits: Optional[Dict[str, int]] = None,
+                 snooze: Sequence[Snooze] = (),
                  say: Optional[Callable[[str], None]] = None,
                  on_event: Optional[Callable[..., None]] = None,
                  make_agent: Optional[Callable[..., Agent]] = None,
@@ -185,6 +267,8 @@ class Watch:
         #: The policy's `send_limits`, applied to each pass on its own: a pass
         #: is a run, and "at most 5 likes" is a promise about one of them.
         self.send_limits: Dict[str, int] = dict(send_limits or {})
+        #: The policy's `snooze` rules: see `Snooze`.
+        self.snooze: List[Snooze] = list(snooze)
         self.say = say or (lambda msg: None)
         self.on_event = on_event
         # Injected so the loop can be tested without a device or a model. The
@@ -320,12 +404,42 @@ class Watch:
             # pass that failed already has the backoff deciding when to try next.
             self._last_pass_at = self._now()
 
+            # The screen the pass left, read once. After a success it is the
+            # next anchor, as it always was; after a failure it is read only
+            # when a snooze rule has a question for it, so a watch without one
+            # touches the phone exactly as often as it did.
+            after = None
+            if outcome in ("success", "needs_user") or self.snooze:
+                after = self._screen_after_pass()
+            rule = snooze_for(after, self.snooze) if after is not None else None
+            if rule is not None:
+                # The app has said the work has run dry. That is not a failure
+                # to back off from, and not "nothing new" either -- the screen
+                # will say the same thing until somebody looks again, which is
+                # what the rest is for. So the anchor is dropped: when it ends,
+                # the next pass runs whatever the probe finds.
+                consecutive_failures = 0
+                self.stats.snoozed += 1
+                if outcome not in ("success", "needs_user"):
+                    # Rested rather than backed off, but still reported: the
+                    # status line is where an operator notices a pass that
+                    # keeps failing on its way to this screen.
+                    self.stats.failures += 1
+                self.anchor = Anchor()
+                self.say(f"  pass {self.stats.passes}: {outcome}; "
+                         f"\"{rule.phrase}\" is on screen -- resting "
+                         f"{_duration(rule.seconds)}")
+                log.info("%r is on screen after pass %d; resting %.0fs",
+                         rule.phrase, self.stats.passes, rule.seconds)
+                self._rest(rule.seconds)
+                continue
+
             if outcome in ("success", "needs_user"):
                 consecutive_failures = 0
                 # Re-read rather than trusting the pass's last frame: the anchor
                 # has to describe the screen as it is *now*, or the next probe
                 # compares against something already stale.
-                self.anchor = self._read_anchor()
+                self.anchor = Anchor.of(after) if after is not None else Anchor()
                 self.say(f"  pass {self.stats.passes}: {outcome} "
                          f"(${self.stats.usd:.4f})")
                 # What the pass concluded. A watch prints one line per pass by
@@ -388,13 +502,26 @@ class Watch:
             outcome = "failed"
         return outcome, self.llm.ledger.total_usd - before
 
-    def _read_anchor(self) -> Anchor:
+    def _screen_after_pass(self) -> Optional[Screen]:
         try:
-            return Anchor.of(self.dev.observe())
+            return self.dev.observe()
         except (DeviceTimeout, DeviceLost) as exc:
-            log.warning("could not read the anchor screen (%s); the next pass "
-                        "will run unconditionally", exc)
-            return Anchor()
+            log.warning("could not read the screen the pass left (%s); the next "
+                        "pass will run unconditionally", exc)
+            return None
+
+    def _rest(self, seconds: float) -> None:
+        """Sleep `seconds`, in short naps, so `stop()` is not kept waiting.
+
+        The ordinary interval is short enough to sleep through; a rest is
+        minutes, and a watch asked to stop should not finish one first.
+        """
+        end = self._now() + seconds
+        while not self._stop:
+            left = end - self._now()
+            if left <= 0:
+                return
+            self._sleep(min(left, 30.0))
 
     # -- ceilings ----------------------------------------------------------
 
@@ -445,6 +572,8 @@ class Watch:
         bits = [f"{s.passes} pass(es)", f"{s.skipped} skipped"]
         if s.paused:
             bits.append(f"{s.paused} paused")
+        if s.snoozed:
+            bits.append(f"{s.snoozed} rested")
         bits += [f"{s.failures} failed", f"${s.usd:.4f}",
                  f"up {s.uptime_s / 3600:.1f}h"]
         return ", ".join(bits)

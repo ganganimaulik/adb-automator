@@ -558,3 +558,99 @@ def test_each_pass_is_handed_the_policys_send_limits(tmp_path):
     watch = Watch(StubDevice([chat()]), StubLLM(), cfg, policy="be brief",
                   send_limits={"like": 5})
     assert watch._default_agent().send_limits == {"like": 5}
+
+
+
+# -- resting when the app says the work has run dry -------------------------
+
+def seen_everyone(apostrophe: str = "'"):
+    """A feed with nobody left in it, as Hinge's Discover draws it."""
+    pkg = "co.hinge.app"
+    return attach(parse(X.dump(
+        X.N("android.widget.FrameLayout", (0, 0, X.W, X.H), package=pkg,
+            children=[
+                X.N("android.widget.TextView", (250, 600, 830, 650),
+                    text=f"You{apostrophe}ve seen everyone for now", package=pkg),
+                X.N("android.widget.Button", (60, 780, 1020, 860),
+                    text="Change filters", package=pkg, clickable=True),
+            ]),
+        X.status_bar()), width=X.W, height=X.H))
+
+
+RULE = "You've seen everyone for now = 15m"
+
+
+def test_snooze_rules_parse_from_the_policy_front_matter():
+    from adbagent.watch import Snooze, parse_snooze
+    assert parse_snooze(RULE) == [Snooze("You've seen everyone for now", 900.0)]
+    assert parse_snooze('"Out of likes" = 12h; Try again = 90s') == [
+        Snooze("Out of likes", 43200.0), Snooze("Try again", 90.0)]
+    assert parse_snooze("") == []
+
+
+def test_a_snooze_rule_that_does_not_parse_is_refused():
+    from adbagent.watch import parse_snooze
+    for bad in ("You've seen everyone for now = 15",      # no unit
+                "You've seen everyone for now",           # no duration
+                "= 15m"):                                  # no words
+        with pytest.raises(ValueError, match="words on screen = 15m"):
+            parse_snooze(bad)
+
+
+def test_a_snooze_matches_whichever_apostrophe_the_app_draws():
+    from adbagent.watch import parse_snooze, snooze_for
+    rules = parse_snooze(RULE)
+    assert snooze_for(seen_everyone("'"), rules) is not None
+    assert snooze_for(seen_everyone("’"), rules) is not None
+    assert snooze_for(chat(), rules) is None
+
+
+def test_a_pass_that_ends_where_the_work_has_run_dry_rests_then_looks_again(cfg):
+    """Without the rule a reactive watch anchors on that screen and never looks
+    again -- the screen does not change on its own. With it, the watch rests
+    the rule's time and then runs a pass whatever the probe says."""
+    from adbagent.watch import parse_snooze
+    watch, slept, goals = build(cfg, [seen_everyone()], ["success", "success"])
+    watch.snooze = parse_snooze(RULE)
+
+    watch.run("like new profiles", max_passes=2)
+
+    assert len(goals) == 2                    # looked again on an unchanged screen
+    assert watch.stats.snoozed == 2
+    assert sum(slept) == 2 * 900
+    assert max(slept) <= 30                   # in naps, so stop() is heard
+
+
+def test_without_a_rule_the_same_screen_is_never_looked_at_again(cfg):
+    watch, slept, goals = build(cfg, [seen_everyone()], ["success", "success"])
+    watch.run("like new profiles", max_passes=2)
+    assert len(goals) == 1
+    assert watch.stats.skipped == 1
+
+
+def test_a_failed_pass_that_ends_there_rests_instead_of_backing_off(cfg):
+    from adbagent.watch import parse_snooze
+    watch, slept, goals = build(cfg, [seen_everyone()], ["failed"])
+    watch.snooze = parse_snooze("seen everyone = 100s")
+
+    watch.run("like new profiles", max_passes=1)
+
+    assert sum(slept) == 100                  # the rest, and no 30s backoff
+    assert watch.stats.failures == 1          # still reported as a failure
+    assert watch.stats.snoozed == 1
+
+
+def test_stopping_cuts_a_rest_short(cfg):
+    from adbagent.watch import parse_snooze
+    watch, slept, goals = build(cfg, [seen_everyone()], ["success"])
+    watch.snooze = parse_snooze(RULE)
+    naps = []
+
+    def nap(seconds):
+        naps.append(seconds)
+        watch.stop()
+
+    watch._sleep = nap
+    watch.run("like new profiles")
+
+    assert naps == [30.0]                     # one nap of the rest, then out

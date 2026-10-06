@@ -1021,15 +1021,15 @@ def test_watch_with_no_goal_anywhere_still_refuses(tmp_path, monkeypatch, capsys
     assert "no goal given" in capsys.readouterr().out
 
 
-def _watch_with_limits(tmp_path, monkeypatch, limits: str):
-    """Run `cmd_watch` on a policy carrying `send_limits` as far as the banner,
-    and hand back what the banner was given."""
+def _watch_with_meta(tmp_path, monkeypatch, **meta):
+    """Run `cmd_watch` on a policy carrying `meta` as front matter, as far as
+    the banner, and hand back what the banner was given."""
     from adbagent import cli
     from adbagent import policies
 
     path = tmp_path / "limited.md"
     path.write_text(policies.with_front_matter(
-        {"goal": "like a few profiles", "send_limits": limits}, "- be kind"),
+        {"goal": "like a few profiles", **meta}, "- be kind"),
         encoding="utf-8")
     (tmp_path / "config.json").write_text(json.dumps({}), encoding="utf-8")
     seen = {}
@@ -1051,7 +1051,8 @@ def _watch_with_limits(tmp_path, monkeypatch, limits: str):
 
 
 def test_watch_takes_its_send_limits_from_the_policy(tmp_path, monkeypatch):
-    code, seen = _watch_with_limits(tmp_path, monkeypatch, "like=5, rose=0")
+    code, seen = _watch_with_meta(tmp_path, monkeypatch,
+                                  send_limits="like=5, rose=0")
     assert code is None                     # reached the banner
     assert seen["send_limits"] == {"like": 5, "rose": 0}
 
@@ -1060,7 +1061,24 @@ def test_a_send_limit_that_does_not_parse_stops_the_watch(tmp_path, monkeypatch,
                                                          capsys):
     """Refused before the watch starts: a limit that is silently not there is
     found out about after the sixth send."""
-    code, seen = _watch_with_limits(tmp_path, monkeypatch, "five likes")
+    code, seen = _watch_with_meta(tmp_path, monkeypatch, send_limits="five likes")
     assert code == 1
     assert not seen                         # never reached the banner
     assert "send_limits" in capsys.readouterr().out
+
+
+def test_watch_takes_its_snooze_rules_from_the_policy(tmp_path, monkeypatch):
+    from adbagent.watch import Snooze
+    code, seen = _watch_with_meta(tmp_path, monkeypatch,
+                                  snooze="You've seen everyone for now = 15m")
+    assert code is None
+    assert seen["snooze"] == [Snooze("You've seen everyone for now", 900.0)]
+
+
+def test_a_snooze_rule_that_does_not_parse_stops_the_watch(tmp_path, monkeypatch,
+                                                          capsys):
+    code, seen = _watch_with_meta(tmp_path, monkeypatch,
+                                  snooze="You've seen everyone for now")
+    assert code == 1
+    assert not seen
+    assert "snooze" in capsys.readouterr().out

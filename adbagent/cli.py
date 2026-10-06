@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__, plan, runlog, scratchpad
 
@@ -1309,7 +1309,8 @@ def cmd_run(args) -> int:
 
 def _watch_banner(out: Out, cfg, goal: str, policy: str,
                   goal_from_policy: bool = False,
-                  send_limits: Optional[Dict[str, int]] = None) -> None:
+                  send_limits: Optional[Dict[str, int]] = None,
+                  snooze: Sequence[Any] = ()) -> None:
     """Say exactly what is about to happen, in the loudest terms available.
 
     A watch is unattended and it sends messages to real people. The one thing
@@ -1343,6 +1344,9 @@ def _watch_banner(out: Out, cfg, goal: str, policy: str,
     if send_limits:
         out.say(out.dim("  send limits per pass: " + ", ".join(
             f"{word}={most}" for word, most in send_limits.items())))
+    for rule in snooze:
+        out.say(out.dim(f"  rest {rule.seconds / 60:g}m when \"{rule.phrase}\" "
+                        f"is on screen after a pass"))
     out.say(out.dim(
         f"  every {w.interval_s:g}s | <={w.max_steps} steps/pass"))
     if w.sweep_s > 0:
@@ -1369,6 +1373,7 @@ def cmd_watch(args) -> int:
     from . import policies as policymod
     from . import skills as skillmod
     from .device import Device
+    from . import watch as watchmod
     from .llm import LLMClient
     from .watch import Watch, load_policy
 
@@ -1418,6 +1423,13 @@ def cmd_watch(args) -> int:
     except ValueError as exc:
         out.bad(f"send_limits in {cfg.watch.policy}: {exc}")
         return 1
+    # ...and the screens that mean the work has run dry for now, e.g.
+    # `snooze: You've seen everyone for now = 15m`. Refused the same way.
+    try:
+        snooze = watchmod.parse_snooze(meta.extra.get("snooze", ""))
+    except ValueError as exc:
+        out.bad(f"snooze in {cfg.watch.policy}: {exc}")
+        return 1
 
     # A watch is unattended by definition: it runs for days with nobody at the
     # terminal. Left as it comes, `safety.confirm` would reach `input()` the
@@ -1431,7 +1443,7 @@ def cmd_watch(args) -> int:
     _ensure_device(args, cfg, out)
 
     _watch_banner(out, cfg, goal, policy, goal_from_policy=goal_from_policy,
-                  send_limits=send_limits)
+                  send_limits=send_limits, snooze=snooze)
 
     # Per-step reporting only under -v. One line per pass is what a loop meant to
     # run for days should print; the full step trace is megabytes by morning.
@@ -1451,7 +1463,7 @@ def cmd_watch(args) -> int:
             dev, skillmod.AppTrace(tasks=goal), on_event=reporter,
             max_actions=WATCH_TRACE_ACTIONS)
         watch = Watch(dev, llm, cfg, policy=policy, send_limits=send_limits,
-                      say=out.say, on_event=trace)
+                      snooze=snooze, say=out.say, on_event=trace)
         try:
             watch.run(goal)
         except KeyboardInterrupt:

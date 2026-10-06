@@ -259,6 +259,23 @@ that send outright. A send past its cap is refused without asking a model, and
 the count is shown to the model every turn and to the judge at the end. A value
 that does not parse stops the watch before it starts.
 
+And it can say when the work has run dry. Some screens say so outright — a feed
+with nobody left in it, a daily limit reached — and they never change on their
+own, so a reactive watch anchored on one would never look again:
+
+```markdown
+---
+snooze: You've seen everyone for now = 15m
+---
+```
+
+When a pass ends on a screen showing those words (case and curly quotes
+ignored), the watch rests that long — `s`, `m` or `h` — and then runs a pass
+whatever the screen says. Several rules go on separate lines or between `;`.
+A failed pass that ends there rests too, rather than backing off. Pair it with
+a line in the policy telling the agent to stop on that screen, so the pass ends
+there instead of trying to make the screen go away.
+
 With a goal saved, the goal argument becomes optional, and `--policy` takes a
 bare name meaning that policy in `watch.policies_dir`:
 
@@ -333,6 +350,7 @@ somebody's inbox.
 | `--draft` | off | every send, unconditionally — replies are composed and recorded only |
 | `safety.check_sends` | on | a send the policy forbids — a second model checks each one first |
 | `send_limits` (policy front matter) | none | sends past a per-pass cap, e.g. `like=5` |
+| `snooze` (policy front matter) | none | passes while the app says there is nothing to do, e.g. `You've seen everyone for now = 15m` |
 | `--steps-per-pass` | 25 | a confused pass; it is abandoned and re-anchored rather than given more budget |
 | `--usd-per-hour` | off | runaway spend — this pauses the loop, it does not end it |
 
