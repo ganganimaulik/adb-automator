@@ -569,3 +569,26 @@ def chat_thread_nested(title: str = "khushi",
               children=[chat_header(title), inner, composer])
     return dump(N("android.widget.FrameLayout", (0, 0, W, H), rid="content",
                   package=IG, children=[status_bar(), pager]))
+
+
+def like_sheet(comment: bool = True) -> str:
+    """Hinge's like composer as it dumps (runs/8de32967fc18 step 13).
+
+    The comment field is not in the tree as a field; the like pill's label grows
+    "with message" once a comment is on it; and the paid Rose sits beside it,
+    so "Send" names both.
+    """
+    pkg = "co.hinge.app"
+    tail = " with message" if comment else ""
+    return dump(N("android.widget.FrameLayout", (0, 0, W, H), package=pkg,
+                  children=[
+                      N("android.widget.ImageView", (60, 120, 1020, 1100),
+                        desc="Alex's photo", package=pkg),
+                      N("android.widget.TextView", (60, 1120, 1020, 1240),
+                        text="Edit comment", package=pkg),
+                      N("android.widget.Button", (60, 1260, 250, 1340),
+                        desc=f"Send a Rose{tail}", package=pkg, clickable=True),
+                      N("android.widget.Button", (270, 1260, 1020, 1340),
+                        desc=f"Send priority like{tail}", package=pkg,
+                        clickable=True),
+                  ]))

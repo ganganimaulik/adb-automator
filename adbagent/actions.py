@@ -848,6 +848,33 @@ def element_at_point(screen: Screen, x: float, y: float) -> Optional[Element]:
     return innermost
 
 
+def elements_named(screen: Screen, text: str) -> List[Element]:
+    """The listed elements a `tap_at`'s description names -- all of them.
+
+    The text half of what `element_at_point` is to a point, and unlike
+    `resolve_target` it never settles on one: that settles a loose match on
+    the shortest label, and on Hinge's like sheet "Send" loosely matches both
+    "Send priority like with message" and "Send a Rose with message", of which
+    the shorter is the paid one. Something about to *tap* the answer needs to
+    know there were two.
+
+    Exact matches win outright; failing those, every element whose label
+    contains the text. Containers bigger than `_POINT_GUARD_MAX_AREA` are left
+    out: a name found only in a scroller's aggregated label names something
+    inside it with no element of its own, and runs/8213dc5e6bf3 was refused
+    twice pointing at WhatsApp's full-screen composer scroller that way.
+    """
+    wanted = text.strip().lower()
+    if not wanted:
+        return []
+    limit = screen.width * screen.height * _POINT_GUARD_MAX_AREA
+    small = [e for e in screen.elements if not (limit > 0 and e.area > limit)]
+    exact = [e for e in small if e.best_text.strip().lower() == wanted]
+    if exact:
+        return exact
+    return [e for e in small if wanted in e.best_text.strip().lower()]
+
+
 class ActionError(RuntimeError):
     """The action could not be carried out on this screen."""
 
@@ -966,7 +993,11 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
                            scale=round(base_scale * remainder, 2), box=box, duration=duration)
     elif action.action == "scroll_to_edge":
         direction = action.direction or "up"
-        moved = dev.fling_to_edge(direction)
+        # The list the model named, when it named one: without it the device
+        # flings the largest scrollable, which is the feed far more often than
+        # the first one in the tree is.
+        moved = dev.fling_to_edge(
+            direction, box=element.bounds if element is not None else None)
         edge = {"up": "top", "down": "bottom",
                 "left": "start", "right": "end"}.get(direction, direction)
         setattr(action, "_result_summary",

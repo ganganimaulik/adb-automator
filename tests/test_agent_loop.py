@@ -245,15 +245,16 @@ def test_a_cached_point_on_the_ban_list_is_dropped_and_located_again(cfg):
     assert state.locates[_locate_key(screen, "the ghost button")] == (0.4, 0.4)
 
 
-def test_a_tap_at_naming_a_listed_element_is_refused_with_its_index(cfg):
-    """The escape hatch is not a shortcut: what the list can name, the list taps."""
+def test_a_tap_at_naming_a_listed_element_taps_it_by_index(cfg):
+    """What the list can name, the list taps -- now without spending a turn to
+    say so: the refusal used to buy the same tap one decision later."""
     dev = fake.FakeDevice(cfg)
     tried = []
 
     def policy(screen, llm):
         if tried:
-            return AgentAction(observation="refused", reasoning="moving on",
-                               action="done", text="taught the index")
+            return AgentAction(observation="it opened", reasoning="moving on",
+                               action="done", text="opened Wi-Fi")
         tried.append(True)
         return AgentAction(observation="Wi-Fi is right there",
                            reasoning="lazy coordinate tap", action="tap_at",
@@ -262,10 +263,10 @@ def test_a_tap_at_naming_a_listed_element_is_refused_with_its_index(cfg):
     outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
-    assert llm.locates == 0             # refused before any locate was paid for
-    assert dev.taps == []
-    assert "tap_at refused" in (state.last_failure or "")
-    assert "#" in (state.last_failure or "")
+    assert llm.locates == 0             # no locate was paid for
+    assert dev.state == "wifi"          # the listed row was tapped
+    assert len(dev.taps) == 1
+    assert "tap_at refused" not in (state.last_failure or "")
 
 
 def test_a_tap_at_naming_something_inside_a_container_label_is_located(cfg):
@@ -345,14 +346,14 @@ def test_a_locate_is_told_ruled_out_points_and_a_repeat_is_not_tapped(cfg):
     assert "keeps placing" in (state.last_failure or "")
 
 
-def test_a_tap_at_landing_on_a_listed_control_is_refused(cfg):
+def test_a_tap_at_landing_on_a_listed_control_taps_that_control(cfg):
     dev = fake.FakeDevice(cfg)
     tried = []
 
     def policy(screen, llm):
         if tried:
-            return AgentAction(observation="refused", reasoning="moving on",
-                               action="done", text="taught the index")
+            return AgentAction(observation="it opened", reasoning="moving on",
+                               action="done", text="opened Wi-Fi")
         tried.append(True)
         # The centre of the "Wi-Fi" row, in fractions: (540, 580) on 1080x2340.
         return AgentAction(observation="saw it on the screenshot",
@@ -362,8 +363,8 @@ def test_a_tap_at_landing_on_a_listed_control_is_refused(cfg):
     outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
-    assert dev.taps == []
-    assert "tap_at refused" in (state.last_failure or "")
+    assert dev.state == "wifi"
+    assert len(dev.taps) == 1
 
 
 def test_a_tap_at_on_bare_canvas_is_not_refused(cfg):
@@ -2773,3 +2774,138 @@ def test_with_the_check_switched_off_a_send_asks_nobody(cfg):
     assert dev.state == "sent"
     assert llm.send_checks == 0
     assert len(state.sends) == 1
+
+
+
+# ---------------------------------------------------------------------------
+# A screen the app has not drawn yet
+# ---------------------------------------------------------------------------
+
+#: The app's window, in the tree and owning the frame, with nothing drawn in it
+#: but the status bar: Hinge's white flash after a like is sent.
+BLANK = X.dump(X.N("android.widget.FrameLayout", (0, 0, X.W, X.H), rid="content"),
+               X.status_bar())
+
+
+class _SlowToDraw(fake.FakeDevice):
+    """A phone whose app shows nothing for a few dumps after a tap that
+    navigates, before the next screen draws."""
+
+    def __init__(self, cfg, blank_dumps: int = 3, **kw):
+        super().__init__(cfg, **kw)
+        self.blank_dumps = blank_dumps
+        self.blank_left = 0
+
+    def tap(self, x: int, y: int) -> None:
+        before = self.state
+        super().tap(x, y)
+        if self.state != before:
+            self.blank_left = self.blank_dumps
+
+    def _xml(self) -> str:
+        if self.blank_left > 0:
+            self.blank_left -= 1
+            return BLANK
+        return super()._xml()
+
+
+def _run_events(cfg, state):
+    from adbagent import runlog
+    path = runlog.run_dir(cfg, state.run_id) / "events.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+
+def test_a_blank_left_by_an_action_is_waited_out_without_asking_the_model(cfg):
+    """``runs/8de32967fc18``: after every like the model was handed the blank
+    and answered `wait`. The harness keeps looking instead, and the next turn
+    sees the screen the app drew."""
+    cfg.device.settle_interval_s = 0
+    dev = _SlowToDraw(cfg)
+
+    outcome, state, llm = run(dev, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+
+    assert outcome == "success"
+    assert llm.calls == 3                         # tap, done, judge -- no `wait`
+    assert "Forget network" in llm.rendered_seen[1]
+    waits = [e for e in _run_events(cfg, state) if e["kind"] == "blank_wait"]
+    assert len(waits) == 1 and waits[0]["drawn"] is True
+
+
+def test_a_screen_that_was_already_blank_is_not_waited_on(cfg):
+    """A canvas or a game reads as blank on every turn; waiting the full
+    `blank_wait_s` on each of them would be a stall of its own."""
+    cfg.device.settle_interval_s = 0
+    dev = fake.FakeDevice(cfg, start="canvas",
+                          app={"canvas": fake.FakeScreen(xml=BLANK)})
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="drawn by hand", reasoning="stop",
+                               action="done", text="tapped the canvas")
+        tried.append(True)
+        return AgentAction(observation="a canvas", reasoning="tap it",
+                           action="tap_at", x=0.5, y=0.5)
+
+    _, state, _ = run(dev, cfg, policy)
+
+    assert not [e for e in _run_events(cfg, state) if e["kind"] == "blank_wait"]
+
+
+def test_with_the_wait_switched_off_the_blank_goes_to_the_model(cfg):
+    cfg.device.blank_wait_s = 0
+    dev = _SlowToDraw(cfg)
+
+    _, state, llm = run(dev, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+
+    assert "Forget network" not in llm.rendered_seen[1]
+
+
+
+def _like_sheet_app():
+    return {"sheet": fake.FakeScreen(xml=X.like_sheet(),
+                                     taps={"Send priority like with message": "sent"}),
+            "sent": fake.FakeScreen(xml=X.detail_screen())}
+
+
+def test_a_tap_at_naming_two_listed_controls_is_refused_naming_both(cfg):
+    """"Send" names the like pill and the paid Rose beside it. The refusal used
+    to offer the shorter label -- the Rose -- as the #N to use."""
+    dev = fake.FakeDevice(cfg, start="sheet", app=_like_sheet_app())
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="refused", reasoning="stop",
+                               action="done", text="did not send")
+        tried.append(True)
+        return AgentAction(observation="the comment is in", reasoning="send",
+                           action="tap_at", text="Send")
+
+    _, state, llm = run(dev, cfg, policy)
+
+    assert dev.taps == []
+    assert llm.locates == 0
+    refusal = state.last_failure or ""
+    assert "Send a Rose with message" in refusal
+    assert "Send priority like with message" in refusal
+
+
+def test_a_tap_at_naming_the_like_pill_taps_the_pill_not_the_rose(cfg):
+    dev = fake.FakeDevice(cfg, start="sheet", app=_like_sheet_app())
+
+    def policy(screen, llm):
+        if dev.state == "sent":
+            return AgentAction(observation="sent", reasoning="stop",
+                               action="done", text="liked")
+        return AgentAction(observation="the comment is in", reasoning="send",
+                           action="tap_at", text="Send Priority Like")
+
+    _, state, llm = run(dev, cfg, policy)
+
+    assert dev.state == "sent"
+    assert len(dev.taps) == 1 and llm.locates == 0
+    # The send is checked and counted against the control's own label.
+    assert llm.send_checks_seen[0]["control"] == "Send priority like with message"
+    assert state.sends.sent[0].label == "Send priority like with message"

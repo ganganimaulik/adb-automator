@@ -1163,6 +1163,12 @@ repeat one already located earlier in the same run**, which is the share still
 saved, and 84% one located in an *earlier* run, which is the share that went
 with the database. A single "send message" pill was located 134 separate times.
 
+A `tap_at` naming a control the tree *does* list is tapped by that control's
+index instead — no locate, and no turn spent being told to use the index. A name
+that fits more than one listed control is refused with all of them, because the
+shortest match is not a safe guess: on a dating app's like sheet, "Send" fits
+both the like button and the paid one beside it.
+
 Keying on the screen hash means every profile in a feed shares one entry — which
 is what makes it worth having, and is also the risk it takes. A tap at a cached
 point that changes nothing drops the entry immediately, so a layout that does
@@ -1265,6 +1271,7 @@ adbagent report runs/<id>        # did the reasoning tokens actually drop?
 | `run.never_screenshot` | `false` | Never pay for vision. Disables sweeping, which needs to read items. |
 | `device.settle_budget_s` | `6.0` | Hard ceiling on one settle. It bounds the re-dumping; it does not decide that the screen has settled — `device.settle_quiet_s` does. It was `2.0`, which is less than a single observation over wireless adb, so the comparison never ran and 95 of ~100 settling observations logged "screen never settled". Raising it costs nothing on a screen that is already still, because that screen returns on its first comparison. Also caps the re-dumping of a frame that holds nothing but the status and nav bars, which is what a dump taken mid-transition returns. |
 | `device.settle_quiet_s` | `0.5` | How long two dumps must agree before the screen counts as settled. Agreement alone is not enough: a screen that has drawn its chrome and not yet its content agrees with itself 0.18s later, and handing that frame over is what the model used to answer with a `wait` action (13 of 103 turns, ~254s across `runs/`). Measured in wall clock, so it is self-calibrating — over a slow link the dumps themselves span the window and it costs nothing. |
+| `device.blank_wait_s` | `8.0` | How long to keep looking, with no model call, when an action leaves the app showing nothing — the white flash after a send, a feed reloading. The settle cannot see it: the blank window agrees with itself, so two blank dumps used to certify it as settled, and the model was handed it 502 times across `runs/` and answered `wait` every time. Only an action that turned a drawn screen blank waits; a screen that is always blank (a canvas, a game) does not. `0` hands the blank over at once. |
 | `device.launch_timeout_s` | `8.0` | How long `open_app` waits for the package to actually reach the foreground. `app_start` returns before the window exists, so without this the next observation describes the launch rather than the app. |
 | `safety.budget_usd` | `2.0` | Session spend ceiling. The run aborts when it is reached. |
 

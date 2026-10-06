@@ -1140,7 +1140,8 @@ class Device:
         self._log_action(f"Double tap at ({px}, {py})")
         self._act(lambda: self.u2.double_click(px, py), "double_tap")
 
-    def fling_to_edge(self, direction: str, max_swipes: int = 50) -> bool:
+    def fling_to_edge(self, direction: str, max_swipes: int = 50,
+                      box: Optional[Sequence[int]] = None) -> bool:
         """Fling a scrollable to its beginning or end in one server-side call.
 
         `scroll` with a large `scroll_amount` is a Python loop of fixed-size
@@ -1154,10 +1155,12 @@ class Device:
         with `scroll_amount >= 2` -- the return-to-top pattern -- and 60 of 169
         runs ended by exhausting the step budget.
 
-        Targets `scrollable=True`, which UiAutomator resolves to the first
-        scrollable view. On a screen with more than one, that is not necessarily
-        the one meant; the model still has `scroll` with an explicit target for
-        those. Returns whether the view moved.
+        Moves the scrollable whose bounds match `box` -- the element the action
+        named -- or, with no box, the largest one on screen. It used to take
+        `scrollable=True` as UiAutomator resolves it, the *first* scrollable in
+        the tree: on a screen with a strip of filter chips above a feed, that is
+        the strip, and the fling reported "already at the edge" without the feed
+        having moved. Returns whether the view moved.
         """
         vertical = direction in ("up", "down")
         to_beginning = direction in ("up", "left")
@@ -1166,13 +1169,41 @@ class Device:
             f"({'vertical' if vertical else 'horizontal'})")
 
         def run() -> bool:
-            obj = self.u2(scrollable=True)
+            obj = self._scrollable_for(box)
             fling = obj.fling
             fling._vertical = vertical
             fling.action = "toBeginning" if to_beginning else "toEnd"
             return bool(fling(max_swipes=max_swipes))
 
         return bool(self._act(run, "fling_to_edge"))
+
+    def _scrollable_for(self, box: Optional[Sequence[int]] = None):
+        """The UiObject a fling should move: the scrollable at `box`, else the
+        largest. Falls back to the first one when they cannot be told apart --
+        one scrollable, or a count or bounds the server would not give."""
+        first = self.u2(scrollable=True)
+        try:
+            count = int(first.count)
+        except Exception:  # noqa: BLE001 -- the first is still a fling
+            return first
+        if count <= 1:
+            return first
+        best, best_score = 0, None
+        for i in range(count):
+            try:
+                b = self.u2(scrollable=True, instance=i).info["bounds"]
+                rect = (b["left"], b["top"], b["right"], b["bottom"])
+            except Exception:  # noqa: BLE001 -- skip what cannot be measured
+                continue
+            if box is not None:
+                # Closest bounds, so a box a few pixels off -- a dump taken a
+                # frame earlier -- still picks its own view.
+                score = -sum(abs(a - c) for a, c in zip(rect, box))
+            else:
+                score = (rect[2] - rect[0]) * (rect[3] - rect[1])
+            if best_score is None or score > best_score:
+                best, best_score = i, score
+        return self.u2(scrollable=True, instance=best)
 
     def wait_for_text(self, text: str, timeout: float = 5.0) -> bool:
         """Wait for `text` to appear, on the device rather than in a poll loop.

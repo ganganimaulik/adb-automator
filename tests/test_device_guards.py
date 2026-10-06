@@ -988,3 +988,82 @@ def test_auto_connect_merges_existing_and_new_devices(monkeypatch):
     assert [d.serial for d in devmod.auto_connect_devices()] \
         == ["usb-phone", "127.0.0.1:5555"]
     assert connected == ["127.0.0.1:5555"]
+
+
+
+# ---------------------------------------------------------------------------
+# Which list a fling moves
+# ---------------------------------------------------------------------------
+
+class _Fling:
+    def __init__(self, log, instance):
+        self.log, self.instance = log, instance
+        self._vertical = True
+        self.action = ""
+
+    def __call__(self, max_swipes=50):
+        self.log.append((self.instance, self._vertical, self.action))
+        return True
+
+
+class _Scrollable:
+    def __init__(self, u2, instance):
+        self.u2, self.instance = u2, instance
+
+    @property
+    def count(self):
+        return len(self.u2.bounds)
+
+    @property
+    def info(self):
+        left, top, right, bottom = self.u2.bounds[self.instance or 0]
+        return {"bounds": {"left": left, "top": top,
+                           "right": right, "bottom": bottom}}
+
+    @property
+    def fling(self):
+        return _Fling(self.u2.flung, self.instance or 0)
+
+
+class _ScrollU2:
+    """`u2(scrollable=True, instance=i)` over a list of scrollables' bounds."""
+
+    def __init__(self, bounds):
+        self.bounds, self.flung = bounds, []
+
+    def __call__(self, scrollable=True, instance=None):
+        return _Scrollable(self, instance)
+
+
+def _scrolling_device(bounds):
+    from adbagent.config import Config
+    from adbagent.device import Device
+
+    dev = Device.__new__(Device)
+    dev.cfg = Config()
+    dev._d = _ScrollU2(bounds)
+    return dev
+
+
+CHIPS = (0, 100, 1080, 200)      # a strip of filter chips, first in the tree
+FEED = (0, 200, 1080, 2200)      # the feed under it
+
+
+def test_a_fling_moves_the_largest_list_when_none_is_named():
+    """The first scrollable in the tree is the chip strip; flinging that
+    reported "already at the top" with the feed never having moved."""
+    dev = _scrolling_device([CHIPS, FEED])
+    assert dev.fling_to_edge("up")
+    assert dev._d.flung == [(1, True, "toBeginning")]
+
+
+def test_a_fling_moves_the_list_the_action_named():
+    dev = _scrolling_device([CHIPS, FEED])
+    dev.fling_to_edge("left", box=CHIPS)
+    assert dev._d.flung == [(0, False, "toBeginning")]
+
+
+def test_a_lone_list_is_flung_without_measuring_anything():
+    dev = _scrolling_device([FEED])
+    dev.fling_to_edge("down")
+    assert dev._d.flung == [(0, True, "toEnd")]

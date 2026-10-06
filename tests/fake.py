@@ -333,6 +333,8 @@ class FakeLLM:
         self.send_checks_seen: List[dict] = []
         #: The harness's send count each judge call was shown.
         self.judge_sent: List[str] = []
+        #: The screen each decide turn was shown, as rendered for the prompt.
+        self.rendered_seen: List[str] = []
 
     @property
     def needs_vision_pass(self) -> bool:
@@ -391,6 +393,7 @@ class FakeLLM:
         self.calls += 1
         self.dates_seen.append(today)
         self.budgets.append(budget)
+        self.rendered_seen.append(rendered)
         if screenshot:
             self.seen_screenshots += 1
             # `is None`, mirroring the real client: "" means a pass ran and found

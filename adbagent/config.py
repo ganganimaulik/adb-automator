@@ -210,6 +210,13 @@ class DeviceConfig:
     #: dumps themselves span the window and it costs nothing, while over a fast
     #: one a few more cheap dumps are taken.
     settle_quiet_s: float = 0.5
+    #: How long to keep looking, with no model call, when an action leaves the
+    #: app showing nothing (`Screen.app_blank`) -- a send's white flash, a feed
+    #: reloading. The settle above cannot see it: the blank window agrees with
+    #: itself, so two blank dumps certify it as settled. In ``runs/`` that blank
+    #: was handed to the model 502 times, and the model's answer, a `wait`, cost
+    #: ~57 minutes of model time. 0 hands it over at once.
+    blank_wait_s: float = 8.0
     #: How long `open_app` waits for the package to actually reach the foreground.
     #: `app_start` returns before the window exists, and a cold start on a loaded
     #: phone can take several seconds; observing before then reads the launch, not

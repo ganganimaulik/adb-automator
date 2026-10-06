@@ -1323,8 +1323,22 @@ def test_scroll_to_edge_flings_and_reports_where_it_went():
     dev.fling_to_edge.return_value = True
     action = act(action="scroll_to_edge", direction="up")
     execute(dev, action, BASE)
-    dev.fling_to_edge.assert_called_once_with("up")
+    dev.fling_to_edge.assert_called_once_with("up", box=None)
     assert getattr(action, "_result_summary") == "flung to the top"
+
+
+def test_scroll_to_edge_flings_the_list_it_names():
+    """A named list is the one moved, not whichever scrollable comes first."""
+    from unittest.mock import MagicMock
+    from adbagent.actions import execute
+
+    dev = MagicMock()
+    dev.fling_to_edge.return_value = True
+    scroller = next(e for e in BASE.elements if e.scrollable)
+    action = act(action="scroll_to_edge", direction="down",
+                 target={"index": scroller.index})
+    execute(dev, action, BASE)
+    dev.fling_to_edge.assert_called_once_with("down", box=scroller.bounds)
 
 
 def test_scroll_to_edge_that_moves_nothing_says_so():

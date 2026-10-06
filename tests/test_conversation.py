@@ -382,24 +382,7 @@ def test_an_unreadable_thread_is_not_a_refusal():
 # -- every door a send goes out through ----------------------------------------
 
 def _like_sheet():
-    """A like composer as Hinge dumps it (``runs/8de32967fc18`` step 13): the
-    comment field is not in the tree as a field, and the pill's label grows to
-    "... with message" once a comment is on it. The paid button sits beside it."""
-    pkg = "co.hinge.app"
-    sheet = X.N("android.widget.FrameLayout", (0, 0, X.W, X.H), package=pkg,
-                children=[
-                    X.N("android.widget.ImageView", (60, 120, 1020, 1100),
-                        desc="Alex's photo", package=pkg),
-                    X.N("android.widget.TextView", (60, 1120, 1020, 1240),
-                        text="Edit comment", package=pkg),
-                    X.N("android.widget.Button", (60, 1260, 250, 1340),
-                        desc="Send a Rose with message", package=pkg,
-                        clickable=True),
-                    X.N("android.widget.Button", (270, 1260, 1020, 1340),
-                        desc="Send priority like with message", package=pkg,
-                        clickable=True),
-                ])
-    return attach(parse(X.dump(sheet), width=X.W, height=X.H))
+    return attach(parse(X.like_sheet(), width=X.W, height=X.H))
 
 
 def test_a_send_command_longer_than_a_button_label_is_still_a_send():

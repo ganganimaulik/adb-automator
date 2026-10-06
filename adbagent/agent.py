@@ -25,10 +25,10 @@ from typing import Any, Dict, List, Optional, Sized, Tuple
 
 from . import (__version__, checkpoint, control, conversation, prompts, runlog,
                safety)
-from .actions import (_POINT_GUARD_MAX_AREA, CONTROL_ACTIONS, NAVIGATIONAL,
-                      POINT_ACTIONS, ActionError, AgentAction, Target,
-                      append_history, content_moved_in_pixels,
-                      element_at_point, element_summary, execute,
+from .actions import (CONTROL_ACTIONS, NAVIGATIONAL, POINT_ACTIONS,
+                      ActionError, AgentAction, Target, append_history,
+                      content_moved_in_pixels, element_at_point,
+                      element_summary, elements_named, execute,
                       format_history_entry, input_target_is_container,
                       resolve_target, synthesise_postcondition, verify)
 from .config import Config
@@ -42,7 +42,7 @@ from .pager import (SweepLog, can_repeat, content_box,
                     stop_repeating, sweep_summary, video_only_drift)
 from .safety import Aborted, LoopDetector
 from .scratchpad import NoteLedger
-from .screen import RENDER_LIMIT, Screen, render
+from .screen import RENDER_LIMIT, Element, Screen, render
 from .skills import Skill, SkillRegistry, goal_app_candidates
 
 log = logging.getLogger("adbagent.agent")
@@ -1873,42 +1873,54 @@ class Agent:
                     and cfg.run.pager_sweep and not cfg.run.never_screenshot):
                 self._ensure_screenshot(screen)
             # tap_at is the escape hatch, not a shortcut. When the list can
-            # name what was asked for -- the text matches a listed element, or
-            # the point lands on a button-sized one -- the tap is refused with
-            # the #N it should have used, before any locate call is paid for.
-            # A refusal is guidance, not a failure: like the reply gate, it is
-            # remembered and the turn continues, and it moves no counters.
+            # name what was asked for -- the text names one listed element, or
+            # the point lands on a button-sized one -- that element is tapped
+            # by index instead, before any locate call is paid for. It used to
+            # be refused with the #N to use, which bought the same tap a turn
+            # later: once per like, in every run following Hinge's skill after
+            # the parser began listing the send pill the skill said was not
+            # listed.
+            #
+            # A name that matches several is still refused, now naming all of
+            # them. On Hinge's like sheet "Send" names both the like pill and
+            # the paid Rose beside it, and the refusal used to offer the Rose.
             if action.action == "tap_at":
-                listed = None
+                named: List[Element] = []
                 if action.x is not None and action.y is not None:
-                    listed = element_at_point(screen, action.x, action.y)
+                    hit = element_at_point(screen, action.x, action.y)
+                    named = [hit] if hit is not None else []
                 elif (action.text or "").strip():
-                    listed = resolve_target(Target(text=action.text.strip()),
-                                            screen)
-                    # The point half's size rule, applied to the text half: a
-                    # name that resolves only to a big container -- a scroller
-                    # whose aggregated label mentions the control -- is naming
-                    # something inside it that has no element of its own, and
-                    # "tap the container by index" is a dead end, not guidance.
-                    # runs/8213dc5e6bf3 refused the named tap_at of WhatsApp's
-                    # "send message" pill twice this way, pointing at the
-                    # full-screen composer scroller whose label contains it.
-                    if (listed is not None and screen.width > 0
-                            and screen.height > 0
-                            and listed.area > screen.width * screen.height
-                                              * _POINT_GUARD_MAX_AREA):
-                        log.info("tap_at %r matches container #%d "
-                                 "(%.0f%% of screen); leaving it to the locate",
-                                 action.text.strip(), listed.index,
-                                 100.0 * listed.area
-                                 / (screen.width * screen.height))
-                        listed = None
-                if listed is not None:
-                    label = f' "{listed.best_text}"' if listed.best_text else ""
+                    named = elements_named(screen, action.text.strip())
+                    # A row and its own title both answer to the row's name.
+                    # One tappable match among several is that control; two
+                    # tappable ones -- the like pill and the Rose -- are not.
+                    tappable = [e for e in named if e.interactive]
+                    if len(named) > 1 and len(tappable) == 1:
+                        named = tappable
+                if len(named) == 1:
+                    listed = named[0]
+                    log.info("step %d: tap_at %s names #%d %r, which is in the "
+                             "list; tapping it by index", state.step,
+                             repr((action.text or "").strip() or "point"),
+                             listed.index, listed.best_text)
+                    rec.event("tap_at_listed", step=state.step,
+                              index=listed.index, label=listed.best_text)
+                    action = action.model_copy(update={
+                        "action": "tap", "x": None, "y": None, "text": None,
+                        "target": Target(index=listed.index,
+                                         key=listed.key or None)})
+                    if sending:
+                        # The control's own label, not the model's words for
+                        # it: that is what the send is counted against.
+                        sending = (conversation.send_label(action, screen)
+                                   or sending)
+                elif named:
+                    listing = ", ".join(f'#{e.index} "{e.best_text}"'
+                                        for e in named[:6])
                     state.last_failure = (
-                        f"tap_at refused: {label} is in the list as "
-                        f"#{listed.index} -- tap it by index. tap_at is only "
-                        f"for controls the list does not name.")
+                        f"tap_at refused: it names {listing} in the list -- "
+                        f"tap the one you mean by index. tap_at is only for "
+                        f"controls the list does not name.")
                     state.remember(format_history_entry(
                         state.step, action, screen=screen, grade="refused",
                         reason=state.last_failure))
@@ -2053,6 +2065,9 @@ class Agent:
             t0_verify = time.monotonic()
             try:
                 after = self.dev.observe(settle=True)
+                # Before anything looks at the frame -- the screenshot below is
+                # also the one the next turn is shown.
+                after = self._wait_out_blank(state, rec, screen, after)
                 if want or action.action in ("scroll", "swipe") or state.want_screenshot:
                     # Also the screenshot the *next* turn will show the model, if
                     # it wants one -- `_ensure_screenshot` will not re-take it.
@@ -2741,6 +2756,38 @@ class Agent:
                       state.consecutive_failures)
             return "failed"
         return None
+
+    # -- a screen the app has not drawn yet ------------------------------------
+
+    def _wait_out_blank(self, state: RunState, rec: Recorder, before: Screen,
+                        after: Screen) -> Screen:
+        """Keep looking, with no model call, while an action has left the app blank.
+
+        Only when the action did it -- `before` had something on it. A screen
+        nothing is ever drawn on reads as blank too, and making every turn on
+        one of those wait the full `blank_wait_s` would be its own stall.
+
+        What it replaces is the model being handed the blank: in ``runs/`` that
+        happened 502 times, 467 of them straight after a like was sent, and
+        every time the model answered `wait` -- a decision, and often a vision
+        read, to say "give it a moment".
+        """
+        grace = self.cfg.device.blank_wait_s
+        if grace <= 0 or not after.app_blank or before.app_blank:
+            return after
+        t0 = time.monotonic()
+        deadline = t0 + grace
+        while after.app_blank and time.monotonic() < deadline:
+            time.sleep(self.cfg.device.settle_interval_s)
+            after = self.dev.observe(settle=True)
+        waited = time.monotonic() - t0
+        drawn = not after.app_blank
+        log.info("step %d: the app drew nothing after the action; waited "
+                 "%.1fs%s", state.step, waited,
+                 "" if drawn else " and it is still blank")
+        rec.event("blank_wait", step=state.step, waited_s=round(waited, 3),
+                  drawn=drawn)
+        return after
 
     # -- sends -------------------------------------------------------------
 

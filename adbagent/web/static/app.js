@@ -384,6 +384,10 @@ const NOTE_LINES = {
     : `send check: refused — ${e.reason || "no reason given"}`,
   sent: (e) => `sent "${e.label}"` + (e.thread ? ` in ${e.thread}` : "") +
     ` (${e.total} this run)`,
+  blank_wait: (e) => `the app drew nothing — waited ${e.waited_s}s` +
+    (e.drawn ? "" : ", still blank"),
+  tap_at_listed: (e) => `tap_at named #${e.index} "${e.label}", which is ` +
+    `listed — tapped it by index`,
 };
 
 /* How a run stops badly. Rendered rather than dropped: an `error` event used to
@@ -3195,6 +3199,8 @@ const CFG_SPEC = [
       help: "Hard ceiling on waiting for one screen to stop moving." }],
     ["settle_quiet_s", "number", { label: "Settle quiet time (s)",
       help: "How long two dumps must agree before the screen counts as settled." }],
+    ["blank_wait_s", "number", { label: "Wait out a blank screen (s)",
+      help: "When an action leaves the app showing nothing — a send's white flash, a feed reloading — keep looking this long before asking the model. 0 asks at once." }],
     ["disable_animations", "bool", { label: "Turn animations off during a run",
       help: "Restored when the run ends." }],
     ["disable_auto_rotate", "bool", { label: "Lock rotation during a run",

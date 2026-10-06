@@ -337,6 +337,28 @@ class Screen:
         return not any(el.bounds[3] > top and el.bounds[1] < bottom
                        for el in self.elements)
 
+    @property
+    def app_blank(self) -> bool:
+        """An app owns the screen and has drawn nothing on it yet.
+
+        The other half of `chrome_only`. That one is the dump taken between two
+        windows; this is the dump taken inside a window that has not painted --
+        the white flash after Hinge sends a like, where the app's window is in
+        the tree and owns the frame and the only elements are the status bar.
+        `chrome_only` is false for it, so the settle loop compared two blank
+        dumps, found them equal, and certified the blank as a settled screen:
+        it was what the model was shown on all six `wait` turns of
+        ``runs/8de32967fc18``.
+
+        A screen nothing is ever drawn on -- a canvas, a game -- reads the same,
+        which is why the agent waits on this only when an action has just
+        turned a drawn screen blank.
+        """
+        if not self.elements or not self.package \
+                or self.package in SYSTEM_UI_PACKAGES:
+            return False
+        return not self.content_elements
+
     def has_system_dialog(self) -> bool:
         target = self.package
         return any(p != target and p not in SYSTEM_UI_PACKAGES
