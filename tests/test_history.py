@@ -16,7 +16,6 @@ from adbagent.agent import Agent
 from adbagent.config import Config
 from adbagent.history import (MIN_OCCURRENCES, History, _describe_action,
                               for_package, packages_in)
-from adbagent.memory import Memory
 
 from . import fake
 
@@ -24,7 +23,6 @@ from . import fake
 @pytest.fixture
 def cfg(tmp_path):
     c = Config()
-    c.memory.db = str(tmp_path / "memory.db")
     c.run.artifacts_dir = str(tmp_path / "runs")
     c.run.max_steps = 25
     c.safety.unattended = True
@@ -165,21 +163,10 @@ def test_an_unreadable_run_does_not_stop_the_others(cfg):
     assert for_package(cfg, "com.example.app").runs >= 1
 
 
-def test_dead_ends_come_from_the_database_keyed_by_app(cfg, tmp_path):
-    from adbagent.screen import Screen
-
-    with Memory(cfg, path=tmp_path / "memory.db") as mem:
-        for i in range(3):
-            screen = Screen(package="com.example.app")
-            screen.skeleton_id = "abcd1234"
-            mem.record_dead_end(screen, f"intent{i}", f"swipe/#{i}/left",
-                                "swiping did not reveal new content")
-
-    dead = for_package(cfg, "com.example.app").dead_ends
-    assert dead and dead[0][1] == 3
-    # Indices are collapsed, not quoted: #0, #1 and #2 are the same finding.
-    assert "swipe on screen abcd1234" == dead[0][0]
-    assert not for_package(cfg, "com.other.app").dead_ends
+# A test stood here for the second source: `dead_ends` read out of `memory.db`,
+# counted per screen and verb so that #0, #1 and #2 of one swipe read as one
+# finding. The table and the field are gone -- every signal this module reports
+# now comes from a run's own recorded events.
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +176,8 @@ def test_dead_ends_come_from_the_database_keyed_by_app(cfg, tmp_path):
 def test_a_real_run_records_where_its_steps_went(cfg, tmp_path):
     """The whole feature rests on this field being written."""
     dev = fake.FakeDevice(cfg)
-    with Memory(cfg, path=tmp_path / "memory.db") as mem:
-        Agent(dev, mem, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
-              cfg).run("open the Wi-Fi screen")
+    Agent(dev, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
+          cfg).run("open the Wi-Fi screen")
 
     history = for_package(cfg, "com.android.settings")
     assert history.runs == 1

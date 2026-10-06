@@ -50,16 +50,14 @@ import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from . import conversation
 from .agent import Agent, Outcome
 from .config import Config
 from .device import Device, DeviceLost, DeviceTimeout
 from .fingerprint import mask_goal
-from .ledger import ReplyLedger
 from .llm import BudgetExceeded, LLMClient, LLMError
-from .memory import Memory
 from .policies import instructions
 from .screen import Screen
 
@@ -101,8 +99,9 @@ then stop:
 Rules for this pass:
   - At most one reply per conversation. Never two.
   - If a send is refused, do not retry it and do not rephrase it. Leave that
-    conversation and move on -- the refusal is the harness preventing a duplicate,
-    and it is always right.
+    item and move on -- the refusal is the harness holding the send back (draft
+    mode, a send limit, or a check against the REPLY POLICY), and it is always
+    right.
   - Do not start conversations with anyone who has not messaged first, unless
     the REPLY POLICY explicitly says to open one. Silence in the policy means no.
   - Do not carry on past what this pass asks for. There is always another pass.
@@ -160,7 +159,6 @@ class Stats:
     #: there *was* something to do.
     paused: int = 0
     failures: int = 0
-    replies_at_start: int = 0
     usd: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
 
@@ -172,19 +170,21 @@ class Stats:
 class Watch:
     """Supervises bounded agent passes forever."""
 
-    def __init__(self, dev: Device, mem: Memory, llm: LLMClient, cfg: Config,
-                 *, policy: str, ledger: ReplyLedger,
+    def __init__(self, dev: Device, llm: LLMClient, cfg: Config,
+                 *, policy: str,
+                 send_limits: Optional[Dict[str, int]] = None,
                  say: Optional[Callable[[str], None]] = None,
                  on_event: Optional[Callable[..., None]] = None,
                  make_agent: Optional[Callable[..., Agent]] = None,
                  sleep: Optional[Callable[[float], None]] = None,
                  clock: Optional[Callable[[], float]] = None):
         self.dev = dev
-        self.mem = mem
         self.llm = llm
         self.cfg = cfg
         self.policy = policy
-        self.ledger = ledger
+        #: The policy's `send_limits`, applied to each pass on its own: a pass
+        #: is a run, and "at most 5 likes" is a promise about one of them.
+        self.send_limits: Dict[str, int] = dict(send_limits or {})
         self.say = say or (lambda msg: None)
         self.on_event = on_event
         # Injected so the loop can be tested without a device or a model. The
@@ -202,7 +202,7 @@ class Watch:
             log.debug("bounding each pass to %d steps (run.max_steps was %d)",
                       cfg.watch.max_steps, cfg.run.max_steps)
             cfg.run.max_steps = cfg.watch.max_steps
-        self.stats = Stats(replies_at_start=len(ledger))
+        self.stats = Stats()
         self.anchor = Anchor()
         #: The `RunState` of the most recent pass, for whoever closes the trace
         #: off when the watch stops. `TraceCollector.app_traces` takes the step
@@ -228,9 +228,13 @@ class Watch:
         """A fresh agent per pass.
 
         Fresh on purpose: a pass is a run, and the per-run state -- history, loop
-        detector, stall counters, scratchpad -- should not carry across. What must
-        survive between passes is exactly what the ledger holds, and that is read
-        back from disk rather than kept in memory.
+        detector, stall counters, scratchpad -- should not carry across.
+
+        Nothing survives a pass any more. The reply ledger used to, and it was
+        the one thing that did: it was read back from disk each pass so that a
+        thread answered in pass 3 was still known to be answered in pass 40.
+        What a pass now knows about what earlier passes said is whatever is
+        visible in the thread on screen -- see `conversation.py`.
 
         No skill learning happens *per pass*, unlike `cmd_run`: rewriting the
         app's skill file every 45 seconds, mostly from passes that did nothing,
@@ -240,9 +244,8 @@ class Watch:
         passes over an inbox and its threads tour the app far more thoroughly
         than any one of them does.
         """
-        return Agent(self.dev, self.mem, self.llm, self.cfg,
-                     ledger=self.ledger, policy=self.policy,
-                     on_event=self._pass_event)
+        return Agent(self.dev, self.llm, self.cfg, policy=self.policy,
+                     send_limits=self.send_limits, on_event=self._pass_event)
 
     def _pass_event(self, kind: str, **kw: Any) -> None:
         """Latch watch-wide facts before forwarding one pass's event.
@@ -323,9 +326,8 @@ class Watch:
                 # has to describe the screen as it is *now*, or the next probe
                 # compares against something already stale.
                 self.anchor = self._read_anchor()
-                sent = len(self.ledger) - self.stats.replies_at_start
                 self.say(f"  pass {self.stats.passes}: {outcome} "
-                         f"({sent} repl(ies) sent so far, ${self.stats.usd:.4f})")
+                         f"(${self.stats.usd:.4f})")
                 # What the pass concluded. A watch prints one line per pass by
                 # default, so without this the only thing a night of watching
                 # leaves on the terminal is a column of "success". Safe to read
@@ -431,13 +433,20 @@ class Watch:
     # -- reporting ---------------------------------------------------------
 
     def status(self) -> str:
+        """What the watch has done. No reply count: it was read off the ledger.
+
+        `len(ledger)` was the one number here that said what the loop had
+        actually *done to somebody* rather than what it had spent doing it, and
+        nothing left in the process knows it -- a send leaves its trace in the
+        pass's events and in the thread on the phone, neither of which this
+        supervisor reads back.
+        """
         s = self.stats
-        sent = len(self.ledger) - s.replies_at_start
         bits = [f"{s.passes} pass(es)", f"{s.skipped} skipped"]
         if s.paused:
             bits.append(f"{s.paused} paused")
-        bits += [f"{s.failures} failed", f"{sent} repl(ies) sent",
-                 f"${s.usd:.4f}", f"up {s.uptime_s / 3600:.1f}h"]
+        bits += [f"{s.failures} failed", f"${s.usd:.4f}",
+                 f"up {s.uptime_s / 3600:.1f}h"]
         return ", ".join(bits)
 
 

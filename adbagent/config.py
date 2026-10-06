@@ -226,11 +226,6 @@ class DeviceConfig:
 
 
 @dataclass
-class MemoryConfig:
-    db: str = "memory.db"
-
-
-@dataclass
 class SafetyConfig:
     # A `package_allowlist` used to live here, along with an `allowed_packages()`
     # that composed it with a list of system packages. Nothing ever consulted
@@ -243,6 +238,11 @@ class SafetyConfig:
     allow_destructive: bool = False
     #: Never prompt; abort instead of asking. For unattended runs.
     unattended: bool = False
+    #: Ask a second, small model before every send -- a message, a reply, a
+    #: like -- whether it breaks the policy, and refuse it on a no or on no
+    #: answer. One call per send, on `llm.model_small`; see
+    #: `Agent._check_send` for what it caught that nothing else would have.
+    check_sends: bool = True
 
 
 @dataclass
@@ -355,17 +355,14 @@ class WatchConfig:
     #: run when a policy changes: the failure mode becomes a wrong draft in the
     #: log instead of a wrong message in somebody's inbox.
     draft: bool = False
-    #: Seconds before the same conversation may be written to again, whatever the
-    #: content digests say. The backstop for the one crash window digests cannot
-    #: close -- see `ledger`.
-    thread_cooldown_s: float = 600.0
-    #: Rolling ceilings on sends. These are circuit breakers, not budgets: a loop
-    #: that has started replying to everything is the thing they exist to stop.
-    max_replies_per_hour: int = 12
-    max_replies_per_thread_per_hour: int = 2
-    #: The reply ledger. Relative paths are relative to the working directory,
-    #: not to the artifacts dir: it must outlive any one run.
-    ledger: str = "watch-replies.jsonl"
+    # A reply ledger used to be configured here, along with a per-thread
+    # cooldown and two rolling ceilings on sends. All four were readings of one
+    # file on disk -- `watch-replies.jsonl` -- which recorded every thread this
+    # loop had answered and refused a send that would have answered one twice.
+    # The file is gone and so is the gate; whether a reply is owed is now the
+    # model's call, made from the thread on screen. `draft` below is the only
+    # switch left that can stop a send.
+    #
     #: File holding the reply instructions, injected verbatim into the prompt.
     #: Required by `adbagent watch` -- there is no default policy, because a
     #: default policy is one nobody wrote and everybody would be surprised by.
@@ -379,11 +376,10 @@ class WatchConfig:
     #: a bare `--policy whatsapp` is resolved against. Only ever read: nothing here
     #: decides which policy a watch uses -- `policy` above and `--policy` do.
     policies_dir: str = "policies"
-    #: Refuse to send when the conversation on screen cannot be identified.
-    #: Leaving this on trades a missed reply for never sending blind; turning it
-    #: off is only sensible while debugging an app whose thread title the parser
-    #: cannot see.
-    fail_closed: bool = True
+    # `fail_closed` stood here: refuse to send when the conversation on screen
+    # cannot be identified. It gated the send that no longer exists to gate --
+    # an unreadable thread now means `conversation_block` renders nothing, so the
+    # model decides with no thread in front of it rather than being refused.
     #: Rolling spend ceiling. Unlike `safety.budget_usd`, hitting this pauses the
     #: watch until the window clears rather than ending it. 0 switches it off.
     max_usd_per_hour: float = 0.0
@@ -409,17 +405,17 @@ class SkillsConfig:
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     device: DeviceConfig = field(default_factory=DeviceConfig)
-    memory: MemoryConfig = field(default_factory=MemoryConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     run: RunConfig = field(default_factory=RunConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     watch: WatchConfig = field(default_factory=WatchConfig)
 
     # -- derived -----------------------------------------------------------
-
-    @property
-    def db_path(self) -> Path:
-        return Path(self.memory.db).expanduser()
+    #
+    # `db_path` lived here, resolving `memory.db` for the SQLite store of what
+    # the agent had learned across runs. Nothing reads a database any more: what
+    # one run learns reaches the next through its app skill (`skills/`) and its
+    # recorded events (`runs/`), both of which are files a person can read.
 
     def api_key(self) -> str:
         return self.llm.api_key or os.environ.get(self.llm.api_key_env, "")
@@ -448,7 +444,6 @@ _ENV_MAP = {
     "ADBAGENT_RPM": "llm.rpm",
     "ADBAGENT_MAX_TOKENS": "llm.max_tokens",
     "ADBAGENT_MAX_TOKENS_IMAGE": "llm.max_tokens_image",
-    "ADBAGENT_DB": "memory.db",
     "ADBAGENT_BUDGET_USD": "safety.budget_usd",
     "ADBAGENT_MAX_STEPS": "run.max_steps",
     "ADBAGENT_PAGER_SWEEP": "run.pager_sweep",
@@ -457,7 +452,6 @@ _ENV_MAP = {
     "ADBAGENT_WATCH_INTERVAL": "watch.interval_s",
     "ADBAGENT_WATCH_POLICY": "watch.policy",
     "ADBAGENT_WATCH_POLICIES_DIR": "watch.policies_dir",
-    "ADBAGENT_WATCH_LEDGER": "watch.ledger",
     "ADBAGENT_WATCH_DRAFT": "watch.draft",
     "ADBAGENT_DISABLE_AUTO_ROTATE": "device.disable_auto_rotate",
     "ANDROID_SERIAL": "device.serial",

@@ -503,11 +503,8 @@ class WatchManager(ChildProcess):
               interval_s: Optional[float] = None,
               sweep_s: Optional[float] = None,
               max_steps: Optional[int] = None,
-              replies_per_hour: Optional[int] = None,
-              replies_per_conversation: Optional[int] = None,
-              cooldown_s: Optional[float] = None,
               usd_per_hour: Optional[float] = None,
-              ledger: str = "", serial: str = "") -> Dict[str, Any]:
+              serial: str = "") -> Dict[str, Any]:
         with self._lock:
             if self.running():
                 raise RuntimeError("a watch is already running")
@@ -524,17 +521,8 @@ class WatchManager(ChildProcess):
                 argv += ["--sweep", str(sweep_s)]
             if max_steps is not None:
                 argv += ["--steps-per-pass", str(max_steps)]
-            if replies_per_hour is not None:
-                argv += ["--replies-per-hour", str(replies_per_hour)]
-            if replies_per_conversation is not None:
-                argv += ["--replies-per-conversation",
-                         str(replies_per_conversation)]
-            if cooldown_s is not None:
-                argv += ["--cooldown", str(cooldown_s)]
             if usd_per_hour is not None:
                 argv += ["--usd-per-hour", str(usd_per_hour)]
-            if ledger:
-                argv += ["--ledger", ledger]
             if serial:
                 argv += ["-d", serial]
             if self.config_path:

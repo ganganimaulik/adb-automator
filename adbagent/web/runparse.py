@@ -80,6 +80,25 @@ def _scratchpad_text(events: List[Dict[str, Any]]) -> str:
         return ""
 
 
+def _plan_text(events: List[Dict[str, Any]]) -> str:
+    """The plan, replayed from the ``progress`` deltas.
+
+    The same arrangement as `_scratchpad_text` and for the same reason: both
+    fields are per-turn deltas, so the last event is not the whole ledger and
+    reading a finished run means replaying all of them. `plan.replay` is what
+    knows how two spellings of one step become one entry, and a view that
+    re-derived that would drift from the prompt the run was actually given.
+
+    Rendered as `plain()` -- the checklist without the "do NOT restate this"
+    preamble, which is addressed to the model and means nothing to a reader.
+    """
+    from .. import plan
+    try:
+        return plan.replay(events).plain()
+    except Exception:  # noqa: BLE001 - a malformed step must not break the view
+        return ""
+
+
 def summarise(path: Path) -> Dict[str, Any]:
     """A run directory's headline fields, for the history list.
 
@@ -167,7 +186,8 @@ def fold_stream(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def run_detail(path: Path) -> Dict[str, Any]:
     """Everything the history detail view renders: summary, cost-of-thinking
-    stats (mirroring `adbagent report`), scratchpad, and the events.
+    stats (mirroring `adbagent report`), the plan, the scratchpad, and the
+    events.
 
     The feed itself is the decision events merged with the raw LLM stream --
     folded, see `fold_stream` -- so a finished run shows the same per-call
@@ -201,7 +221,8 @@ def run_detail(path: Path) -> Dict[str, Any]:
     feed = sorted(events + fold_stream(read_events(path, STREAM_NAME)),
                   key=lambda e: e.get("t", 0.0))
     return {"summary": summary, "stats": stats,
-            "scratchpad": _scratchpad_text(events), "events": feed}
+            "scratchpad": _scratchpad_text(events),
+            "plan": _plan_text(events), "events": feed}
 
 
 def list_runs(artifacts_dir: Path) -> List[Dict[str, Any]]:

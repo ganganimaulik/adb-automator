@@ -233,6 +233,10 @@
           <summary class="small">cost of thinking</summary>
           <div class="readout-rest solo" id="detail-stats"></div>
         </details>
+        <!-- What the run was working through, and what it collected. Both are
+             per-turn deltas in the events, so both are replayed whole by the
+             server rather than read off the last one. -->
+        <div class="progress-note" id="detail-progress" hidden></div>
         <div class="ledger-pin" id="detail-ledger" hidden></div>
         <div class="feed-head">
           <h3>Steps · newest first</h3>
@@ -290,11 +294,11 @@
       <details class="runopts" id="watchopts">
         <summary><span id="watchopts-summary"></span></summary>
         <div class="optgroups">
+          <!-- Three reply ceilings stood beside the spend one: replies/hour,
+               per conversation/hour, and a cooldown. All three were readings of
+               the reply ledger, and went with it. -->
           <fieldset class="optgroup">
             <legend>Limits</legend>
-            <label>replies/hour <input type="number" id="watch-rph" min="0" placeholder="12"></label>
-            <label>per conversation/hour <input type="number" id="watch-rpc" min="0" placeholder="2"></label>
-            <label>cooldown (seconds) <input type="number" id="watch-cooldown" min="0" step="30" placeholder="600"></label>
             <label>$/hour <input type="number" id="watch-usd" min="0" step="0.1" placeholder="off"></label>
           </fieldset>
           <fieldset class="optgroup">
@@ -310,26 +314,11 @@
       </div>
     </form>
 
-    <!-- The record the never-double-reply guarantee is built on, and the only
-         place that answers "what did it say, to whom, when". The product of a
-         watch, so it comes before the machinery. -->
-    <div class="panel">
-      <div class="panel-head">
-        <h3>Replies sent</h3>
-        <span class="grow"></span>
-        <button class="ghost" id="btn-ledger-reload">reload</button>
-      </div>
-      <div class="table-wrap">
-        <table id="watch-ledger-table">
-          <thead><tr><th>conversation</th><th>replies</th><th>last</th><th>state</th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <p class="small" id="watch-ledger-empty" hidden>
-        Nothing sent yet. A conversation appears here the moment a reply is
-        attempted — before the gesture goes out, so a crash cannot lose it.</p>
-      <p class="small mono path" id="watch-ledger-path"></p>
-    </div>
+    <!-- A "Replies sent" table stood here: one row per conversation the watch
+         had ever answered, read back from the reply ledger, and the only view
+         of what it had said to whom. The ledger is gone, and nothing outside a
+         pass knows what that pass sent — so what a watch is doing is shown
+         where it happens, in the live pass below. -->
 
     <div id="watch-live" hidden>
       <div class="readouts">
@@ -364,8 +353,11 @@
       </div>
       <div class="live-body">
         <div class="live-main">
+          <!-- Both are per pass, not per watch: a pass is a run, and the plan
+               and the scratchpad are per-run ledgers reset at every pass
+               boundary. Said on the panels, or a night of passes reads as one. -->
           <div class="progress-note" id="w-progress" hidden></div>
-          <div class="ledger-pin" id="w-ledger" hidden></div>
+          <div class="ledger-pin" id="w-ledger" data-scope="this pass" hidden></div>
           <div class="feed-head">
             <h3>This pass · newest first</h3>
             <div class="seg" role="group" aria-label="feed density">

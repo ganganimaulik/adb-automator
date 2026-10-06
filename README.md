@@ -41,7 +41,7 @@ $ adbagent run "turn on airplane mode"
 - [Safety](#safety)
 - [When It Stops Getting Anywhere](#when-it-stops-getting-anywhere)
 - [Galleries and Carousels](#galleries-and-carousels)
-- [Collected Data](#collected-data)
+- [What a Run Keeps](#what-a-run-keeps)
 - [Reports & Replay](#reports)
 - [App Skills](#app-skills)
 - [Tuning](#tuning)
@@ -242,6 +242,23 @@ The front matter is a note *about* the policy and never reaches the prompt — t
 instructions below it are what goes in, verbatim, as before. A policy without
 front matter is a policy, unchanged; this is opt-in.
 
+It can also cap what one pass sends, counted by the harness rather than by the
+model, whose own tally drifts (a pass told to send seven likes sent eight and
+reported seven):
+
+```markdown
+---
+goal: like new profiles on Discover, at most 5 per pass
+send_limits: like=5, rose=0
+---
+```
+
+Each word caps the sends whose control mentions it — `like=5` counts "Send
+priority like with message" and leaves "Send message" alone — and `0` forbids
+that send outright. A send past its cap is refused without asking a model, and
+the count is shown to the model every turn and to the judge at the end. A value
+that does not parse stops the watch before it starts.
+
 With a goal saved, the goal argument becomes optional, and `--policy` takes a
 bare name meaning that policy in `watch.policies_dir`:
 
@@ -254,38 +271,70 @@ instructions into the editor *and* puts its goal in the goal box. When the two
 drift apart — a one-off start under a different goal — the editor says so and
 offers both ways out rather than choosing for you.
 
-### It cannot reply twice
+### How it avoids replying twice
 
 The failure that matters is not a wasted step, it is a second message to a real
-person. The screen cannot tell you whether you already answered — you can scroll
-away and back, the app re-renders, a send lands while the confirmation is still
-animating — so the answer lives in a file (`watch-replies.jsonl`, fsynced) and is
-checked by the harness immediately before every send.
+person. What prevents one is the model reading the thread it is about to answer.
 
-What identifies a conversation's state is the **tail** of it: the last six message
-texts, masked so a timestamp ticking from "2m" to "3m" is not mistaken for news.
-The rule is then simply *reply only when the tail differs from the tail recorded
-last time we replied here*. Sending changes the tail, so it will not match again
-until somebody else says something. Three messages in a row from one person change
-it three times, and each earns a reply.
+Every turn that lands on a conversation, the prompt carries that conversation:
+the last twelve messages, newest last, each marked `us:` or `them:` — and then
+the reading, stated outright, because a model shown twelve lines of dialogue and
+left to infer whose turn it is will sometimes infer wrong:
 
-Three doors are gated, not one: the Send control, the keyboard's action key, and
-`input_text` with `press_enter`. The record is written *before* the gesture, so a
-crash between the tap and the write cannot lose it — the cost being that a send
-which never lands leaves that conversation "in doubt", and one in doubt gets a
-cooldown four times as long, loudly, until you look at it.
+```
+THIS CONVERSATION (khushi) — newest last:
+  them:  hey
+  us:    you around?
+       · 2m
+-> the last message in this thread is YOURS: you have already replied here.
+   Do NOT reply again. Leave this conversation and deal with another one.
+```
 
-The prompt also lists what has been answered, but that is advice. The gate is the
-guarantee, and it cannot be talked out of it.
+Sides are read geometrically: an outgoing bubble hugs the right edge of the
+message list, an incoming one the left. A line whose margins are too close to
+call — a date separator, a security notice — belongs to nobody and is shown as
+such. So is thread chrome recognised by its resource id, which matters more than
+it sounds: a relative timestamp sits hard against the left edge, so on geometry
+alone it reads as *their* message, and a thread whose last real bubble is ours
+would then claim they spoke last. Order is geometric too — top to bottom, not
+the order the accessibility tree lists them in. Hinge's thread dumps newest
+first, and read in tree order every thread's oldest message looked like its
+newest.
+
+Before any send goes out — a reply, a comment, a like — a second, small model
+(`llm.model_small`) is shown the policy, that thread, the draft and what the pass
+has already sent, and asked one question: would this break a rule? A no, or no
+answer, and the send is refused and the model told why. It is the check that
+stops a decider which read the thread and still got it wrong: one was about to
+answer "Nvmm." with the reply the policy reserves for greetings. One call per
+send; `safety.check_sends` switches it off.
+
+**Be clear about what this is.** It is two models deciding, better informed. It
+is not a guarantee, and two things follow:
+
+- **Nothing survives the process.** A reply is knowable only because it is *on
+  the screen*. Scroll it out of the tail, or let the app fail to render it, and
+  the evidence is gone — for the decider and the check alike.
+- **A send can still be wrong.** The check sees what the decider saw, so it
+  catches a misreading, not a thread nobody could see.
+
+This replaced a harness gate that *was* a guarantee: an fsynced ledger
+(`watch-replies.jsonl`) of every thread's masked tail, consulted immediately
+before every send, plus a per-thread cooldown and two rolling reply ceilings. It
+could not be talked out of it. It is gone, along with `--replies-per-hour`,
+`--replies-per-conversation`, `--cooldown` and `--fail-open`.
+
+`--draft` stops every send, unconditionally. Run it first when a policy changes:
+the failure mode becomes a wrong draft in the log instead of a wrong message in
+somebody's inbox.
 
 | ceiling | default | what it stops |
 |---|---|---|
-| `--replies-per-hour` | 12 | a loop that has started answering everything |
-| `--replies-per-conversation` | 2 per hour | one conversation absorbing the whole budget |
-| `--cooldown` | 600s | a second reply into the same thread, whatever the digests say |
+| `--draft` | off | every send, unconditionally — replies are composed and recorded only |
+| `safety.check_sends` | on | a send the policy forbids — a second model checks each one first |
+| `send_limits` (policy front matter) | none | sends past a per-pass cap, e.g. `like=5` |
 | `--steps-per-pass` | 25 | a confused pass; it is abandoned and re-anchored rather than given more budget |
 | `--usd-per-hour` | off | runaway spend — this pauses the loop, it does not end it |
-| `--fail-open` | off | sending into a conversation the harness cannot identify |
 
 `--sweep` is the one dial here that spends rather than saves; it is described
 [below](#unless-the-work-does-not-announce-itself).
@@ -455,21 +504,48 @@ analysing each screen — for paging through a long feed to reach something, whe
 the in-between content does not matter. The pixels still decide whether the
 content moved, so the repeat stops at the end of the content either way.
 
-## Collected data
+## What a run keeps
 
-For goals that gather information, the model sends each fact as a `{key, value}`
-record and the harness keeps the union. It sends only what is new, because
-anything already collected is shown back to it and cannot be lost.
+Two ledgers, both written by the model and maintained by the harness, and both
+on the same contract: **the model sends only what is new or corrected, and the
+harness keeps the union.** A record it stops mentioning cannot go missing,
+because nothing replaces it — it is simply still there.
 
-That shape is the second attempt. The first asked the model to restate its
-complete findings every turn, and from a real run: four measured weights present
-at step 73, all four gone at step 74, never restated across the remaining 59
-turns, and the closing report listed a photo as unreadable when it had already
-been read.
+**Collected data** (the `notes` field). For goals that gather information, each
+fact is a `{key, value}` record. When a re-read disagrees with the first reading,
+the previous value is kept and shown alongside the current one rather than
+silently overwritten — an upsert would hide the disagreement, which is the thing
+worth seeing.
+
+**The plan** (the `progress` field). `{id, text, status}` records —
+`pending`/`active`/`done`/`blocked` — rendered back as a checklist. A step
+reaching `done` also resets the stall ladder, but only if it was declared on an
+*earlier* turn, and only once per id ever: declaring and completing five steps in
+one breath buys nothing, and oscillating a step back to `pending` cannot mint a
+second credit.
+
+Both shapes are the second attempt. The first asked the model to restate
+everything every turn, and from a real run: four measured weights present at
+step 73, all four gone at step 74, never restated across the remaining 59 turns,
+and the closing report listed a photo as unreadable when it had already been
+read. The plan kept that contract a while longer, as one free-text string
+rewritten from scratch each turn — measured across `runs/`, the field was present
+on 76 of 103 turns and its text changed on 72, so a *rewording* was resetting the
+stall ladder on 70% of all steps.
 
 ```bash
 adbagent scratchpad              # what the latest run collected
 ```
+
+Everything else a run keeps is the harness's own and derived from watching the
+device rather than from anything the model says: the step history, the per-screen
+ban list and loop detector, the stall counters, the paging evidence, the in-run
+[locate cache](#what-it-remembers), and which apps it has been in. A run that
+stops with unfinished business writes all of it to `runs/<id>/checkpoint.json`,
+which is what `--resume` reads back.
+
+Both ledgers are shown above the feed in the web UI — for a live run, for a
+finished one in History, and per pass in a watch.
 
 ## Reports
 
@@ -664,13 +740,13 @@ steps around a takeover describe a path it never found, attributed to it, and
 the next run would be sent down a route that does not exist. Every app the run
 touched is excluded, not just the one it was in when the phone changed hands: a
 person may open one app to unblock another, and no trace can say which of its
-steps were theirs. A *failed* run still teaches, because its dead ends are real.
-This one's are not.
+steps were theirs. A *failed* run still teaches, because what it found really
+did not work. This one's findings are not its own.
 
 **The Watch tab has the same three buttons**, and it is where they earn their
 keep: a watch owns the phone for hours, and wanting it back for two minutes
-should not mean throwing away the pass in flight along with the reply ledger's
-place in it. A standing pause carries into each new pass, because it is a mode
+should not mean throwing away the pass in flight. A standing pause carries into
+each new pass, because it is a mode
 somebody switched on rather than an instruction to whichever pass happened to be
 running. The takeover flag is the watch's own and sticks for as long as it runs:
 one run has one state that can answer for itself, but a watch has one per pass
@@ -714,8 +790,8 @@ trailing it as a card of its own. Under the row go the frames that step was
 shown and whatever a sweep read there. **Trace** puts back everything else, in
 place: the model's reasoning and its plan, what the step cost in tokens and how
 much of that prompt was cached, the raw thinking-and-response stream per call,
-the delta ledger, and every line the harness wrote to itself — the dead ends it
-remembered, the actions it refused, the gestures it retried. Nothing is deleted
+the delta ledger, and every line the harness wrote to itself — the actions it
+banned on a screen, the ones it refused, the gestures it retried. Nothing is deleted
 for story; it is one class away, and the toggle is remembered.
 
 While a call is in flight its raw stream is shown live in a panel per call (from
@@ -852,18 +928,20 @@ been sent. Four things about it are deliberate:
   at startup, so a save mid-watch would take effect at no predictable moment;
   the server refuses it and says so rather than pretending.
 
-**Replies sent** is the ledger, and it is the interesting panel: one row per
-conversation, how many replies it has had, and whether the last one was
-*confirmed* or is still *in doubt*. A row appears the moment a reply is
-attempted — before the gesture goes out — so a crash cannot lose it. It sits
-above the policy editor and the live feed rather than at the bottom of the tab,
-because it is the product of a watch and not an appendix to it. Each pass appears
-in the live feed as its own run, at the same story/trace densities as Work,
-because it is one.
+A **Replies sent** panel stood above the policy editor: one row per
+conversation, how many replies it had had, and whether the last one was
+*confirmed* or still *in doubt*. It was the product of a watch rather than an
+appendix to it — and it was a view of the reply ledger, so it went with it.
+Nothing outside a pass knows what that pass sent now, so what a watch is doing
+is shown where it happens: each pass appears in the live feed as its own run, at
+the same story/trace densities as Work, because it is one. Above that feed sit
+the pass's **plan** and its **collected data**, both labelled *this pass* —
+they are per-run ledgers reset at every pass boundary, and a night of passes
+would otherwise read as one.
 
-The four rate limits — replies per hour, replies per conversation per hour, the
-per-conversation cooldown and the hourly spend — are one **limits** cluster on
-the form, since they are one decision about how loud this thing is allowed to be.
+**Limits** is now one field, the hourly spend. It used to be four: replies per
+hour, replies per conversation per hour, and the per-conversation cooldown were
+the other three, and all three were readings of the ledger.
 
 A watch and a run refuse each other, as do a watch and a screenshot, an app list
 or a screen dump: there is one phone, and opening a device session resets its
@@ -1055,31 +1133,40 @@ false`.
 
 ## What it remembers
 
-Two things outlive the process, and they are keyed differently on purpose.
+**Nothing outlives the process, except as files a person can read.** What one run
+knows reaches the next through its app skill (`skills/`) and its recorded events
+(`runs/`) — and, within a single run, through the ledgers on
+[`RunState`](#what-a-run-keeps).
 
-**Dead ends.** An action that changed nothing on a screen is recorded, keyed by
-screen *and* by goal, and read back for 24 hours — in this run and in later ones.
-Without it every run rediscovers the same dud control on the same screen. It is
-keyed by goal because "this row does nothing" can be true of one goal and false
-of another, and it expires because an app that was broken last night may be
-fixed this morning.
+There was a SQLite database (`memory.db`) holding two caches, and it is worth
+saying what went with it:
+
+**Dead ends.** An action that changed nothing on a screen was recorded — keyed by
+screen *and* by goal, since "this row does nothing" can be true of one goal and
+false of another — and read back for 24 hours, so a later run would not
+rediscover the same dud control. What is left is the live ban list: per screen,
+per run, and reported to the model as `BANNED ACTIONS on this screen`. The
+cross-run half is gone, and it was not a clean loss either way: of the six rows
+the database had accumulated, **two were provably false**, both `input_text`
+postconditions comparing what was typed against what the accessibility tree
+renders (`'Hey hottie ...'` vs `'Hey hottie ..'`, because the dumper draws the
+emoji as two dots). Both actions had worked, and in `runs/c1d57cc79d9c` the
+false entry was replayed into the prompt on steps 18, 20 and 22 of one run.
 
 **Located controls.** When `tap_at` names a control the accessibility tree does
 not list, a vision model places it on a screenshot — the most expensive thing a
-turn can do short of deciding. The answer is kept for 12 hours, keyed by screen
-and by the control's name, so the same question is not paid for twice. Measured
-over the 169 runs in `runs/`: 577 `tap_at` actions named a control and they
-resolve to 94 distinct (screen, name) pairs — 37% repeat one already located
-earlier in the same run, 84% one located in an earlier run, and a single
-"send message" pill was located 134 separate times.
+turn can do short of deciding. That answer is still cached, but only for the run
+that paid for it (`RunState.locates`), keyed on the content-free screen hash and
+the control's name. Measured over the 169 runs in `runs/`: 577 `tap_at` actions
+named a control and they resolve to 94 distinct (screen, name) pairs — **37%
+repeat one already located earlier in the same run**, which is the share still
+saved, and 84% one located in an *earlier* run, which is the share that went
+with the database. A single "send message" pill was located 134 separate times.
 
-Unlike a dead end it is *not* keyed by goal: where a control sits is a fact
-about the layout, and what you are trying to do has no bearing on it. It is
-keyed on the content-free screen hash, so every profile in a feed shares one
-entry — which is what makes it worth having, and is also the risk it takes. A
-tap at a remembered point that changes nothing drops the entry immediately, so
-a layout that does move with its content costs one turn to discover rather than
-a day of wrong taps.
+Keying on the screen hash means every profile in a feed shares one entry — which
+is what makes it worth having, and is also the risk it takes. A tap at a cached
+point that changes nothing drops the entry immediately, so a layout that does
+move with its content costs one turn to discover rather than a run of wrong taps.
 
 ## Tuning
 

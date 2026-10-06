@@ -1350,7 +1350,7 @@ def _policy(tmp_path, text="reply only to people I follow") -> Path:
 
 
 def _configure_watch(tmp_path, **watch):
-    """Point the app's config file at a policy and a ledger under tmp."""
+    """Point the app's config file at a policy under tmp."""
     cfg = tmp_path / "config.json"
     data = json.loads(cfg.read_text(encoding="utf-8"))
     data.setdefault("llm", {})["model"] = "fake/model"
@@ -1363,7 +1363,11 @@ def test_watch_state_reports_defaults(web, tmp_path):
     body = web.get("/api/watch").json()
     assert body["active"]["running"] is False
     assert body["defaults"]["interval_s"] == 45.0
-    assert body["defaults"]["fail_closed"] is True
+    assert body["defaults"]["draft"] is False
+    # `fail_closed` was reported here, and `ledger_path` beside it. Both went
+    # with the reply ledger.
+    assert "fail_closed" not in body["defaults"]
+    assert "ledger_path" not in body
     assert body["policy_path"].endswith("policy.md")
 
 
@@ -1771,8 +1775,7 @@ def test_watch_lifecycle_and_argv(web, tmp_path, monkeypatch):
 
     res = web.post("/api/watch", json={
         "goal": "watch my instagram dms", "draft": True,
-        "interval_s": 30, "max_steps": 12, "replies_per_hour": 5,
-        "replies_per_conversation": 1, "cooldown_s": 300, "usd_per_hour": 0.5,
+        "interval_s": 30, "max_steps": 12, "usd_per_hour": 0.5,
     })
     assert res.status_code == 200
     argv = spawned[0].argv
@@ -1780,11 +1783,13 @@ def test_watch_lifecycle_and_argv(web, tmp_path, monkeypatch):
     assert "watch my instagram dms" in argv
     assert "--draft" in argv
     for flag, value in (("--interval", "30.0"), ("--steps-per-pass", "12"),
-                        ("--replies-per-hour", "5"),
-                        ("--replies-per-conversation", "1"),
-                        ("--cooldown", "300.0"), ("--usd-per-hour", "0.5")):
+                        ("--usd-per-hour", "0.5")):
         assert flag in argv, flag
         assert argv[argv.index(flag) + 1] == value, flag
+    # The reply ceilings are not flags any more, so nothing may forward them.
+    for gone in ("--replies-per-hour", "--replies-per-conversation",
+                 "--cooldown", "--ledger", "--fail-open"):
+        assert gone not in argv, gone
 
     assert web.get("/api/watch").json()["active"]["running"] is True
     # One watch at a time.
@@ -2028,33 +2033,10 @@ def test_a_watch_can_name_the_policy_to_start(web, tmp_path, monkeypatch):
     assert "watch my dms" in spawned[0].argv
 
 
-# -- the reply ledger -------------------------------------------------------
-
-def test_ledger_is_empty_before_anything_is_sent(web, tmp_path):
-    _configure_watch(tmp_path, ledger=str(tmp_path / "replies.jsonl"))
-    body = web.get("/api/watch/ledger").json()
-    assert body["exists"] is False
-    assert body["total"] == 0 and body["threads"] == []
-
-
-def test_ledger_lists_threads_newest_first(web, tmp_path):
-    from adbagent.ledger import ReplyLedger, content_digest, thread_key
-    path = tmp_path / "replies.jsonl"
-    _configure_watch(tmp_path, ledger=str(path))
-    led = ReplyLedger(path)
-    led.record_attempt(thread_key("khushi"), content_digest(["hey"]),
-                       preview="khushi: hey", at=1000)
-    led.record_confirmed(thread_key("khushi"), content_digest(["hey", "hi"]),
-                         preview="khushi: hi", at=1001)
-    led.record_attempt(thread_key("shreya"), content_digest(["yo"]),
-                       preview="shreya: yo", at=2000)
-
-    body = web.get("/api/watch/ledger").json()
-    assert body["exists"] is True
-    assert body["total"] == 2                       # attempts, not confirmations
-    assert [t["preview"] for t in body["threads"]] == ["shreya: yo", "khushi: hi"]
-    assert body["threads"][0]["confirmed"] is False  # in doubt, and shown as such
-    assert body["threads"][1]["confirmed"] is True
+# Two tests stood here against `GET /api/watch/ledger`: that it reported an
+# empty ledger before anything was sent, and that it listed threads newest
+# first with the in-doubt one marked. The endpoint and the file behind it are
+# gone -- what a pass said is recoverable only from that pass's own events.
 
 
 # ---------------------------------------------------------------------------

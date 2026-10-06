@@ -4,7 +4,7 @@ Read this file to understand the whole system. The shape is:
 
     perceive -> ask the LLM -> guard -> act -> verify -> learn -> repeat
 
-The LLM appears in exactly two places, both marked `### LLM ###`. Everything
+The LLM appears only where a line is marked `### LLM ###`. Everything
 else -- recognising the screen, resolving an anchor, dismissing a nag, deciding
 whether an action worked, noticing a loop, ending the run when a programmatic
 assertion passes -- is ordinary code. That is the entire point: the model is
@@ -248,6 +248,14 @@ class RunState:
     #: Consecutive "the goal is already met" verdicts. Reset by the first verdict
     #: that disagrees -- see `Agent._finish_goal_check`.
     goal_check_hits: int = 0
+    #: Every send this run made that `verify` saw land, counted here rather
+    #: than left to the model's own tally -- see `conversation.SendLog`.
+    sends: conversation.SendLog = field(default_factory=conversation.SendLog)
+    #: Sends the send check said no to, keyed by ``exact_id/signature``, with
+    #: its reason. The same send asked for again on the same frame gets the same
+    #: answer without paying for the question twice. Only a "no" is kept: a
+    #: check that could not be asked may well be answerable next turn.
+    refused_sends: Dict[str, str] = field(default_factory=dict)
 
     @property
     def elapsed(self) -> float:
@@ -718,7 +726,8 @@ def _banned_tap_points(state: RunState, screen: Screen
 class Agent:
     def __init__(self, dev: Device, llm: Optional[LLMClient],
                  cfg: Config, *, oracle: Optional[Oracle] = None,
-                 on_event=None, policy: str = ""):
+                 on_event=None, policy: str = "",
+                 send_limits: Optional[Dict[str, int]] = None):
         self.dev = dev
         self.llm = llm
         self.cfg = cfg
@@ -727,6 +736,9 @@ class Agent:
         self.skills = SkillRegistry(cfg.skills.skills_dir)
         #: The operator's reply instructions, verbatim. Empty for a run.
         self.policy = policy
+        #: How many sends of each kind one run may make, from the policy's
+        #: `send_limits` -- see `conversation.parse_send_limits`. Empty: no cap.
+        self.send_limits: Dict[str, int] = dict(send_limits or {})
         #: The channel anything outside uses to hold this run. Made per run, in
         #: `run()`, because it is scoped to the run's own directory -- see
         #: `control.py` for why that is the right place for it.
@@ -1443,14 +1455,23 @@ class Agent:
             # `skill_note` is deliberately not in here: it goes to its own
             # message above the history instead, because it changes per app
             # rather than per turn. See `prompts.skill_block`.
-            # Which conversations are already answered. Advisory only -- the
-            # guarantee is `conversation.reply_gate` -- and it rides in `notes`
-            # rather than beside the policy because it changes as replies go out,
-            # and this block is rebuilt every turn anyway.
-            handled_note = ""
-            if self.ledger is not None:
-                handled_note = prompts.handled_block(
-                    [st.preview for st in self.ledger.recent() if st.preview])
+            # The thread on screen, if this screen is one: who said what, and
+            # whether the last word in it is already ours. This is the whole of
+            # what replaced the reply ledger and its gate -- the model decides
+            # whether a reply is owed, and this is the evidence it decides on.
+            #
+            # Read every turn rather than only before a send, because the turn
+            # that matters is the one *choosing* the action: a model that can see
+            # its own reply at the bottom of the thread does not compose a second
+            # one. Gated on there being a composer on screen, which is one pass
+            # over the nodes -- a launcher or a feed pays that and nothing more.
+            #
+            # It rides in `notes` rather than beside the policy because it changes
+            # every turn, and this block is rebuilt every turn anyway.
+            convo_note = ""
+            if conversation.on_a_conversation(screen):
+                convo_note = prompts.conversation_block(
+                    conversation.read_conversation(screen))
             # Ordered least specific first, so specificity increases toward the
             # answer. It used to run the other way: `situational` -- the two
             # standing blocks of generic advice, 63% of all NOTE text across
@@ -1458,7 +1479,7 @@ class Agent:
             # i.e. the final thing read before answering, while `last_failure`,
             # the one sentence about what just happened on this screen, was
             # eighth of ten.
-            notes = "\n\n".join(filter(None, (situational, handled_note,
+            notes = "\n\n".join(filter(None, (situational, convo_note,
                                              note, vision_note,
                                              pager_note, hint, elem_hint,
                                              ban_note, strategy_note,
@@ -1494,9 +1515,13 @@ class Agent:
                     # say -- not one of the 105 decide prompts in ``runs/``
                     # carries a step number or an elapsed time, while SYSTEM
                     # tells the model not to search "indefinitely". See
-                    # `prompts.budget_line`.
-                    budget=prompts.budget_line(state.step, cfg.run.max_steps,
-                                               state.elapsed),
+                    # `prompts.budget_line`. What the run has sent rides with
+                    # it: a send limit is a ceiling too, and the tally is the
+                    # one the model is told to trust over its own.
+                    budget="\n\n".join(filter(None, (
+                        prompts.budget_line(state.step, cfg.run.max_steps,
+                                            state.elapsed),
+                        state.sends.render(self.send_limits)))),
                     # `is not None`, not truthiness: a pydantic model is always
                     # truthy so this happened to be right, but the distinction
                     # it relies on is between "the pass ran" and "it did not".
@@ -1815,35 +1840,26 @@ class Agent:
                 )
                 continue
 
-            # ---- 5b. draft mode -----------------------------------------
-            # The only refusal left in front of a send. It is not about
-            # duplicates -- whether a reply is owed is decided by the model, from
-            # the thread `prompts.conversation_block` puts in front of it -- it
-            # is the switch that means "compose, never send", and it holds
-            # whatever the model concluded.
+            # ---- 5b. the gates in front of a send that need no model -------
+            # Draft mode, the switch that means "compose, never send" and holds
+            # whatever the model concluded; and the policy's `send_limits`,
+            # which hold a count the model kept losing (`conversation.SendLog`).
+            # Here, ahead of everything below that can spend a locate on the
+            # send. The third gate asks a model, so it runs last, at 6a.
             #
             # A reply ledger used to stand here: an fsynced record of every
             # thread's tail, consulted on the very screen the gesture was about
             # to land on, and the thing a model that had talked itself into
             # answering the same message twice ran into. It is gone, and with it
             # the guarantee -- see `conversation.py` for what that trade gives
-            # up. This is still placed after the stall block and the dry-run
-            # short circuit for the reason the ledger needed: nothing between
-            # here and the gesture may decide not to send it.
-            refusal = conversation.draft_refusal(action, screen, cfg)
+            # up, and for what the send check at 6a buys back.
+            sending = conversation.send_label(action, screen)
+            refusal = ""
+            if sending:
+                refusal = (state.sends.over_limit(sending, self.send_limits)
+                           or conversation.draft_refusal(action, screen, cfg))
             if refusal:
-                log.warning("step %d: not sending -- %s", state.step, refusal)
-                self.on_event("safety_warning",
-                              message=f"step {state.step}: send refused -- "
-                                      f"{refusal}")
-                rec.event("send_refused", step=state.step, reason=refusal)
-                state.last_failure = (
-                    f"the reply was not sent: {refusal}. Do not try to send it "
-                    f"again -- leave this conversation and deal with another "
-                    f"one, or report done.")
-                state.remember(format_history_entry(
-                    state.step, action, screen=screen, grade="refused",
-                    reason=refusal))
+                self._refuse_send(state, rec, screen, action, refusal)
                 continue
 
             # ---- 6. act -------------------------------------------------
@@ -1983,6 +1999,14 @@ class Agent:
                              "the locate placed the field at (%.2f, %.2f)",
                              state.step, holder.index, where[0], where[1])
                     setattr(action, "_focus_point", where)
+            # ---- 6a. the send check ------------------------------------
+            # Last, after every guard above that could still stop the send, so
+            # the call is paid only for a send that is otherwise going out.
+            if sending and self.llm is not None and cfg.safety.check_sends:
+                refusal = self._check_send(state, rec, screen, action, sending)
+                if refusal:
+                    self._refuse_send(state, rec, screen, action, refusal)
+                    continue
             try:
                 element = execute(self.dev, action, screen)
             except (ActionError, ValueError, ShellDenied, IntentRefused) as exc:
@@ -2120,6 +2144,18 @@ class Agent:
             # itself now carries the evidence -- our message is in the thread, on
             # the sent side -- and `conversation_block` reads it back off the
             # screen on the next turn that lands on this conversation.
+            #
+            # What is kept is the count: a send `verify` saw land, against the
+            # thread it went into. Counted on `ok` alone -- a send that changed
+            # nothing did not go out, and one graded `soft_fail` might have,
+            # which is the side to count on.
+            if sending and outcome.ok:
+                thread = conversation.thread_on(screen)
+                state.sends.record(state.step, sending,
+                                   thread.title if thread else "")
+                rec.event("sent", step=state.step, label=sending,
+                          thread=thread.title if thread else "",
+                          total=len(state.sends))
 
             # ---- 8. learn (no LLM) --------------------------------------
             # Two more ways a step can count as progress, both about the device
@@ -2656,6 +2692,10 @@ class Agent:
                                  scratchpad=collected,
                                  progress=state.plan.plain(),
                                  done_text=action.text or "",
+                                 # The harness's count, not the summary's: a
+                                 # `done` claiming seven likes over eight sends
+                                 # passed as "at least 7" without it.
+                                 sent=state.sends.render(self.send_limits),
                                  step=state.step, recorder=rec,
                                  on_event=self.on_event)
         t_judge = time.monotonic() - t0_judge
@@ -2701,6 +2741,89 @@ class Agent:
                       state.consecutive_failures)
             return "failed"
         return None
+
+    # -- sends -------------------------------------------------------------
+
+    def _refuse_send(self, state: RunState, rec: Recorder, screen: Screen,
+                     action: AgentAction, reason: str) -> None:
+        """Hold a send back and tell the model why, whichever gate held it.
+
+        Not a failed step: nothing is wrong with the screen or the control, and
+        counting it would let a run of refusals end the run at
+        `max_consecutive_failures` rather than let the model move on. Each
+        `reason` carries its own next step, because what to do instead differs
+        -- another thread, another item, or `done`.
+        """
+        log.warning("step %d: not sending -- %s", state.step, reason)
+        self.on_event("safety_warning",
+                      message=f"step {state.step}: send refused -- {reason}")
+        rec.event("send_refused", step=state.step, reason=reason)
+        state.last_failure = (f"not sent: {reason}. Do not retry this send and "
+                              f"do not rephrase it.")
+        state.remember(format_history_entry(
+            state.step, action, screen=screen, grade="refused", reason=reason))
+
+    def _check_send(self, state: RunState, rec: Recorder, screen: Screen,
+                    action: AgentAction, control: str) -> str:
+        """Ask a second model whether this send breaks the policy. "" lets it go.
+
+        The decider chose the send at whatever effort the turn got, with the
+        policy one block among a dozen. In ``runs/0fc8159ca26c`` step 7 that
+        was `low`, and it set out to answer "Nvmm." -- named in the policy as a
+        brush-off -- with the reply reserved for greetings; across ``runs/``,
+        205 of 586 send taps were decided at the high effort. The old reply
+        ledger refused seven more: second replies to threads already answered,
+        which nothing but the model stood in front of once it went.
+
+        Fails closed. A send nobody could check is the one action that cannot
+        be taken back, and holding it costs a pass at most.
+        """
+        key = f"{screen.exact_id}/{action.signature()}"
+        if key in state.refused_sends:
+            return state.refused_sends[key]
+        thread = conversation.thread_on(screen)
+        model_name = self.llm.model_small if self.llm else ""
+        self.on_event("llm_start", step=state.step, purpose="send_check",
+                      model=model_name, screenshot=False)
+        t0 = time.monotonic()
+        mark = self.llm.ledger.mark()
+        verdict = None
+        failure = ""
+        try:
+            verdict = self.llm.check_send(                  ### LLM ###
+                goal=state.goal, policy=self.policy,
+                sent=state.sends.render(self.send_limits),
+                conversation=(prompts.conversation_block(thread)
+                              if thread else ""),
+                control=control, action=action.describe(),
+                draft=conversation.draft_in(action, screen),
+                history=state.history, rendered=render(screen),
+                step=state.step, recorder=rec, on_event=self.on_event)
+        except BudgetExceeded:
+            raise
+        except LLMError as exc:
+            log.warning("step %d: the send check failed: %s", state.step, exc)
+            failure = str(exc)
+        calls = self.llm.ledger.since(mark)
+        elapsed = time.monotonic() - t0
+        self.on_event("llm_end", step=state.step, purpose="send_check",
+                      elapsed=elapsed, call=calls[-1] if calls else None)
+        state.llm_calls += 1
+        rec.event("send_check", step=state.step, control=control,
+                  send=bool(verdict and verdict.send),
+                  reason=(verdict.reason if verdict is not None else failure),
+                  wall_s=round(elapsed, 3), llm=step_metrics(calls))
+        if verdict is not None and verdict.send:
+            return ""
+        if verdict is None:
+            return (f"the send check could not be asked ({failure}), and a send "
+                    f"nobody checked does not go out -- leave it for now and "
+                    f"carry on with whatever else the goal needs")
+        refusal = (f"the send check refused it: "
+                   f"{verdict.reason or 'no reason given'} -- leave it and move "
+                   f"on to whatever else the goal needs, or report done")
+        state.refused_sends[key] = refusal
+        return refusal
 
     def _replan(self, state: RunState, rec: Recorder, screen: Screen,
                 stalled: int) -> bool:

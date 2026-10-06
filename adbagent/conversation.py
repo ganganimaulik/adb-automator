@@ -31,13 +31,19 @@ ledger's removal actually made:
   to render it, and the evidence is gone. The ledger's digests-and-cooldowns
   closed exactly that window; this does not.
 * **A determined model can still double-reply.** `ITERATION_CONTRACT` and the
-  policy say not to, and this block gives them the evidence to act on. None of
-  the three can refuse.
+  policy say not to, and this block gives them the evidence to act on. What
+  can refuse is the send check (`Agent._check_send`): a second, small model
+  shown only the policy, this thread, the draft and `SendLog`, asked whether
+  the send breaks a rule. It sees what the decider saw, so it closes the gap
+  left by a decider that misread it -- ``runs/0fc8159ca26c`` was about to
+  answer "Nvmm." with the reply the greeting rule reserves for greetings --
+  and not the gap left by a thread nobody can see.
 
-`watch.draft` is the one thing here that still refuses, and it is not about
-duplicates: it means "compose, never send", so it holds whatever the model
-concluded. It covers the Send control *and* the keyboard's action key, because
-in most chat apps the action key sends too and gating only the button would
+Three things here refuse a send without asking a model. `watch.draft` means
+"compose, never send", so it holds whatever the model concluded; a policy's
+`send_limits` cap how many sends of a kind one run may make (`SendLog`). Both
+see every door a send can go out through -- `send_label` -- because in most
+chat apps the keyboard's action key sends too, and gating only the button would
 leave the other door open.
 
 Sides are read for left-to-right layouts: the sent side is the right one. An
@@ -51,9 +57,9 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Mapping, Optional, Tuple
 
-from .actions import AgentAction, resolve_target
+from .actions import AgentAction, element_at_point, resolve_target
 from .config import Config
 from .fingerprint import CHAT_SEND_TEXT, rid_norm
 from .screen import SYSTEM_UI_PACKAGES, Element, Screen
@@ -71,6 +77,21 @@ _NOT_A_TITLE = re.compile(
 
 #: A header text longer than this is a message that has drifted up, not a name.
 _TITLE_MAX_CHARS = 60
+
+#: Resource-id fragments marking something drawn *in* the thread that nobody
+#: said: a timestamp, a date divider, an unread marker.
+#:
+#: Geometry alone cannot tell these from a short incoming message, and the
+#: commonest of them breaks the one signal that matters. A relative timestamp
+#: under the newest bubble is drawn hard against the left edge, so it classifies
+#: as `THEIRS` -- and then a thread whose last real bubble is ours reads as
+#: "they spoke last", which is the exact wrong answer on a reply pass. Width
+#: does not separate them either: "2m" and "ok" are both short.
+#:
+#: So they are recognised the way the title is, by what the app calls them.
+#: Anything matching keeps its place in the thread and carries no side.
+_NOT_A_MESSAGE_RID = re.compile(r"time|stamp|date|divider|separator|unread",
+                                re.I)
 
 #: Fraction of screen height treated as header when the scroller cannot be used
 #: to split one off -- no scroller at all, or one that contains the header.
@@ -100,8 +121,21 @@ _SIDE_MARGIN_DIFF = 0.1
 #: Keys that send a message in a chat composer.
 _SEND_KEYS = {"enter", "search", "send", "done", "go"}
 
-#: A matching label longer than this is prose, not a button.
+#: A matching label longer than this is prose, not a button...
 _SEND_LABEL_MAX_CHARS = 24
+
+#: ...unless it opens with the verb, which is how a control is phrased and how
+#: a bubble that merely mentions sending usually is not. Hinge's like pill reads
+#: "Send priority like with message" once a comment is on it -- 31 characters --
+#: and under the 24-character rule alone not one like that went out with its
+#: comment ever counted as a send, so draft mode would have let every one of
+#: them through.
+_SEND_COMMAND_MAX_CHARS = 48
+
+#: A `tap_at` names its control in the model's own words ("the Send Priority
+#: Like pill at the bottom of the sheet"), so the cap on what can count as naming
+#: a send control is a description's length rather than a button's.
+_SEND_DESCRIPTION_MAX_CHARS = 80
 
 #: Which side a message is on, and what the prompt block calls it.
 OURS = "us"
@@ -203,7 +237,8 @@ def _leaves(nodes: List[Element]) -> List[Element]:
     """Text-bearing leaves, in document order.
 
     Leaves only, so a bubble whose text is repeated on its container is counted
-    once rather than twice.
+    once rather than twice. Document order is not reading order -- see the sort
+    in `read_conversation`.
     """
     return [n for n in nodes if not n.children and n.best_text.strip()]
 
@@ -252,12 +287,14 @@ def _title_from(candidates: List[Element]) -> str:
 
 
 def side_of(el: Element, left: int, right: int) -> str:
-    """Which side of the thread `el` sits on, or "" when it straddles.
+    """Which side of the thread `el` sits on, or "" when nobody said it.
 
     `left` and `right` are the message list's own edges, not the screen's: a
     thread inset from the window, or one beside a navigation rail on a tablet,
     is still read against the list it is drawn in.
     """
+    if _NOT_A_MESSAGE_RID.search(rid_norm(el.resource_id)):
+        return ""
     width = right - left
     if width <= 0:
         return ""
@@ -301,6 +338,18 @@ def read_conversation(screen: Screen) -> Conversation:
         header = [e for e in body if e.bounds[3] <= band]
         chosen = {id(e) for e in header}
         body = [e for e in body if id(e) not in chosen]
+
+    # Oldest first by where the bubbles are drawn, not by where they sit in the
+    # tree. A chat list laid out from the bottom up -- `reverseLayout`, or an
+    # adapter that holds the newest message at position 0 -- emits its children
+    # newest-first, and Hinge's does: in ``runs/0fc8159ca26c`` step 3 the bubbles
+    # come out at y=1355, then 1194, then 934. Read in that order, `said[-1]` is
+    # the *oldest* message -- on Hinge the like comment that opened the match --
+    # so a thread they answered last read as "yours, do not reply", and a thread
+    # you had already answered, opened by *their* like, read as "theirs, no reply
+    # under it yet". Top edge first, then left edge, and the sort is stable, so
+    # two bubbles on one row keep the order the tree gave them.
+    body = sorted(body, key=lambda e: (e.bounds[1], e.bounds[0]))
 
     messages = [Message(text=e.best_text.strip(), side=side_of(e, *edges))
                 for e in body if not e.editable and e.best_text.strip()]
@@ -349,27 +398,51 @@ def on_a_conversation(screen: Screen) -> bool:
     return _has_composer(screen)
 
 
+def _names_a_send(label: str) -> bool:
+    """Does this control's label say it sends? See `_SEND_COMMAND_MAX_CHARS`."""
+    label = label.strip()
+    if not label or not CHAT_SEND_TEXT.search(label):
+        return False
+    if len(label) <= _SEND_LABEL_MAX_CHARS:
+        return True
+    return (len(label) <= _SEND_COMMAND_MAX_CHARS
+            and CHAT_SEND_TEXT.match(label) is not None)
+
+
 def send_label(action: AgentAction, screen: Screen) -> str:
     """The label of the control this action would send with, or "".
 
-    All three doors, because covering only the button leaves the others open:
+    All four doors, because covering only the button leaves the others open:
 
     * a tap on something labelled send/post/share/publish,
+    * a `tap_at` that names one -- the escape hatch for a control the list does
+      not show, and the way every Hinge like went out before the parser exposed
+      the like pill. It used to be no door at all: draft mode, which checks only
+      this function, would have let all of them through,
     * the keyboard action key while a composer holds focus,
     * ``input_text`` with ``press_enter``, which types and sends in one step.
 
-    The label must be short as well as matching: a message bubble that happens
-    to contain the word "send" is not a send control, and refusing a tap on it
-    would strand the loop on a screen it is allowed to read.
+    The label must look like a control's as well as matching: a message bubble
+    that happens to contain the word "send" is not a send control, and refusing
+    a tap on it would strand the loop on a screen it is allowed to read.
     """
     if action.action in ("tap", "long_press") and action.target is not None:
         element = resolve_target(action.target, screen)
         if element is None or not element.interactive:
             return ""
         label = (element.best_text or "").strip()
-        if label and len(label) <= _SEND_LABEL_MAX_CHARS \
-                and CHAT_SEND_TEXT.search(label):
-            return label
+        return label if _names_a_send(label) else ""
+    if action.action == "tap_at":
+        # Named first: before the locate runs there is no point yet, and the
+        # model's description is the only thing saying what is about to be hit.
+        described = " ".join((action.text or "").split())
+        if (described and len(described) <= _SEND_DESCRIPTION_MAX_CHARS
+                and CHAT_SEND_TEXT.search(described)):
+            return described
+        if action.x is not None and action.y is not None:
+            element = element_at_point(screen, action.x, action.y)
+            label = (element.best_text or "").strip() if element is not None else ""
+            return label if _names_a_send(label) else ""
         return ""
     if action.action == "press_key":
         key = (action.key or "").strip().lower()
@@ -383,16 +456,14 @@ def send_label(action: AgentAction, screen: Screen) -> str:
 def draft_refusal(action: AgentAction, screen: Screen, cfg: Config) -> str:
     """Why this send may not go out, or "" when it may.
 
-    The only refusal left in front of a send, and the only one that never needed
-    durable state: `watch.draft` means "compose, never send", so what it holds
-    back is whatever the model decided, whether or not that decision was right.
-    It is the first thing to run when a policy changes -- the failure mode
-    becomes a wrong draft in the log instead of a wrong message in somebody's
-    inbox.
+    `watch.draft` means "compose, never send", so what it holds back is
+    whatever the model decided, whether or not that decision was right. It is
+    the first thing to run when a policy changes -- the failure mode becomes a
+    wrong draft in the log instead of a wrong message in somebody's inbox.
 
-    Never refuses on anything else. Whether a reply is *owed* is the model's
-    call, made from `prompts.conversation_block`; there is no harness veto on it
-    any more.
+    Never refuses on anything else. Whether a reply is *owed* is decided from
+    `prompts.conversation_block` by the model, and then checked by
+    `Agent._check_send`; how many sends one run may make is `SendLog`'s.
     """
     if not cfg.watch.draft:
         return ""
@@ -400,3 +471,156 @@ def draft_refusal(action: AgentAction, screen: Screen, cfg: Config) -> str:
         return ""
     return ("draft mode is on -- the reply was composed and recorded but not "
             "sent; move on to the next thread")
+
+
+# ---------------------------------------------------------------------------
+# what a send says, and what this run has already sent
+# ---------------------------------------------------------------------------
+
+def draft_in(action: AgentAction, screen: Screen) -> str:
+    """What a send is about to say, or "" when the screen does not show it.
+
+    The text `input_text` is about to type, when the send is that; otherwise
+    whatever sits in a composer, the focused one first. A field's hint is not
+    a draft -- an empty composer often dumps its placeholder as its text. ""
+    is a real answer: Hinge's like sheet keeps its comment out of the tree, and
+    the send check is told to read the recent steps for it instead.
+    """
+    if action.action == "input_text":
+        return (action.text or "").strip()
+    fields = sorted((e for e in app_nodes(screen) if e.editable),
+                    key=lambda e: not e.focused)
+    for f in fields:
+        text = (f.text or "").strip()
+        if text and text != (f.hint or "").strip():
+            return text
+    return ""
+
+
+def thread_on(screen: Screen) -> Optional[Conversation]:
+    """The conversation on screen, or None when there is no readable one."""
+    if not on_a_conversation(screen):
+        return None
+    convo = read_conversation(screen)
+    return convo if convo.readable else None
+
+
+def _mentions(label: str, word: str) -> bool:
+    """`word` appears in `label` as a word of its own, in any case."""
+    return re.search(rf"(?<![^\W_]){re.escape(word)}(?![^\W_])", label,
+                     re.I) is not None
+
+
+def parse_send_limits(text: str) -> Dict[str, int]:
+    """``like=5, rose=0`` as ``{"like": 5, "rose": 0}``. Raises ValueError.
+
+    The policy's `send_limits` front matter key. Each word caps the sends whose
+    control mentions it -- so ``like=5`` counts "Send priority like with
+    message" and leaves "Send message" alone -- and 0 forbids them outright.
+    Strict on purpose: a limit that is silently misread is a limit that is not
+    there, and the operator is told so before the watch starts rather than
+    after it has sent the sixth one.
+    """
+    limits: Dict[str, int] = {}
+    for part in re.split(r"[,;]", text or ""):
+        part = part.strip()
+        if not part:
+            continue
+        matched = re.fullmatch(r"([^=:]+?)\s*[=:]\s*(\d+)", part)
+        if not matched:
+            raise ValueError(f"{part!r} is not a send limit -- write it as "
+                             f"word=N, e.g. like=5")
+        limits[matched.group(1).strip().lower()] = int(matched.group(2))
+    return limits
+
+
+@dataclass
+class Sent:
+    """One send that went through: the control it went out on, and where."""
+
+    step: int
+    label: str
+    #: The conversation it went into, when it went into a readable one.
+    thread: str = ""
+
+
+@dataclass
+class SendLog:
+    """What this run has sent, counted by the harness rather than remembered.
+
+    A model's own tally drifts. ``runs/115da462a220`` sent eight likes on a
+    goal of seven and its `done` said "Sent 7"; ``runs/8de32967fc18`` had sent
+    six against "at most 5" and was composing a seventh when it was stopped.
+    The judge passed the first -- "at least 7" -- because nothing it was shown
+    could tell the difference. This counts the sends `verify` saw land, and the
+    count is what the model, the send check and the judge are all shown.
+
+    Per run, which is per pass in a watch: nothing survives the process, the
+    same trade `conversation_block` makes. A send that opens a confirmation
+    instead of sending -- an upsell's "Send like anyway" -- counts twice for
+    one like. That is the safe direction to be wrong in.
+    """
+
+    sent: List[Sent] = field(default_factory=list)
+
+    def __len__(self) -> int:
+        return len(self.sent)
+
+    def record(self, step: int, label: str, thread: str = "") -> None:
+        self.sent.append(Sent(step=step, label=label, thread=thread))
+
+    def count(self, word: str) -> int:
+        """Sends whose control mentions `word`."""
+        return sum(1 for s in self.sent if _mentions(s.label, word))
+
+    def over_limit(self, label: str, limits: Mapping[str, int]) -> str:
+        """Why one more send on `label` would break a limit, or ""."""
+        for word, most in limits.items():
+            if not _mentions(label, word):
+                continue
+            used = self.count(word)
+            if not most:
+                return (f"the policy forbids \"{word}\" sends -- do not send "
+                        f"this; finish whatever else the goal needs, then "
+                        f"report done")
+            if used >= most:
+                return (f"the policy allows {most} \"{word}\" send(s) per run "
+                        f"and {used} have already gone out -- send no more of "
+                        f"them; finish whatever else the goal needs, then "
+                        f"report done")
+        return ""
+
+    def render(self, limits: Optional[Mapping[str, int]] = None) -> str:
+        """The block the decider, the send check and the judge are shown.
+
+        "" when there is nothing sent and nothing limited, so a run that never
+        sends carries no extra text into any prompt.
+        """
+        limits = limits or {}
+        if not self.sent and not limits:
+            return ""
+        if self.sent:
+            lines = [f"SENT THIS RUN, counted by the harness from the sends that "
+                     f"went through -- when your own count disagrees, this one "
+                     f"is right: {len(self.sent)}"]
+            groups: Dict[Tuple[str, str], int] = {}
+            for s in self.sent:
+                groups[(s.label, s.thread)] = groups.get((s.label, s.thread), 0) + 1
+            for (label, thread), n in groups.items():
+                where = f" in the conversation with {thread}" if thread else ""
+                lines.append(f"  - {n} x \"{label}\"{where}")
+        else:
+            lines = ["SENT THIS RUN: nothing yet."]
+        for word, most in limits.items():
+            used = self.count(word)
+            if not most:
+                lines.append(f"FORBIDDEN: \"{word}\" sends. Any will be "
+                             f"refused.")
+            elif used >= most:
+                lines.append(f"LIMIT REACHED: {used} of {most} \"{word}\" "
+                             f"send(s) used. Any more will be refused -- finish "
+                             f"whatever else the goal needs, then report done.")
+            else:
+                lines.append(f"LIMIT: at most {most} \"{word}\" send(s) this "
+                             f"run -- {used} used, {most - used} left.")
+        return "\n".join(lines)

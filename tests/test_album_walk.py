@@ -30,7 +30,6 @@ from PIL import Image
 from adbagent.actions import AgentAction
 from adbagent.agent import Agent
 from adbagent.config import Config
-from adbagent.memory import Memory
 from adbagent.screen import Screen, parse
 from adbagent.fingerprint import attach
 
@@ -149,23 +148,18 @@ def unread_album_walker():
 @pytest.fixture
 def cfg(tmp_path):
     c = Config()
-    c.memory.db = str(tmp_path / "memory.db")
     c.run.artifacts_dir = str(tmp_path / "runs")
     c.run.max_steps = 60
     c.safety.unattended = True
     return c
 
 
-@pytest.fixture
-def mem(cfg, tmp_path):
-    with Memory(cfg, path=tmp_path / "memory.db") as m:
-        yield m
 
 
-def walk(cfg, mem, **device_kw):
+def walk(cfg, **device_kw):
     dev = AlbumDevice(cfg, **device_kw)
     llm = fake.FakeLLM(dev, album_walker())
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
     return dev, llm, outcome, state
 
 
@@ -177,8 +171,8 @@ def _readings(cfg, run_id):
     return [e for e in _events(cfg, run_id) if e["kind"] == "item_reading"]
 
 
-def test_every_photo_is_read(cfg, mem):
-    dev, llm, outcome, state = walk(cfg, mem, chrome_fades_after=999)
+def test_every_photo_is_read(cfg):
+    dev, llm, outcome, state = walk(cfg, chrome_fades_after=999)
 
     assert outcome == "success"
     assert dev.index == len(STAMPS) - 1, "the album was not walked to the end"
@@ -188,60 +182,60 @@ def test_every_photo_is_read(cfg, mem):
     assert len(_readings(cfg, state.run_id)) >= len(STAMPS) - 2
 
 
-def test_the_walk_costs_a_step_or_two_per_photo(cfg, mem):
+def test_the_walk_costs_a_step_or_two_per_photo(cfg):
     """The run that motivated this used 136 steps for these fifteen photos."""
-    _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
+    _, _, _, state = walk(cfg, chrome_fades_after=999)
     assert state.step <= len(STAMPS) * 2, f"took {state.step} steps"
 
 
-def test_no_forced_back_ejects_the_agent_from_the_album(cfg, mem):
+def test_no_forced_back_ejects_the_agent_from_the_album(cfg):
     """`exact_id` is identical for all fifteen photos, so without the pixel
     signal the loop breaker fires and dumps the agent out of the viewer."""
-    dev, _, _, _ = walk(cfg, mem, chrome_fades_after=999)
+    dev, _, _, _ = walk(cfg, chrome_fades_after=999)
     assert "press(back)" not in dev.actions
 
 
-def test_a_dropped_fling_is_detected_and_retried(cfg, mem):
-    dev, _, outcome, state = walk(cfg, mem, chrome_fades_after=999,
+def test_a_dropped_fling_is_detected_and_retried(cfg):
+    dev, _, outcome, state = walk(cfg, chrome_fades_after=999,
                                   drop_swipes=frozenset({2, 7, 10}))
     assert dev.dropped == [2, 7, 10]
     assert outcome == "success"
     assert dev.index == len(STAMPS) - 1
 
 
-def test_the_same_minute_twins_need_no_special_handling(cfg, mem):
+def test_the_same_minute_twins_need_no_special_handling(cfg):
     """Two photos sent in the same minute used to collide, because identity was
     the caption. The pixels tell them apart without anyone having to try."""
-    dev, _, outcome, _ = walk(cfg, mem, chrome_fades_after=999,
+    dev, _, outcome, _ = walk(cfg, chrome_fades_after=999,
                               drop_swipes=frozenset({3}))
     assert outcome == "success"
     assert dev.index == len(STAMPS) - 1
 
 
-def test_the_agent_is_handed_what_the_sweep_read(cfg, mem):
-    _, llm, _, _ = walk(cfg, mem, chrome_fades_after=999)
+def test_the_agent_is_handed_what_the_sweep_read(cfg):
+    _, llm, _, _ = walk(cfg, chrome_fades_after=999)
     notes = "\n".join(llm.notes)
     assert "YOU REPEATED" in notes
     assert "`notes`" in notes, "the model was not told to keep what it needs"
 
 
-def test_the_agent_is_told_nothing_it_cannot_know(cfg, mem):
+def test_the_agent_is_told_nothing_it_cannot_know(cfg):
     """The old block closed with verdicts about a set: how many items it held,
     which were unread, that every one had been read. None was observable."""
-    _, llm, _, _ = walk(cfg, mem, chrome_fades_after=999)
+    _, llm, _, _ = walk(cfg, chrome_fades_after=999)
     notes = "\n".join(llm.notes)
     for claim in ("ITEMS INSPECTED IN THIS SET", "STILL NOT READ",
                   "LAST item of this set", "Every item in this set"):
         assert claim not in notes, claim
 
 
-def test_hidden_chrome_does_not_stop_the_walk(cfg, mem):
+def test_hidden_chrome_does_not_stop_the_walk(cfg):
     """With `chrome_fades_after=1` the caption is gone on almost every turn.
 
     That used to pause the sweep outright -- items "could not be told apart".
     The content hash crops the bands the chrome lives in, so it never mattered.
     """
-    dev, _, outcome, _ = walk(cfg, mem, chrome_fades_after=1)
+    dev, _, outcome, _ = walk(cfg, chrome_fades_after=1)
     assert outcome == "success"
     assert dev.index == len(STAMPS) - 1
 
@@ -260,9 +254,9 @@ def decides(llm) -> int:
     return llm.calls - llm.judges
 
 
-def test_sweeping_replaces_reasoning_turns_with_vision_reads(cfg, mem):
+def test_sweeping_replaces_reasoning_turns_with_vision_reads(cfg):
     cfg.device.serial = ""
-    dev, llm, outcome, state = walk(cfg, mem, chrome_fades_after=999)
+    dev, llm, outcome, state = walk(cfg, chrome_fades_after=999)
     assert outcome == "success"
     assert dev.index == len(STAMPS) - 1
     # Fifteen photos on a handful of decisions: start the walk, resume after the
@@ -271,12 +265,12 @@ def test_sweeping_replaces_reasoning_turns_with_vision_reads(cfg, mem):
     assert len(llm.reads_requested) >= len(STAMPS) - 3
 
 
-def test_the_saving_is_real_and_not_an_accounting_trick(cfg, mem):
+def test_the_saving_is_real_and_not_an_accounting_trick(cfg):
     """Same album, same policy, sweep off then on."""
     cfg.run.pager_sweep = False
-    dev_without, without, _, _ = walk(cfg, mem, chrome_fades_after=999)
+    dev_without, without, _, _ = walk(cfg, chrome_fades_after=999)
     cfg.run.pager_sweep = True
-    dev_with, with_sweep, _, _ = walk(cfg, mem, chrome_fades_after=999)
+    dev_with, with_sweep, _, _ = walk(cfg, chrome_fades_after=999)
     # Both walked the whole album; only the bill differs.
     assert dev_without.index == dev_with.index == len(STAMPS) - 1
 
@@ -284,15 +278,15 @@ def test_the_saving_is_real_and_not_an_accounting_trick(cfg, mem):
         f"{decides(without)} -> {decides(with_sweep)}")
 
 
-def test_sweeping_off_restores_a_turn_per_photo(cfg, mem):
+def test_sweeping_off_restores_a_turn_per_photo(cfg):
     cfg.run.pager_sweep = False
-    _, llm, outcome, state = walk(cfg, mem, chrome_fades_after=999)
+    _, llm, outcome, state = walk(cfg, chrome_fades_after=999)
     assert outcome == "success"
     assert llm.reads_requested == []
     assert decides(llm) >= len(STAMPS)
 
 
-def test_the_model_can_sweep_without_the_per_item_read(cfg, mem):
+def test_the_model_can_sweep_without_the_per_item_read(cfg):
     """`read_each=False` skips the vision read, not the repeat: the album is
     still walked to the end in a handful of decisions, and no frame is read
     or kept for it."""
@@ -300,7 +294,7 @@ def test_the_model_can_sweep_without_the_per_item_read(cfg, mem):
 
     dev = AlbumDevice(cfg, chrome_fades_after=999)
     llm = fake.FakeLLM(dev, unread_album_walker())
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert outcome == "success"
     assert dev.index == len(STAMPS) - 1, "the album was not walked to the end"
@@ -319,11 +313,11 @@ def test_the_model_can_sweep_without_the_per_item_read(cfg, mem):
         "*read_item*"))
 
 
-def test_a_sweep_only_ever_swipes(cfg, mem):
+def test_a_sweep_only_ever_swipes(cfg):
     """The safety case. The sweep repeats one gesture; it never taps, types,
     presses a key or navigates, so it can take no action the model did not
     already authorise on this screen."""
-    dev, _, _, _ = walk(cfg, mem, chrome_fades_after=999)
+    dev, _, _, _ = walk(cfg, chrome_fades_after=999)
     swipes = [a for a in dev.actions if a.startswith("scroll(")]
     assert swipes, "the album was never paged"
     # `list_apps('')` is the once-per-run "which apps did the goal name" lookup
@@ -335,32 +329,32 @@ def test_a_sweep_only_ever_swipes(cfg, mem):
     assert not any(a.startswith("input_text") for a in dev.actions)
 
 
-def test_a_dropped_fling_mid_sweep_is_retried_not_mistaken_for_the_end(cfg, mem):
+def test_a_dropped_fling_mid_sweep_is_retried_not_mistaken_for_the_end(cfg):
     """A ViewPager drops flings it judges too slow. Believing the first one would
     hand back four photos early and report the album as finished."""
-    dev, _, outcome, state = walk(cfg, mem, chrome_fades_after=999,
+    dev, _, outcome, state = walk(cfg, chrome_fades_after=999,
                                   drop_swipes=frozenset({4, 9}))
     assert dev.dropped == [4, 9]
     assert outcome == "success"
     assert dev.index == len(STAMPS) - 1
 
 
-def test_the_sweep_hands_back_when_the_gesture_stops_working(cfg, mem):
+def test_the_sweep_hands_back_when_the_gesture_stops_working(cfg):
     """The only stopping condition that is not a budget.
 
     It used to also hand back when the caption vanished, because items "could
     not be told apart" without one. Nothing needs telling apart now, so a faded
     overlay is not an event.
     """
-    _, _, outcome, state = walk(cfg, mem, chrome_fades_after=999)
+    _, _, outcome, state = walk(cfg, chrome_fades_after=999)
     sweeps = [e for e in _events(cfg, state.run_id) if e["kind"] == "sweep"]
     assert sweeps
     assert any("stopped changing" in e["reason"] for e in sweeps), sweeps
 
 
-def test_a_sweep_is_capped_so_an_endless_feed_cannot_run_away(cfg, mem):
+def test_a_sweep_is_capped_so_an_endless_feed_cannot_run_away(cfg):
     cfg.run.pager_sweep_max = 3
-    _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
+    _, _, _, state = walk(cfg, chrome_fades_after=999)
     events = _events(cfg, state.run_id)
     sweeps = [e for e in events if e["kind"] == "sweep"]
     assert sweeps
@@ -368,10 +362,10 @@ def test_a_sweep_is_capped_so_an_endless_feed_cannot_run_away(cfg, mem):
     assert any("limit was reached" in e["reason"] for e in sweeps)
 
 
-def test_a_sweep_costs_one_history_entry_not_one_per_photo(cfg, mem):
+def test_a_sweep_costs_one_history_entry_not_one_per_photo(cfg):
     """Twelve near-identical lines would push everything else out of the prompt
     to say what the ledger block already says per item, in more detail."""
-    _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
+    _, _, _, state = walk(cfg, chrome_fades_after=999)
     swept_lines = [h for h in state.history if "repeated" in h]
     assert swept_lines
     assert len(swept_lines) <= 3
@@ -380,8 +374,8 @@ def test_a_sweep_costs_one_history_entry_not_one_per_photo(cfg, mem):
     assert sum(1 for h in state.history if "swipe" in h) < len(STAMPS)
 
 
-def test_the_sweep_records_every_frame_it_read(cfg, mem):
-    _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
+def test_the_sweep_records_every_frame_it_read(cfg):
+    _, _, _, state = walk(cfg, chrome_fades_after=999)
     readings = _readings(cfg, state.run_id)
     assert len(readings) >= len(STAMPS) - 3
     assert all(e["reading"] for e in readings)
@@ -395,13 +389,13 @@ def test_the_sweep_records_every_frame_it_read(cfg, mem):
         assert current == previous + 1 or current == 1, positions
 
 
-def test_every_sweep_reading_keeps_the_frame_it_was_read_from(cfg, mem):
+def test_every_sweep_reading_keeps_the_frame_it_was_read_from(cfg):
     """A sweep is most of a run's vision calls and gets no live panel, so the
     reading and the frame it came off are the whole record of one -- and "what
     did it read off photo 7" is not answerable from the text alone."""
     from pathlib import Path
 
-    _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
+    _, _, _, state = walk(cfg, chrome_fades_after=999)
     directory = Path(cfg.run.artifacts_dir) / state.run_id
     readings = [e for e in _events(cfg, state.run_id)
                 if e["kind"] == "item_reading"]
@@ -414,21 +408,21 @@ def test_every_sweep_reading_keeps_the_frame_it_was_read_from(cfg, mem):
         assert event["shot"].startswith(f"step_{event['step']:03d}_read_item_")
 
 
-def test_no_frames_are_kept_when_there_is_nothing_to_read_with(cfg, mem):
+def test_no_frames_are_kept_when_there_is_nothing_to_read_with(cfg):
     """`never_screenshot` takes the sweep's reads away entirely; it must not
     leave the run writing frames nobody was shown."""
     from pathlib import Path
 
     cfg.run.never_screenshot = True
-    _, _, _, state = walk(cfg, mem, chrome_fades_after=999)
+    _, _, _, state = walk(cfg, chrome_fades_after=999)
     assert not list((Path(cfg.run.artifacts_dir) / state.run_id).glob("*.jpg"))
 
 
-def test_the_sweep_stops_rather_than_declaring_the_album_finished(cfg, mem):
+def test_the_sweep_stops_rather_than_declaring_the_album_finished(cfg):
     """It used to record an "edge" and call the set complete. It reports what
     happened -- the gesture stopped moving anything -- and says nothing about
     whether more exists somewhere else."""
-    _, llm, _, state = walk(cfg, mem, chrome_fades_after=999)
+    _, llm, _, state = walk(cfg, chrome_fades_after=999)
     sweeps = [e for e in _events(cfg, state.run_id) if e["kind"] == "sweep"]
     assert any("no longer advances" in e["reason"] for e in sweeps), sweeps
     assert "complete" not in "\n".join(llm.notes)
@@ -451,10 +445,10 @@ def _events(cfg, run_id):
 # now. The reading still has to survive verbatim -- it is the fact the run is
 # collecting -- so what is pinned is that it reaches the model unedited.
 
-def test_a_sweep_reading_reaches_the_model_verbatim(cfg, mem):
+def test_a_sweep_reading_reaches_the_model_verbatim(cfg):
     dev = AlbumDevice(cfg, chrome_fades_after=999)
     llm = fake.FakeLLM(dev, album_walker())
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     readings = [e["reading"] for e in _readings(cfg, state.run_id)]
     assert readings, "no frame was read at all"
@@ -463,13 +457,13 @@ def test_a_sweep_reading_reaches_the_model_verbatim(cfg, mem):
         f"the reading never reached the model: {readings[0]!r}")
 
 
-def test_a_reading_is_not_rounded_away_by_a_paraphrase(cfg, mem):
+def test_a_reading_is_not_rounded_away_by_a_paraphrase(cfg):
     """The album policy's `observation` restates the same photo, and a
     restatement is where a figure gets rounded off."""
     dev = AlbumDevice(cfg, chrome_fades_after=999)
     llm = fake.FakeLLM(dev, album_walker())
     llm.vision_reading = "chicken breast on scale, 428 g"
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     readings = [e["reading"] for e in _readings(cfg, state.run_id)]
     assert readings
@@ -479,7 +473,7 @@ def test_a_reading_is_not_rounded_away_by_a_paraphrase(cfg, mem):
     assert not any("a photo of a scale is on screen" in r for r in readings)
 
 
-def test_the_item_read_is_the_item_and_not_the_frame_around_it(cfg, mem):
+def test_the_item_read_is_the_item_and_not_the_frame_around_it(cfg):
     """A sweep is most of a run's vision calls, and each one asks a question about
     one bitmap. The status bar and the nav bar are not that bitmap:
     `ITEM_READING_SYSTEM` spends two of its rules telling the model to ignore
@@ -493,7 +487,7 @@ def test_the_item_read_is_the_item_and_not_the_frame_around_it(cfg, mem):
 
     dev = AlbumDevice(cfg, chrome_fades_after=999)
     llm = fake.FakeLLM(dev, album_walker())
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert llm.item_frames_seen, "no item was read"
     box = content_box(Screen(width=dev.size[0], height=dev.size[1]))
@@ -511,14 +505,14 @@ def test_the_item_read_is_the_item_and_not_the_frame_around_it(cfg, mem):
             assert img.size == (32, 32), img.size
 
 
-def test_a_frame_that_cannot_be_cropped_is_still_read(cfg, mem, monkeypatch):
+def test_a_frame_that_cannot_be_cropped_is_still_read(cfg, monkeypatch):
     """A crop is an improvement, never a precondition. When it cannot be taken --
     a truncated capture, a format PIL will not open -- the whole frame must reach
     the model rather than nothing reaching it."""
     monkeypatch.setattr("adbagent.agent.crop_frac", lambda *a, **kw: None)
     dev = AlbumDevice(cfg, chrome_fades_after=999)
     llm = fake.FakeLLM(dev, album_walker())
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     assert llm.item_frames_seen, "the item was not read at all"
     for frame in llm.item_frames_seen:

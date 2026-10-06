@@ -1044,7 +1044,7 @@ class TraceCollector:
                 for pkg in packages]
 
 
-def explore_app(dev: Any, mem: Any, llm: Any, cfg: Any, *, query: str = "",
+def explore_app(dev: Any, llm: Any, cfg: Any, *, query: str = "",
                 tasks: str = "",
                 on_event: Optional[Callable[..., None]] = None) -> AppTrace:
     """Drive an app on the phone and record what a skill needs to know.
@@ -1113,7 +1113,7 @@ def explore_app(dev: Any, mem: Any, llm: Any, cfg: Any, *, query: str = "",
     collector = TraceCollector(dev, exp, on_event)
     collector.record(screen, 0)
 
-    agent = Agent(dev, mem, llm, cfg, on_event=collector)
+    agent = Agent(dev, llm, cfg, on_event=collector)
     outcome, state = agent.run(exploration_goal(package, exp.tasks))
     return collector.finish(outcome, state)
 

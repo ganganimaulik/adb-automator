@@ -376,6 +376,14 @@ const NOTE_LINES = {
   goal_check: (e) => e.satisfied
     ? "goal check: already satisfied"
     : `goal check: not yet — ${e.evidence || "no reason given"}`,
+  // The gates in front of a send. Each held send used to reach the feed as the
+  // bare word `send_refused`, which is the one place the reason matters most.
+  send_refused: (e) => `send held back — ${e.reason || "no reason given"}`,
+  send_check: (e) => e.send
+    ? `send check: ok — ${e.reason || "no reason given"}`
+    : `send check: refused — ${e.reason || "no reason given"}`,
+  sent: (e) => `sent "${e.label}"` + (e.thread ? ` in ${e.thread}` : "") +
+    ` (${e.total} this run)`,
 };
 
 /* How a run stops badly. Rendered rather than dropped: an `error` event used to
@@ -424,7 +432,12 @@ function paintLedger(box, ledger, fresh, dropped) {
   if (!ledger || !ledger.size) { box.hidden = true; return; }
   box.hidden = false;
   const n = ledger.size;
-  box.innerHTML = `<div class="lk">collected data · ${n} ` +
+  // A watch's box says "this pass": its ledger is reset at every pass boundary,
+  // because a pass is a run and the scratchpad is per-run. Without the
+  // qualifier the panel reads as the whole watch's haul, which after a night of
+  // passes is wrong by a factor of fifty.
+  const scope = box.dataset.scope ? ` · ${box.dataset.scope}` : "";
+  box.innerHTML = `<div class="lk">collected data${scope} · ${n} ` +
     `${n === 1 ? "record" : "records"}</div><div class="notes-body"></div>`;
   const body = box.querySelector(".notes-body");
   for (const [id, rec] of ledger) body.appendChild(noteRow(rec, fresh.has(id)));
@@ -877,7 +890,8 @@ function updateCountersFromEvent(ev, v) {
    feed from the run it opened. */
 
 const LLM_PURPOSES = { decide: "decide", judge: "judge",
-  analyze_image: "vision read", read_item: "item read" };
+  analyze_image: "vision read", read_item: "item read",
+  send_check: "send check" };
 
 function fmtTok(n) {
   n = n || 0;
@@ -1803,9 +1817,6 @@ function paintWatchOpts() {
     const v = $(id).value.trim();
     if (v) bits.push(fmt(v));
   };
-  put("watch-rph", (v) => `${v} replies/hour`);
-  put("watch-rpc", (v) => `${v} per conversation`);
-  put("watch-cooldown", (v) => `${v}s cooldown`);
   put("watch-usd", (v) => `$${v}/hour`);
   put("watch-serial", (v) => v);
   if ($("watch-no-learn").checked) bits.push("no learning");
@@ -2188,15 +2199,15 @@ watchLive.setRunning = (running, stopping) => {
   $("watch-policy-select").disabled = running;
   paintWatchBanner(running, stopping);
 };
-// Every pass writes a reply or it does not; either way the ledger is what
-// changed, so refresh it when one ends rather than making the reader ask.
 watchLive.onEvent = (ev) => {
   // What the pass is actually doing, from the pass. Same source as the Work
   // tab's: the request went into a file the loop reads at the top of its next
   // step, and until it has, nothing has changed.
+  //
+  // A `reply_attempt`/`reply_confirmed`/`run_end` here used to refresh the
+  // reply-ledger table. There is no table and no such events: a send leaves a
+  // `decide` in this pass's feed and a message in the thread, and nothing else.
   if (ev.kind === "control") paintHold(watchLive, ev.mode, ev.mode);
-  if (ev.kind === "reply_attempt" || ev.kind === "reply_confirmed"
-      || ev.kind === "run_end") loadLedger().catch(() => {});
 };
 watchLive.onEnd = () => { $("watch-hint").textContent = ""; };
 
@@ -2239,9 +2250,6 @@ function watchOptions() {
     interval_s: num("watch-interval"),
     sweep_s: num("watch-sweep"),
     max_steps: num("watch-steps", true),
-    replies_per_hour: num("watch-rph", true),
-    replies_per_conversation: num("watch-rpc", true),
-    cooldown_s: num("watch-cooldown"),
     usd_per_hour: num("watch-usd"),
   };
 }
@@ -2401,7 +2409,6 @@ async function loadWatch() {
   const data = await api("/api/watch");
   watchDefaults = data.defaults || {};
   $("watch-policy-path").textContent = data.policy_path || "(no policy path set)";
-  $("watch-ledger-path").textContent = data.ledger_path || "";
   // Placeholders, not values: an empty field means "whatever config says", and
   // filling them in would silently pin today's defaults into every start.
   const ph = (id, v) => { if (v !== undefined && v !== null) $(id).placeholder = String(v); };
@@ -2410,9 +2417,6 @@ async function loadWatch() {
   // and a good deal clearer than showing a 0.
   if (watchDefaults.sweep_s) ph("watch-sweep", watchDefaults.sweep_s);
   ph("watch-steps", watchDefaults.max_steps);
-  ph("watch-rph", watchDefaults.max_replies_per_hour);
-  ph("watch-rpc", watchDefaults.max_replies_per_thread_per_hour);
-  ph("watch-cooldown", watchDefaults.thread_cooldown_s);
   const active = data.active || {};
   if (active.running) $("watch-draft").checked = !!active.draft;
   paintWatchBanner(!!active.running, !!active.stopping);
@@ -2431,7 +2435,6 @@ async function loadWatch() {
     $("watch-goal").value = active.goal;
     paintPolicyGoalNote();
   }
-  await loadLedger();
 }
 
 async function loadPolicy() {
@@ -2449,27 +2452,11 @@ async function loadPolicy() {
   paintPolicyGoalNote();
 }
 
-async function loadLedger() {
-  const data = await api("/api/watch/ledger");
-  const tbody = document.querySelector("#watch-ledger-table tbody");
-  tbody.innerHTML = "";
-  const rows = data.threads || [];
-  $("watch-ledger-empty").hidden = rows.length > 0;
-  $("watch-ledger-table").hidden = rows.length === 0;
-  $("watch-ledger-path").textContent = data.path || "";
-  for (const t of rows) {
-    const tr = document.createElement("tr");
-    tr.innerHTML =
-      `<td>${esc(t.preview || t.thread_key)}</td>` +
-      `<td>${t.reply_count}</td>` +
-      `<td class="small" title="${esc(fmtTime(t.last_attempt_at))}">` +
-      `${esc(fmtRel(t.last_attempt_at))}</td>` +
-      `<td class="small">${t.confirmed
-        ? "<span class=\"ok\">confirmed</span>"
-        : "<span class=\"warn\">unconfirmed — in doubt</span>"}</td>`;
-    tbody.appendChild(tr);
-  }
-}
+/* `loadLedger` stood here: one row per conversation the watch had ever replied
+   to, read from `/api/watch/ledger` -- who, how many times, how long ago, and
+   whether the send was ever confirmed. It was the only view of what a watch had
+   said to whom. Both the endpoint and the file behind it are gone; what a pass
+   said survives in that pass's own feed. */
 
 $("watch-draft").addEventListener("change", () => paintWatchBanner(false));
 
@@ -2535,9 +2522,6 @@ $("btn-policy-save").addEventListener("click", async () => {
     applyPolicyGoal();
   } catch (err) { notice(err.message); }
 });
-
-$("btn-ledger-reload").addEventListener("click", () =>
-  loadLedger().catch((err) => notice(err.message)));
 
 $("watch-form").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -2870,6 +2854,7 @@ async function openRunDetail(id) {
   feed._notesCard = null;
   feed._ledgerBox = $("detail-ledger");
   $("detail-ledger").hidden = true;
+  $("detail-progress").hidden = true;
   $("run-detail-view").scrollIntoView({ block: "start" });
   try {
     const d = await api("/api/runs/" + encodeURIComponent(id));
@@ -2933,6 +2918,15 @@ async function openRunDetail(id) {
     // Every per-step ledger panel folded, unlike a live run's last one: this
     // page already opens with the finished ledger in full, above the feed.
     finalizeNotes(feed);
+    // The plan the run was working through, replayed whole by the server from
+    // the per-turn `progress` deltas. Straight from the payload rather than
+    // accumulated out of the feed, because `plan.replay` is what knows how two
+    // spellings of one step become one entry -- and because this way a run
+    // recorded before the `plan` event existed still shows its plan.
+    if (d.plan) {
+      $("detail-progress").hidden = false;
+      $("detail-progress").textContent = d.plan;
+    }
     // A run recorded before the events carried their records still has the
     // server's replay of the ledger, which is better than nothing at all.
     if ((!feed._notes || !feed._notes.size) && d.scratchpad) {
@@ -3213,6 +3207,8 @@ const CFG_SPEC = [
       help: "Deleting, sending, paying, uninstalling. Off, they are refused." }],
     ["unattended", "bool", { label: "Never prompt",
       help: "Refuse anything that would need a person rather than asking." }],
+    ["check_sends", "bool", { label: "Check every send against the policy",
+      help: "Before a message, reply or like goes out, a second, small model reads the policy, the thread and the draft, and the send is refused unless it says yes. One call per send." }],
   ]],
   ["run", [
     ["max_steps", "number", { label: "Max steps",
@@ -3256,36 +3252,35 @@ const CFG_SPEC = [
       help: "One model call at the end, folding what the run saw into the app's skill." }],
   ]],
   // The Watch tab can override most of these per start, but they belong here
-  // too: these are the ceilings, and a ceiling you have to retype on every start
-  // is one that will be forgotten once. `policy` and `ledger` especially -- those
-  // are paths, and the Watch tab reads them from here rather than asking.
+  // too: a setting you have to retype on every start is one that will be
+  // forgotten once. `policy` especially -- it is a path, and the Watch tab reads
+  // it from here rather than asking.
+  //
+  // Four are gone, all of them readings of a reply ledger that no longer
+  // exists: `ledger` (the file), `thread_cooldown_s`, `max_replies_per_hour`
+  // and `max_replies_per_thread_per_hour`. So is `fail_closed`, which refused a
+  // send on a thread it could not identify. What stops a send now is `draft`,
+  // the policy's `send_limits`, and `safety.check_sends`.
   ["watch", [
     ["policy", "text", { label: "Reply policy file",
       help: "The instructions that decide what gets replied to and what it says. A watch will not start without one. The one the Watch tab opens on, and the one a bare `adbagent watch` uses." }],
     ["policies_dir", "text", { label: "Policies directory",
       help: "Where the other policies live. Every policy in here is offered in the Watch tab's picker, and each carries the goal it was written for." }],
-    ["ledger", "text", { label: "Reply ledger file",
-      help: "The record the never-double-reply guarantee is built on." }],
     ["interval_s", "number", { label: "Seconds between passes" }],
     ["sweep_s", "number", { label: "Sweep every (s)",
       help: "Run a pass this often even when nothing on screen has changed, for work that does not announce itself. 0 is off, and off only ever spends on a screen that changed." }],
     ["max_steps", "number", { label: "Steps per pass" }],
     ["draft", "bool", { label: "Draft only",
-      help: "Compose and record replies, and never send them." }],
-    ["fail_closed", "bool", { label: "Fail closed",
-      help: "If the ledger cannot be written, do not send." }],
-    ["thread_cooldown_s", "number", { label: "Cooldown per conversation (s)" }],
-    ["max_replies_per_hour", "number", { label: "Replies per hour" }],
-    ["max_replies_per_thread_per_hour", "number",
-      { label: "Replies per conversation per hour" }],
+      help: "Compose and record replies, and never send them. The one switch that stops every send; otherwise each send is checked against the policy first (Safety → Check every send)." }],
     ["max_usd_per_hour", "number", { label: "Spend per hour ($)",
       help: "0 is off." }],
     ["backoff_initial_s", "number", { label: "Backoff, first wait (s)",
       help: "After a pass that changed nothing." }],
     ["backoff_max_s", "number", { label: "Backoff, longest wait (s)" }],
   ]],
-  ["memory", [["db", "text", { label: "Memory database",
-    help: "What it remembers about screens between runs." }]]],
+  // A `memory` section held `db`, the SQLite file of what the agent remembered
+  // about screens between runs. Nothing reads a database now: what one run
+  // learns reaches the next through its app skill and its recorded events.
 ];
 
 /* The handful anyone actually sets, in the order they get set in. Everything
@@ -3300,7 +3295,7 @@ const CFG_TIER1 = [
 /* Section names as a person would say them. */
 const CFG_SECTIONS = {
   llm: "Model & API", device: "Phone", safety: "Safety", run: "Run behaviour",
-  skills: "App skills", watch: "Watch", memory: "Memory",
+  skills: "App skills", watch: "Watch",
 };
 
 /* The value of the "custom…" option, chosen so no model id can be it. Not a NUL
@@ -3916,9 +3911,6 @@ const PERSIST_FIELDS = [
   { id: "watch-sweep", key: "adbagent.watch-sweep", type: "text" },
   { id: "watch-steps", key: "adbagent.watch-steps", type: "text" },
   { id: "watch-serial", key: "adbagent.watch-serial", type: "text" },
-  { id: "watch-rph", key: "adbagent.watch-rph", type: "text" },
-  { id: "watch-rpc", key: "adbagent.watch-rpc", type: "text" },
-  { id: "watch-cooldown", key: "adbagent.watch-cooldown", type: "text" },
   { id: "watch-usd", key: "adbagent.watch-usd", type: "text" },
 ];
 

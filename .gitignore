@@ -49,7 +49,6 @@ venv.bak/
 runs/
 config.json
 *.log
-memory.db*
 
 # Operating System & IDE Files
 .DS_Store
@@ -73,4 +72,3 @@ policies/
 # are local state rather than source. `SkillRegistry.load_skills` recreates the
 # directory on a fresh clone, which then learns its own.
 skills/
-watch-replies.jsonl

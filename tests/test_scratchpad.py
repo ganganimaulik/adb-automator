@@ -25,7 +25,6 @@ from adbagent import scratchpad as sp
 from adbagent.actions import AgentAction
 from adbagent.agent import Agent
 from adbagent.config import Config
-from adbagent.memory import Memory
 from tests.fake import FakeDevice, FakeLLM
 
 MENU = ("MENU: Oats meal: oats 100g, whey 60g, almonds 5g, cashews 5g, "
@@ -298,17 +297,12 @@ def test_replay_rebuilds_a_finished_run_from_its_deltas():
 @pytest.fixture
 def cfg(tmp_path):
     c = Config()
-    c.memory.db = str(tmp_path / "memory.db")
     c.run.artifacts_dir = str(tmp_path / "runs")
     c.run.max_steps = 6
     c.safety.unattended = True
     return c
 
 
-@pytest.fixture
-def mem(cfg, tmp_path):
-    with Memory(cfg, path=tmp_path / "memory.db") as m:
-        yield m
 
 
 def collect_then_drop(notes):
@@ -325,19 +319,19 @@ def collect_then_drop(notes):
     return policy
 
 
-def run_collection(cfg, mem, notes):
+def run_collection(cfg, notes):
     dev = FakeDevice(cfg)
     llm = FakeLLM(dev, collect_then_drop(notes))
     judged = {}
     original = llm.judge
     llm.judge = lambda **kw: (judged.update(kw), original(**kw))[1]
-    outcome, state = Agent(dev, mem, llm, cfg).run("record every weight")
+    outcome, state = Agent(dev, llm, cfg).run("record every weight")
     return llm, state, judged, outcome
 
 
-def test_the_loop_keeps_a_reading_a_later_turn_stops_mentioning(cfg, mem):
+def test_the_loop_keeps_a_reading_a_later_turn_stops_mentioning(cfg):
     _, state, _, outcome = run_collection(
-        cfg, mem, [recs(("9:59", "potatoes 403g")),
+        cfg, [recs(("9:59", "potatoes 403g")),
                    recs(("10:03", "tomatoes 120g")),
                    recs(("10:07", "rice 290g"))])
     assert outcome == "success"
@@ -353,12 +347,12 @@ def run_events(cfg, run_id):
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def test_the_event_carries_the_records_a_step_collected(cfg, mem):
+def test_the_event_carries_the_records_a_step_collected(cfg):
     """The live view renders the ledger from these. Carrying only the keys and a
     count -- which is what the event had -- shows that a record arrived and not
     what it says, so the values have to be in the file."""
     _, state, _, _ = run_collection(
-        cfg, mem, [recs(("9:59", "potatoes 403g")),
+        cfg, [recs(("9:59", "potatoes 403g")),
                    recs(("10:03", "tomatoes 120g"))])
     written = [e for e in run_events(cfg, state.run_id) if e["kind"] == "scratchpad"]
     assert len(written) == 2
@@ -371,42 +365,42 @@ def test_the_event_carries_the_records_a_step_collected(cfg, mem):
     assert written[1]["total"] == 2
 
 
-def test_what_a_step_collected_is_recorded_under_that_step(cfg, mem):
+def test_what_a_step_collected_is_recorded_under_that_step(cfg):
     """After the decision that produced it. Both the file and the live feed play
     back in order, and a ledger that lands above its own step reads as belonging
     to the step before."""
-    _, state, _, _ = run_collection(cfg, mem, [recs(("9:59", "potatoes 403g"))])
+    _, state, _, _ = run_collection(cfg, [recs(("9:59", "potatoes 403g"))])
     kinds = [e["kind"] for e in run_events(cfg, state.run_id)
              if e["kind"] in ("decide", "scratchpad")]
     assert kinds[:2] == ["decide", "scratchpad"]
 
 
-def test_a_step_that_collected_nothing_writes_no_ledger_event(cfg, mem):
-    _, state, _, _ = run_collection(cfg, mem, [None, recs(("9:59", "potatoes 403g"))])
+def test_a_step_that_collected_nothing_writes_no_ledger_event(cfg):
+    _, state, _, _ = run_collection(cfg, [None, recs(("9:59", "potatoes 403g"))])
     written = [e for e in run_events(cfg, state.run_id) if e["kind"] == "scratchpad"]
     assert [e["step"] for e in written] == [2]
 
 
-def test_the_run_records_the_ceilings_it_was_given(cfg, mem):
+def test_the_run_records_the_ceilings_it_was_given(cfg):
     """`max_steps` and the budget are in a config file that changes, and
     `--max-steps` on one invocation leaves no other trace. The live view shows
     "step 4/6" from these -- a step count against nothing is not a position."""
-    _, state, _, _ = run_collection(cfg, mem, [recs(("9:59", "potatoes 403g"))])
+    _, state, _, _ = run_collection(cfg, [recs(("9:59", "potatoes 403g"))])
     start = next(e for e in run_events(cfg, state.run_id) if e["kind"] == "run_start")
     assert start["max_steps"] == cfg.run.max_steps == 6
     assert start["budget_usd"] == cfg.safety.budget_usd
 
 
-def test_the_judge_grades_on_everything_collected_not_the_last_turn(cfg, mem):
+def test_the_judge_grades_on_everything_collected_not_the_last_turn(cfg):
     """The run reported the 10:03 photo as unreadable while its own earlier notes
     held the reading. The judge sees every record either way."""
-    _, _, judged, _ = run_collection(cfg, mem, [STEP_73, STEP_74, STEP_74])
+    _, _, judged, _ = run_collection(cfg, [STEP_73, STEP_74, STEP_74])
     assert "tomatoes 120g" in judged["scratchpad"]
 
 
-def test_the_model_is_shown_the_ledger_it_no_longer_has_to_restate(cfg, mem):
+def test_the_model_is_shown_the_ledger_it_no_longer_has_to_restate(cfg):
     llm, _, _, _ = run_collection(
-        cfg, mem, [recs(("9:59", "potatoes 403g")), recs(("10:03", "tomatoes 120g"))])
+        cfg, [recs(("9:59", "potatoes 403g")), recs(("10:03", "tomatoes 120g"))])
     shown = [call for call in llm.scratchpads if "potatoes 403g" in call]
     assert shown, "the collected ledger was never handed back to the model"
     assert "do NOT restate" in shown[-1]

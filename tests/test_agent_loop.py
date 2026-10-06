@@ -11,10 +11,10 @@ import json
 import pytest
 
 from adbagent.actions import AgentAction, Target
-from adbagent.agent import Agent, Oracle, Recorder, RunState, needs_screenshot
+from adbagent.agent import (Agent, Oracle, Recorder, RunState, _locate_key,
+                            needs_screenshot)
 from adbagent.config import Config
 from adbagent.device import DeviceTimeout
-from adbagent.memory import Memory
 
 from . import fake
 from . import xmlgen as X
@@ -23,25 +23,20 @@ from . import xmlgen as X
 @pytest.fixture
 def cfg(tmp_path):
     c = Config()
-    c.memory.db = str(tmp_path / "memory.db")
     c.run.artifacts_dir = str(tmp_path / "runs")
     c.run.max_steps = 25
     c.safety.unattended = True      # never block a test on input()
     return c
 
 
-@pytest.fixture
-def mem(cfg, tmp_path):
-    with Memory(cfg, path=tmp_path / "memory.db") as m:
-        yield m
 
 
 GOAL = "open the Wi-Fi settings screen"
 
 
-def run(dev, mem, cfg, policy, **kw):
+def run(dev, cfg, policy, **kw):
     llm = fake.FakeLLM(dev, policy)
-    agent = Agent(dev, mem, llm, cfg, **kw)
+    agent = Agent(dev, llm, cfg, **kw)
     outcome, state = agent.run(GOAL)
     return outcome, state, llm
 
@@ -50,16 +45,16 @@ def run(dev, mem, cfg, policy, **kw):
 # Basic operation
 # ---------------------------------------------------------------------------
 
-def test_run_uses_the_llm_and_succeeds(cfg, mem):
+def test_run_uses_the_llm_and_succeeds(cfg):
     dev = fake.FakeDevice(cfg)
-    outcome, state, llm = run(dev, mem, cfg,
+    outcome, state, llm = run(dev, cfg,
                               fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     assert outcome == "success"
     assert dev.state == "wifi"
     assert llm.calls >= 2          # at least one decide plus the completion judge
 
 
-def test_every_turn_is_told_what_day_the_phone_thinks_it_is(cfg, mem):
+def test_every_turn_is_told_what_day_the_phone_thinks_it_is(cfg):
     """A goal bounded in time cannot be read without it.
 
     ``runs/963a4f4ae96c`` -- "check today and yesterday's messages" -- had no
@@ -67,7 +62,7 @@ def test_every_turn_is_told_what_day_the_phone_thinks_it_is(cfg, mem):
     today's down through Sunday, Saturday and 27 Jul.
     """
     dev = fake.FakeDevice(cfg)
-    _, _, llm = run(dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, _, llm = run(dev, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
 
     # Every decide turn, and the same date on each -- this message sits above
     # the goal, so a value that moved would evict everything after it.
@@ -76,12 +71,12 @@ def test_every_turn_is_told_what_day_the_phone_thinks_it_is(cfg, mem):
     assert dev.date_reads == 1
 
 
-def test_a_phone_that_will_not_give_its_date_is_not_guessed_for(cfg, mem):
+def test_a_phone_that_will_not_give_its_date_is_not_guessed_for(cfg):
     """The host clock is not a fallback: it can be a day out, and the prompt
     states this as fact with nothing on screen to check it against."""
     dev = fake.FakeDevice(cfg)
     dev.date = ""
-    _, _, llm = run(dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, _, llm = run(dev, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
 
     assert llm.dates_seen and set(llm.dates_seen) == {""}
 
@@ -90,7 +85,7 @@ def test_a_phone_that_will_not_give_its_date_is_not_guessed_for(cfg, mem):
 # tap_at with a named control, grounded by the vision locate
 # ---------------------------------------------------------------------------
 
-def test_a_named_tap_at_is_grounded_by_the_vision_locate(cfg, mem):
+def test_a_named_tap_at_is_grounded_by_the_vision_locate(cfg):
     """The decider names a control it has no pixels for; the locate places it.
 
     Works in every model configuration because the decider never handles
@@ -115,7 +110,7 @@ def test_a_named_tap_at_is_grounded_by_the_vision_locate(cfg, mem):
                            reasoning="name it and have it located",
                            action="tap_at", text="the Wi-Fi row icon")
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
     assert dev.state == "wifi"
@@ -126,25 +121,25 @@ def test_a_named_tap_at_is_grounded_by_the_vision_locate(cfg, mem):
     assert abs(dev.taps[0][0] - cx) <= 1 and abs(dev.taps[0][1] - cy) <= 1
 
 
-def _locator(cfg, mem, dev, location):
+def _locator(cfg, dev, location):
     """An agent, a state and a recorder, for calling `_locate_cached` directly."""
     from adbagent.agent import Recorder
 
     llm = fake.FakeLLM(dev, lambda *a: None)
     llm.location = location
-    return (Agent(dev, mem, llm, cfg), llm,
+    return (Agent(dev, llm, cfg), llm,
             RunState(goal=GOAL, run_id="r", intent_id="i"),
             Recorder(cfg, "r"))
 
 
-def test_the_second_locate_of_the_same_control_is_free(cfg, mem):
+def test_the_second_locate_of_the_same_control_is_free(cfg):
     """A locate is a screenshot plus a vision call, and it is asked the same
     question over and over: across ``runs/``, 577 named `tap_at`s resolve to 94
     distinct (skeleton, name) pairs, and "send message" on one WhatsApp
     skeleton was located 134 separate times."""
     dev = fake.FakeDevice(cfg)
     screen = dev.observe()
-    agent, llm, state, rec = _locator(cfg, mem, dev, (0.5, 0.9))
+    agent, llm, state, rec = _locator(cfg, dev, (0.5, 0.9))
     try:
         first = agent._locate_cached(state, rec, screen, "the send pill")
         second = agent._locate_cached(state, rec, screen, "the send pill")
@@ -157,10 +152,10 @@ def test_the_second_locate_of_the_same_control_is_free(cfg, mem):
     assert llm.locates == 1
 
 
-def test_a_different_control_or_screen_is_located_afresh(cfg, mem):
+def test_a_different_control_or_screen_is_located_afresh(cfg):
     dev = fake.FakeDevice(cfg)
     screen = dev.observe()
-    agent, llm, state, rec = _locator(cfg, mem, dev, (0.5, 0.9))
+    agent, llm, state, rec = _locator(cfg, dev, (0.5, 0.9))
     try:
         agent._locate_cached(state, rec, screen, "the send pill")
         agent._locate_cached(state, rec, screen, "the attach button")
@@ -174,31 +169,33 @@ def test_a_different_control_or_screen_is_located_afresh(cfg, mem):
         rec.close()
 
 
-def test_a_locate_that_misses_is_not_cached(cfg, mem):
+def test_a_locate_that_misses_is_not_cached(cfg):
     """There is nothing to remember, and caching "not found" would stop the
     next turn looking on a screen that may since have drawn the control."""
     dev = fake.FakeDevice(cfg)
     screen = dev.observe()
-    agent, llm, state, rec = _locator(cfg, mem, dev, None)
+    agent, llm, state, rec = _locator(cfg, dev, None)
     try:
         assert agent._locate_cached(state, rec, screen, "the send pill") is None
         assert agent._locate_cached(state, rec, screen, "the send pill") is None
     finally:
         rec.close()
     assert llm.locates == 2
-    assert mem.recall_locate(screen, "the send pill") is None
+    assert _locate_key(screen, "the send pill") not in state.locates
 
 
-def test_a_cached_point_that_taps_nothing_is_forgotten(cfg, mem):
+def test_a_located_point_that_taps_nothing_is_forgotten(cfg):
     """The invalidation half. Without it the cache is worse than paying for the
     locate: a vision call that misses costs one turn, a cached miss would cost
-    every remaining turn that named the same control."""
+    every remaining turn in the run that named the same control.
+
+    The cache is per-run now (`RunState.locates`) rather than a table keyed by
+    screen and surviving a day, so this drives it through a real run instead of
+    seeding a database: the locate is paid, the point is cached, the tap on it
+    changes nothing, and the entry is gone by the time the run ends.
+    """
     dev = fake.FakeDevice(cfg)
     screen = dev.observe()
-    # A point on bare canvas: tapping it changes nothing on the scripted phone.
-    mem.record_locate(screen, "the ghost button", 0.5, 0.97)
-    assert mem.recall_locate(screen, "the ghost button") is not None
-
     tries = []
 
     def policy(scr, llm):
@@ -207,32 +204,34 @@ def test_a_cached_point_that_taps_nothing_is_forgotten(cfg, mem):
                                reasoning="give up on it", action="done",
                                text="the point was dead")
         tries.append(True)
+        # A point on bare canvas: tapping it changes nothing on the scripted
+        # phone, which is what makes the step grade `no_change`.
         llm.location = (0.5, 0.97)
-        return AgentAction(observation="aiming at the remembered point",
-                           reasoning="tap where it was last seen",
+        return AgentAction(observation="aiming at the ghost button",
+                           reasoning="tap where vision put it",
                            action="tap_at", text="the ghost button")
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
-    assert llm.locates == 0          # the cached point was used, not re-derived
-    # ...and having changed nothing, it is no longer remembered.
-    assert mem.recall_locate(screen, "the ghost button") is None
+    assert llm.locates == 1          # the point was derived once and cached...
+    # ...and having changed nothing, it is no longer cached.
+    assert _locate_key(screen, "the ghost button") not in state.locates
 
 
-def test_a_cached_point_on_the_ban_list_is_dropped_and_located_again(cfg, mem):
+def test_a_cached_point_on_the_ban_list_is_dropped_and_located_again(cfg):
     """Something has tapped there since and nothing happened. Falling through
     to a real locate is the whole reason to check the ban list first."""
     dev = fake.FakeDevice(cfg)
     screen = dev.observe()
-    mem.record_locate(screen, "the ghost button", 0.5, 0.97)
 
     state = RunState(goal=GOAL, run_id="r", intent_id="i")
+    state.locates[_locate_key(screen, "the ghost button")] = (0.5, 0.97)
     state.loops.ban(screen.skeleton_id, "tap_at/0.50,0.97")
 
     llm = fake.FakeLLM(dev, lambda *a: None)
     llm.location = (0.4, 0.4)
-    agent = Agent(dev, mem, llm, cfg)
+    agent = Agent(dev, llm, cfg)
 
     from adbagent.agent import Recorder
     rec = Recorder(cfg, "r")
@@ -243,10 +242,10 @@ def test_a_cached_point_on_the_ban_list_is_dropped_and_located_again(cfg, mem):
 
     assert where == (0.4, 0.4)       # the fresh locate, not the banned point
     assert llm.locates == 1
-    assert mem.recall_locate(screen, "the ghost button") == (0.4, 0.4)
+    assert state.locates[_locate_key(screen, "the ghost button")] == (0.4, 0.4)
 
 
-def test_a_tap_at_naming_a_listed_element_is_refused_with_its_index(cfg, mem):
+def test_a_tap_at_naming_a_listed_element_is_refused_with_its_index(cfg):
     """The escape hatch is not a shortcut: what the list can name, the list taps."""
     dev = fake.FakeDevice(cfg)
     tried = []
@@ -260,7 +259,7 @@ def test_a_tap_at_naming_a_listed_element_is_refused_with_its_index(cfg, mem):
                            reasoning="lazy coordinate tap", action="tap_at",
                            text="Wi-Fi")
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
     assert llm.locates == 0             # refused before any locate was paid for
@@ -269,7 +268,7 @@ def test_a_tap_at_naming_a_listed_element_is_refused_with_its_index(cfg, mem):
     assert "#" in (state.last_failure or "")
 
 
-def test_a_tap_at_naming_something_inside_a_container_label_is_located(cfg, mem):
+def test_a_tap_at_naming_something_inside_a_container_label_is_located(cfg):
     """The text half of the refusal guard takes the point half's size rule:
     a name that resolves only as a substring of a big container's aggregated
     label is naming something inside it that has no element of its own, and
@@ -300,7 +299,7 @@ def test_a_tap_at_naming_something_inside_a_container_label_is_located(cfg, mem)
                            reasoning="name it and have it located",
                            action="tap_at", text="send message")
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
     assert llm.locates == 1 and llm.locates_seen == ["send message"]
@@ -309,7 +308,7 @@ def test_a_tap_at_naming_something_inside_a_container_label_is_located(cfg, mem)
     assert dev.taps == [(int(0.59 * X.W), int(0.67 * X.H))]
 
 
-def test_a_locate_is_told_ruled_out_points_and_a_repeat_is_not_tapped(cfg, mem):
+def test_a_locate_is_told_ruled_out_points_and_a_repeat_is_not_tapped(cfg):
     """A locate call is stateless: asked again for the same control on an
     unchanged screen, the model re-derives the same wrong point. The harness
     knows that point is dead -- the tap landed and nothing changed -- so the
@@ -335,7 +334,7 @@ def test_a_locate_is_told_ruled_out_points_and_a_repeat_is_not_tapped(cfg, mem):
                            reasoning="name it and have it located",
                            action="tap_at", text="send message")
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
     assert llm.locates == 2
@@ -346,7 +345,7 @@ def test_a_locate_is_told_ruled_out_points_and_a_repeat_is_not_tapped(cfg, mem):
     assert "keeps placing" in (state.last_failure or "")
 
 
-def test_a_tap_at_landing_on_a_listed_control_is_refused(cfg, mem):
+def test_a_tap_at_landing_on_a_listed_control_is_refused(cfg):
     dev = fake.FakeDevice(cfg)
     tried = []
 
@@ -360,14 +359,14 @@ def test_a_tap_at_landing_on_a_listed_control_is_refused(cfg, mem):
                            reasoning="lazy coordinate tap", action="tap_at",
                            x=0.5, y=0.248)
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
     assert dev.taps == []
     assert "tap_at refused" in (state.last_failure or "")
 
 
-def test_a_tap_at_on_bare_canvas_is_not_refused(cfg, mem):
+def test_a_tap_at_on_bare_canvas_is_not_refused(cfg):
     """The guard refuses listed controls, not coordinates: a point that hits
     nothing button-sized in the list goes straight through."""
     dev = fake.FakeDevice(cfg)
@@ -383,13 +382,13 @@ def test_a_tap_at_on_bare_canvas_is_not_refused(cfg, mem):
                            reasoning="press where the control is drawn",
                            action="tap_at", x=0.5, y=0.2)
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
     assert dev.taps == [(540, 468)]
 
 
-def test_a_locate_miss_is_a_failed_step_never_a_tapped_guess(cfg, mem):
+def test_a_locate_miss_is_a_failed_step_never_a_tapped_guess(cfg):
     dev = fake.FakeDevice(cfg)
     tried = []
 
@@ -402,7 +401,7 @@ def test_a_locate_miss_is_a_failed_step_never_a_tapped_guess(cfg, mem):
                            reasoning="name it anyway", action="tap_at",
                            text="the record button")
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
     assert llm.locates == 1            # the locate was asked...
@@ -410,7 +409,7 @@ def test_a_locate_miss_is_a_failed_step_never_a_tapped_guess(cfg, mem):
     assert "could not locate" in (state.last_failure or "")
 
 
-def test_a_blind_deciders_guessed_point_is_replaced_by_the_locate(cfg, mem):
+def test_a_blind_deciders_guessed_point_is_replaced_by_the_locate(cfg):
     """A blind decider never saw a frame, so the x/y it writes are guesses by
     construction: when the control is also named, the locate answers and its
     point -- not the guess -- is what goes out.
@@ -442,7 +441,7 @@ def test_a_blind_deciders_guessed_point_is_replaced_by_the_locate(cfg, mem):
                            action="tap_at", x=0.5, y=0.2,
                            text="the Wi-Fi row icon")
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
     assert dev.state == "wifi"
@@ -451,7 +450,7 @@ def test_a_blind_deciders_guessed_point_is_replaced_by_the_locate(cfg, mem):
     assert abs(dev.taps[0][0] - cx) <= 1 and abs(dev.taps[0][1] - cy) <= 1
 
 
-def test_a_seeing_deciders_named_point_is_kept(cfg, mem):
+def test_a_seeing_deciders_named_point_is_kept(cfg):
     """The override is for blind deciders only: a model shown the frame taps
     the point it read off it, and no locate is paid for."""
     cfg.llm.vision_in_decider = True
@@ -469,7 +468,7 @@ def test_a_seeing_deciders_named_point_is_kept(cfg, mem):
                            action="tap_at", x=0.5, y=0.2,
                            text="the record button")
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
     assert llm.locates == 0
@@ -480,7 +479,7 @@ def test_a_seeing_deciders_named_point_is_kept(cfg, mem):
 # input_text aimed at a container: the vision locate finds the field
 # ---------------------------------------------------------------------------
 
-def test_input_text_aimed_at_a_scroller_is_grounded_by_the_locate(cfg, mem):
+def test_input_text_aimed_at_a_scroller_is_grounded_by_the_locate(cfg):
     """A composer the model aims at through the message-list scroller must not
     be typed into via the scroller's centre: nothing there takes focus, the
     keys go nowhere, and the tree keeps rendering the field's old text. The
@@ -505,7 +504,7 @@ def test_input_text_aimed_at_a_scroller_is_grounded_by_the_locate(cfg, mem):
                            reasoning="type into it", action="input_text",
                            target={"index": scroller.index}, text="hello there")
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
     assert llm.locates == 1 and llm.locates_seen == ["the text input field"]
@@ -517,7 +516,7 @@ def test_input_text_aimed_at_a_scroller_is_grounded_by_the_locate(cfg, mem):
     assert any(a.startswith("input_text('hello there'") for a in dev.actions)
 
 
-def test_an_input_text_container_locate_miss_is_never_tapped(cfg, mem):
+def test_an_input_text_container_locate_miss_is_never_tapped(cfg):
     """A locate that cannot find the field is a failed step, never a tap at
     the container's centre -- that tap would focus nothing and type into the
     void."""
@@ -537,7 +536,7 @@ def test_an_input_text_container_locate_miss_is_never_tapped(cfg, mem):
                            reasoning="type into it", action="input_text",
                            target={"index": scroller.index}, text="hello")
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"
     assert llm.locates == 1
@@ -546,7 +545,7 @@ def test_an_input_text_container_locate_miss_is_never_tapped(cfg, mem):
     assert "could not locate" in (state.last_failure or "")
 
 
-def test_an_input_text_that_changes_nothing_is_a_failed_step(cfg, mem):
+def test_an_input_text_that_changes_nothing_is_a_failed_step(cfg):
     """Failed focus, caught after the fact: the tap that was meant to focus
     the field hit nothing editable, the keys went nowhere, and the dump is
     byte-identical. It used to grade a success -- the field's stale text was
@@ -567,7 +566,7 @@ def test_an_input_text_that_changes_nothing_is_a_failed_step(cfg, mem):
                            action="input_text", target={"index": send.index},
                            text="on my way")
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "success"   # the run goes on to decide what comes next
     assert llm.locates == 0
@@ -580,25 +579,25 @@ def test_an_input_text_that_changes_nothing_is_a_failed_step(cfg, mem):
 # Completion
 # ---------------------------------------------------------------------------
 
-def test_a_programmatic_assertion_ends_the_run_with_no_judge(cfg, mem):
+def test_a_programmatic_assertion_ends_the_run_with_no_judge(cfg):
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    outcome, state = Agent(dev, mem, llm, cfg,
+    outcome, state = Agent(dev, llm, cfg,
                            oracle=Oracle(text="Forget network")).run(GOAL)
     assert outcome == "success"
     assert llm.judges == 0
 
 
-def test_shell_assertion(cfg, mem):
+def test_shell_assertion(cfg):
     dev = fake.FakeDevice(cfg)
     dev.shell_replies["settings get global wifi_on"] = "1"
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     oracle = Oracle(shell="settings get global wifi_on", equals="1")
-    outcome, _ = Agent(dev, mem, llm, cfg, oracle=oracle).run(GOAL)
+    outcome, _ = Agent(dev, llm, cfg, oracle=oracle).run(GOAL)
     assert outcome == "success"
 
 
-def test_premature_done_is_rejected_by_the_judge(cfg, mem):
+def test_premature_done_is_rejected_by_the_judge(cfg):
     """Claiming success too early is a documented failure of every mobile agent."""
     dev = fake.FakeDevice(cfg)
 
@@ -617,13 +616,13 @@ def test_premature_done_is_rejected_by_the_judge(cfg, mem):
                            action="done", text="done for real")
 
     llm = fake.FakeLLM(dev, policy, judge_result=False)
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
     assert llm.judges >= 1
     assert outcome in ("failed", "success")
     assert any("rejected" in line for line in state.history)
 
 
-def test_assertion_overrules_a_premature_done(cfg, mem):
+def test_assertion_overrules_a_premature_done(cfg):
     dev = fake.FakeDevice(cfg)
 
     def policy(screen, llm):
@@ -641,7 +640,7 @@ def test_assertion_overrules_a_premature_done(cfg, mem):
                            key="back")
 
     llm = fake.FakeLLM(dev, policy)
-    outcome, state = Agent(dev, mem, llm, cfg,
+    outcome, state = Agent(dev, llm, cfg,
                            oracle=Oracle(text="Forget network")).run(GOAL)
     assert outcome == "success"
     assert dev.state == "wifi"
@@ -652,7 +651,7 @@ def test_assertion_overrules_a_premature_done(cfg, mem):
 # Guards
 # ---------------------------------------------------------------------------
 
-def test_credential_screen_hands_over_and_learns_nothing(cfg, mem):
+def test_credential_screen_hands_over_and_learns_nothing(cfg):
     dev = fake.FakeDevice(cfg)
     dev.app["home"] = fake.FakeScreen(xml=X.dump(
         X.N("android.widget.FrameLayout", (0, 0, X.W, X.H), rid="content", children=[
@@ -663,20 +662,20 @@ def test_credential_screen_hands_over_and_learns_nothing(cfg, mem):
     dev._xml = lambda: dev.app[dev.state].xml  # type: ignore[assignment]
 
     llm = fake.FakeLLM(dev, fake.tap_label("Sign in"))
-    outcome, state = Agent(dev, mem, llm, cfg).run("log in")
+    outcome, state = Agent(dev, llm, cfg).run("log in")
     assert outcome == "needs_user"
     assert llm.calls == 0, "the model must never even see a credential screen"
 
 
-def test_irreversible_action_is_refused_when_unattended(cfg, mem):
+def test_irreversible_action_is_refused_when_unattended(cfg):
     dev = fake.FakeDevice(cfg, start="wifi")
     llm = fake.FakeLLM(dev, fake.tap_label("Forget network"))
-    outcome, state = Agent(dev, mem, llm, cfg).run("forget this network")
+    outcome, state = Agent(dev, llm, cfg).run("forget this network")
     assert "Forget network" not in "".join(dev.actions)
     assert any("refused" in line for line in state.history)
 
 
-def test_interstitial_is_dismissed_without_an_llm_call(cfg, mem):
+def test_interstitial_is_dismissed_without_an_llm_call(cfg):
     dev = fake.FakeDevice(cfg)
     dev.app["home"] = fake.FakeScreen(
         xml=X.settings_screen(extra_roots=[
@@ -691,12 +690,12 @@ def test_interstitial_is_dismissed_without_an_llm_call(cfg, mem):
     dev._xml = lambda: dev.app[dev.state].xml  # type: ignore[assignment]
 
     llm = fake.FakeLLM(dev, fake.tap_label("Wi-Fi"))
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
     # The dismiss happened before any model call.
     assert dev.taps, "the nag should have been tapped"
 
 
-def test_loop_breaker_stops_a_stuck_agent(cfg, mem):
+def test_loop_breaker_stops_a_stuck_agent(cfg):
     """A model that keeps choosing a dud action must not burn the whole budget."""
     dev = fake.FakeDevice(cfg)
     cfg.run.max_steps = 12
@@ -707,14 +706,14 @@ def test_loop_breaker_stops_a_stuck_agent(cfg, mem):
                            action="tap", target={"index": el.index})
 
     llm = fake.FakeLLM(dev, useless)
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
     assert outcome == "failed"
     assert state.step <= cfg.run.max_steps
     # The dud action was banned rather than retried forever.
     assert any(state.loops.bans_for(k) for k in state.loops.banned)
 
 
-def test_step_budget_is_enforced(cfg, mem):
+def test_step_budget_is_enforced(cfg):
     dev = fake.FakeDevice(cfg)
     cfg.run.max_steps = 3
     cfg.run.max_consecutive_failures = 99
@@ -724,16 +723,16 @@ def test_step_budget_is_enforced(cfg, mem):
                            direction="down")
 
     llm = fake.FakeLLM(dev, wander)
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
     assert outcome == "failed" and state.step == 3
 
 
-def test_dry_run_touches_nothing(cfg, mem):
+def test_dry_run_touches_nothing(cfg):
     cfg.run.dry_run = True
     cfg.run.max_steps = 3
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.tap_label("Wi-Fi"))
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
     assert dev.taps == []
     assert dev.state == "home"
 
@@ -746,7 +745,7 @@ def test_dry_run_touches_nothing(cfg, mem):
 # A reply the schema will not take is a failed step, not a dead run
 # ---------------------------------------------------------------------------
 
-def test_an_unreadable_reply_costs_a_step_and_the_run_carries_on(cfg, mem):
+def test_an_unreadable_reply_costs_a_step_and_the_run_carries_on(cfg):
     """It used to end the run from `Agent.run`'s handler.
 
     On 2026-09-01 that discarded seventeen good steps of runs/e59baa3570d2 --
@@ -767,7 +766,7 @@ def test_an_unreadable_reply_costs_a_step_and_the_run_carries_on(cfg, mem):
                            "tap requires a target")
         return reach(screen, llm)
 
-    outcome, state, _ = run(dev, mem, cfg, policy)
+    outcome, state, _ = run(dev, cfg, policy)
 
     assert outcome == "success"
     assert dev.state == "wifi"
@@ -775,7 +774,7 @@ def test_an_unreadable_reply_costs_a_step_and_the_run_carries_on(cfg, mem):
     assert state.step > 1
 
 
-def test_a_model_that_never_answers_valid_json_still_ends_the_run(cfg, mem):
+def test_a_model_that_never_answers_valid_json_still_ends_the_run(cfg):
     """Carrying on must not mean carrying on forever: the same strike count as
     any other persistent failure, with the history intact."""
     from adbagent.llm import LLMError
@@ -785,13 +784,13 @@ def test_a_model_that_never_answers_valid_json_still_ends_the_run(cfg, mem):
     def policy(screen, llm):
         raise LLMError("model never produced a valid AgentAction")
 
-    outcome, state, llm = run(dev, mem, cfg, policy)
+    outcome, state, llm = run(dev, cfg, policy)
 
     assert outcome == "failed"
     assert llm.calls == cfg.run.max_consecutive_failures
 
 
-def test_running_out_of_budget_still_aborts_immediately(cfg, mem):
+def test_running_out_of_budget_still_aborts_immediately(cfg):
     """The one LLM failure with nothing to retry with."""
     from adbagent.llm import BudgetExceeded
 
@@ -800,7 +799,7 @@ def test_running_out_of_budget_still_aborts_immediately(cfg, mem):
     def policy(screen, llm):
         raise BudgetExceeded("spent $20.01, budget is $20.00")
 
-    outcome, _state, llm = run(dev, mem, cfg, policy)
+    outcome, _state, llm = run(dev, cfg, policy)
 
     assert outcome == "aborted"
     assert llm.calls == 1
@@ -917,10 +916,10 @@ def test_never_screenshot_wins(cfg):
 # Artifacts
 # ---------------------------------------------------------------------------
 
-def test_run_writes_artifacts(cfg, mem, tmp_path):
+def test_run_writes_artifacts(cfg, tmp_path):
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
     events = (tmp_path / "runs" / state.run_id / "events.jsonl")
     assert events.exists()
     lines = [l for l in events.read_text().splitlines() if l.strip()]
@@ -928,12 +927,12 @@ def test_run_writes_artifacts(cfg, mem, tmp_path):
     assert {"run_start", "decide", "verify", "run_end"} <= kinds
 
 
-def test_run_mirrors_the_llm_stream(cfg, mem, tmp_path):
+def test_run_mirrors_the_llm_stream(cfg, tmp_path):
     # The web UI tails stream.jsonl to show the model thinking live. A fake
     # LLM never chunks, but the loop's own llm_start/llm_end still land there.
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
     stream = tmp_path / "runs" / state.run_id / "stream.jsonl"
     assert stream.exists()
     records = [json.loads(l) for l in stream.read_text().splitlines() if l.strip()]
@@ -1038,14 +1037,14 @@ def _stream_records(tmp_path, run_id, kind, purpose):
             if r["kind"] == kind and r.get("purpose") == purpose]
 
 
-def test_the_decider_keeps_the_frame_when_it_is_the_one_looking(cfg, mem, tmp_path):
+def test_the_decider_keeps_the_frame_when_it_is_the_one_looking(cfg, tmp_path):
     """`vision_in_decider` sends the image to the deciding model itself, so that
     is the call the kept frame belongs to and the UI hangs it off."""
     cfg.run.always_screenshot = True
     cfg.llm.vision_in_decider = True
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     kept = sorted(p.name for p in (tmp_path / "runs" / state.run_id).glob("*.jpg"))
     assert kept and all("_decide_" in name for name in kept)
@@ -1053,13 +1052,13 @@ def test_the_decider_keeps_the_frame_when_it_is_the_one_looking(cfg, mem, tmp_pa
     assert starts and all(r["shot"] in kept for r in starts)
 
 
-def test_a_blind_decider_is_given_no_frame_of_its_own(cfg, mem, tmp_path):
+def test_a_blind_decider_is_given_no_frame_of_its_own(cfg, tmp_path):
     """Without it the decider reads prose, and the vision pass is the call that
     was shown the screenshot -- so the decide panel must not claim one."""
     cfg.run.always_screenshot = True          # vision_in_decider stays off
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert not list((tmp_path / "runs" / state.run_id).glob("*_decide_*.jpg"))
     starts = _stream_records(tmp_path, state.run_id, "llm_start", "decide")
@@ -1097,7 +1096,7 @@ def test_the_plan_accumulates_instead_of_being_overwritten():
     assert state.plan.outstanding() == ["find the contact", "send the message"]
 
 
-def test_list_apps_in_agent_loop(cfg, mem):
+def test_list_apps_in_agent_loop(cfg):
     dev = fake.FakeDevice(cfg)
     step_count = {"n": 0}
 
@@ -1113,13 +1112,13 @@ def test_list_apps_in_agent_loop(cfg, mem):
                            action="done", text="opened whatsapp")
 
     llm = fake.FakeLLM(dev, policy)
-    outcome, state = Agent(dev, mem, llm, cfg).run("open whatsapp")
+    outcome, state = Agent(dev, llm, cfg).run("open whatsapp")
     assert outcome == "success"
     assert "list_apps('whatsapp')" in dev.actions
     assert "open_app(com.whatsapp)" in dev.actions
 
 
-def test_scroll_swipe_no_change_does_not_ban_action(cfg, mem):
+def test_scroll_swipe_no_change_does_not_ban_action(cfg):
     """When a scroll or swipe action encounters no_change, it must not be added to the ban list."""
     dev = fake.FakeDevice(cfg)
     step_count = {"n": 0}
@@ -1133,13 +1132,13 @@ def test_scroll_swipe_no_change_does_not_ban_action(cfg, mem):
                            action="done", text="finished")
 
     llm = fake.FakeLLM(dev, policy)
-    outcome, state = Agent(dev, mem, llm, cfg).run("scroll feed")
+    outcome, state = Agent(dev, llm, cfg).run("scroll feed")
     assert outcome == "success"
     # Even if scroll down was graded no_change, scroll/down must not be in banned
     assert "scroll/down" not in state.loops.bans_for(dev.observe().skeleton_id)
 
 
-def test_a_scroll_that_revealed_nothing_is_refused_the_second_time(cfg, mem):
+def test_a_scroll_that_revealed_nothing_is_refused_the_second_time(cfg):
     """The stop is enforced in code, not left as advice the model can ignore.
 
     The first scroll down grades no_change on the unchanged screen. When the
@@ -1159,14 +1158,14 @@ def test_a_scroll_that_revealed_nothing_is_refused_the_second_time(cfg, mem):
                            action="done", text="finished")
 
     llm = fake.FakeLLM(dev, policy)
-    outcome, state = Agent(dev, mem, llm, cfg).run("scroll the feed")
+    outcome, state = Agent(dev, llm, cfg).run("scroll the feed")
     assert outcome == "success"
     # The device saw exactly one scroll; the second was refused in code.
     assert dev.actions.count("scroll(down)") == 1
     assert "refused" in state.last_failure
 
 
-def test_a_dead_scroll_rearms_after_the_screen_changes(cfg, mem):
+def test_a_dead_scroll_rearms_after_the_screen_changes(cfg):
     """The refusal is keyed on the exact frame, not the screen's shape.
 
     A feed that loads more content is the same skeleton with a different
@@ -1195,7 +1194,7 @@ def test_a_dead_scroll_rearms_after_the_screen_changes(cfg, mem):
                            action="done", text="finished")
 
     llm = fake.FakeLLM(dev, policy)
-    outcome, state = Agent(dev, mem, llm, cfg).run("scroll the feed")
+    outcome, state = Agent(dev, llm, cfg).run("scroll the feed")
     assert outcome == "success"
     # Both post-change scrolls reached the device: step 2's was refused, but
     # the toggle changed the frame, so step 4's ran and was graded on its own
@@ -1209,7 +1208,7 @@ def test_a_dead_scroll_rearms_after_the_screen_changes(cfg, mem):
 # Screenshots are captured once per screen
 # ---------------------------------------------------------------------------
 
-def test_a_screen_is_photographed_once_however_many_times_it_is_needed(cfg, mem):
+def test_a_screen_is_photographed_once_however_many_times_it_is_needed(cfg):
     """Verification's screenshot IS the next turn's screenshot.
 
     `observe(settle=True)` has already waited for the tree to stop moving, and
@@ -1232,18 +1231,18 @@ def test_a_screen_is_photographed_once_however_many_times_it_is_needed(cfg, mem)
                            action="done", text="done")
 
     llm = fake.FakeLLM(dev, policy)
-    outcome, state = Agent(dev, mem, llm, cfg).run("scroll the feed")
+    outcome, state = Agent(dev, llm, cfg).run("scroll the feed")
     assert outcome == "success"
     # Step 1 decides (1) and verifies (2). Step 2 reuses the verify screenshot,
     # and so does the completion judge. Four captures would mean the fix regressed.
     assert dev.screenshots == 2
 
 
-def test_the_screenshot_the_model_saw_is_the_one_the_dhash_came_from(cfg, mem):
+def test_the_screenshot_the_model_saw_is_the_one_the_dhash_came_from(cfg):
     from adbagent.agent import Agent as _Agent
 
     dev = fake.FakeDevice(cfg)
-    agent = _Agent(dev, mem, None, cfg)
+    agent = _Agent(dev, None, cfg)
     screen = dev.observe()
     first = agent._ensure_screenshot(screen)
     assert dev.screenshots == 1
@@ -1261,11 +1260,11 @@ def _events(tmp_path, run_id):
             if line.strip()]
 
 
-def test_every_decision_records_what_it_cost(cfg, mem, tmp_path):
+def test_every_decision_records_what_it_cost(cfg, tmp_path):
     """Latency work needs per-step tokens in the artifact, not just a total."""
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
     assert decides
@@ -1277,13 +1276,13 @@ def test_every_decision_records_what_it_cost(cfg, mem, tmp_path):
         assert "wall_s" in event
 
 
-def test_a_vision_turn_is_attributed_both_of_its_calls(cfg, mem, tmp_path):
+def test_a_vision_turn_is_attributed_both_of_its_calls(cfg, tmp_path):
     """A screenshot turn is an image analysis *then* a decision. Charging the
     step for only the last one is how a 2-call turn reads as a 1-call turn."""
     cfg.run.always_screenshot = True
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
     assert decides[0]["llm"]["n_calls"] == 2
@@ -1294,7 +1293,7 @@ def test_a_vision_turn_is_attributed_both_of_its_calls(cfg, mem, tmp_path):
     assert decides[0]["llm"]["completion_tokens"] == 150
 
 
-def test_a_decision_records_the_element_its_ordinal_resolved_to(cfg, mem, tmp_path):
+def test_a_decision_records_the_element_its_ordinal_resolved_to(cfg, tmp_path):
     """`tap #3` names a position in a list that is not in the artifact.
 
     So the trace -- and the live feed the web UI builds off it -- could say what
@@ -1303,7 +1302,7 @@ def test_a_decision_records_the_element_its_ordinal_resolved_to(cfg, mem, tmp_pa
     """
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     taps = [e for e in _events(tmp_path, state.run_id)
             if e["kind"] == "decide" and e["action"]["action"] == "tap"]
@@ -1321,7 +1320,7 @@ def _screens(tmp_path, run_id):
             if line.strip()]
 
 
-def test_each_step_records_where_its_elements_were(cfg, mem, tmp_path):
+def test_each_step_records_where_its_elements_were(cfg, tmp_path):
     """The list `#N` is a position in, so a reader can draw it.
 
     Its own file, not `events.jsonl`: that one is parsed in full by the history,
@@ -1330,7 +1329,7 @@ def test_each_step_records_where_its_elements_were(cfg, mem, tmp_path):
     """
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     screens = _screens(tmp_path, state.run_id)
     decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
@@ -1355,7 +1354,7 @@ def test_each_step_records_where_its_elements_were(cfg, mem, tmp_path):
     assert match[0]["b"] == tap["target_element"]["bounds"]
 
 
-def test_the_geometry_stops_where_the_rendered_screen_does(cfg, mem, tmp_path):
+def test_the_geometry_stops_where_the_rendered_screen_does(cfg, tmp_path):
     """`render` shows the model the first `RENDER_LIMIT` elements and says how
     many it left out. Recording past that point would number a longer list than
     the one the model picked out of."""
@@ -1363,13 +1362,13 @@ def test_the_geometry_stops_where_the_rendered_screen_does(cfg, mem, tmp_path):
 
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     for line in _screens(tmp_path, state.run_id):
         assert len(line["els"]) <= RENDER_LIMIT
 
 
-def test_a_screens_file_that_cannot_be_written_does_not_end_the_run(cfg, mem,
+def test_a_screens_file_that_cannot_be_written_does_not_end_the_run(cfg,
                                                                     tmp_path):
     """A side channel, like the LLM stream: the run is the events file, and a
     disk that will not take the drawing aid is not a reason to stop driving."""
@@ -1384,14 +1383,14 @@ def test_a_screens_file_that_cannot_be_written_does_not_end_the_run(cfg, mem,
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(Recorder, "__init__", break_screens)
-        outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+        outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert outcome == "success"
     # And the run's own record is untouched by the channel that failed.
     assert [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
 
 
-def test_a_decision_records_the_geometry_needed_to_draw_it(cfg, mem, tmp_path):
+def test_a_decision_records_the_geometry_needed_to_draw_it(cfg, tmp_path):
     """The rectangle, and the screen it was measured against.
 
     `center` is the point the tap lands on and is all the run needs; a reader
@@ -1401,7 +1400,7 @@ def test_a_decision_records_the_geometry_needed_to_draw_it(cfg, mem, tmp_path):
     """
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
     assert decides
@@ -1420,13 +1419,13 @@ def test_a_decision_records_the_geometry_needed_to_draw_it(cfg, mem, tmp_path):
     assert left <= cx <= right and top <= cy <= bottom
 
 
-def test_an_action_without_a_target_records_no_element(cfg, mem, tmp_path):
+def test_an_action_without_a_target_records_no_element(cfg, tmp_path):
     """The field is absent rather than null, so a reader can tell "nothing to
     resolve" from "resolved to nothing" -- which for a tap is the reason the
     step is about to fail."""
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     untargeted = [e for e in _events(tmp_path, state.run_id)
                   if e["kind"] == "decide" and not e["action"].get("target")]
@@ -1434,7 +1433,7 @@ def test_an_action_without_a_target_records_no_element(cfg, mem, tmp_path):
     assert all("target_element" not in e for e in untargeted)
 
 
-def test_a_target_that_matches_nothing_is_recorded_as_such(cfg, mem, tmp_path):
+def test_a_target_that_matches_nothing_is_recorded_as_such(cfg, tmp_path):
     dev = fake.FakeDevice(cfg)
 
     def policy(screen, llm):
@@ -1444,17 +1443,17 @@ def test_a_target_that_matches_nothing_is_recorded_as_such(cfg, mem, tmp_path):
         return AgentAction(observation="settings", reasoning="give up",
                            action="fail", text="no such element")
 
-    _, state = Agent(dev, mem, fake.FakeLLM(dev, policy), cfg).run(GOAL)
+    _, state = Agent(dev, fake.FakeLLM(dev, policy), cfg).run(GOAL)
 
     first = next(e for e in _events(tmp_path, state.run_id)
                  if e["kind"] == "decide")
     assert first["target_element"] is None
 
 
-def test_the_judge_is_costed_separately_from_the_step_that_proposed_done(cfg, mem, tmp_path):
+def test_the_judge_is_costed_separately_from_the_step_that_proposed_done(cfg, tmp_path):
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     judges = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "judge"]
     assert len(judges) == 1
@@ -1462,12 +1461,12 @@ def test_the_judge_is_costed_separately_from_the_step_that_proposed_done(cfg, me
     assert "llm" in judges[0] and "wall_s" in judges[0]
 
 
-def test_the_run_total_omits_the_per_call_breakdown(cfg, mem, tmp_path):
+def test_the_run_total_omits_the_per_call_breakdown(cfg, tmp_path):
     """Each call already has its own event; repeating them all in `run_end`
     would double the size of the artifact for nothing."""
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     end = next(e for e in _events(tmp_path, state.run_id) if e["kind"] == "run_end")
     assert "calls" not in end["llm"]
@@ -1479,7 +1478,7 @@ def test_the_run_total_omits_the_per_call_breakdown(cfg, mem, tmp_path):
 # Repeated history, folded in the loop
 # ---------------------------------------------------------------------------
 
-def test_a_repeated_action_folds_in_the_history_the_loop_keeps(cfg, mem):
+def test_a_repeated_action_folds_in_the_history_the_loop_keeps(cfg):
     """`prompts.history_only_block` renders whatever the loop appended, so the
     fold has to happen on the way in -- see `actions.append_history`."""
     cfg.run.max_steps = 8
@@ -1492,7 +1491,7 @@ def test_a_repeated_action_folds_in_the_history_the_loop_keeps(cfg, mem):
                            reasoning="let the screen settle",
                            action="wait", duration=0.05)
 
-    _, state, _ = run(fake.FakeDevice(cfg), mem, cfg, policy)
+    _, state, _ = run(fake.FakeDevice(cfg), cfg, policy)
 
     waits = [line for line in state.history if "wait" in line]
     assert len(waits) == 1, f"identical waits were not folded: {waits}"
@@ -1501,23 +1500,23 @@ def test_a_repeated_action_folds_in_the_history_the_loop_keeps(cfg, mem):
     assert "waiting, turn 1" in waits[0] and "waiting, turn 5" in waits[0]
 
 
-def test_the_situational_advice_only_shows_up_when_it_applies(cfg, mem):
+def test_the_situational_advice_only_shows_up_when_it_applies(cfg):
     """The scrolling and app-switching blocks are a big chunk of what the system
     prompt used to be, and irrelevant on a turn like this one."""
     dev = fake.FakeDevice(cfg)
-    _, _, llm = run(dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, _, llm = run(dev, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
 
     assert llm.notes, "no NOTE block was built at all"
     assert not any("SWITCHING APPS" in note for note in llm.notes)
 
 
-def test_a_screenshot_turn_is_timed_for_both_of_its_calls(cfg, mem, tmp_path):
+def test_a_screenshot_turn_is_timed_for_both_of_its_calls(cfg, tmp_path):
     """`report`'s latency/step reads `wall_s`, so a step whose cost covers two
     calls must have a clock that covers them too."""
     cfg.run.always_screenshot = True
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
     assert decides[0]["llm"]["n_calls"] == 2
@@ -1525,48 +1524,19 @@ def test_a_screenshot_turn_is_timed_for_both_of_its_calls(cfg, mem, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Dead ends survive the run that found them
+# Dead ends last as long as the run that found them
 # ---------------------------------------------------------------------------
+#
+# They used to outlive it: `memory.db`'s `dead_end` table was the only knowledge
+# in this system that survived the process, read back for 24 hours as "do not
+# repeat these" against the same screen and goal. Two tests here covered it --
+# that a dud found in one run reached the next run's prompt, and that a dud
+# recorded against a different goal did not. Both are gone with the table.
+#
+# What is left is the live ban list, which is per screen and per run.
 
-def test_a_dud_control_found_in_one_run_is_not_retried_in_the_next(cfg, mem):
-    """The only knowledge in this system that outlives the process.
-
-    Failures were being written to SQLite on every step and read back by nothing,
-    so every run rediscovered the same dud control on the same screen.
-    """
-    from adbagent.memory import intent_key
-
-    dev = fake.FakeDevice(cfg)
-    screen = dev.observe()
-    dud = AgentAction(observation="settings", reasoning="try it",
-                      action="tap", target={"index": 4})
-    mem.record_dead_end(screen, intent_key(GOAL), dud.signature(),
-                        "nothing changed")
-
-    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    Agent(dev, mem, llm, cfg).run(GOAL)
-
-    note = "\n".join(llm.notes)
-    assert "KNOWN DEAD ENDS here from earlier runs" in note
-    assert dud.signature() in note
-    assert "nothing changed" in note
-
-
-def test_a_dead_end_from_a_different_goal_is_not_mentioned(cfg, mem):
-    dev = fake.FakeDevice(cfg)
-    screen = dev.observe()
-    dud = AgentAction(observation="settings", reasoning="try it",
-                      action="tap", target={"index": 4})
-    mem.record_dead_end(screen, "some-other-intent", dud.signature(), "no change")
-
-    llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    Agent(dev, mem, llm, cfg).run(GOAL)
-    assert "KNOWN DEAD ENDS" not in "\n".join(llm.notes)
-
-
-def test_this_runs_bans_are_not_repeated_as_remembered_ones(cfg, mem):
-    """Both lists come from the same failure once it has been recorded, and
-    saying it twice in one prompt reads as two separate findings."""
+def test_a_dud_control_is_not_retried_inside_the_run_that_found_it(cfg):
+    """The ban list is what stops a run re-tapping a control that did nothing."""
     dev = fake.FakeDevice(cfg)
     calls = {"n": 0}
 
@@ -1580,7 +1550,32 @@ def test_this_runs_bans_are_not_repeated_as_remembered_ones(cfg, mem):
                            action="done", text="finished")
 
     llm = fake.FakeLLM(dev, policy)
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
+
+    note = "\n".join(llm.notes)
+    assert "BANNED ACTIONS on this screen" in note
+    assert "tap/#7" in note
+    # And nothing claims to know it from an earlier run any more.
+    assert "KNOWN DEAD ENDS" not in note
+
+
+def test_this_runs_bans_are_listed_once(cfg):
+    """One failure, one line. It used to be able to appear twice -- once as a
+    live ban and once as a remembered dead end -- which read as two findings."""
+    dev = fake.FakeDevice(cfg)
+    calls = {"n": 0}
+
+    def policy(screen, llm):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            # #7 is "VPN", a row the fake never navigates from: no change.
+            return AgentAction(observation="settings", reasoning="try VPN",
+                               action="tap", target={"index": 7})
+        return AgentAction(observation="settings", reasoning="done",
+                           action="done", text="finished")
+
+    llm = fake.FakeLLM(dev, policy)
+    Agent(dev, llm, cfg).run(GOAL)
     for note in llm.notes:
         signature = "tap/#7"
         if "BANNED ACTIONS" in note and signature in note:
@@ -1633,37 +1628,33 @@ def test_a_failure_buys_deeper_thinking(cfg):
     assert "did not work" in why
 
 
-def test_one_remembered_dead_end_is_not_a_maze(cfg):
-    """A note about one control must not make every visit to a screen hard.
+def test_nothing_is_blocked_without_a_live_ban(cfg):
+    """`blocked_here` used to take a second argument: the count of remembered
+    `memory.db` rows for this screen and goal, which needed two before it
+    counted. One was not evidence that a screen is a maze --
+    ``runs/e8d6aa742852`` carried a single row against the WhatsApp chat
+    skeleton (`input_text/k=f4c3`, "the field never took focus") recorded an
+    hour before the run, and both chats it opened escalated to `high` on it;
+    steps 3 and 5 then spent 193 seconds and 35,924 characters of thinking, and
+    57,470 characters without finishing at all.
 
-    ``runs/e8d6aa742852`` carried a single remembered row against the WhatsApp chat
-    skeleton -- `input_text/k=f4c3`, "the field never took focus" -- recorded an
-    hour before the run. Both chats it opened escalated to `high` on it. Steps 3
-    and 5 then spent 193 seconds and 35,924 characters of thinking, and 57,470
-    characters without finishing at all.
+    That input is gone with the database, and so is the threshold it needed.
     """
     from adbagent.agent import blocked_here
 
-    assert not blocked_here(set(), {"input_text/k=f4c3": "never took focus"})
+    assert not blocked_here(set())
     assert effort(deep(cfg), blocked=False) == ("none", "")
 
 
-def test_a_live_ban_still_buys_deeper_thinking(cfg):
-    """A ban is this run, this screen, just now: the way forward *is* unclear."""
+def test_a_live_ban_buys_deeper_thinking(cfg):
+    """A ban is this run, this screen, just now: the way forward *is* unclear,
+    and one has always been enough."""
     from adbagent.agent import blocked_here
 
-    assert blocked_here({"tap/k=1234"}, {})
+    assert blocked_here({"tap/k=1234"})
     chosen, why = effort(deep(cfg), blocked=True)
     assert chosen == "high"
     assert "lead nowhere" in why
-
-
-def test_several_remembered_dead_ends_still_count(cfg):
-    """The clause keeps the case it was written for: a screen that is a maze."""
-    from adbagent.agent import blocked_here
-
-    assert blocked_here(set(), {"tap/k=1": "nothing changed",
-                                "swipe/k=2/up": "revealed nothing"})
 
 
 def test_a_new_screen_does_not_buy_deeper_thinking(cfg):
@@ -1715,20 +1706,20 @@ def test_a_rejected_action_buys_deeper_thinking(cfg):
     assert "rejected" in why
 
 
-def test_the_first_step_of_a_run_is_always_a_hard_one(cfg, mem, tmp_path):
+def test_the_first_step_of_a_run_is_always_a_hard_one(cfg, tmp_path):
     """visit == 0 on the opening screen, which is the turn that picks the whole
     approach -- exactly the wrong one to skimp on."""
     deep(cfg)
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     first = next(e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide")
     assert first["effort"] == "high"
     assert first["hard_because"]
 
 
-def test_a_settled_walk_runs_shallow(cfg, mem, tmp_path):
+def test_a_settled_walk_runs_shallow(cfg, tmp_path):
     """Revisiting a screen that has caused no trouble costs the floor.
 
     Every step here succeeds, so the only escalation is the opening turn -- the
@@ -1753,7 +1744,7 @@ def test_a_settled_walk_runs_shallow(cfg, mem, tmp_path):
                            action="done", text="done")
 
     llm = fake.FakeLLM(dev, policy)
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     decides = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "decide"]
     shown = [(e["step"], e["effort"], e["hard_because"]) for e in decides]
@@ -1765,13 +1756,13 @@ def test_a_settled_walk_runs_shallow(cfg, mem, tmp_path):
     assert decides[2]["hard_because"] == "", shown
 
 
-def test_the_chosen_depth_is_recorded_for_every_decision(cfg, mem, tmp_path):
+def test_the_chosen_depth_is_recorded_for_every_decision(cfg, tmp_path):
     """Without this in the artifact there is no way to tell whether a run that
     got slower got deeper, or a run that got cheaper got shallower."""
     deep(cfg)
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     for event in _events(tmp_path, state.run_id):
         if event["kind"] == "decide":
@@ -1803,7 +1794,7 @@ class _FlakyDevice(fake.FakeDevice):
         return super().observe(settle=settle)
 
 
-def _rendered_per_turn(dev, mem, cfg, policy):
+def _rendered_per_turn(dev, cfg, policy):
     """(device state, rendered activity) for every decide call of a run."""
     seen = []
 
@@ -1813,14 +1804,14 @@ def _rendered_per_turn(dev, mem, cfg, policy):
             return super().decide(rendered=rendered, **kw)
 
     llm = _Spy(dev, policy)
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
     return outcome, seen
 
 
-def test_a_recovered_device_is_re_observed_before_the_next_decision(cfg, mem):
+def test_a_recovered_device_is_re_observed_before_the_next_decision(cfg):
     dev = _FlakyDevice(cfg)          # the post-action settle blows up
     outcome, seen = _rendered_per_turn(
-        dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+        dev, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
 
     assert dev.blew_up               # the recovery path really was taken
     assert outcome == "success"
@@ -1829,7 +1820,7 @@ def test_a_recovered_device_is_re_observed_before_the_next_decision(cfg, mem):
         assert f".{state_name.title()}Activity" in header, seen
 
 
-def test_recovery_during_the_act_call_also_re_observes(cfg, mem):
+def test_recovery_during_the_act_call_also_re_observes(cfg):
     """`execute` can raise after the gesture reached the phone."""
     dev = fake.FakeDevice(cfg)
     real_tap = dev.tap
@@ -1843,7 +1834,7 @@ def test_recovery_during_the_act_call_also_re_observes(cfg, mem):
 
     dev.tap = tap
     outcome, seen = _rendered_per_turn(
-        dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+        dev, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
 
     assert fired["n"] >= 1
     for state_name, header in seen:
@@ -1854,7 +1845,7 @@ def test_recovery_during_the_act_call_also_re_observes(cfg, mem):
 # Rejected completions
 # ---------------------------------------------------------------------------
 
-def test_repeated_rejected_dones_give_up_instead_of_burning_the_budget(cfg, mem):
+def test_repeated_rejected_dones_give_up_instead_of_burning_the_budget(cfg):
     """Each rejection costs a screenshot, a vision pass and a high-effort judge
     call. They were not counted as failures, so `max_consecutive_failures` never
     fired and the run went all the way to the step budget."""
@@ -1866,14 +1857,14 @@ def test_repeated_rejected_dones_give_up_instead_of_burning_the_budget(cfg, mem)
                            action="done", text="I think it's done")
 
     llm = fake.FakeLLM(dev, policy, judge_result=False)
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert outcome == "failed"
     assert state.step == cfg.run.max_consecutive_failures < cfg.run.max_steps
     assert llm.judges == cfg.run.max_consecutive_failures
 
 
-def test_progress_between_rejections_resets_the_give_up_counter(cfg, mem):
+def test_progress_between_rejections_resets_the_give_up_counter(cfg):
     """A run that keeps working after a premature `done` is not a stuck one."""
     cfg.run.max_consecutive_failures = 2
     dev = fake.FakeDevice(cfg)
@@ -1892,7 +1883,7 @@ def test_progress_between_rejections_resets_the_give_up_counter(cfg, mem):
                            action="press_key", key="back")
 
     llm = fake.FakeLLM(dev, policy, judge_result=False)
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert state.step > cfg.run.max_consecutive_failures
 
@@ -1910,7 +1901,7 @@ def _nag_screen(label: str, package: str = X.PKG) -> str:
                     package=package, text=label, rid="dismiss", clickable=True)])])
 
 
-def test_a_dismiss_that_never_works_hands_the_screen_to_the_model(cfg, mem):
+def test_a_dismiss_that_never_works_hands_the_screen_to_the_model(cfg):
     """A "Skip" that is disabled, or sits on a WebView where the tap lands
     nowhere, used to be pressed until the step budget ran out with the model
     never consulted once."""
@@ -1924,7 +1915,7 @@ def test_a_dismiss_that_never_works_hands_the_screen_to_the_model(cfg, mem):
                            text="fin")
 
     llm = fake.FakeLLM(dev, policy)
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     from adbagent.agent import MAX_DISMISS_TRIES
     assert len(dev.taps) == MAX_DISMISS_TRIES
@@ -1933,7 +1924,7 @@ def test_a_dismiss_that_never_works_hands_the_screen_to_the_model(cfg, mem):
     assert any("harness dismissed 'Skip'" in line for line in state.history)
 
 
-def test_a_dismissal_that_works_is_not_held_against_the_next_one(cfg, mem):
+def test_a_dismissal_that_works_is_not_held_against_the_next_one(cfg):
     """Two nags in a row are two dismissals, not one dismissal and a refusal.
 
     The memo is keyed on `exact_id` for this: `skeleton_id` is content-free, so
@@ -1955,7 +1946,7 @@ def test_a_dismissal_that_works_is_not_held_against_the_next_one(cfg, mem):
 
     llm = fake.FakeLLM(dev, lambda s, l: AgentAction(
         observation="clear", reasoning="done", action="done", text="fin"))
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     assert len(dev.taps) == 2, "both nags should have been dismissed"
 
@@ -1991,12 +1982,12 @@ def _two_cycle_policy(dev):
     return policy
 
 
-def test_a_two_cycle_where_every_step_succeeds_is_stopped(cfg, mem, tmp_path):
+def test_a_two_cycle_where_every_step_succeeds_is_stopped(cfg, tmp_path):
     """The regression test for `runs/2521862d7a23`."""
     cfg.run.max_steps = 60
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert outcome == "failed"
     # Well inside the budget: the old loop only stopped at `max_steps`.
@@ -2008,10 +1999,10 @@ def test_a_two_cycle_where_every_step_succeeds_is_stopped(cfg, mem, tmp_path):
     assert llm.replans == 1, "one stall episode should buy exactly one replan"
 
 
-def test_the_stall_is_put_to_the_model_before_anything_is_refused(cfg, mem):
+def test_the_stall_is_put_to_the_model_before_anything_is_refused(cfg):
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     nudges = [n for n in llm.notes if "NO PROGRESS FOR" in n]
     assert nudges, "the model was never told it had stopped getting anywhere"
@@ -2020,10 +2011,10 @@ def test_the_stall_is_put_to_the_model_before_anything_is_refused(cfg, mem):
     assert any("REFUSING" in n for n in nudges), "the refusal was never named"
 
 
-def test_the_replan_is_shown_what_has_been_tried(cfg, mem):
+def test_the_replan_is_shown_what_has_been_tried(cfg):
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     assert llm.replans_seen, "no replan ran"
     tried = dict(llm.replans_seen[0])
@@ -2031,20 +2022,20 @@ def test_the_replan_is_shown_what_has_been_tried(cfg, mem):
     assert max(tried.values()) >= 2, "it was not shown the repetition"
 
 
-def test_the_agreed_strategy_is_carried_into_later_turns(cfg, mem):
+def test_the_agreed_strategy_is_carried_into_later_turns(cfg):
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
     llm.replan_strategy = "open Bluetooth from the list instead"
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     assert any("open Bluetooth from the list instead" in n for n in llm.notes)
 
 
-def test_a_replan_that_abandons_ends_the_run_there(cfg, mem, tmp_path):
+def test_a_replan_that_abandons_ends_the_run_there(cfg, tmp_path):
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
     llm.replan_abandon = True
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert outcome == "failed"
     replans = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "replan"]
@@ -2053,7 +2044,7 @@ def test_a_replan_that_abandons_ends_the_run_there(cfg, mem, tmp_path):
     assert "stalled_out" not in [e["kind"] for e in _events(tmp_path, state.run_id)]
 
 
-def test_rewording_the_progress_note_does_not_buy_the_run_more_time(cfg, mem, tmp_path):
+def test_rewording_the_progress_note_does_not_buy_the_run_more_time(cfg, tmp_path):
     """The model must not hold the reset switch of the guard that bounds it.
 
     `_loop` used to call `note_progress` whenever `action.progress` differed from
@@ -2077,7 +2068,7 @@ def test_rewording_the_progress_note_does_not_buy_the_run_more_time(cfg, mem, tm
         return AgentAction.model_validate(
             {**action.model_dump(), "progress": next(reworded)})
 
-    outcome, state = Agent(dev, mem, llm := fake.FakeLLM(dev, policy), cfg).run(GOAL)
+    outcome, state = Agent(dev, llm := fake.FakeLLM(dev, policy), cfg).run(GOAL)
 
     assert outcome == "failed"
     kinds = [e["kind"] for e in _events(tmp_path, state.run_id)]
@@ -2091,7 +2082,7 @@ def test_rewording_the_progress_note_does_not_buy_the_run_more_time(cfg, mem, tm
     assert len(state.plan) == 0 and state.plan.credited == set()
 
 
-def test_finishing_a_plan_step_resets_the_stall_ladder(cfg, mem, tmp_path):
+def test_finishing_a_plan_step_resets_the_stall_ladder(cfg, tmp_path):
     """The other half of the change: a real milestone must count as progress.
 
     Every signal `note_progress` listens to is about the device -- a screen not
@@ -2121,7 +2112,7 @@ def test_finishing_a_plan_step_resets_the_stall_ladder(cfg, mem, tmp_path):
         return AgentAction.model_validate(
             {**action.model_dump(), "progress": progress})
 
-    outcome, state = Agent(dev, mem, llm := fake.FakeLLM(dev, policy), cfg).run(GOAL)
+    outcome, state = Agent(dev, llm := fake.FakeLLM(dev, policy), cfg).run(GOAL)
 
     kinds = [e["kind"] for e in _events(tmp_path, state.run_id)]
     assert "stalled_out" not in kinds, "a run finishing plan steps was stopped"
@@ -2138,7 +2129,7 @@ def test_finishing_a_plan_step_resets_the_stall_ladder(cfg, mem, tmp_path):
     assert sum(len(e["completed"]) for e in plans) == state.plan.done_count
 
 
-def test_one_stall_episode_can_buy_more_than_one_replan(cfg, mem, tmp_path):
+def test_one_stall_episode_can_buy_more_than_one_replan(cfg, tmp_path):
     """`replanned_at` counts steps, not stall depth.
 
     Holding the stall value meant that after a first fire at stalled=8 the next
@@ -2151,14 +2142,14 @@ def test_one_stall_episode_can_buy_more_than_one_replan(cfg, mem, tmp_path):
     cfg.run.stall_block_at = 0          # let the cycle run rather than refusing it
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     assert llm.replans >= 2, (
         f"a stall lasting {cfg.run.stall_give_up_at} steps bought only "
         f"{llm.replans} replan(s)")
 
 
-def test_the_agreed_strategy_survives_the_run_getting_somewhere(cfg, mem):
+def test_the_agreed_strategy_survives_the_run_getting_somewhere(cfg):
     """A plan outlives the turn that asked for it.
 
     `note_progress` used to clear `strategy`, and `strategy` reached the prompt
@@ -2178,7 +2169,7 @@ def test_the_agreed_strategy_survives_the_run_getting_somewhere(cfg, mem):
     assert state.strategy == "open Bluetooth from the list instead"
 
 
-def test_the_strategy_is_its_own_block_and_not_part_of_the_stall_note(cfg, mem):
+def test_the_strategy_is_its_own_block_and_not_part_of_the_stall_note(cfg):
     """The two have different lifetimes, so they cannot share a render.
 
     The stall note describes a condition that is true right now; a strategy is a
@@ -2199,12 +2190,12 @@ def test_the_strategy_is_its_own_block_and_not_part_of_the_stall_note(cfg, mem):
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, _two_cycle_policy(dev))
     llm.replan_strategy = "open Bluetooth from the list instead"
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
     assert any("AGREED NEW APPROACH" in n for n in llm.notes), \
         "the strategy never reached the prompt"
 
 
-def test_every_turn_is_told_where_it_stands_against_its_budget(cfg, mem):
+def test_every_turn_is_told_where_it_stands_against_its_budget(cfg):
     """Nothing used to say, on any of the 105 decide prompts in ``runs/``.
 
     SYSTEM tells the model not to search "indefinitely" while giving it no
@@ -2214,7 +2205,7 @@ def test_every_turn_is_told_where_it_stands_against_its_budget(cfg, mem):
     """
     cfg.run.max_steps = 25
     dev = fake.FakeDevice(cfg)
-    _, _, llm = run(dev, mem, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
+    _, _, llm = run(dev, cfg, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
 
     assert llm.budgets, "no turn was shown a budget"
     assert all("BUDGET:" in b for b in llm.budgets), llm.budgets
@@ -2260,14 +2251,14 @@ def _never_stops_policy(dev):
     return policy
 
 
-def test_a_run_that_has_already_met_its_goal_is_stopped(cfg, mem, tmp_path):
+def test_a_run_that_has_already_met_its_goal_is_stopped(cfg, tmp_path):
     cfg.run.max_steps = 60
     cfg.run.goal_check_every = 2
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, _never_stops_policy(dev))
     llm.goal_check_result = True
 
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert outcome == "success"
     assert state.step < 12, f"ran {state.step} steps past being finished"
@@ -2279,7 +2270,7 @@ def test_a_run_that_has_already_met_its_goal_is_stopped(cfg, mem, tmp_path):
     assert state.evidence
 
 
-def test_one_satisfied_verdict_is_not_enough_to_stop_a_run(cfg, mem, tmp_path):
+def test_one_satisfied_verdict_is_not_enough_to_stop_a_run(cfg, tmp_path):
     """The only guard that ends a run on a model's say-so without being asked to.
 
     A single sample of anything is how a run that still had work to do gets cut
@@ -2293,25 +2284,25 @@ def test_one_satisfied_verdict_is_not_enough_to_stop_a_run(cfg, mem, tmp_path):
     # Satisfied once, then it changes its mind, then never again.
     llm.goal_check_result = lambda step: step == 2
 
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert outcome != "success" or state.step > 3, \
         "a single satisfied verdict ended the run"
     assert llm.goal_checks > 3
 
 
-def test_the_goal_check_is_off_by_default_for_a_run_that_is_working(cfg, mem):
+def test_the_goal_check_is_off_by_default_for_a_run_that_is_working(cfg):
     """It must not change a run that ends on its own."""
     cfg.run.goal_check_every = 2
     dev = fake.FakeDevice(cfg)
-    outcome, state, llm = run(dev, mem, cfg,
+    outcome, state, llm = run(dev, cfg,
                               fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     assert outcome == "success"
     assert llm.goal_check_result is False
     assert state.goal_check_hits == 0
 
 
-def test_a_goal_check_that_fails_never_loses_the_run(cfg, mem):
+def test_a_goal_check_that_fails_never_loses_the_run(cfg):
     """It is an optimisation on a loop that already terminates on its budgets."""
     cfg.run.max_steps = 20
     cfg.run.goal_check_every = 1
@@ -2322,14 +2313,14 @@ def test_a_goal_check_that_fails_never_loses_the_run(cfg, mem):
         raise RuntimeError("the checker fell over")
 
     llm.goal_check = boom
-    outcome, _ = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, _ = Agent(dev, llm, cfg).run(GOAL)
     assert outcome == "success"
 
 
-def test_a_run_that_keeps_learning_is_never_nudged(cfg, mem):
+def test_a_run_that_keeps_learning_is_never_nudged(cfg):
     """The ladder must stay invisible to a run that is working."""
     dev = fake.FakeDevice(cfg)
-    outcome, state, llm = run(dev, mem, cfg,
+    outcome, state, llm = run(dev, cfg,
                               fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     assert outcome == "success"
     assert state.steps_since_progress == 0
@@ -2337,7 +2328,7 @@ def test_a_run_that_keeps_learning_is_never_nudged(cfg, mem):
     assert not any("NO PROGRESS" in n for n in llm.notes)
 
 
-def test_collecting_data_on_one_screen_is_progress(cfg, mem):
+def test_collecting_data_on_one_screen_is_progress(cfg):
     """A read-only goal never leaves its screen and must not read as a stall."""
     cfg.run.max_steps = 12
     dev = fake.FakeDevice(cfg)
@@ -2355,13 +2346,13 @@ def test_collecting_data_on_one_screen_is_progress(cfg, mem):
                                    "value": f"value {seen['n']}"}])
 
     llm = fake.FakeLLM(dev, collector)
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
     assert outcome == "success"
     assert llm.replans == 0
     assert not any("NO PROGRESS" in n for n in llm.notes)
 
 
-def test_a_terminal_action_is_never_refused_by_the_stall_guard(cfg, mem, tmp_path):
+def test_a_terminal_action_is_never_refused_by_the_stall_guard(cfg, tmp_path):
     """`done` and `fail` are the exits a stall is trying to push the agent to.
 
     The `fail` here is issued on a turn where the harness is already refusing
@@ -2382,7 +2373,7 @@ def test_a_terminal_action_is_never_refused_by_the_stall_guard(cfg, mem, tmp_pat
         return cycle(screen, llm)
 
     llm = fake.FakeLLM(dev, policy)
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     events = _events(tmp_path, state.run_id)
     kinds = [e["kind"] for e in events]
@@ -2393,7 +2384,7 @@ def test_a_terminal_action_is_never_refused_by_the_stall_guard(cfg, mem, tmp_pat
     assert "stalled_out" not in kinds, "the fail was swallowed by the guard"
 
 
-def test_a_long_scroll_that_keeps_revealing_content_is_not_a_stall(cfg, mem):
+def test_a_long_scroll_that_keeps_revealing_content_is_not_a_stall(cfg):
     """The main false positive to guard against.
 
     A model searching a long feed writes no records and never leaves the
@@ -2421,14 +2412,14 @@ def test_a_long_scroll_that_keeps_revealing_content_is_not_a_stall(cfg, mem):
                            action="scroll", direction="down")
 
     llm = fake.FakeLLM(dev, searcher)
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert outcome == "success"
     assert llm.replans == 0, "a working search was sent to the replan tier"
     assert not any("NO PROGRESS" in n for n in llm.notes)
 
 
-def test_a_scroll_that_reveals_nothing_still_stalls(cfg, mem, tmp_path):
+def test_a_scroll_that_reveals_nothing_still_stalls(cfg, tmp_path):
     """The other side of it: scrolling a wall is not progress just because it
     is a scroll. `verify` answers "probably moved" for a gesture it has no
     image to check, and taking that at face value here would make the ladder
@@ -2447,7 +2438,7 @@ def test_a_scroll_that_reveals_nothing_still_stalls(cfg, mem, tmp_path):
                            action="scroll", direction="down")
 
     llm = fake.FakeLLM(dev, searcher)
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert outcome == "failed"
     assert state.step < cfg.run.max_steps, f"ran {state.step} steps against a wall"
@@ -2458,7 +2449,7 @@ def test_a_scroll_that_reveals_nothing_still_stalls(cfg, mem, tmp_path):
 # The image the step thought it had
 # ---------------------------------------------------------------------------
 
-def test_a_failed_vision_pass_withdraws_the_instruction_to_use_the_image(cfg, mem):
+def test_a_failed_vision_pass_withdraws_the_instruction_to_use_the_image(cfg):
     """`needs_screenshot` only asks for an image when the tree cannot answer the
     question, and the note it returns says so: "rely on the screenshot", "look at
     the screen itself". When the vision call fails that note is an instruction to
@@ -2468,7 +2459,7 @@ def test_a_failed_vision_pass_withdraws_the_instruction_to_use_the_image(cfg, me
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     llm.vision_fails = True
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     assert llm.notes, "no decide turn happened"
     first = llm.notes[0]
@@ -2476,18 +2467,18 @@ def test_a_failed_vision_pass_withdraws_the_instruction_to_use_the_image(cfg, me
     assert "element list" in first
 
 
-def test_a_working_vision_pass_adds_no_such_warning(cfg, mem):
+def test_a_working_vision_pass_adds_no_such_warning(cfg):
     cfg.run.always_screenshot = True
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     llm.vision_reading = "Wi-Fi is on"
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     assert llm.notes
     assert not any("could NOT be read" in note for note in llm.notes)
 
 
-def test_an_unreadable_value_buys_one_sharper_look(cfg, mem):
+def test_an_unreadable_value_buys_one_sharper_look(cfg):
     """Both vision prompts ask the model to say "unreadable" by name, and nothing
     used to act on it -- so a value the capture had thrown away read the same as a
     value the screen never held. The everyday frame is downscaled to a 1280 long
@@ -2499,7 +2490,7 @@ def test_an_unreadable_value_buys_one_sharper_look(cfg, mem):
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     llm.vision_reading = "unreadable, the figure is too blurry to make out"
     llm.vision_reading_after_reread = "Wi-Fi password: hunter2"
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     assert SHARP_LONG_EDGE in dev.shot_edges
     assert SHARP_LONG_EDGE > 1280
@@ -2512,7 +2503,7 @@ def test_an_unreadable_value_buys_one_sharper_look(cfg, mem):
     assert "unreadable" not in llm.analyses_seen[0]
 
 
-def test_a_readable_value_is_never_re_read(cfg, mem):
+def test_a_readable_value_is_never_re_read(cfg):
     """An empty or answered `reading` is not a blurry one, and re-reading it at
     four times the pixels buys nothing."""
     from adbagent.agent import SHARP_LONG_EDGE
@@ -2521,12 +2512,12 @@ def test_a_readable_value_is_never_re_read(cfg, mem):
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     llm.vision_reading = "Wi-Fi is on, 3 networks in range"
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     assert SHARP_LONG_EDGE not in dev.shot_edges
 
 
-def test_one_sharper_look_per_screen_not_per_turn(cfg, mem):
+def test_one_sharper_look_per_screen_not_per_turn(cfg):
     """The second look answers "is the blur mine or the app's". Asking that twice
     of the same pixels cannot change the answer, and a screen the run sits on for
     twenty turns would otherwise buy twenty full-resolution captures."""
@@ -2542,12 +2533,12 @@ def test_one_sharper_look_per_screen_not_per_turn(cfg, mem):
 
     llm = fake.FakeLLM(dev, stay)
     llm.vision_reading = "unreadable, glare on the display"
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     assert dev.shot_edges.count(SHARP_LONG_EDGE) == 1
 
 
-def test_a_failed_re_read_leaves_the_first_answer_standing(cfg, mem):
+def test_a_failed_re_read_leaves_the_first_answer_standing(cfg):
     """A re-read is an improvement, never a way to lose what was already read."""
     dev = fake.FakeDevice(cfg)
     cfg.run.always_screenshot = True
@@ -2565,14 +2556,14 @@ def test_a_failed_re_read_leaves_the_first_answer_standing(cfg, mem):
 
     llm = Flaky(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     llm.vision_reading = "unreadable, too small to read"
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     # The failed re-read must not be mistaken for "the image could not be read
     # this turn" -- the first pass answered, and its answer is what stands.
     assert not any("could NOT be read" in note for note in llm.notes)
 
 
-def test_a_sharper_look_that_reads_no_better_does_not_erase_the_first_answer(cfg, mem):
+def test_a_sharper_look_that_reads_no_better_does_not_erase_the_first_answer(cfg):
     """More pixels are not monotonically more answer. Against a real phone the
     full-resolution frame came back with all four fields empty where the
     downscaled one had at least said what it could not read -- and
@@ -2582,23 +2573,23 @@ def test_a_sharper_look_that_reads_no_better_does_not_erase_the_first_answer(cfg
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     llm.vision_reading = "unreadable, glare on the display"
     llm.vision_reading_after_reread = ""            # the sharper frame says nothing
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     assert "glare on the display" in llm.analyses_seen[0]
 
 
-def test_a_sharper_look_that_is_still_unreadable_is_not_taken_as_progress(cfg, mem):
+def test_a_sharper_look_that_is_still_unreadable_is_not_taken_as_progress(cfg):
     cfg.run.always_screenshot = True
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     llm.vision_reading = "unreadable, the meter is behind glass"
     llm.vision_reading_after_reread = "unreadable, still cannot make out the digits"
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     assert "behind glass" in llm.analyses_seen[0]
 
 
-def test_a_screenshot_turn_costs_one_vision_call_even_when_it_reads_nothing(cfg, mem):
+def test_a_screenshot_turn_costs_one_vision_call_even_when_it_reads_nothing(cfg):
     """The agent runs the vision pass itself so it can keep the structured fields,
     and hands the rendered result to `decide`. An analysis with all four fields
     empty renders to "" -- which used to read as "no analysis was done" and buy a
@@ -2610,7 +2601,7 @@ def test_a_screenshot_turn_costs_one_vision_call_even_when_it_reads_nothing(cfg,
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
     llm.vision_reading = ""            # nothing to report, and nothing wrong
     llm.vision_label = ""
-    Agent(dev, mem, llm, cfg).run(GOAL)
+    Agent(dev, llm, cfg).run(GOAL)
 
     # One pass per decide turn that was given a frame, plus the judge's own pass
     # on the final screen -- which nobody analysed for it. Two per decide turn is
@@ -2620,12 +2611,12 @@ def test_a_screenshot_turn_costs_one_vision_call_even_when_it_reads_nothing(cfg,
         f"turn(s) and {llm.judges} judge(s)")
 
 
-def test_keyboard_interrupt_raises(cfg, mem, monkeypatch):
+def test_keyboard_interrupt_raises(cfg, monkeypatch):
     """KeyboardInterrupt inside agent.run loop must be re-raised so callers
     and watch loops know the run was stopped by user request."""
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    agent = Agent(dev, mem, llm, cfg)
+    agent = Agent(dev, llm, cfg)
 
     def raise_interrupt(*args, **kwargs):
         raise KeyboardInterrupt()
@@ -2635,3 +2626,150 @@ def test_keyboard_interrupt_raises(cfg, mem, monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         agent.run(GOAL)
 
+
+
+# ---------------------------------------------------------------------------
+# The gates in front of a send
+# ---------------------------------------------------------------------------
+
+def _thread_app():
+    """A chat whose Send button lands: tapping it shows the thread with the
+    reply in it, and that thread has a Send button of its own to be tempted by."""
+    after = X.chat_thread(messages=["hey", "you around?", "hey", "on my way"])
+    return {
+        "thread": fake.FakeScreen(xml=X.chat_thread(draft="on my way"),
+                                  taps={"Send": "sent"}),
+        "sent": fake.FakeScreen(xml=after, taps={"Send": "sent"}),
+    }
+
+
+def _tap_send(screen):
+    send = next(e for e in screen.elements if e.best_text == "Send")
+    return AgentAction(observation="the reply is typed", reasoning="send it",
+                       action="tap", target={"index": send.index})
+
+
+def _sends_then_done(times: int = 1):
+    """Ask to send `times` times, then say done."""
+    asked = []
+
+    def policy(screen, llm):
+        if len(asked) >= times:
+            return AgentAction(observation="finished", reasoning="stop",
+                               action="done", text="handled the thread")
+        asked.append(True)
+        return _tap_send(screen)
+
+    return policy
+
+
+def _run_with(dev, cfg, policy, check=True, **kw):
+    llm = fake.FakeLLM(dev, policy)
+    llm.send_check_result = check
+    outcome, state = Agent(dev, llm, cfg, **kw).run(GOAL)
+    return outcome, state, llm
+
+
+def test_a_send_the_check_approves_goes_out_and_is_counted(cfg):
+    dev = fake.FakeDevice(cfg, start="thread", app=_thread_app())
+
+    outcome, state, llm = _run_with(dev, cfg, _sends_then_done())
+
+    assert outcome == "success"
+    assert dev.state == "sent"
+    assert llm.send_checks == 1
+    seen = llm.send_checks_seen[0]
+    assert seen["control"] == "Send"
+    assert seen["draft"] == "on my way"
+    assert "THIS CONVERSATION (khushi)" in seen["conversation"]
+    assert [(s.label, s.thread) for s in state.sends.sent] == [("Send", "khushi")]
+    # The decider is shown the harness's count from the next turn on...
+    assert '1 x "Send" in the conversation with khushi' in llm.budgets[-1]
+    # ...and so is the judge, which used to grade a `done` on the model's word.
+    assert "SENT THIS RUN" in llm.judge_sent[-1]
+
+
+def test_a_send_the_check_refuses_is_never_made(cfg):
+    """``runs/0fc8159ca26c`` step 7: the decider set out to answer "Nvmm." with
+    the reply the policy keeps for greetings. A no from the check stops the tap
+    itself, and the model is told why."""
+    dev = fake.FakeDevice(cfg, start="thread", app=_thread_app())
+
+    outcome, state, llm = _run_with(dev, cfg, _sends_then_done(), check=False)
+
+    assert dev.taps == []
+    assert dev.state == "thread"
+    assert len(state.sends) == 0
+    assert any("the send check refused it" in line for line in state.history)
+    assert outcome == "success"     # held back is not failed: the run goes on
+
+
+def test_the_same_refused_send_is_not_asked_about_twice(cfg):
+    dev = fake.FakeDevice(cfg, start="thread", app=_thread_app())
+
+    _, state, llm = _run_with(dev, cfg, _sends_then_done(times=2), check=False)
+
+    assert dev.taps == []
+    assert llm.send_checks == 1
+
+
+def test_a_send_nobody_could_check_is_held_back(cfg):
+    from adbagent.llm import LLMError
+    dev = fake.FakeDevice(cfg, start="thread", app=_thread_app())
+
+    _, state, llm = _run_with(dev, cfg, _sends_then_done(),
+                              check=LLMError("no healthy upstream"))
+
+    assert dev.taps == []
+    assert any("could not be asked" in line for line in state.history)
+
+
+def test_a_send_past_the_policys_limit_is_refused_without_asking(cfg):
+    """``runs/8de32967fc18`` had sent six against "at most 5" and was composing
+    a seventh. The limit holds a count the model kept losing, and needs no
+    model to hold it."""
+    dev = fake.FakeDevice(cfg, start="thread", app=_thread_app())
+
+    _, state, llm = _run_with(dev, cfg, _sends_then_done(times=2),
+                              send_limits={"send": 1})
+
+    assert len(dev.taps) == 1           # the first went out, the second did not
+    assert state.sends.count("send") == 1
+    assert llm.send_checks == 1         # the refusal cost no call
+    assert any("the policy allows 1" in line for line in state.history)
+    assert "LIMIT REACHED" in llm.budgets[-1]
+
+
+def test_draft_mode_holds_a_send_made_by_naming_the_control(cfg):
+    """A `tap_at` naming the pill used to be no door at all. It is now held
+    before the locate is paid for, let alone the check."""
+    cfg.watch.draft = True
+    dev = fake.FakeDevice(cfg, start="thread", app=_thread_app())
+    asked = []
+
+    def policy(screen, llm):
+        if asked:
+            return AgentAction(observation="held", reasoning="stop",
+                               action="done", text="drafted")
+        asked.append(True)
+        return AgentAction(observation="the pill is not listed",
+                           reasoning="name it", action="tap_at",
+                           text="the Send button")
+
+    _, state, llm = _run_with(dev, cfg, policy)
+
+    assert dev.taps == []
+    assert llm.locates == 0
+    assert llm.send_checks == 0
+    assert any("draft mode is on" in line for line in state.history)
+
+
+def test_with_the_check_switched_off_a_send_asks_nobody(cfg):
+    cfg.safety.check_sends = False
+    dev = fake.FakeDevice(cfg, start="thread", app=_thread_app())
+
+    _, state, llm = _run_with(dev, cfg, _sends_then_done(), check=False)
+
+    assert dev.state == "sent"
+    assert llm.send_checks == 0
+    assert len(state.sends) == 1

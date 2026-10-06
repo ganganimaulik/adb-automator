@@ -19,7 +19,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 from adbagent.actions import AgentAction
 from adbagent.config import Config
 from adbagent.fingerprint import attach
-from adbagent.llm import Call, Ledger, ScreenAnalysis, Strategy, Verdict
+from adbagent.llm import (Call, Ledger, ScreenAnalysis, SendCheck, Strategy,
+                          Verdict)
 from adbagent.screen import Screen, parse
 
 from . import xmlgen as X
@@ -322,6 +323,16 @@ class FakeLLM:
         self.replans_seen: List[tuple] = []
         self.replan_strategy = "use the search box instead of the grid"
         self.replan_abandon = False
+        #: What the send check answers: True lets every send through, so a test
+        #: that is not about sends runs exactly as it did. A callable is handed
+        #: the call's keyword arguments and answers for that send; an exception
+        #: instance is raised, to stand for a check that could not be asked.
+        self.send_check_result = True
+        #: How often the send check was asked, and what it was shown each time.
+        self.send_checks = 0
+        self.send_checks_seen: List[dict] = []
+        #: The harness's send count each judge call was shown.
+        self.judge_sent: List[str] = []
 
     @property
     def needs_vision_pass(self) -> bool:
@@ -418,10 +429,31 @@ class FakeLLM:
               progress: str = "", image_analysis: Optional[str] = None, **kwargs) -> Verdict:
         self.judges += 1
         self.calls += 1
+        self.judge_sent.append(kwargs.get("sent", ""))
         if screenshot and image_analysis is None:     # `is None`, as `decide` does
             image_analysis = self.analyze_image(screenshot, goal=goal, rendered=rendered)
         return Verdict(satisfied=self.judge_result,
                        evidence="fake judge" if self.judge_result else "not yet")
+
+    def check_send(self, **kwargs) -> SendCheck:
+        """The last look at a send, answered from `send_check_result`.
+
+        Counted apart from `calls`, as the judge's vision read and the goal check
+        are: a test asserting how many reasoning turns a goal took must not have
+        a send's check folded into them.
+        """
+        self.send_checks += 1
+        self.send_checks_seen.append(kwargs)
+        self.ledger.record(Call(model=self.model_small, prompt_tokens=700,
+                                completion_tokens=40, purpose="send_check"))
+        result = self.send_check_result
+        if isinstance(result, Exception):
+            raise result
+        if callable(result):
+            result = result(kwargs)
+        return SendCheck(send=bool(result),
+                         reason=("nothing in the rules forbids it" if result
+                                 else "the rules do not allow this reply"))
 
     def goal_check(self, *, goal: str, history=(), rendered: str = "",
                    scratchpad: str = "", progress: str = "", step: int = 0,

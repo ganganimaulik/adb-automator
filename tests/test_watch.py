@@ -11,7 +11,6 @@ import pytest
 from adbagent.config import Config
 from adbagent.device import DeviceLost
 from adbagent.fingerprint import attach
-from adbagent.ledger import ReplyLedger
 from adbagent.screen import parse
 from adbagent.watch import Anchor, Watch, load_policy, screen_digest
 
@@ -124,16 +123,18 @@ def cfg():
     return c
 
 
-def build(cfg, frames, outcomes=(), spend=0.0, ledger_path=None, tmp_path=None,
-          takeovers=()):
-    """A Watch wired to stubs, plus the lists that record what it did."""
+def build(cfg, frames, outcomes=(), spend=0.0, tmp_path=None, takeovers=()):
+    """A Watch wired to stubs, plus the lists that record what it did.
+
+    `tmp_path` is unused now and kept so the call sites read unchanged: it used
+    to place the reply ledger, which was the one piece of state a Watch carried
+    across passes.
+    """
     llm = StubLLM()
     clock, goals = FakeClock(), []
     agent = StubAgent(list(outcomes), goals, spend=spend, llm=llm,
                       takeovers=takeovers)
-    watch = Watch(StubDevice(frames), None, llm, cfg,
-                  policy="be brief",
-                  ledger=ReplyLedger(ledger_path or (tmp_path / "l.jsonl")),
+    watch = Watch(StubDevice(frames), llm, cfg, policy="be brief",
                   make_agent=lambda: agent,
                   sleep=clock.sleep, clock=clock)
     return watch, clock.slept, goals
@@ -548,3 +549,12 @@ def test_the_trace_takes_the_watchs_word_over_the_last_passs(cfg, tmp_path):
     clean = TraceCollector(Dev(), AppTrace(package="com.instagram.android"))
     clean.finish("stopped", StubState(40))
     assert clean.trace.took_over is False
+
+
+def test_each_pass_is_handed_the_policys_send_limits(tmp_path):
+    """Per pass, because a pass is a run and "at most 5" is about one of them."""
+    cfg = Config()
+    cfg.skills.skills_dir = str(tmp_path / "skills")
+    watch = Watch(StubDevice([chat()]), StubLLM(), cfg, policy="be brief",
+                  send_limits={"like": 5})
+    assert watch._default_agent().send_limits == {"like": 5}

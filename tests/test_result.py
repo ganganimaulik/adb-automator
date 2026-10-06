@@ -22,7 +22,6 @@ from adbagent.actions import AgentAction
 from adbagent.agent import Agent, Oracle
 from adbagent.cli import Out, _result_block, build_parser, cmd_report
 from adbagent.config import Config
-from adbagent.memory import Memory
 
 from . import fake
 
@@ -30,17 +29,12 @@ from . import fake
 @pytest.fixture
 def cfg(tmp_path):
     c = Config()
-    c.memory.db = str(tmp_path / "memory.db")
     c.run.artifacts_dir = str(tmp_path / "runs")
     c.run.max_steps = 25
     c.safety.unattended = True
     return c
 
 
-@pytest.fixture
-def mem(cfg, tmp_path):
-    with Memory(cfg, path=tmp_path / "memory.db") as m:
-        yield m
 
 
 GOAL = "open the Wi-Fi settings screen and tell me what it says"
@@ -60,7 +54,7 @@ def events_of(cfg, run_id):
 # The run carries its answer out
 # ---------------------------------------------------------------------------
 
-def test_the_run_keeps_what_it_answered(cfg, mem):
+def test_the_run_keeps_what_it_answered(cfg):
     dev = fake.FakeDevice(cfg)
 
     def policy(screen, llm):
@@ -72,24 +66,24 @@ def test_the_run_keeps_what_it_answered(cfg, mem):
                            action="done",
                            text="Wi-Fi is on and connected to Home-5G.")
 
-    outcome, state = Agent(dev, mem, fake.FakeLLM(dev, policy), cfg).run(GOAL)
+    outcome, state = Agent(dev, fake.FakeLLM(dev, policy), cfg).run(GOAL)
     assert outcome == "success"
     assert state.result == "Wi-Fi is on and connected to Home-5G."
     assert state.evidence == "fake judge"
 
 
-def test_the_answer_is_written_into_run_end(cfg, mem):
+def test_the_answer_is_written_into_run_end(cfg):
     """A report a week later reconstructs the run from this file alone."""
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     end = [e for e in events_of(cfg, state.run_id) if e["kind"] == "run_end"][-1]
     assert end["result"] == "reached wifi"
     assert end["evidence"] == "fake judge"
 
 
-def test_a_rejected_done_is_not_the_answer(cfg, mem):
+def test_a_rejected_done_is_not_the_answer(cfg):
     """A completion the judge threw out is not what the run concluded.
 
     Keeping it would have a run that went on for another thirty steps and then
@@ -104,7 +98,7 @@ def test_a_rejected_done_is_not_the_answer(cfg, mem):
                            action="done", text="all finished, nothing to do")
 
     llm = fake.FakeLLM(dev, policy, judge_result=False)
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
 
     assert outcome == "failed"
     assert state.result == ""
@@ -112,7 +106,7 @@ def test_a_rejected_done_is_not_the_answer(cfg, mem):
     assert "rejected" in state.evidence
 
 
-def test_giving_up_says_why(cfg, mem):
+def test_giving_up_says_why(cfg):
     dev = fake.FakeDevice(cfg)
 
     def policy(screen, llm):
@@ -120,12 +114,12 @@ def test_giving_up_says_why(cfg, mem):
                            action="fail",
                            text="the Wi-Fi row is not on this screen")
 
-    outcome, state = Agent(dev, mem, fake.FakeLLM(dev, policy), cfg).run(GOAL)
+    outcome, state = Agent(dev, fake.FakeLLM(dev, policy), cfg).run(GOAL)
     assert outcome == "failed"
     assert state.result == "the Wi-Fi row is not on this screen"
 
 
-def test_an_assertion_that_settles_it_says_which_check_passed(cfg, mem, capsys):
+def test_an_assertion_that_settles_it_says_which_check_passed(cfg, capsys):
     """The oracle ends the run at the top of the loop, before the model is asked
     anything, so there is no summary and never will be. The condition that
     passed is the whole answer this path has -- without it the ending is the
@@ -141,7 +135,7 @@ def test_an_assertion_that_settles_it_says_which_check_passed(cfg, mem, capsys):
                            action="press_key", key="back")
 
     llm = fake.FakeLLM(dev, policy)
-    outcome, state = Agent(dev, mem, llm, cfg,
+    outcome, state = Agent(dev, llm, cfg,
                            oracle=Oracle(text="Forget network")).run(GOAL)
     assert outcome == "success"
     assert llm.judges == 0

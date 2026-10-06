@@ -1187,6 +1187,7 @@ details.card summary:hover { color: var(--text); }
 .progress-note::before {
   content: "plan";
   display: block;
+  white-space: normal;
   font-family: var(--mono);
   font-size: 10px;
   text-transform: uppercase;
@@ -1194,6 +1195,12 @@ details.card summary:hover { color: var(--text); }
   color: var(--text-faint);
   margin-bottom: 2px;
 }
+
+/* The watch's plan is the *pass's* plan -- reset at every pass boundary, like
+   its scratchpad -- and the panel has to say so for the same reason the ledger
+   box does: without it, a night of passes reads as one long plan. The history
+   detail view needs no qualifier; there is exactly one run on that page. */
+#w-progress::before { content: "plan · this pass"; }
 
 /* -- live LLM stream -------------------------------------------------------- */
 
@@ -1569,7 +1576,7 @@ details.panel[open] > summary { margin-bottom: 12px; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
 th { color: var(--text-faint); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
-#watch-ledger-table tbody tr:hover, #dev-table tbody tr:hover { background: var(--bg-hover); }
+#dev-table tbody tr:hover { background: var(--bg-hover); }
 
 pre.log {
   background: var(--bg-sunk);

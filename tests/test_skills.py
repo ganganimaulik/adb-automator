@@ -4,7 +4,6 @@ import pytest
 
 from adbagent.actions import AgentAction
 from adbagent.config import Config
-from adbagent.memory import Memory
 from adbagent.skills import (DEFAULT_EXPLORE_STEPS, MIN_LEARNABLE_STEPS,
                              AppTrace, ExplorationBlocked, Skill,
                              SkillGenerator, SkillRegistry, TraceCollector,
@@ -490,7 +489,6 @@ def test_cli_skills_generate_explores_with_the_skill_model(tmp_path, monkeypatch
     `llm.model`, so a configured skill model only ever saw the write-up."""
     import adbagent.device
     import adbagent.llm
-    import adbagent.memory
     import adbagent.skills as skillmod
     from adbagent import cli
 
@@ -521,7 +519,6 @@ def test_cli_skills_generate_explores_with_the_skill_model(tmp_path, monkeypatch
     monkeypatch.setattr(cli, "_ensure_device", lambda *a, **kw: None)
     monkeypatch.setattr(adbagent.llm, "LLMClient", SpyClient)
     monkeypatch.setattr(adbagent.device, "Device", Nothing)
-    monkeypatch.setattr(adbagent.memory, "Memory", Nothing)
     monkeypatch.setattr(skillmod, "explore_app",
                         lambda *a, **kw: AppTrace(package="com.explored.app",
                                                   screens=["home", "detail"],
@@ -544,7 +541,6 @@ def test_cli_skills_generate_explores_with_the_skill_model(tmp_path, monkeypatch
 @pytest.fixture
 def cfg(tmp_path):
     c = Config()
-    c.memory.db = str(tmp_path / "memory.db")
     c.run.artifacts_dir = str(tmp_path / "runs")
     c.run.max_steps = DEFAULT_EXPLORE_STEPS
     c.skills.skills_dir = str(tmp_path / "skills")
@@ -552,10 +548,6 @@ def cfg(tmp_path):
     return c
 
 
-@pytest.fixture
-def mem(cfg, tmp_path):
-    with Memory(cfg, path=tmp_path / "memory.db") as m:
-        yield m
 
 
 def note_then_done(label: str):
@@ -600,35 +592,35 @@ def test_resolve_package_says_nothing_rather_than_guessing():
     assert resolve_package(dev, "xy") == ""
 
 
-def test_a_locked_phone_stops_the_run_instead_of_exploring_the_lock_screen(cfg, mem):
+def test_a_locked_phone_stops_the_run_instead_of_exploring_the_lock_screen(cfg):
     """The old command opened the app behind the keyguard, saw
     com.android.systemui, and filed that as the app's skill."""
     dev = fake.FakeDevice(cfg, locked=True)
     with pytest.raises(ExplorationBlocked, match="lock screen"):
-        explore_app(dev, mem, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg,
+        explore_app(dev, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg,
                     query="settings")
 
 
-def test_an_app_that_is_not_installed_stops_the_run(cfg, mem):
+def test_an_app_that_is_not_installed_stops_the_run(cfg):
     dev = fake.FakeDevice(cfg)
     with pytest.raises(ExplorationBlocked, match="no installed app matches"):
-        explore_app(dev, mem, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg,
+        explore_app(dev, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg,
                     query="com.nope.missing")
 
 
-def test_an_app_that_will_not_come_forward_stops_the_run(cfg, mem):
+def test_an_app_that_will_not_come_forward_stops_the_run(cfg):
     """`app_start` reports nothing when it fails, so the foreground is checked.
     Here Spotify is installed but the scripted phone only ever draws Settings."""
     dev = fake.FakeDevice(cfg)
     with pytest.raises(ExplorationBlocked, match="would not come to the foreground"):
-        explore_app(dev, mem, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg,
+        explore_app(dev, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg,
                     query="spotify")
 
 
-def test_exploring_by_name_opens_the_resolved_package_and_drives_it(cfg, mem):
+def test_exploring_by_name_opens_the_resolved_package_and_drives_it(cfg):
     dev = fake.FakeDevice(cfg, start="launcher")
     llm = fake.FakeLLM(dev, note_then_done("Wi-Fi"))
-    exp = explore_app(dev, mem, llm, cfg, query="settings")
+    exp = explore_app(dev, llm, cfg, query="settings")
 
     assert exp.package == "com.android.settings"
     assert "open_app(com.android.settings)" in dev.actions
@@ -639,9 +631,9 @@ def test_exploring_by_name_opens_the_resolved_package_and_drives_it(cfg, mem):
     assert "flow:open wi-fi" in exp.notes.lower()
 
 
-def test_exploring_with_no_app_named_uses_the_app_in_front(cfg, mem):
+def test_exploring_with_no_app_named_uses_the_app_in_front(cfg):
     dev = fake.FakeDevice(cfg)
-    exp = explore_app(dev, mem, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg)
+    exp = explore_app(dev, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg)
 
     assert exp.package == "com.android.settings"
     assert exp.chosen_by == "foreground"
@@ -678,17 +670,17 @@ def test_an_app_you_installed_beats_one_that_shipped_with_the_phone():
     assert candidates == ["com.android.settings", "com.strava.app"]
 
 
-def test_tasks_naming_two_apps_are_referred_back_rather_than_guessed(cfg, mem):
+def test_tasks_naming_two_apps_are_referred_back_rather_than_guessed(cfg):
     dev = fake.FakeDevice(cfg)
     dev.third_party = ["com.whatsapp", "com.spotify.music"]
     with pytest.raises(ExplorationBlocked, match="more than one installed app"):
-        explore_app(dev, mem, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg,
+        explore_app(dev, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg,
                     tasks="share a whatsapp chat to spotify")
 
 
-def test_the_app_the_tasks_name_is_opened_without_an_argument(cfg, mem):
+def test_the_app_the_tasks_name_is_opened_without_an_argument(cfg):
     dev = fake.FakeDevice(cfg, start="launcher")
-    exp = explore_app(dev, mem, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg,
+    exp = explore_app(dev, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg,
                       tasks="open Settings and check the Wi-Fi screen")
 
     assert exp.package == "com.android.settings"
@@ -696,15 +688,15 @@ def test_the_app_the_tasks_name_is_opened_without_an_argument(cfg, mem):
     assert "open_app(com.android.settings)" in dev.actions
 
 
-def test_an_explicit_argument_still_wins_over_the_tasks(cfg, mem):
+def test_an_explicit_argument_still_wins_over_the_tasks(cfg):
     dev = fake.FakeDevice(cfg, start="launcher")
-    exp = explore_app(dev, mem, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg,
+    exp = explore_app(dev, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg,
                       query="settings", tasks="read the whatsapp chats")
     assert exp.package == "com.android.settings"
     assert exp.chosen_by == "named"
 
 
-def test_the_default_tasks_never_name_an_app(cfg, mem):
+def test_the_default_tasks_never_name_an_app(cfg):
     """Inference reads what you wrote, not the boilerplate the harness adds when
     you write nothing."""
     dev = fake.FakeDevice(cfg)
@@ -712,13 +704,13 @@ def test_the_default_tasks_never_name_an_app(cfg, mem):
     assert package_from_text(dev, DEFAULT_EXPLORE_TASKS) == ("", [])
 
 
-def test_exploring_with_nothing_but_the_launcher_in_front_stops(cfg, mem):
+def test_exploring_with_nothing_but_the_launcher_in_front_stops(cfg):
     dev = fake.FakeDevice(cfg, start="launcher")
     with pytest.raises(ExplorationBlocked, match="rather than an app"):
-        explore_app(dev, mem, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg)
+        explore_app(dev, fake.FakeLLM(dev, note_then_done("Wi-Fi")), cfg)
 
 
-def test_screenshots_are_spent_on_distinct_screens_not_the_first_n_steps(cfg, mem):
+def test_screenshots_are_spent_on_distinct_screens_not_the_first_n_steps(cfg):
     """A tour crosses the same list repeatedly. Twelve pictures of the home
     screen teach the synthesis nothing that one does."""
     dev = fake.FakeDevice(cfg)
@@ -737,7 +729,7 @@ def test_screenshots_are_spent_on_distinct_screens_not_the_first_n_steps(cfg, me
         return AgentAction(observation="detail screen", reasoning="out",
                            action="press_key", key="back")
 
-    exp = explore_app(dev, mem, fake.FakeLLM(dev, wander), cfg, query="settings")
+    exp = explore_app(dev, fake.FakeLLM(dev, wander), cfg, query="settings")
     assert exp.steps >= 6
     assert len(exp.screens) <= 4          # far fewer records than steps
     assert len(exp.screenshots) == len(exp.screens)
@@ -1045,7 +1037,7 @@ def test_a_failed_run_still_teaches(tmp_path):
     assert "HOW THE EXPLORATION ENDED: failed" in sent[0][1]["content"]
 
 
-def test_the_trace_attributes_a_multi_app_run_to_the_app_it_worked_in(cfg, mem):
+def test_the_trace_attributes_a_multi_app_run_to_the_app_it_worked_in(cfg):
     """A goal that crosses apps should update the skill for the one the steps
     were spent in, not whichever was in front when the run ended."""
     dev = fake.FakeDevice(cfg)
@@ -1073,7 +1065,7 @@ def test_the_trace_ignores_the_launcher_when_picking_the_app(cfg):
     assert collector.main_package == "com.whatsapp"
 
 
-def test_the_collector_passes_events_through_to_the_reporter(cfg, mem):
+def test_the_collector_passes_events_through_to_the_reporter(cfg):
     """It wraps whatever reporter the caller already had; a run that started
     printing progress must not stop."""
     dev = fake.FakeDevice(cfg)
@@ -1082,7 +1074,7 @@ def test_the_collector_passes_events_through_to_the_reporter(cfg, mem):
     llm = fake.FakeLLM(dev, note_then_done("Wi-Fi"))
 
     from adbagent.agent import Agent
-    outcome, state = Agent(dev, mem, llm, cfg, on_event=collector).run("open Wi-Fi")
+    outcome, state = Agent(dev, llm, cfg, on_event=collector).run("open Wi-Fi")
 
     assert "step" in seen and "perceive" in seen
     trace = collector.finish(outcome, state)

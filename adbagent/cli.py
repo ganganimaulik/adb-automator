@@ -146,7 +146,6 @@ OVERRIDES = {
     "max_tokens": "llm.max_tokens",
     "max_tokens_image": "llm.max_tokens_image",
     "device": "device.serial",
-    "db": "memory.db",
     "budget_usd": "safety.budget_usd",
     "max_steps": "run.max_steps",
     "artifacts_dir": "run.artifacts_dir",
@@ -165,12 +164,7 @@ OVERRIDES = {
     "watch_max_steps": "watch.max_steps",
     "watch_draft": "watch.draft",
     "watch_policy": "watch.policy",
-    "watch_ledger": "watch.ledger",
-    "watch_cooldown": "watch.thread_cooldown_s",
-    "watch_replies_per_hour": "watch.max_replies_per_hour",
-    "watch_replies_per_thread": "watch.max_replies_per_thread_per_hour",
     "watch_usd_per_hour": "watch.max_usd_per_hour",
-    "watch_fail_closed": "watch.fail_closed",
 }
 
 
@@ -443,14 +437,6 @@ def cmd_doctor(args) -> int:
     else:
         out.warn("no model chosen -- run: adbagent models")
         problems += 1
-
-    out.say()
-    out.say(out.bold("Memory"))
-    out.ok(f"database {cfg.db_path}")
-    if cfg.db_path.exists():
-        out.ok("database exists")
-    else:
-        out.say(out.dim("        (not created yet -- it appears on the first run)"))
 
     out.say()
     if problems:
@@ -1184,7 +1170,6 @@ def cmd_run(args) -> int:
     from .agent import Agent, Oracle
     from .device import Device
     from .llm import LLMClient
-    from .memory import Memory
 
     out = Out()
     cfg = build_config(args)
@@ -1245,7 +1230,7 @@ def cmd_run(args) -> int:
 
     exit_code = 0
     iteration = 0
-    with Device(cfg, args.device or "") as dev, Memory(cfg) as mem:
+    with Device(cfg, args.device or "") as dev:
         # One client for the whole session, so --budget-usd bounds the *session*
         # rather than resetting on every iteration (which would make it useless
         # with --repeat inf).
@@ -1255,12 +1240,13 @@ def cmd_run(args) -> int:
             llm.run_id = f"run-{int(time.time())}-{iteration}"
             spent_before = llm.ledger.total_usd
             # The trace wraps the reporter, so the run pays nothing for it beyond
-            # a screenshot of each new screen -- and a new Agent per iteration
-            # reads back whatever the last one learned.
+            # a screenshot of each new screen. A new Agent per iteration starts
+            # from nothing: what an earlier iteration learned reaches this one
+            # only through the app's skill file, written when the last one ended.
             trace = skillmod.TraceCollector(
                 dev, skillmod.AppTrace(tasks=goal),
                 on_event=_live_reporter(out, max_steps=cfg.run.max_steps))
-            agent = Agent(dev, mem, llm, cfg, oracle=oracle, on_event=trace)
+            agent = Agent(dev, llm, cfg, oracle=oracle, on_event=trace)
             if infinite or total > 1:
                 out.say(out.bold(f"\n  iteration {iteration}"))
             started = time.monotonic()
@@ -1321,13 +1307,21 @@ def cmd_run(args) -> int:
 # watch
 # ---------------------------------------------------------------------------
 
-def _watch_banner(out: Out, cfg, goal: str, policy: str, ledger,
-                  goal_from_policy: bool = False) -> None:
+def _watch_banner(out: Out, cfg, goal: str, policy: str,
+                  goal_from_policy: bool = False,
+                  send_limits: Optional[Dict[str, int]] = None) -> None:
     """Say exactly what is about to happen, in the loudest terms available.
 
     A watch is unattended and it sends messages to real people. The one thing
     nobody should ever have to guess is whether this invocation is going to put
     words in somebody's inbox, so that line is first, coloured, and unambiguous.
+
+    It used to print the reply ledger's path and how many replies were already
+    in it, then the ceilings each pass ran under. All of that is gone: there is
+    no ledger, no cooldown and no reply ceiling, so what stops a second reply is
+    the model reading the thread on screen and, unless it is switched off, a
+    second model checking each send against the policy. The LIVE line says
+    which of the two is standing.
     """
     w = cfg.watch
     out.say()
@@ -1335,20 +1329,22 @@ def _watch_banner(out: Out, cfg, goal: str, policy: str, ledger,
     if w.draft:
         out.say(f"  {out.green('DRAFT MODE')} -- replies are composed and "
                 f"recorded, and never sent.")
+    elif cfg.safety.check_sends:
+        out.say(f"  {out.red('LIVE')} -- replies WILL be sent to real people "
+                f"from this device. Each send is checked against the policy by "
+                f"a second model first.")
     else:
         out.say(f"  {out.red('LIVE')} -- replies WILL be sent to real people "
-                f"from this device.")
+                f"from this device. Nothing but the model's own reading of each "
+                f"thread stops it answering one twice.")
     out.say(out.dim(f"  policy: {w.policy} ({len(policy)} chars)"
                     + ("; the goal above is the one saved with it"
                        if goal_from_policy else "")))
-    out.say(out.dim(f"  ledger: {ledger.path} "
-                    f"({len(ledger)} repl(ies) already recorded)"))
+    if send_limits:
+        out.say(out.dim("  send limits per pass: " + ", ".join(
+            f"{word}={most}" for word, most in send_limits.items())))
     out.say(out.dim(
-        f"  every {w.interval_s:g}s | <={w.max_steps} steps/pass | "
-        f"<={w.max_replies_per_hour}/h | "
-        f"<={w.max_replies_per_thread_per_hour}/conversation/h | "
-        f"{w.thread_cooldown_s:g}s cooldown | "
-        f"fail_{'closed' if w.fail_closed else 'OPEN'}"))
+        f"  every {w.interval_s:g}s | <={w.max_steps} steps/pass"))
     if w.sweep_s > 0:
         # Said on its own line because it changes what the loop costs: without
         # it a quiet app spends nothing, with it a pass runs on the clock
@@ -1369,12 +1365,11 @@ WATCH_TRACE_ACTIONS = 400
 
 
 def cmd_watch(args) -> int:
+    from . import conversation
     from . import policies as policymod
     from . import skills as skillmod
     from .device import Device
-    from .ledger import ReplyLedger
     from .llm import LLMClient
-    from .memory import Memory
     from .watch import Watch, load_policy
 
     out = Out()
@@ -1403,15 +1398,25 @@ def cmd_watch(args) -> int:
     # one has been saved: the pairing is the point -- these instructions are only
     # correct under that goal -- and retyping it per start is how a watch ends up
     # running the WhatsApp policy under the goal left over from Instagram.
+    meta = policymod.read(cfg.watch.policy)
     goal = (args.goal or "").strip()
     goal_from_policy = False
     if not goal:
-        goal = policymod.read(cfg.watch.policy).goal
+        goal = meta.goal
         goal_from_policy = bool(goal)
     if not goal:
         out.bad("no goal given -- say what to watch, e.g. "
                 "\"watch my instagram direct messages\", or save a goal with "
                 f"the policy in {cfg.watch.policy}")
+        return 1
+    # The policy's caps on what one pass may send, e.g. `send_limits: like=5`.
+    # A cap that does not parse is refused here rather than ignored: a limit
+    # that is silently not there is found out about after the sixth send.
+    try:
+        send_limits = conversation.parse_send_limits(
+            meta.extra.get("send_limits", ""))
+    except ValueError as exc:
+        out.bad(f"send_limits in {cfg.watch.policy}: {exc}")
         return 1
 
     # A watch is unattended by definition: it runs for days with nobody at the
@@ -1425,18 +1430,17 @@ def cmd_watch(args) -> int:
 
     _ensure_device(args, cfg, out)
 
-    ledger = ReplyLedger(cfg.watch.ledger)
-    _watch_banner(out, cfg, goal, policy, ledger,
-                  goal_from_policy=goal_from_policy)
+    _watch_banner(out, cfg, goal, policy, goal_from_policy=goal_from_policy,
+                  send_limits=send_limits)
 
     # Per-step reporting only under -v. One line per pass is what a loop meant to
     # run for days should print; the full step trace is megabytes by morning.
     reporter = _live_reporter(out, max_steps=cfg.watch.max_steps) \
         if args.verbose else None
 
-    with Device(cfg, args.device or "") as dev, Memory(cfg) as mem:
-        # One client for the whole watch, so the rolling ceilings and the ledger
-        # both see the session rather than a single pass.
+    with Device(cfg, args.device or "") as dev:
+        # One client for the whole watch, so the rolling spend ceiling sees the
+        # session rather than a single pass.
         llm = LLMClient(cfg, run_id=f"watch-{int(time.time())}")
         # One trace across every pass, folded into the app's skill once when the
         # watch stops -- not per pass, which would rewrite the file the next pass
@@ -1446,7 +1450,7 @@ def cmd_watch(args) -> int:
         trace = skillmod.TraceCollector(
             dev, skillmod.AppTrace(tasks=goal), on_event=reporter,
             max_actions=WATCH_TRACE_ACTIONS)
-        watch = Watch(dev, mem, llm, cfg, policy=policy, ledger=ledger,
+        watch = Watch(dev, llm, cfg, policy=policy, send_limits=send_limits,
                       say=out.say, on_event=trace)
         try:
             watch.run(goal)
@@ -1969,8 +1973,6 @@ def cmd_skills(args) -> int:
 
     if action == "generate":
         from . import skills as skillmod
-        from .memory import Memory
-
         # The positional form is the documented one -- `skills generate whatsapp`
         # -- and `--app` stays as an alias for anyone who already types it.
         app_target = (getattr(args, "target", "") or getattr(args, "app", "") or "").strip()
@@ -2019,9 +2021,9 @@ def cmd_skills(args) -> int:
 
         llm = LLMClient(cfg, run_id=f"skill-{int(time.time())}")
         try:
-            with Device(cfg, getattr(args, "device", "") or "") as dev, Memory(cfg) as mem:
+            with Device(cfg, getattr(args, "device", "") or "") as dev:
                 exp = skillmod.explore_app(
-                    dev, mem, llm, cfg, query=app_target, tasks=user_tasks,
+                    dev, llm, cfg, query=app_target, tasks=user_tasks,
                     on_event=_live_reporter(out, max_steps=cfg.run.max_steps))
         except skillmod.ExplorationBlocked as exc:
             out.bad(f"nothing was explored: {exc}")
@@ -2248,7 +2250,6 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-tokens-image", dest="max_tokens_image", type=int,
                         help="max completion tokens for image model calls "
                              "(falls back to --max-tokens)")
-    parser.add_argument("--db", help="path to the memory database")
 
 
 def _add_device(parser: argparse.ArgumentParser) -> None:
@@ -2366,20 +2367,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--steps-per-pass", dest="watch_max_steps", type=int,
                    metavar="N",
                    help="step budget for one pass over the inbox (default 25)")
-    p.add_argument("--replies-per-hour", dest="watch_replies_per_hour",
-                   type=int, metavar="N",
-                   help="circuit breaker on total replies (default 12)")
-    p.add_argument("--replies-per-conversation",
-                   dest="watch_replies_per_thread", type=int, metavar="N",
-                   help="circuit breaker per conversation, per hour (default 2)")
-    p.add_argument("--cooldown", dest="watch_cooldown", type=float,
-                   metavar="SECONDS",
-                   help="minimum gap between two replies to the same "
-                        "conversation (default 600)")
-    p.add_argument("--ledger", dest="watch_ledger", metavar="FILE",
-                   help="where the record of sent replies lives "
-                        "(default watch-replies.jsonl). Deleting it allows "
-                        "every conversation to be answered again")
     p.add_argument("--usd-per-hour", dest="watch_usd_per_hour", type=float,
                    metavar="USD",
                    help="pause the loop when spend in the last hour reaches "
@@ -2387,12 +2374,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-learn", dest="learn_after_run", action="store_false",
                    default=None,
                    help="do not update the app's skill when the watch stops")
-    p.add_argument("--fail-open", dest="watch_fail_closed",
-                   action="store_false", default=None,
-                   help="send even when the conversation on screen cannot be "
-                        "identified. Off by default, and off is the safe setting: "
-                        "an unidentifiable conversation is one where a duplicate "
-                        "cannot be ruled out")
     _add_common(p)
     _add_device(p)
     p.set_defaults(func=cmd_watch)

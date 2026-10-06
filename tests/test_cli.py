@@ -988,7 +988,7 @@ def _watch_upto_banner(tmp_path, monkeypatch, argv):
 
     monkeypatch.setattr(cli, "_ensure_device", lambda args, cfg, out: None)
     monkeypatch.setattr(cli, "_watch_banner",
-                        lambda out, cfg, goal, policy, ledger, **kw: (_ for _ in ()).throw(
+                        lambda out, cfg, goal, policy, **kw: (_ for _ in ()).throw(
                             _Banner(goal, cfg.watch.policy,
                                     kw.get("goal_from_policy", False))))
     return cli.cmd_watch(parse(argv + ["-c", str(tmp_path / "config.json"),
@@ -1019,3 +1019,48 @@ def test_watch_with_no_goal_anywhere_still_refuses(tmp_path, monkeypatch, capsys
                               ["watch", "--policy", str(tmp_path / "bare.md")])
     assert code == 1
     assert "no goal given" in capsys.readouterr().out
+
+
+def _watch_with_limits(tmp_path, monkeypatch, limits: str):
+    """Run `cmd_watch` on a policy carrying `send_limits` as far as the banner,
+    and hand back what the banner was given."""
+    from adbagent import cli
+    from adbagent import policies
+
+    path = tmp_path / "limited.md"
+    path.write_text(policies.with_front_matter(
+        {"goal": "like a few profiles", "send_limits": limits}, "- be kind"),
+        encoding="utf-8")
+    (tmp_path / "config.json").write_text(json.dumps({}), encoding="utf-8")
+    seen = {}
+
+    def banner(out, cfg, goal, policy, **kw):
+        seen.update(kw)
+        raise _Banner(goal, cfg.watch.policy, kw.get("goal_from_policy", False))
+
+    monkeypatch.setattr(cli, "_ensure_device", lambda args, cfg, out: None)
+    monkeypatch.setattr(cli, "_watch_banner", banner)
+    code = None
+    try:
+        code = cli.cmd_watch(parse(["watch", "--policy", str(path),
+                                    "-c", str(tmp_path / "config.json"),
+                                    "--model", "m"]))
+    except _Banner:
+        pass
+    return code, seen
+
+
+def test_watch_takes_its_send_limits_from_the_policy(tmp_path, monkeypatch):
+    code, seen = _watch_with_limits(tmp_path, monkeypatch, "like=5, rose=0")
+    assert code is None                     # reached the banner
+    assert seen["send_limits"] == {"like": 5, "rose": 0}
+
+
+def test_a_send_limit_that_does_not_parse_stops_the_watch(tmp_path, monkeypatch,
+                                                         capsys):
+    """Refused before the watch starts: a limit that is silently not there is
+    found out about after the sixth send."""
+    code, seen = _watch_with_limits(tmp_path, monkeypatch, "five likes")
+    assert code == 1
+    assert not seen                         # never reached the banner
+    assert "send_limits" in capsys.readouterr().out

@@ -31,14 +31,11 @@
     "disable_auto_rotate": true
   },
 
-  "memory": {
-    "db": "memory.db"
-  },
-
   "safety": {
     "budget_usd": 2.0,
     "allow_destructive": false,
-    "unattended": false
+    "unattended": false,
+    "check_sends": true
   },
 
   "run": {

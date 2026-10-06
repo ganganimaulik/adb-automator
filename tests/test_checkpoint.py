@@ -16,7 +16,6 @@ from adbagent import checkpoint, runlog
 from adbagent.actions import AgentAction
 from adbagent.agent import Agent, RunState
 from adbagent.config import Config
-from adbagent.memory import Memory
 
 from . import fake
 
@@ -26,17 +25,12 @@ GOAL = "open the Wi-Fi settings screen"
 @pytest.fixture
 def cfg(tmp_path):
     c = Config()
-    c.memory.db = str(tmp_path / "memory.db")
     c.run.artifacts_dir = str(tmp_path / "runs")
     c.run.max_steps = 25
     c.safety.unattended = True      # never block a test on input()
     return c
 
 
-@pytest.fixture
-def mem(cfg, tmp_path):
-    with Memory(cfg, path=tmp_path / "memory.db") as m:
-        yield m
 
 
 def populated_state() -> RunState:
@@ -75,6 +69,8 @@ def populated_state() -> RunState:
     state.last_progress = "it recorded 1 new data record(s)"
     state.strategy = "use the search box instead of the grid"
     state.replanned_at = 5
+    state.sends.record(4, "Send priority like with message")
+    state.sends.record(6, "Send message", thread="Alex")
     return state
 
 
@@ -149,6 +145,10 @@ def test_round_trip_preserves_everything_the_loop_needs(cfg):
     # `attempts` is not the ring buffer and must not be rebuilt from it: the
     # question it answers is about steps that have already fallen out.
     assert fresh.loops.times_on("exact1", "tap/#4") == 1
+    # What the run had sent. A resume that forgot it would start the policy's
+    # send limits from zero.
+    assert fresh.sends.sent == state.sends.sent
+    assert fresh.sends.count("like") == 1
 
 
 def test_load_returns_none_when_there_is_nothing_to_load(cfg, tmp_path):
@@ -248,7 +248,7 @@ def test_a_consumed_answer_does_not_outlive_the_step_that_used_it(cfg):
     assert any("428913" in line for line in data["history"])
 
 
-def test_an_answered_run_resumes_with_the_answer_in_hand(cfg, mem):
+def test_an_answered_run_resumes_with_the_answer_in_hand(cfg):
     """End to end: the run stops to ask, the answer goes into the checkpoint
     from outside, and the resumed sitting shows the model what it was told."""
     dev = fake.FakeDevice(cfg)
@@ -257,7 +257,7 @@ def test_an_answered_run_resumes_with_the_answer_in_hand(cfg, mem):
         return AgentAction(observation="a code is wanted", reasoning="cannot know",
                            action="ask_user", text="what is the code texted to you?")
 
-    outcome, state = Agent(dev, mem, fake.FakeLLM(dev, asks), cfg).run(GOAL)
+    outcome, state = Agent(dev, fake.FakeLLM(dev, asks), cfg).run(GOAL)
     assert outcome == "needs_user"
 
     run_dir = runlog.run_dir(cfg, state.run_id)
@@ -265,7 +265,7 @@ def test_an_answered_run_resumes_with_the_answer_in_hand(cfg, mem):
 
     data = checkpoint.load(run_dir)
     _, resumed = Agent(
-        dev, mem, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
+        dev, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
         cfg).run(GOAL, run_id=state.run_id, resume=data)
     assert any("428913" in line for line in resumed.history)
 
@@ -283,14 +283,14 @@ def test_an_answered_run_resumes_with_the_answer_in_hand(cfg, mem):
 # The loop, end to end
 # ---------------------------------------------------------------------------
 
-def test_a_failed_run_leaves_a_checkpoint_and_success_clears_it(cfg, mem):
+def test_a_failed_run_leaves_a_checkpoint_and_success_clears_it(cfg):
     dev = fake.FakeDevice(cfg)
 
     def gives_up(screen, llm):
         return AgentAction(observation="stuck", reasoning="cannot",
                            action="fail", text="giving up")
 
-    outcome, state = Agent(dev, mem, fake.FakeLLM(dev, gives_up), cfg).run(GOAL)
+    outcome, state = Agent(dev, fake.FakeLLM(dev, gives_up), cfg).run(GOAL)
     assert outcome == "failed"
     run_dir = runlog.run_dir(cfg, state.run_id)
     data = checkpoint.load(run_dir)
@@ -299,23 +299,23 @@ def test_a_failed_run_leaves_a_checkpoint_and_success_clears_it(cfg, mem):
 
     # Continue the same run, with a model that now knows the way.
     resumed_outcome, resumed = Agent(
-        dev, mem, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
+        dev, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
         cfg).run(GOAL, run_id=state.run_id, resume=data)
     assert resumed_outcome == "success"
     assert resumed.step > data["step"]       # step numbers continue, not restart
     assert not (run_dir / checkpoint.NAME).exists()
 
 
-def test_a_successful_run_leaves_no_checkpoint(cfg, mem):
+def test_a_successful_run_leaves_no_checkpoint(cfg):
     dev = fake.FakeDevice(cfg)
     outcome, state = Agent(
-        dev, mem, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
+        dev, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
         cfg).run(GOAL)
     assert outcome == "success"
     assert not (runlog.run_dir(cfg, state.run_id) / checkpoint.NAME).exists()
 
 
-def test_resume_restores_what_the_run_had_learned(cfg, mem):
+def test_resume_restores_what_the_run_had_learned(cfg):
     dev = fake.FakeDevice(cfg)
     cfg.run.max_steps = 2        # tiny budget, so the first sitting fails
 
@@ -323,14 +323,14 @@ def test_resume_restores_what_the_run_had_learned(cfg, mem):
         return AgentAction(observation="browsing", reasoning="not done yet",
                            action="scroll", direction="down")
 
-    outcome, state = Agent(dev, mem, fake.FakeLLM(dev, wanders), cfg).run(GOAL)
+    outcome, state = Agent(dev, fake.FakeLLM(dev, wanders), cfg).run(GOAL)
     assert outcome == "failed"
     assert state.step == 2
 
     data = checkpoint.load(runlog.run_dir(cfg, state.run_id))
     cfg.run.max_steps = 25
     outcome, resumed = Agent(
-        dev, mem, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
+        dev, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
         cfg).run(GOAL, run_id=state.run_id, resume=data)
     assert outcome == "success"
     # The resumed run still holds the failed sitting's history: the model is
@@ -341,16 +341,16 @@ def test_resume_restores_what_the_run_had_learned(cfg, mem):
     assert resumed.llm_calls > data["llm_calls"]
 
 
-def test_a_resumed_run_appends_to_its_own_trace(cfg, mem):
+def test_a_resumed_run_appends_to_its_own_trace(cfg):
     dev = fake.FakeDevice(cfg)
 
     def gives_up(screen, llm):
         return AgentAction(observation="stuck", reasoning="cannot",
                            action="fail", text="giving up")
 
-    _, state = Agent(dev, mem, fake.FakeLLM(dev, gives_up), cfg).run(GOAL)
+    _, state = Agent(dev, fake.FakeLLM(dev, gives_up), cfg).run(GOAL)
     data = checkpoint.load(runlog.run_dir(cfg, state.run_id))
-    Agent(dev, mem, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
+    Agent(dev, fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])),
           cfg).run(GOAL, run_id=state.run_id, resume=data)
 
     events = [json.loads(line) for line in

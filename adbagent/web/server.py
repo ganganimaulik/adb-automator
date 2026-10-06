@@ -107,11 +107,7 @@ class WatchRequest(BaseModel):
     interval_s: Optional[float] = None
     sweep_s: Optional[float] = None
     max_steps: Optional[int] = None
-    replies_per_hour: Optional[int] = None
-    replies_per_conversation: Optional[int] = None
-    cooldown_s: Optional[float] = None
     usd_per_hour: Optional[float] = None
-    ledger: str = ""
     serial: str = ""
 
 
@@ -886,8 +882,7 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
                 "defaults": dataclasses.asdict(cfg.watch),
                 "policy_path": _policy_path(),
                 "policies_dir": str(Path(cfg.watch.policies_dir).expanduser())
-                                if cfg.watch.policies_dir else "",
-                "ledger_path": str(Path(cfg.watch.ledger).expanduser())}
+                                if cfg.watch.policies_dir else ""}
 
     @app.get("/api/watch/policies")
     def list_policies() -> Dict[str, Any]:
@@ -981,30 +976,12 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
                                       title=update.title or None)
         return {"saved": True, "path": found, "goal": policy.goal}
 
-    @app.get("/api/watch/ledger")
-    def get_ledger(limit: int = 100) -> Dict[str, Any]:
-        """What has actually been sent, newest first.
-
-        The watch's most important artifact by a distance: it is the only place
-        that answers "what did it say to whom", and it is the record the
-        never-double-reply guarantee is built on.
-        """
-        from ..ledger import ReplyLedger
-        cfg = load_cfg()
-        path = Path(cfg.watch.ledger).expanduser()
-        led = ReplyLedger(path)
-        return {
-            "path": str(path),
-            "exists": path.is_file(),
-            "total": len(led),
-            "threads": [{
-                "thread_key": st.thread_key,
-                "preview": st.preview,
-                "last_attempt_at": st.last_attempt_at,
-                "reply_count": st.reply_count,
-                "confirmed": st.confirmed,
-            } for st in led.recent(limit)],
-        }
+    # `GET /api/watch/ledger` stood here: the reply ledger, newest thread first,
+    # which was the only place that answered "what did it say to whom" and the
+    # record the never-double-reply guarantee was built on. Both are gone. What
+    # a watch said is recoverable only from the passes themselves --
+    # `runs/<id>/events.jsonl`, which the run feed already reads -- and the
+    # guarantee is now the model's reading of each thread on screen.
 
     @app.post("/api/watch")
     def start_watch(req: WatchRequest) -> Dict[str, Any]:
@@ -1034,11 +1011,8 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             return watcher.start(
                 goal, policy=policy, draft=req.draft, no_learn=req.no_learn,
                 interval_s=req.interval_s, sweep_s=req.sweep_s,
-                max_steps=req.max_steps,
-                replies_per_hour=req.replies_per_hour,
-                replies_per_conversation=req.replies_per_conversation,
-                cooldown_s=req.cooldown_s, usd_per_hour=req.usd_per_hour,
-                ledger=req.ledger, serial=req.serial)
+                max_steps=req.max_steps, usd_per_hour=req.usd_per_hour,
+                serial=req.serial)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
 

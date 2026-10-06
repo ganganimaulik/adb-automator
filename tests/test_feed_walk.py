@@ -30,7 +30,6 @@ from PIL import Image
 from adbagent.actions import AgentAction
 from adbagent.agent import Agent
 from adbagent.config import Config
-from adbagent.memory import Memory
 from adbagent.screen import Screen, parse
 from adbagent.fingerprint import attach
 
@@ -101,23 +100,18 @@ def feed_walker():
 @pytest.fixture
 def cfg(tmp_path):
     c = Config()
-    c.memory.db = str(tmp_path / "memory.db")
     c.run.artifacts_dir = str(tmp_path / "runs")
     c.run.max_steps = 40
     c.safety.unattended = True
     return c
 
 
-@pytest.fixture
-def mem(cfg, tmp_path):
-    with Memory(cfg, path=tmp_path / "memory.db") as m:
-        yield m
 
 
-def walk(cfg, mem):
+def walk(cfg):
     dev = FeedDevice(cfg)
     llm = fake.FakeLLM(dev, feed_walker())
-    outcome, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
     return dev, llm, outcome, state
 
 
@@ -129,28 +123,28 @@ def _events(cfg, run_id):
 
 # ---------------------------------------------------------------------------
 
-def test_a_vertical_feed_is_swept(cfg, mem):
+def test_a_vertical_feed_is_swept(cfg):
     """The headline. The old gate accepted only left/right, so this feed -- the
     surface where most real swiping happens -- was never swept at all."""
-    dev, llm, outcome, state = walk(cfg, mem)
+    dev, llm, outcome, state = walk(cfg)
     sweeps = [e for e in _events(cfg, state.run_id) if e["kind"] == "sweep"]
     assert sweeps, "an upward-paging feed authorised no sweep"
     assert all(e["gesture"] == "swipe up" for e in sweeps), sweeps
     assert dev.index > 1, "the feed never advanced"
 
 
-def test_the_sweep_never_flings_sideways_on_a_feed_that_pages_up(cfg, mem):
+def test_the_sweep_never_flings_sideways_on_a_feed_that_pages_up(cfg):
     """The old code retargeted horizontal swipes onto the largest horizontal
     scroller -- here the tab strip -- so "next reel" became "next tab"."""
-    dev, _, _, _ = walk(cfg, mem)
+    dev, _, _, _ = walk(cfg)
     assert "scroll(left)" not in dev.actions
     assert "scroll(right)" not in dev.actions
 
 
-def test_an_endless_feed_is_capped_and_never_called_finished(cfg, mem):
+def test_an_endless_feed_is_capped_and_never_called_finished(cfg):
     """A feed has no end, so nothing may claim it reached one."""
     cfg.run.pager_sweep_max = 5
-    _, llm, _, state = walk(cfg, mem)
+    _, llm, _, state = walk(cfg)
     sweeps = [e for e in _events(cfg, state.run_id) if e["kind"] == "sweep"]
     assert sweeps
     assert all(e["swept"] <= 5 for e in sweeps), sweeps
@@ -161,11 +155,11 @@ def test_an_endless_feed_is_capped_and_never_called_finished(cfg, mem):
         assert claim not in handed_back, claim
 
 
-def test_the_status_bar_clock_names_nothing_on_a_captionless_feed(cfg, mem):
+def test_the_status_bar_clock_names_nothing_on_a_captionless_feed(cfg):
     """There is no caption anywhere in this tree. The old code fell through to a
     bare clock pattern and matched the status bar, so every frame was "an item"
     named after the minute it was seen in."""
-    _, llm, _, state = walk(cfg, mem)
+    _, llm, _, state = walk(cfg)
     readings = [e for e in _events(cfg, state.run_id)
                 if e["kind"] == "item_reading"]
     assert readings, "nothing was read"
@@ -173,8 +167,8 @@ def test_the_status_bar_clock_names_nothing_on_a_captionless_feed(cfg, mem):
     assert not any("9:41" in json.dumps(e) for e in readings)
 
 
-def test_the_loop_detector_does_not_eject_the_agent_from_the_feed(cfg, mem):
+def test_the_loop_detector_does_not_eject_the_agent_from_the_feed(cfg):
     """Every reel has the same `exact_id`, so a loop detector counting that
     alone concludes the agent is stuck and presses back."""
-    dev, _, outcome, _ = walk(cfg, mem)
+    dev, _, outcome, _ = walk(cfg)
     assert "press(back)" not in dev.actions

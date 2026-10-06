@@ -476,11 +476,16 @@ def chat_thread(title: str = "khushi",
                 composer_focused: bool = False,
                 title_rid: str = "thread_title",
                 with_send: bool = True,
-                with_header: bool = True) -> str:
+                with_header: bool = True,
+                newest_first: bool = False) -> str:
     """One open conversation.
 
     `stamp` is a relative timestamp rendered beside the last bubble -- the thing
     that moves on its own and must not read as a new message.
+
+    `newest_first` keeps every bubble where it is drawn and reverses the order
+    the list emits them in, as a list laid out from the bottom up does -- Hinge's
+    thread dumps that way, newest bubble first.
     """
     texts = messages if messages is not None else ["hey", "you around?"]
     bubbles: List[N] = []
@@ -496,6 +501,8 @@ def chat_thread(title: str = "khushi",
     if stamp:
         bubbles.append(N("android.widget.TextView", (40, top, 300, top + 60),
                          text=stamp, rid="timestamp", package=IG))
+    if newest_first:
+        bubbles.reverse()
 
     kids: List[N] = [status_bar()]
     if with_header:

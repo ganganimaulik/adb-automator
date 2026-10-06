@@ -2706,3 +2706,68 @@ def test_the_compacted_history_still_only_grows_between_jumps():
             rewrites += 1
         previous = block
     assert rewrites <= len(history) // HISTORY_CHUNK + 1
+
+
+# ---------------------------------------------------------------------------
+# The send check
+# ---------------------------------------------------------------------------
+
+def test_the_send_check_asks_the_small_model_with_the_rules_and_the_draft(
+        monkeypatch):
+    from adbagent import prompts
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = Config()
+    cfg.llm.model = "main-model"
+    cfg.llm.model_small = "small-model"
+    client = LLMClient(cfg)
+    seen = {}
+
+    def mock_post(messages, *, model, schema, max_tokens, purpose, **kw):
+        seen.update(messages=messages, model=model, purpose=purpose)
+        return ('{"send": false, "reason": "Nvmm. is a brush-off, not a '
+                'greeting"}'), None
+
+    monkeypatch.setattr(client, "_post", mock_post)
+    verdict = client.check_send(
+        goal="watch the inbox", policy="reply only to greetings",
+        conversation="THIS CONVERSATION (Alex): them: Nvmm.",
+        control="Send message", action='tap #11 "Send message"',
+        draft="up for a movie?", history=["1. tapped Alex"],
+        rendered="#11 [Button] Send message")
+
+    assert verdict.send is False and "brush-off" in verdict.reason
+    assert seen["model"] == client.model_small
+    assert seen["purpose"] == "send_check"
+    assert seen["messages"][0]["content"] == prompts.SEND_CHECK_SYSTEM
+    user = seen["messages"][1]["content"]
+    assert "reply only to greetings" in user
+    assert '"up for a movie?"' in user
+    assert "Nvmm." in user
+    assert "SENT THIS RUN: nothing yet." in user
+
+
+def test_a_send_with_no_readable_draft_points_the_check_at_the_steps():
+    """Hinge's like sheet keeps the comment out of the tree. The check is told
+    where to look rather than left to refuse what it cannot see."""
+    from adbagent import prompts
+
+    text = prompts.send_check_user(goal="like profiles", control="Send like",
+                                   action='tap #5 "Send like"', draft="",
+                                   history=["4. input_text 'Hey' -> success"])
+    assert "not readable from the element list" in text
+    assert "4. input_text 'Hey'" in text
+    assert "none were written" in text       # no policy: judged on the goal
+
+
+def test_the_judge_is_shown_the_harness_send_count():
+    from adbagent import prompts
+
+    sent = ("SENT THIS RUN, counted by the harness from the sends that went "
+            "through -- when your own count disagrees, this one is right: 8")
+    text = prompts.judge_user("send likes on 7 new profiles", ["1. tap"],
+                              "screen", done_text="Sent 7 likes", sent=sent)
+    assert sent in text
+    assert "SENT THIS RUN" in prompts.JUDGE_SYSTEM

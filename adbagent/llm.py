@@ -1674,6 +1674,7 @@ class LLMClient:
               screenshot: Optional[bytes] = None,
               max_tokens: int = 0, scratchpad: str = "",
               progress: str = "", done_text: str = "",
+              sent: str = "",
               step: int = 0, recorder: Optional[Any] = None,
               image_analysis: Optional[str] = None,
               on_event: Optional[Callable[..., None]] = None) -> "Verdict":
@@ -1695,7 +1696,7 @@ class LLMClient:
         content: List[Dict[str, Any]] = [
             text_part(prompts.judge_user(goal, history, rendered, scratchpad,
                                         progress, image_analysis=image_analysis or "",
-                                        done_text=done_text))]
+                                        done_text=done_text, sent=sent))]
         messages = [
             {"role": "system", "content": prompts.JUDGE_SYSTEM},
             {"role": "user", "content": content},
@@ -1709,6 +1710,40 @@ class LLMClient:
         return self.structured(messages, Verdict, model=target,
                                max_tokens=max_tokens, purpose="judge",
                                effort=self.cfg.llm.effort_for("judge", hard=True),
+                               **kw)
+
+    def check_send(self, *, goal: str, policy: str = "", sent: str = "",
+                   conversation: str = "", control: str = "", action: str = "",
+                   draft: str = "", history: Sequence[str] = (),
+                   rendered: str = "", step: int = 0,
+                   recorder: Optional[Any] = None,
+                   on_event: Optional[Callable[..., None]] = None) -> "SendCheck":
+        """Would this send break one of the owner's rules? Asked just before it.
+
+        On `model_small` at the hard effort, as `judge` is: both are a verdict on
+        what the deciding model did, and both are better asked of a model that
+        did not do it. No screenshot -- the question is about the rules and the
+        record, and the decider has already looked at the frame.
+        """
+        from . import prompts
+
+        messages = [
+            {"role": "system", "content": prompts.SEND_CHECK_SYSTEM},
+            {"role": "user",
+             "content": prompts.send_check_user(
+                 goal=goal, policy=policy, sent=sent,
+                 conversation=conversation, control=control, action=action,
+                 draft=draft, history=history, rendered=rendered)},
+        ]
+        if recorder is not None:
+            recorder.dump_messages(step, messages, purpose="send_check")
+        kw = {}
+        if on_event is not None:
+            kw["on_event"] = on_event
+        return self.structured(messages, SendCheck, model=self.model_small,
+                               purpose="send_check",
+                               effort=self.cfg.llm.effort_for("send_check",
+                                                              hard=True),
                                **kw)
 
     def goal_check(self, *, goal: str, history: Sequence[str] = (),
@@ -1799,6 +1834,13 @@ class Verdict(BaseModel):
 
     satisfied: bool
     evidence: str = ""
+
+
+class SendCheck(BaseModel):
+    """The last look at a send before it goes out. See `prompts.SEND_CHECK_SYSTEM`."""
+
+    send: bool
+    reason: str = ""
 
 
 class Strategy(BaseModel):

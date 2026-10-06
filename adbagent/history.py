@@ -14,21 +14,20 @@ seen once is dropped rather than passed on -- the current run's trace already
 carries it, and forwarding it again under the heading "history" would be
 laundering a single observation into a trend.
 
-Two sources, because they know different things:
+One source: ``runs/<id>/events.jsonl`` -- what happened, step by step, including
+the verification grade the harness gave each action.
 
-* ``runs/<id>/events.jsonl`` -- what happened, step by step, including the
-  verification grade the harness gave each action.
-* the ``dead_end`` table -- what the agent already decided was a dud, keyed by
-  screen and expiring after a day. Its `action_sig` carries element indices,
-  which mean nothing across runs, so those are counted per screen and verb
-  rather than quoted.
+There were two. The other was the ``dead_end`` table, what the agent had
+already decided was a dud, keyed by screen and expiring after a day. It is gone
+with `memory.db`, and what it contributed is the one signal here that was not
+derived from a run's own trace -- a judgement rather than an observation. The
+events are the honest half anyway: a control that keeps failing verification
+shows up in them, in the run that watched it fail.
 """
 
 from __future__ import annotations
 
 import logging
-import sqlite3
-import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -140,12 +139,10 @@ class History:
     stuck: List[Tuple[str, int]] = field(default_factory=list)
     #: (control label, times an irreversible action was refused there)
     refusals: List[Tuple[str, int]] = field(default_factory=list)
-    #: (what led nowhere, times) from the dead-end table
-    dead_ends: List[Tuple[str, int]] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         return bool(self.failures or self.stuck or self.refusals
-                    or self.dead_ends or self.runs > 1)
+                    or self.runs > 1)
 
     def to_prompt_text(self) -> str:
         """The digest handed to skill synthesis. Empty when nothing repeated."""
@@ -167,8 +164,6 @@ class History:
             lines.append(f"  the loop detector broke out of screen {screen} {n} times")
         for label, n in self.refusals:
             lines.append(f"  an irreversible control {label!r} was reached {n} times")
-        for what, n in self.dead_ends:
-            lines.append(f"  {what} led nowhere {n} times")
         lines.append("  Turn a repeated one into a nuance with a way around it. "
                      "Something listed once or twice may still be circumstance.")
         return "\n".join(lines)
@@ -180,33 +175,6 @@ def _run_dirs(artifacts_dir: Path, limit: int) -> List[Path]:
     dirs = [p for p in artifacts_dir.iterdir() if (p / "events.jsonl").is_file()]
     dirs.sort(key=lambda p: (p / "events.jsonl").stat().st_mtime, reverse=True)
     return dirs[:limit]
-
-
-def _dead_ends_for(db_path: Path, package: str) -> List[Tuple[str, int]]:
-    """Dud actions this app has already accumulated, per screen and verb.
-
-    The stored signature is ``verb/#index/direction``; the index is dropped for
-    the reason `_describe_action` gives, which collapses "every direction on
-    this screen was tried" into one line that is actually usable.
-    """
-    if not db_path.is_file():
-        return []
-    try:
-        db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        rows = db.execute(
-            "SELECT skeleton_id, action_sig FROM dead_end "
-            "WHERE app_key=? AND expires_at > ?",
-            (package, time.time())).fetchall()
-        db.close()
-    except sqlite3.Error as exc:
-        log.warning("could not read dead ends for %s: %s", package, exc)
-        return []
-
-    counts: Counter = Counter()
-    for skeleton, sig in rows:
-        verb = str(sig).split("/")[0]
-        counts[f"{verb} on screen {str(skeleton)[:8]}"] += 1
-    return [(what, n) for what, n in counts.most_common(6) if n >= MIN_OCCURRENCES]
 
 
 def for_package(cfg: Any, package: str, *,
@@ -266,5 +234,4 @@ def for_package(cfg: Any, package: str, *,
                         if n >= MIN_OCCURRENCES]
     history.stuck = [(s, n) for s, n in stuck.most_common(5) if n >= MIN_OCCURRENCES]
     history.refusals = [(l, n) for l, n in refusals.most_common(5) if n >= MIN_OCCURRENCES]
-    history.dead_ends = _dead_ends_for(Path(cfg.db_path).expanduser(), package)
     return history

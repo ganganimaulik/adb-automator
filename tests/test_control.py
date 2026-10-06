@@ -17,7 +17,6 @@ from adbagent import checkpoint, control, runlog
 from adbagent.actions import AgentAction
 from adbagent.agent import Agent, RunState
 from adbagent.config import Config
-from adbagent.memory import Memory
 
 from . import fake
 
@@ -27,17 +26,12 @@ GOAL = "open the Wi-Fi settings screen"
 @pytest.fixture
 def cfg(tmp_path):
     c = Config()
-    c.memory.db = str(tmp_path / "memory.db")
     c.run.artifacts_dir = str(tmp_path / "runs")
     c.run.max_steps = 25
     c.safety.unattended = True
     return c
 
 
-@pytest.fixture
-def mem(cfg, tmp_path):
-    with Memory(cfg, path=tmp_path / "memory.db") as m:
-        yield m
 
 
 def _events(tmp_path, run_id):
@@ -248,7 +242,7 @@ def test_a_pause_can_still_be_interrupted(tmp_path):
 # In the loop
 # ---------------------------------------------------------------------------
 
-def test_the_loop_reads_its_control_file_and_says_so(cfg, mem, tmp_path):
+def test_the_loop_reads_its_control_file_and_says_so(cfg, tmp_path):
     dev = fake.FakeDevice(cfg)
     run_dir = tmp_path / "runs"
     seen = {"paused": False}
@@ -272,7 +266,7 @@ def test_the_loop_reads_its_control_file_and_says_so(cfg, mem, tmp_path):
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(control.Control, "__init__", patched)
-        outcome, state = Agent(dev, mem, fake.FakeLLM(dev, policy), cfg).run(GOAL)
+        outcome, state = Agent(dev, fake.FakeLLM(dev, policy), cfg).run(GOAL)
 
     assert outcome == "success"
     assert seen["paused"], "the loop never held"
@@ -281,30 +275,30 @@ def test_the_loop_reads_its_control_file_and_says_so(cfg, mem, tmp_path):
     assert "pause" in modes and "run" in modes
 
 
-def test_a_run_clears_its_control_file_at_both_ends(cfg, mem, tmp_path):
+def test_a_run_clears_its_control_file_at_both_ends(cfg, tmp_path):
     """On the way in, so a resume does not inherit what the last sitting was
     told; on the way out, so a run stopped while held leaves no `pause` for the
     next one to find."""
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
     assert control.read(runlog.run_dir(cfg, state.run_id)) is None
 
     # Now leave one behind and resume: the second sitting must not act on it.
     run_dir = runlog.run_dir(cfg, state.run_id)
     control.send(run_dir, "pause", 99)
     data = checkpoint.load(run_dir) or {"goal": GOAL, "step": 1}
-    outcome, resumed = Agent(dev, mem, fake.FakeLLM(
+    outcome, resumed = Agent(dev, fake.FakeLLM(
         dev, fake.reach_state(dev, "wifi", ["Wi-Fi"])), cfg).run(
             GOAL, run_id=state.run_id, resume=data)
     assert outcome == "success"
     assert resumed.paused_s == 0.0
 
 
-def test_the_run_reports_how_long_it_was_held(cfg, mem, tmp_path):
+def test_the_run_reports_how_long_it_was_held(cfg, tmp_path):
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
 
     end = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "run_end"][-1]
     # Recorded on every run, held or not: otherwise the wall clock in the trace
@@ -352,7 +346,7 @@ def test_moving_between_the_two_holds_is_said_out_loud(tmp_path):
     assert said == ["release", "pause", "run"]
 
 
-def test_the_loop_closes_and_reopens_the_session_around_a_takeover(cfg, mem,
+def test_the_loop_closes_and_reopens_the_session_around_a_takeover(cfg,
                                                                    tmp_path):
     dev = fake.FakeDevice(cfg)
     run_dir = tmp_path / "runs"
@@ -376,7 +370,7 @@ def test_the_loop_closes_and_reopens_the_session_around_a_takeover(cfg, mem,
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(control.Control, "__init__", patched)
         outcome, state = Agent(
-            dev, mem, fake.FakeLLM(dev, policy), cfg,
+            dev, fake.FakeLLM(dev, policy), cfg,
             on_event=lambda kind, **kw: emitted.append(kind)).run(GOAL)
 
     assert outcome == "success"
@@ -395,14 +389,14 @@ def test_the_loop_closes_and_reopens_the_session_around_a_takeover(cfg, mem,
     assert state.took_over is True
 
 
-def test_a_takeover_tells_the_model_it_happened(cfg, mem, tmp_path):
+def test_a_takeover_tells_the_model_it_happened(cfg, tmp_path):
     """Otherwise the model reads the new screen as the result of its own last
     action, and concludes that whatever it did worked."""
     state = RunState(goal=GOAL, run_id="r1", intent_id="i1")
     state.step = 4
     state.steps_since_progress = 6
     dev = fake.FakeDevice(cfg)
-    agent = Agent(dev, mem, fake.FakeLLM(dev, lambda s, l: None), cfg)
+    agent = Agent(dev, fake.FakeLLM(dev, lambda s, l: None), cfg)
 
     class Rec:
         def __init__(self): self.events = []
@@ -420,7 +414,7 @@ def test_a_takeover_tells_the_model_it_happened(cfg, mem, tmp_path):
     assert agent._reobserve is True
 
 
-def test_a_run_somebody_drove_teaches_the_skill_nothing(cfg, mem, tmp_path):
+def test_a_run_somebody_drove_teaches_the_skill_nothing(cfg, tmp_path):
     """The trace records every step as the agent's, so the steps around a
     takeover describe a path the agent never found."""
     from adbagent.skills import AppTrace, SkillRegistry, learn_from_run
@@ -453,15 +447,15 @@ def test_the_takeover_flag_reaches_every_app_the_run_touched(cfg):
     assert [t.took_over for t in collector.app_traces()] == [True, True]
 
 
-def test_an_ordinary_run_still_teaches(cfg, mem, tmp_path):
+def test_an_ordinary_run_still_teaches(cfg, tmp_path):
     """The guard must be about takeovers and nothing else."""
     dev = fake.FakeDevice(cfg)
     llm = fake.FakeLLM(dev, fake.reach_state(dev, "wifi", ["Wi-Fi"]))
-    _, state = Agent(dev, mem, llm, cfg).run(GOAL)
+    _, state = Agent(dev, llm, cfg).run(GOAL)
     assert state.took_over is False
 
 
-def test_a_terminal_action_is_not_a_step_the_loop_can_be_held_before(cfg, mem,
+def test_a_terminal_action_is_not_a_step_the_loop_can_be_held_before(cfg,
                                                                      tmp_path):
     """The read happens at the top of a step, so a run that ends on its first
     decision is never held -- and must not hang waiting to be."""
@@ -471,6 +465,6 @@ def test_a_terminal_action_is_not_a_step_the_loop_can_be_held_before(cfg, mem,
         return AgentAction(observation="stuck", reasoning="cannot",
                            action="fail", text="giving up")
 
-    outcome, state = Agent(dev, mem, fake.FakeLLM(dev, gives_up), cfg).run(GOAL)
+    outcome, state = Agent(dev, fake.FakeLLM(dev, gives_up), cfg).run(GOAL)
     assert outcome == "failed"
     assert state.paused_s == 0.0
