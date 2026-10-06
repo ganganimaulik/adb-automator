@@ -63,12 +63,16 @@ Thumbs.db
 *.swp
 *.swo
 
-# personal reply policy -- never commit
+# personal reply policies -- ignored by default. The Hinge one is tracked on
+# purpose; keep real people's names out of it, this repo is public.
 date.md
-policies/
+policies/*
+!policies/hinge_policy.md
 
 # Learned app skills. Device- and account-specific: they are written from live
 # runs against this phone's apps and carry whatever those screens said, so they
 # are local state rather than source. `SkillRegistry.load_skills` recreates the
-# directory on a fresh clone, which then learns its own.
-skills/
+# directory on a fresh clone, which then learns its own. The Hinge skill is
+# tracked on purpose, beside its policy -- same rule about names.
+skills/*
+!skills/hinge.json
