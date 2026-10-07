@@ -1346,7 +1346,7 @@ def _watch_banner(out: Out, cfg, goal: str, policy: str,
             f"{word}={most}" for word, most in send_limits.items())))
     for rule in snooze:
         out.say(out.dim(f"  rest {rule.seconds / 60:g}m when \"{rule.phrase}\" "
-                        f"is on screen after a pass"))
+                        f"is on screen after a pass, or until the screen changes"))
     out.say(out.dim(
         f"  every {w.interval_s:g}s | <={w.max_steps} steps/pass"))
     if w.sweep_s > 0:

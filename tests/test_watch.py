@@ -25,6 +25,33 @@ def settings():
     return attach(parse(X.settings_screen(), width=X.W, height=X.H))
 
 
+def ran_dry(chats: str = "Chats", badge: str = "", banner: str = ""):
+    """A feed with nobody left in it, above a tab bar. No app in particular.
+
+    `chats` is the chat tab's description, which is where navigation bars put
+    an unread count -- ``Chats, 2 unread`` -- above a label that only says
+    ``Chats``. `badge` draws the count as a bare number of its own instead, and
+    `banner` lays a line of text over the feed.
+    """
+    pkg = "com.example.feed"
+    feed = [X.N("android.widget.TextView", (250, 600, 830, 650),
+                text="Nobody new for now", package=pkg)]
+    if banner:
+        feed.append(X.N("android.widget.TextView", (60, 300, 1020, 380),
+                        text=banner, package=pkg))
+    tab = [X.N("android.widget.TextView", (760, 2220, 920, 2280),
+               text="Chats", package=pkg)]
+    if badge:
+        tab.append(X.N("android.widget.TextView", (880, 2170, 940, 2210),
+                       text=badge, package=pkg))
+    feed.append(X.N("android.widget.FrameLayout", (720, 2160, 960, 2300),
+                    desc=chats, package=pkg, clickable=True, children=tab))
+    return attach(parse(X.dump(
+        X.N("android.widget.FrameLayout", (0, 0, X.W, X.H), package=pkg,
+            children=feed),
+        X.status_bar()), width=X.W, height=X.H))
+
+
 class StubLedgerHolder:
     """Minimal stand-in for LLMClient.ledger."""
 
@@ -149,6 +176,21 @@ def test_screen_digest_ignores_a_ticking_clock():
 def test_screen_digest_notices_a_new_message():
     assert screen_digest(chat()) != \
            screen_digest(chat(messages=["hey", "you around?", "hello?"]))
+
+
+def test_screen_digest_reads_a_tabs_description_not_just_its_label():
+    """The unread count lives on the tab, whose own label is a child node: the
+    leaves alone say ``Chats`` before and after a message arrives."""
+    assert screen_digest(ran_dry(chats="Chats")) != \
+           screen_digest(ran_dry(chats="Chats, 1 unread"))
+    assert screen_digest(ran_dry(chats="Chats, 1 unread")) != \
+           screen_digest(ran_dry(chats="Chats, 2 unread"))
+
+
+def test_screen_digest_notices_a_bare_count_going_up():
+    """A count is the news, not a ticking clock to be masked away."""
+    assert screen_digest(ran_dry(badge="3")) != screen_digest(ran_dry(badge="4"))
+    assert screen_digest(ran_dry(badge="3")) == screen_digest(ran_dry(badge="3"))
 
 
 def test_anchor_matches_only_the_same_package_and_content():
@@ -613,12 +655,14 @@ def test_a_pass_that_ends_where_the_work_has_run_dry_rests_then_looks_again(cfg)
     watch, slept, goals = build(cfg, [seen_everyone()], ["success", "success"])
     watch.snooze = parse_snooze(RULE)
 
-    watch.run("like new profiles", max_passes=2)
+    # The pass, the nineteen looks a 15m rest takes at 45s, the pass it owes.
+    watch.run("like new profiles", max_passes=1 + 19 + 1)
 
     assert len(goals) == 2                    # looked again on an unchanged screen
     assert watch.stats.snoozed == 2
-    assert sum(slept) == 2 * 900
-    assert max(slept) <= 30                   # in naps, so stop() is heard
+    assert watch.stats.woken == 0
+    assert watch._last_pass_at == 900         # when the rest was up, not before
+    assert max(slept) <= cfg.watch.interval_s  # looking all the while
 
 
 def test_without_a_rule_the_same_screen_is_never_looked_at_again(cfg):
@@ -633,9 +677,9 @@ def test_a_failed_pass_that_ends_there_rests_instead_of_backing_off(cfg):
     watch, slept, goals = build(cfg, [seen_everyone()], ["failed"])
     watch.snooze = parse_snooze("seen everyone = 100s")
 
-    watch.run("like new profiles", max_passes=1)
+    watch.run("like new profiles", max_passes=1 + 2)    # the pass, two looks
 
-    assert sum(slept) == 100                  # the rest, and no 30s backoff
+    assert slept == [45.0, 45.0, 10.0]        # the rest, and no 30s backoff
     assert watch.stats.failures == 1          # still reported as a failure
     assert watch.stats.snoozed == 1
 
@@ -653,4 +697,108 @@ def test_stopping_cuts_a_rest_short(cfg):
     watch._sleep = nap
     watch.run("like new profiles")
 
-    assert naps == [30.0]                     # one nap of the rest, then out
+    assert naps == [cfg.watch.interval_s]     # one look's wait, then out
+
+
+DRY = "Nobody new for now = 15m"
+
+
+def test_any_change_on_screen_cuts_a_rest_short(cfg):
+    """The work ran dry on that screen, not in the app. A message arriving
+    meanwhile changes something on it -- here the chat tab's description -- and
+    that is a reason to look now, not when the fifteen minutes are up."""
+    from adbagent.watch import parse_snooze
+    frames = [ran_dry(), ran_dry(),            # the first pass, and where it ended
+              ran_dry(),                        # 45s into the rest: nothing yet
+              ran_dry(chats="Chats, 1 unread")]  # 90s in
+    watch, slept, goals = build(cfg, frames, ["success", "success"])
+    watch.snooze = parse_snooze(DRY)
+    said = []
+    watch.say = said.append
+
+    watch.run("reply to anyone new, then work the feed", max_passes=3)
+
+    assert len(goals) == 2
+    assert watch._last_pass_at == 90
+    assert watch.stats.woken == 1
+    assert any('"Chats, 1 unread" appeared' in line for line in said)
+    assert "1 woken" in watch.status()
+
+
+def test_a_count_drawn_on_its_own_cuts_a_rest_short_too(cfg):
+    from adbagent.watch import parse_snooze
+    frames = [ran_dry(badge="3")] * 3 + [ran_dry(badge="4")]
+    watch, slept, goals = build(cfg, frames, ["success", "success"])
+    watch.snooze = parse_snooze(DRY)
+
+    watch.run("reply to anyone new, then work the feed", max_passes=3)
+
+    assert len(goals) == 2
+    assert watch.stats.woken == 1
+
+
+def test_another_app_in_front_cuts_a_rest_short(cfg):
+    """Any change, as for an idle watch: a phone that has wandered off the app
+    is not where the next pass expects to find it."""
+    from adbagent.watch import parse_snooze
+    watch, slept, goals = build(cfg, [ran_dry(), ran_dry(), settings()],
+                                ["success", "success"])
+    watch.snooze = parse_snooze(DRY)
+    said = []
+    watch.say = said.append
+
+    watch.run("work the feed", max_passes=2)
+
+    assert len(goals) == 2
+    assert watch.stats.woken == 1
+    assert any("com.android.settings is in front" in line for line in said)
+
+
+def test_a_ticking_timestamp_does_not_cut_a_rest_short(cfg):
+    """Masked as it always was: what moves on its own is not news."""
+    from adbagent.watch import parse_snooze
+    frames = [ran_dry(banner=f"Last active {m}m ago") for m in (2, 2, 3, 4)]
+    watch, slept, goals = build(cfg, frames, ["success", "success"])
+    watch.snooze = parse_snooze("Nobody new for now = 100s")
+
+    watch.run("work the feed", max_passes=1 + 2 + 1)
+
+    assert watch.stats.woken == 0
+    assert watch._last_pass_at == 100         # the rest ran its full length
+
+
+def test_a_sweep_does_not_cut_a_rest_short(cfg):
+    """A sweep due mid-rest would spend a pass being told the same thing."""
+    from adbagent.watch import parse_snooze
+    cfg.watch.sweep_s = 60.0
+    watch, slept, goals = build(cfg, [seen_everyone()], ["success", "success"])
+    watch.snooze = parse_snooze(RULE)
+
+    watch.run("like new profiles", max_passes=1 + 19 + 1)
+
+    assert len(goals) == 2
+    assert watch._last_pass_at == 900
+
+
+def test_a_rest_that_ends_while_spending_is_paused_still_owes_its_pass(cfg):
+    """The anchor goes when the rest does. Kept, the pause would hand the loop
+    back as an idle watch anchored on a screen that never changes."""
+    from adbagent.watch import parse_snooze
+    cfg.watch.max_usd_per_hour = 0.10
+    watch, slept, goals = build(cfg, [ran_dry()], ["success"] * 3, spend=0.06)
+    watch.snooze = parse_snooze("Nobody new for now = 100s")
+
+    # pass, two looks, pass, two looks, the pause, pass
+    watch.run("work the feed", max_passes=1 + 2 + 1 + 2 + 1 + 1)
+
+    assert watch.stats.paused == 1
+    assert len(goals) == 3, "the pass the rest owed never came after the pause"
+
+
+def test_what_changed_says_what_went_when_nothing_came():
+    from adbagent.watch import what_changed
+    assert what_changed(ran_dry(banner="Loading"), ran_dry()) == \
+        '"Loading" went away'
+    # A long line is clipped: it may be somebody's whole message.
+    said = what_changed(ran_dry(), ran_dry(banner="x" * 200))
+    assert said == '"' + "x" * 57 + '..." appeared'

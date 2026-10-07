@@ -11,7 +11,7 @@
   "workflows": [
     {
       "name": "browse_discover_profiles",
-      "steps": "Open the app and tap 'Discover' in the bottom nav. To go through a profile to its end in one action, use scroll_to_edge with direction='down' on the profile scroller. To advance to the next profile, tap 'Skip <name>' (X icon) at bottom-left."
+      "steps": "Open the app and tap 'Discover' in the bottom nav. To go through a profile to its end in one action, use scroll_to_edge with direction='down' on the profile scroller. To advance to the next profile, tap 'Skip <name>' (X icon) at bottom-left. An 'Undo last skip' control appears after skipping if you need to reverse it."
     },
     {
       "name": "fast_scroll_to_top_photo",
@@ -23,7 +23,7 @@
     },
     {
       "name": "view_messages",
-      "steps": "Tap 'Matches' (4th tab in bottom nav) to access conversations. The conversation list is divided into 'Your turn' (matches waiting for your reply) and 'Their turn' (matches where you sent the last message). ONLY open and process conversations under 'Your turn'; completely skip 'Their turn'. Check the preview snippet before opening — skip any chat showing your own outgoing text. When inside a chat, inspect the bottom-most message directly above the input box: if it is an outgoing purple bubble or has a 'Sent' / 'Delivered' status indicator (e.g. [Button] 'Sent' at bottom-right), you were the last sender — do not type anything, and tap 'Back' to return to Matches. When replying to a genuine new incoming message per policy, type the reply via input_text with confidence='low' to trigger a screenshot verification turn before tapping Send."
+      "steps": "Tap 'Matches' (4th tab in bottom nav, badged with the new-message count) to access conversations. The conversation list is divided into collapsible sections: 'Your turn (N)' (matches waiting for your reply), 'Their turn' (matches where you sent the last message), and 'Hidden (N)'. ONLY open and process conversations under 'Your turn'; completely skip 'Their turn' and 'Hidden'. Check the preview snippet before opening — skip any chat showing your own outgoing text. When inside a chat, inspect the bottom-most message directly above the input box: if it is an outgoing purple bubble or has a 'Sent' / 'Delivered' status indicator (e.g. [Button] 'Sent' at bottom-right), you were the last sender — do not type anything, and tap 'Back' to return to Matches. When replying to a genuine new incoming message per policy, type the reply via input_text into 'Send a message' with confidence='low' to trigger a screenshot verification turn before tapping Send."
     }
   ],
   "nuances": [
@@ -33,24 +33,28 @@
     "The profile's name and pronouns appear as separate top-left text elements (e.g. 'Alex', 'she/her') ONLY when the profile is scrolled to its first photo. Their absence from the element list is the reliable signal that you are mid-profile or at the bottom -- at the bottom of 'S' the list held only 'Selfie Verified' and two 'Like photo' buttons.",
     "Several like buttons are listed at once, one per card visible on screen, and their labels repeat ('Like photo', 'Like photo prompt', 'Like prompt'). The first photo's heart is the TOPMOST: prefer @top-right over @bottom-right. Tapping the lower one likes the card below it.",
     "The like composer shows the media being liked, and Hinge draws a '1/N' badge on a profile's first photo (observed: '1/4' in the composer for a first photo, no badge in the composer for a last photo). A visible badge that does not read '1/' means the wrong photo is loaded.",
-    "The Matches tab is the messages/chat area (labelled 'Matches' in bottom nav).",
     "The Matches conversation list is split into 'Your turn' and 'Their turn'. 'Their turn' indicates the user was the last to message and is waiting for a reply; never open or reply to chats under 'Their turn'.",
-    "Inside a chat thread, outgoing messages appear as purple bubbles on the right and display a 'Sent' status indicator ([Button] 'Sent') at bottom-right below the bubble. Incoming messages appear as white bubbles on the left.",
     "Paid-upsell controls (Boost, Roses, HingeX, Signals) appear on various screens; do not tap them.",
     "In the like-comment composer the send pill IS in the element list: 'Send priority like' before a comment is typed, 'Send priority like with message' after. Tap it by #N. 'Send a Rose' beside it is a paid feature -- never tap it.",
     "When typing in the like-comment composer, if the element list only shows #1 [Scroller], target 'Edit comment' specifically so focus lands on the text field rather than empty space in the scroller center.",
     "Pre-Send Verification is mandatory: Never tap Send if the visual analysis or screenshot shows an empty comment box. If empty, re-tap 'Edit comment' and re-type the comment.",
     "Do not guess x/y fractions for the send pill: it is listed, so tap it by #N.",
-    "If the screen goes blank white after tapping send, wait 2 seconds for UI recovery before relaunching."
+    "If the screen goes blank white after tapping send, wait 2 seconds for UI recovery before relaunching.",
+    "The Matches tab is the messages/chat area (labelled 'Matches' in bottom nav, with a badge count of new messages).",
+    "The Matches conversation list is split into collapsible sections: 'Your turn (N)', 'Their turn', and 'Hidden (N)'. 'Their turn' and 'Hidden' indicate chats that do not need a reply; never open or reply to them.",
+    "Inside a chat thread, outgoing messages appear as purple bubbles on the right and display a 'Sent' status indicator ([Button] 'Sent') at bottom-right below the bubble. Incoming messages appear as white bubbles on the left. The reply field is labelled 'Send a message' and sits beside a 'Record voice note' button -- do not tap the voice note button.",
+    "The like-comment composer can enter a broken state where the screenshot renders fully black and repeated input_text and tap attempts on 'Edit comment' never focus the field (a 'Choose input method' system notification was present). Do not keep retrying input in this state: restart_app co.hinge.app, wait for the splash/loading screen to clear, then re-open the composer from the profile's first photo and type again.",
+    "After restart_app, Hinge shows a splash/loading screen (H logo on Discover) before the profile card redraws; wait for it rather than tapping during the load."
   ],
   "recommendations": [
     "Fast return to 1st photo: use scroll_to_edge with direction='up' on the profile scroller -- one action, and it cannot stop short.",
     "Before every like, check the element list for the profile name + pronouns at top-left. That check is cheap, it is the only evidence that you are on the first photo, and a like is irreversible -- an observation saying 'at the first photo' is not evidence.",
     "Fast profile exploration: use scroll_to_edge with direction='down' to reach the end of a profile in one action.",
     "Use bottom nav (Discover, Matches) for navigation; avoid press_key back inside Hinge.",
-    "Conversations: Only open chats listed under 'Your turn'. Never tap or message chats under 'Their turn'. In chat, verify the bottom-most bubble is an incoming message from the match (not an outgoing purple bubble or one followed by 'Sent') before drafting a reply.",
-    "To send a like comment or reply: type text via input_text into 'Edit comment' with confidence='low', inspect the resulting image analysis to confirm text 'Hey 🔥' is visually rendered in the comment field. If empty, re-type before sending. Then tap the send control by its #N (it is in the element list) and confirm the composer closed.",
-    "Treat all paid features (Boost, Roses, HingeX) as off-limits."
+    "Treat all paid features (Boost, Roses, HingeX) as off-limits.",
+    "Conversations: Only open chats listed under 'Your turn'. Never tap or message chats under 'Their turn' or 'Hidden'. In chat, verify the bottom-most bubble is an incoming message from the match (not an outgoing purple bubble or one followed by 'Sent') before drafting a reply.",
+    "To send a like comment or reply: type text via input_text into 'Edit comment' (composer) or 'Send a message' (chat) with confidence='low', inspect the resulting image analysis to confirm text 'Hey 🔥' is visually rendered in the comment field. If empty, re-type before sending. Then tap the send control by its #N (it is in the element list) and confirm the composer closed.",
+    "If the composer screenshot renders black and 'Edit comment' will not take focus after one retry, stop retrying: restart_app co.hinge.app, wait out the splash screen, and redo the like from the first photo."
   ],
   "custom_prompt": ""
 }

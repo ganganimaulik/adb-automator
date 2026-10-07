@@ -38,6 +38,14 @@ pass getting back. Self-healing falls out of that: a screen that went off, an
 app that got killed, a notification shade left open all look like "not the
 anchor", and the fix is the same pass that handles a new message.
 
+**A rest is still a watch.** A policy's `snooze` rule names a screen that says
+the work has run dry -- a feed with nobody left in it -- and how long to leave it
+alone. The loop anchors on that screen and goes on probing it like any other; the
+rule's time only says when to run a pass whatever the probe finds. Any change in
+the meantime ends the rest early, because the work ran dry on that screen, not in
+the app: a message that arrives while the feed is empty shows up as an unread
+count on a tab, and a rest that never looked would sit on it for the full time.
+
 **Failure is a pause, never an exit.** A failed pass doubles a backoff and the
 loop continues. Only a keyboard interrupt stops it. A watch that exits because
 the phone dropped off Wi-Fi for a minute is not a watch.
@@ -49,6 +57,7 @@ import hashlib
 import logging
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -110,27 +119,76 @@ Rules for this pass:
     next pass starts from wherever you leave the screen."""
 
 
+#: A bare count, the way an unread badge draws one: ``3``, ``(12)``.
+_COUNT = re.compile(r"\(?\d{1,4}\)?")
+
+
+def _written(screen: Screen) -> List[Tuple[str, str]]:
+    """``(as drawn, as compared)`` for each text the app has on screen, in order.
+
+    Every node's text *and* its content description, containers included. A
+    tab's unread count is rarely a node of its own: navigation bars put it in the
+    tab's description -- ``Chats, 3 unread`` -- while the label drawn under the
+    icon is a child, so reading only the leaves, or only a node's text when it
+    has both, misses exactly the change a watch is waiting for.
+
+    Compared through `mask_goal`, so a clock, a relative timestamp or a battery
+    percentage moving on its own is not mistaken for news -- except a bare count,
+    which `mask_goal` folds into ``<n>`` and which is kept as drawn: an unread
+    badge going from 3 to 4 is a message arriving.
+    """
+    out: List[Tuple[str, str]] = []
+    for node in conversation.app_nodes(screen):
+        for raw in (node.text, node.content_desc):
+            shown = " ".join(raw.split())
+            if shown:
+                out.append((shown, shown if _COUNT.fullmatch(shown)
+                            else mask_goal(shown)))
+    return out
+
+
 def screen_digest(screen: Screen) -> str:
     """A digest of everything the app has written on screen, masked.
 
     The novelty signal. Deliberately the opposite of `skeleton_id`, which is
     content-free so that two visits to the same layout hash alike -- exactly the
     wrong instrument for "did a new message arrive", which is a question about
-    content and nothing else.
+    content and nothing else. What counts as written, and what is masked, is
+    `_written`'s to say.
 
-    Masked through `mask_goal` so a clock, a relative timestamp or an unread
-    badge ticking over is not mistaken for news, and read from the raw nodes for
-    the same reason `conversation.read_conversation` is: pruning folds a list into
-    one summary string on its scroller.
+    Read from the raw nodes, before pruning, for the reasons
+    `conversation.app_nodes` gives.
     """
-    texts = [n.best_text.strip()
-             for n in conversation.app_nodes(screen)
-             if not n.children and n.best_text.strip()]
     h = hashlib.sha256()
-    for t in texts:
-        h.update(mask_goal(t).encode("utf-8", "replace"))
+    for _shown, compared in _written(screen):
+        h.update(compared.encode("utf-8", "replace"))
         h.update(b"\x00")
     return h.hexdigest()[:16]
+
+
+def _quote(text: str, most: int = 60) -> str:
+    return f"\"{text if len(text) <= most else text[:most - 3] + '...'}\""
+
+
+def what_changed(before: Screen, now: Screen) -> str:
+    """A few words on how `now` differs from `before`, for the log.
+
+    Asked once a probe has found the two different, so that an operator reading
+    a watch that keeps cutting its rests short can see what keeps doing it: the
+    first text that is new, or failing that the first one that went.
+    """
+    if now.package != before.package:
+        return f"{now.package or 'nothing'} is in front"
+    was, nxt = _written(before), _written(now)
+    added = Counter(c for _s, c in nxt) - Counter(c for _s, c in was)
+    for shown, compared in nxt:
+        if added[compared]:
+            return f"{_quote(shown)} appeared"
+    gone = Counter(c for _s, c in was) - Counter(c for _s, c in nxt)
+    for shown, compared in was:
+        if gone[compared]:
+            return f"{_quote(shown)} went away"
+    return "the same text, in a different order"
 
 
 @dataclass
@@ -159,10 +217,27 @@ class Snooze:
     tell that apart from "nothing new yet": the screen will not change on its
     own, so a reactive watch would never look again, and a sweep would spend a
     pass every `sweep_s` being told the same thing.
+
+    So `seconds` is a deadline, not a nap: the probe goes on while the watch
+    rests, and a pass runs when the screen changes or the time is up, whichever
+    comes first. See `_Rest`.
     """
 
     phrase: str
     seconds: float
+
+
+@dataclass
+class _Rest:
+    """A rest in progress: when it began, when it is over, and on what screen.
+
+    The screen is kept whole, not as the anchor's digest, so that the line
+    saying a rest was cut short can say what changed -- see `what_changed`.
+    """
+
+    started: float
+    until: float
+    screen: Screen
 
 
 _SNOOZE_DURATION = re.compile(
@@ -239,6 +314,9 @@ class Stats:
     #: Passes that ended on a screen a `snooze` rule names, and so were followed
     #: by that rule's rest rather than the usual interval.
     snoozed: int = 0
+    #: Rests cut short because the screen changed under them. Read next to
+    #: `snoozed`: how often the app had work again before the rule's time was up.
+    woken: int = 0
     failures: int = 0
     usd: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
@@ -304,6 +382,8 @@ class Watch:
         self._spend: List[Tuple[float, float]] = []
         #: When the last pass finished, for the sweep. None until one has.
         self._last_pass_at: Optional[float] = None
+        #: The rest the loop is in, if a `snooze` rule put it in one.
+        self._rest: Optional[_Rest] = None
         self._stop = False
 
     # -- construction ------------------------------------------------------
@@ -375,15 +455,47 @@ class Watch:
                 self._sleep(delay)
                 continue
 
+            rest = self._rest
             if self.anchor.matches(screen):
-                if not self._sweep_due():
+                if rest is not None:
+                    left = rest.until - self._now()
+                    if left > 0:
+                        self.stats.skipped += 1
+                        log.debug("resting on %s and nothing new; %.0fs left",
+                                  screen.package, left)
+                        self._sleep(min(w.interval_s, left))
+                        continue
+                    log.debug("the rest is over; a pass runs whatever the "
+                              "screen says")
+                elif not self._sweep_due():
                     self.stats.skipped += 1
                     log.debug("nothing new on %s; sleeping %.0fs",
                               screen.package, w.interval_s)
                     self._sleep(w.interval_s)
                     continue
-                log.debug("nothing new on %s, but the %.0fs sweep is due",
-                          screen.package, w.sweep_s)
+                else:
+                    log.debug("nothing new on %s, but the %.0fs sweep is due",
+                              screen.package, w.sweep_s)
+            elif rest is not None:
+                # The screen changed while the watch rested. The app said there
+                # was nothing to do *on that screen*; whatever it has written
+                # since -- an unread count, a banner, another app in front -- is
+                # a reason to look now rather than when the rule's time is up.
+                self.stats.woken += 1
+                change = what_changed(rest.screen, screen)
+                into = self._now() - rest.started
+                self.say(f"  rest cut short {into / 60:.1f}m into "
+                         f"{_duration(rest.until - rest.started)}: {change}")
+                log.info("the screen changed %.0fs into a %.0fs rest (%s)",
+                         into, rest.until - rest.started, change)
+            if rest is not None:
+                # Over either way, and the anchor goes with it. It was the screen
+                # saying there was nothing to do, and the pass this rest owes
+                # must not be skipped because the screen still says so: a spend
+                # pause between here and the pass would otherwise leave the
+                # watch anchored on that screen for good.
+                self._rest = None
+                self.anchor = Anchor()
 
             # -- is the loop allowed to spend? -----------------------------
             paused = self._spend_pause()
@@ -416,8 +528,9 @@ class Watch:
                 # The app has said the work has run dry. That is not a failure
                 # to back off from, and not "nothing new" either -- the screen
                 # will say the same thing until somebody looks again, which is
-                # what the rest is for. So the anchor is dropped: when it ends,
-                # the next pass runs whatever the probe finds.
+                # what the rest is for. So the watch anchors on it and probes it
+                # like any other screen, and the top of the loop runs a pass when
+                # it changes or when the rule's time is up, whichever is first.
                 consecutive_failures = 0
                 self.stats.snoozed += 1
                 if outcome not in ("success", "needs_user"):
@@ -425,13 +538,17 @@ class Watch:
                     # status line is where an operator notices a pass that
                     # keeps failing on its way to this screen.
                     self.stats.failures += 1
-                self.anchor = Anchor()
+                now = self._now()
+                self.anchor = Anchor.of(after)
+                self._rest = _Rest(started=now, until=now + rule.seconds,
+                                   screen=after)
                 self.say(f"  pass {self.stats.passes}: {outcome}; "
                          f"\"{rule.phrase}\" is on screen -- resting "
-                         f"{_duration(rule.seconds)}")
-                log.info("%r is on screen after pass %d; resting %.0fs",
-                         rule.phrase, self.stats.passes, rule.seconds)
-                self._rest(rule.seconds)
+                         f"{_duration(rule.seconds)}, or until it changes")
+                log.info("%r is on screen after pass %d; resting %.0fs, or "
+                         "until the screen changes", rule.phrase,
+                         self.stats.passes, rule.seconds)
+                self._sleep(min(w.interval_s, rule.seconds))
                 continue
 
             if outcome in ("success", "needs_user"):
@@ -510,19 +627,6 @@ class Watch:
                         "pass will run unconditionally", exc)
             return None
 
-    def _rest(self, seconds: float) -> None:
-        """Sleep `seconds`, in short naps, so `stop()` is not kept waiting.
-
-        The ordinary interval is short enough to sleep through; a rest is
-        minutes, and a watch asked to stop should not finish one first.
-        """
-        end = self._now() + seconds
-        while not self._stop:
-            left = end - self._now()
-            if left <= 0:
-                return
-            self._sleep(min(left, 30.0))
-
     # -- ceilings ----------------------------------------------------------
 
     def _backoff(self, consecutive: int) -> float:
@@ -574,6 +678,8 @@ class Watch:
             bits.append(f"{s.paused} paused")
         if s.snoozed:
             bits.append(f"{s.snoozed} rested")
+        if s.woken:
+            bits.append(f"{s.woken} woken")
         bits += [f"{s.failures} failed", f"${s.usd:.4f}",
                  f"up {s.uptime_s / 3600:.1f}h"]
         return ", ".join(bits)

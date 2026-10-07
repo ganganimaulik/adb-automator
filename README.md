@@ -270,11 +270,16 @@ snooze: You've seen everyone for now = 15m
 ```
 
 When a pass ends on a screen showing those words (case and curly quotes
-ignored), the watch rests that long — `s`, `m` or `h` — and then runs a pass
-whatever the screen says. Several rules go on separate lines or between `;`.
-A failed pass that ends there rests too, rather than backing off. Pair it with
-a line in the policy telling the agent to stop on that screen, so the pass ends
-there instead of trying to make the screen go away.
+ignored), the watch rests up to that long — `s`, `m` or `h`. It keeps looking
+while it rests, with the same UI dump an idle watch takes between passes (every
+`--interval` seconds, 45 by default), and any change on the screen ends the rest
+early: a message that arrives while the feed is empty shows up as an unread count
+on a tab, and the next pass runs then. Otherwise it runs a pass when the time is
+up, whatever the screen says. The log line for a rest cut short names what
+changed, so a watch that keeps waking up says why. Several rules go on separate
+lines or between `;`. A failed pass that ends there rests too, rather than
+backing off. Pair it with a line in the policy telling the agent to stop on that
+screen, so the pass ends there instead of trying to make the screen go away.
 
 With a goal saved, the goal argument becomes optional, and `--policy` takes a
 bare name meaning that policy in `watch.policies_dir`:
@@ -363,6 +368,12 @@ Between passes the loop dumps the UI — an adb round trip, no model call — an
 compares a masked digest of the app's own text against the screen the last pass
 left behind. Equal means no new message, so it sleeps. That is also the honest
 answer to "how would it know something arrived": it looked.
+
+The digest covers every text and accessibility description the app has on
+screen, containers included — a tab's unread count usually lives in the tab's
+description (`Chats, 3 unread`), not in a node of its own. Clocks, relative
+timestamps and percentages are masked so that they do not read as news; counts
+are not, because a count going from 3 to 4 is the news.
 
 The comparison is against a remembered anchor (package plus content digest) rather
 than against the previous look. Comparing consecutive looks would read a phone
