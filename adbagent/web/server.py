@@ -194,17 +194,30 @@ def screencap(serial: str = "", max_long_edge: int = 720,
 
     from PIL import Image
 
-    from ..device import adb_path
+    from ..device import _host_window_screenshot, _is_black_image, adb_path
 
+    image: Optional[Image.Image] = None
     argv = [adb_path()]
     if serial:
         argv += ["-s", serial]
     argv += ["exec-out", "screencap", "-p"]
     proc = subprocess.run(argv, capture_output=True, timeout=FRAME_TIMEOUT_S)
-    if proc.returncode != 0 or not proc.stdout:
+    if proc.returncode != 0:
         detail = (proc.stderr or b"").decode("utf-8", "replace").strip()
         raise RuntimeError(detail or "screencap returned nothing")
-    image = Image.open(io.BytesIO(proc.stdout))
+    if proc.stdout:
+        try:
+            image = Image.open(io.BytesIO(proc.stdout))
+        except Exception:
+            pass
+
+    if _is_black_image(image):
+        host_img = _host_window_screenshot()
+        if host_img is not None:
+            image = host_img
+
+    if image is None:
+        raise RuntimeError("screencap returned nothing")
     w, h = image.size
     factor = min(1.0, max_long_edge / max(w, h)) if max(w, h) else 1.0
     if factor < 1.0:

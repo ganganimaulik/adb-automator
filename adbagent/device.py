@@ -21,6 +21,7 @@ import logging
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -543,6 +544,130 @@ PRESS_KEYS = frozenset({
 })
 
 
+def _is_black_image(image: Optional[Image.Image]) -> bool:
+    """True when the image is completely black or near-black (e.g. from FLAG_SECURE)."""
+    if image is None:
+        return True
+    try:
+        extrema = image.convert("L").getextrema()
+        return extrema[1] < 10
+    except Exception:
+        return False
+
+
+def _host_window_screenshot() -> Optional[Image.Image]:
+    """Capture emulator rendering window on Windows when ADB screencap returns black (FLAG_SECURE).
+
+    Android's FLAG_SECURE blanks SurfaceFlinger captures, but emulators like BlueStacks
+    render to standard Windows desktop windows without OS-level DRM restrictions.
+    """
+    if sys.platform != "win32":
+        return None
+
+    result: List[Image.Image] = []
+
+    def worker() -> None:
+        try:
+            import ctypes
+            # Ensure physical pixel coordinates under Windows DPI scaling (e.g. 125%, 150%)
+            # so the viewport capture is never truncated by DPI virtualization.
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            except Exception:
+                try:
+                    ctypes.windll.user32.SetProcessDPIAware()
+                except Exception:
+                    pass
+
+            user32 = ctypes.windll.user32
+            # Connect to interactive desktop if running in an isolated thread/desktop
+            h_default = user32.OpenDesktopW("Default", 0, False, 0x01FF)
+            if h_default:
+                user32.SetThreadDesktop(h_default)
+
+            import win32gui
+            import win32ui
+            hwnds: List[int] = []
+            win32gui.EnumWindows(lambda h, p: p.append(h), hwnds)
+
+            target_hwnd: Optional[int] = None
+            fallback_hwnd: Optional[int] = None
+            for h in hwnds:
+                if not win32gui.IsWindowVisible(h):
+                    continue
+                cls = win32gui.GetClassName(h)
+                title = win32gui.GetWindowText(h)
+                rect = win32gui.GetWindowRect(h)
+                w, h_len = rect[2] - rect[0], rect[3] - rect[1]
+                if w < 200 or h_len < 200:
+                    continue
+                if "overlay" in title.lower() or "SaveBits" in cls:
+                    continue
+                if not (cls.startswith("Qt") or "BlueStacks" in title or "HD-Player" in cls or "LDPlayer" in cls):
+                    continue
+
+                # For BlueStacks, the Android viewport is a child window named 'HD-Player'
+                children: List[int] = []
+                try:
+                    win32gui.EnumChildWindows(h, lambda ch, p: p.append(ch), children)
+                except Exception:
+                    pass
+
+                for ch in children:
+                    c_title = win32gui.GetWindowText(ch)
+                    c_rect = win32gui.GetWindowRect(ch)
+                    cw, ch_h = c_rect[2] - c_rect[0], c_rect[3] - c_rect[1]
+                    if (c_title in ("HD-Player", "RenderWindow") or "Player" in c_title) and cw > 200 and ch_h > 200:
+                        target_hwnd = ch
+                        break
+                if target_hwnd:
+                    break
+                if not fallback_hwnd:
+                    fallback_hwnd = h
+
+            if not target_hwnd:
+                target_hwnd = fallback_hwnd
+            if not target_hwnd:
+                return
+
+            rect = win32gui.GetWindowRect(target_hwnd)
+            w = max(1, rect[2] - rect[0])
+            h = max(1, rect[3] - rect[1])
+
+            hwndDC = win32gui.GetWindowDC(target_hwnd)
+            mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+            saveDC = mfcDC.CreateCompatibleDC()
+            saveBitMap = win32ui.CreateBitmap()
+            saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
+            saveDC.SelectObject(saveBitMap)
+
+            try:
+                res = user32.PrintWindow(target_hwnd, saveDC.GetSafeHdc(), 2)
+                if not res:
+                    res = user32.PrintWindow(target_hwnd, saveDC.GetSafeHdc(), 0)
+                if res:
+                    bmpinfo = saveBitMap.GetInfo()
+                    bmpstr = saveBitMap.GetBitmapBits(True)
+                    img = Image.frombuffer("RGB", (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
+                                           bmpstr, "raw", "BGRX", 0, 1)
+                    if not _is_black_image(img):
+                        result.append(img)
+            finally:
+                win32gui.DeleteObject(saveBitMap.GetHandle())
+                saveDC.DeleteDC()
+                mfcDC.DeleteDC()
+                win32gui.ReleaseDC(target_hwnd, hwndDC)
+                if h_default:
+                    user32.CloseDesktop(h_default)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("host emulator window capture failed: %s", exc)
+
+    t = threading.Thread(target=worker, daemon=True, name="host-emulator-screenshot")
+    t.start()
+    t.join(timeout=3.0)
+    return result[0] if result else None
+
+
 class Device:
     """A guarded uiautomator2 session."""
 
@@ -1051,6 +1176,15 @@ class Device:
         if image is None:
             image = _guard(lambda: self.u2.adb_device.screenshot(),
                            self.cfg.device.watchdog_s, "screencap")
+
+        if _is_black_image(image):
+            host_img = _host_window_screenshot()
+            if host_img is not None:
+                log.info("ADB screencap was black (FLAG_SECURE); recovered full-color frame from emulator host window")
+                if self._size[0] > 0 and self._size[1] > 0:
+                    image = host_img.resize(self._size, Image.Resampling.LANCZOS)
+                else:
+                    image = host_img
 
         w, h = image.size
         factor = min(1.0, max_long_edge / max(w, h))

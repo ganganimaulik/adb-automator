@@ -7,15 +7,15 @@
     "hinge",
     "Hinge dating"
   ],
-  "description": "Hinge is a dating app built around profile cards on the Discover tab and messages on the Matches tab. Main flow: Discover tab displays profile cards as vertical scrollers to like photos with comments; Matches tab displays conversations to check and reply to incoming messages.",
+  "description": "Hinge is a dating app built around profile cards on the Discover tab and messages on the Matches tab. Main flow: Discover tab displays profile cards as vertical scrollers to like photos with comments; Matches tab displays conversations to check and reply to incoming messages. Discover can run dry and show a 'You've seen everyone for now' end state.",
   "workflows": [
     {
       "name": "browse_discover_profiles",
-      "steps": "Open the app and tap 'Discover' in the bottom nav. To go through a profile to its end in one action, use scroll_to_edge with direction='down' on the profile scroller. To advance to the next profile, tap 'Skip <name>' (X icon) at bottom-left. An 'Undo last skip' control appears after skipping if you need to reverse it."
+      "steps": "Open the app and tap 'Discover' in the bottom nav. To go through a profile to its end in one action, use scroll_to_edge with direction='down' on the profile scroller. To advance to the next profile, tap 'Skip <name>' (X icon) at bottom-left. An 'Undo last skip' control appears after skipping if you need to reverse it. When the deck is exhausted, Discover shows 'You've seen everyone for now' with 'Change filters' and 'Review skipped profiles' buttons -- this is a normal end state; do not tap either button, just end the pass."
     },
     {
       "name": "fast_scroll_to_top_photo",
-      "steps": "To get back to the 1st photo of a profile in one action, use scroll_to_edge with direction='up' on the profile scroller: it flings until the profile stops moving, so it cannot stop short. Then CONFIRM you arrived: the profile's name and pronouns (e.g. [Text] 'Alex', [Text] 'she/her' at top-left) are listed only at the head of the card. If they are not in the element list, you are still mid-profile -- repeat scroll_to_edge up before doing anything else."
+      "steps": "To get back to the 1st photo of a profile in one action, use scroll_to_edge with direction='up' on the profile scroller. Then CONFIRM you arrived: the profile's name (e.g. [Text] 'Vi') and pronouns (e.g. 'she/her') at top-left are listed only at the head of the card. If the name is present but pronouns are missing, or neither is present, you are still mid-profile -- repeat scroll_to_edge up. A single up-fling does not always reach the top; in one run it took two up-flings plus a confirming tap before the full header appeared. Only proceed to like once the full header is confirmed."
     },
     {
       "name": "like_photo_or_prompt_with_comment",
@@ -23,7 +23,7 @@
     },
     {
       "name": "view_messages",
-      "steps": "Tap 'Matches' (4th tab in bottom nav, badged with the new-message count) to access conversations. The conversation list is divided into collapsible sections: 'Your turn (N)' (matches waiting for your reply), 'Their turn' (matches where you sent the last message), and 'Hidden (N)'. ONLY open and process conversations under 'Your turn'; completely skip 'Their turn' and 'Hidden'. Check the preview snippet before opening — skip any chat showing your own outgoing text. When inside a chat, inspect the bottom-most message directly above the input box: if it is an outgoing purple bubble or has a 'Sent' / 'Delivered' status indicator (e.g. [Button] 'Sent' at bottom-right), you were the last sender — do not type anything, and tap 'Back' to return to Matches. When replying to a genuine new incoming message per policy, type the reply via input_text into 'Send a message' with confidence='low' to trigger a screenshot verification turn before tapping Send."
+      "steps": "Tap 'Matches' (4th tab in bottom nav, badged with the new-message count) to access conversations. The conversation list is divided into collapsible sections: 'Your turn (N)' (matches waiting for your reply), 'Their turn', and 'Hidden (N)'. ONLY open and process conversations under 'Your turn'; completely skip 'Their turn' and 'Hidden'. Check the preview snippet before opening -- skip any chat showing your own outgoing text. When inside a chat, inspect the bottom-most message directly above the input box: if it is an outgoing purple bubble or has a 'Sent' status indicator (e.g. [Button] 'Sent'), you were the last sender -- do not type anything, and tap 'Back' (top-left chevron) to return to Matches. When replying to a genuine new incoming message per policy, type the reply via input_text into 'Send a message' with confidence='low' to trigger a screenshot verification turn before tapping Send. Do not tap 'Record voice note' beside the input field."
     }
   ],
   "nuances": [
@@ -34,7 +34,6 @@
     "Several like buttons are listed at once, one per card visible on screen, and their labels repeat ('Like photo', 'Like photo prompt', 'Like prompt'). The first photo's heart is the TOPMOST: prefer @top-right over @bottom-right. Tapping the lower one likes the card below it.",
     "The like composer shows the media being liked, and Hinge draws a '1/N' badge on a profile's first photo (observed: '1/4' in the composer for a first photo, no badge in the composer for a last photo). A visible badge that does not read '1/' means the wrong photo is loaded.",
     "The Matches conversation list is split into 'Your turn' and 'Their turn'. 'Their turn' indicates the user was the last to message and is waiting for a reply; never open or reply to chats under 'Their turn'.",
-    "Paid-upsell controls (Boost, Roses, HingeX, Signals) appear on various screens; do not tap them.",
     "In the like-comment composer the send pill IS in the element list: 'Send priority like' before a comment is typed, 'Send priority like with message' after. Tap it by #N. 'Send a Rose' beside it is a paid feature -- never tap it.",
     "When typing in the like-comment composer, if the element list only shows #1 [Scroller], target 'Edit comment' specifically so focus lands on the text field rather than empty space in the scroller center.",
     "Pre-Send Verification is mandatory: Never tap Send if the visual analysis or screenshot shows an empty comment box. If empty, re-tap 'Edit comment' and re-type the comment.",
@@ -43,18 +42,33 @@
     "The Matches tab is the messages/chat area (labelled 'Matches' in bottom nav, with a badge count of new messages).",
     "The Matches conversation list is split into collapsible sections: 'Your turn (N)', 'Their turn', and 'Hidden (N)'. 'Their turn' and 'Hidden' indicate chats that do not need a reply; never open or reply to them.",
     "Inside a chat thread, outgoing messages appear as purple bubbles on the right and display a 'Sent' status indicator ([Button] 'Sent') at bottom-right below the bubble. Incoming messages appear as white bubbles on the left. The reply field is labelled 'Send a message' and sits beside a 'Record voice note' button -- do not tap the voice note button.",
-    "The like-comment composer can enter a broken state where the screenshot renders fully black and repeated input_text and tap attempts on 'Edit comment' never focus the field (a 'Choose input method' system notification was present). Do not keep retrying input in this state: restart_app co.hinge.app, wait for the splash/loading screen to clear, then re-open the composer from the profile's first photo and type again.",
-    "After restart_app, Hinge shows a splash/loading screen (H logo on Discover) before the profile card redraws; wait for it rather than tapping during the load."
+    "The like-comment composer has Android FLAG_SECURE enabled; adbagent now automatically captures full-color frames via emulator host window fallback. Once the comment 'Hey 🔥' is typed, the send button changes to 'Send priority like with message' in the element list. If the button already reads 'with message', the text is entered; do not re-type.",
+    "After restart_app, Hinge shows a splash/loading screen (H logo on Discover) before the profile card redraws; wait for it rather than tapping during the load.",
+    "press_key back from the Matches conversation list can land INSIDE the top chat thread instead of leaving the tab (observed: back from Matches list opened the 'Your turn' chat). To leave Matches, tap a bottom-nav tab, not back.",
+    "scroll_to_edge up does not always reach the top in one fling: observed cases where after one up-fling the element list had no name header, and another where the name was present but pronouns were not. Repeat the up-fling until BOTH name and pronouns appear at top-left before liking.",
+    "The comment field in the like composer is labelled 'Edit comment' in the element list but shows placeholder 'Add a comment' on screen -- same field.",
+    "A chat being under 'Your turn' does not by itself mean a reply is due -- read the newest incoming message and apply reply policy; a non-greeting message may require no reply.",
+    "Paid-upsell controls (Boost, Roses, HingeX, Signals) appear on various screens; do not tap them. 'Send a Rose' sits beside the send pill in the composer -- never tap it.",
+    "In the like-comment composer the send pill IS in the element list: 'Send priority like' before a comment is typed, 'Send priority like with message' after. Tap it by #N; do not guess x/y fractions.",
+    "When the Discover deck is exhausted, the screen shows 'You've seen everyone for now' with 'Change filters' and 'Review skipped profiles'. This is a terminal state for the pass -- do not tap either button or keep scrolling.",
+    "The exhausted-Discover screen still shows the filter chips row at top ('Signals', 'Age', 'Height', 'Dating Intentions', 'Active today') and the full bottom nav (Discover, Standouts, Likes You, Matches, Profile Hub) -- the Matches badge count is readable there, so you can check for new messages without leaving Discover first.",
+    "Inside a chat thread the header shows the match's name with a 'Verified' badge, a 'Back' chevron at top-left, a 'More' (three-dot) menu at top-right, and 'Chat' / 'Profile' tabs below the name. Use the 'Back' chevron to return to the Matches list; do not tap 'More' or 'Profile' unless the task requires it.",
+    "A chat thread can interleave the match's photo cards between messages (a photo with your like comment attached, e.g. 'Hey 🔥', appears inline in the thread). Do not mistake these inline photos for a new profile to like."
   ],
   "recommendations": [
     "Fast return to 1st photo: use scroll_to_edge with direction='up' on the profile scroller -- one action, and it cannot stop short.",
     "Before every like, check the element list for the profile name + pronouns at top-left. That check is cheap, it is the only evidence that you are on the first photo, and a like is irreversible -- an observation saying 'at the first photo' is not evidence.",
     "Fast profile exploration: use scroll_to_edge with direction='down' to reach the end of a profile in one action.",
-    "Use bottom nav (Discover, Matches) for navigation; avoid press_key back inside Hinge.",
-    "Treat all paid features (Boost, Roses, HingeX) as off-limits.",
     "Conversations: Only open chats listed under 'Your turn'. Never tap or message chats under 'Their turn' or 'Hidden'. In chat, verify the bottom-most bubble is an incoming message from the match (not an outgoing purple bubble or one followed by 'Sent') before drafting a reply.",
-    "To send a like comment or reply: type text via input_text into 'Edit comment' (composer) or 'Send a message' (chat) with confidence='low', inspect the resulting image analysis to confirm text 'Hey 🔥' is visually rendered in the comment field. If empty, re-type before sending. Then tap the send control by its #N (it is in the element list) and confirm the composer closed.",
-    "If the composer screenshot renders black and 'Edit comment' will not take focus after one retry, stop retrying: restart_app co.hinge.app, wait out the splash screen, and redo the like from the first photo."
+    "To send a like comment or reply: type text via input_text into 'Edit comment' (composer) or 'Send a message' (chat) with confidence='low', inspect the resulting image analysis or element list (confirm 'Send priority like with message') before sending. Then tap the send control by its #N (it is in the element list) and confirm the composer closed.",
+    "In the composer, if 'Send priority like with message' is present, the comment is loaded. Do not repeat input_text if the button already confirms the message is attached.",
+    "Fast return to 1st photo: use scroll_to_edge with direction='up' on the profile scroller, and be prepared to issue it twice -- verify with the name + pronouns header, not with the action's success.",
+    "Use bottom nav (Discover, Matches) for navigation; avoid press_key back inside Hinge -- from the Matches list it can drop you into a chat thread.",
+    "Check Matches before working Discover each pass; only open chats under 'Your turn', and even then reply only when policy requires it based on the newest incoming message.",
+    "Treat all paid features (Boost, Roses, HingeX, Signals) as off-limits.",
+    "To send a like comment or reply: type text via input_text into 'Edit comment' (composer) or 'Send a message' (chat) with confidence='low', then confirm via the element list ('Send priority like with message') or screenshot before tapping the send control by its #N.",
+    "When Discover shows 'You've seen everyone for now', stop liking for the pass and leave the phone on the Discover or Matches list -- never inside a profile or a chat.",
+    "Cap each Discover pass at 5 new likes so the pass finishes cleanly; after the cap, stop and leave the phone on a list screen."
   ],
   "custom_prompt": ""
 }

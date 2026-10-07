@@ -1067,3 +1067,44 @@ def test_a_lone_list_is_flung_without_measuring_anything():
     dev = _scrolling_device([FEED])
     dev.fling_to_edge("down")
     assert dev._d.flung == [(0, True, "toEnd")]
+
+
+def test_is_black_image_distinguishes_black_from_content():
+    from PIL import Image
+    from adbagent.device import _is_black_image
+
+    assert _is_black_image(None) is True
+    black = Image.new("RGB", (100, 100), color=(0, 0, 0))
+    assert _is_black_image(black) is True
+
+    near_black = Image.new("RGB", (100, 100), color=(5, 5, 5))
+    assert _is_black_image(near_black) is True
+
+    normal = Image.new("RGB", (100, 100), color=(120, 150, 200))
+    assert _is_black_image(normal) is False
+
+
+def test_screenshot_falls_back_when_adb_capture_is_black(monkeypatch):
+    from unittest.mock import MagicMock
+    from PIL import Image
+    from adbagent.device import Device
+    from adbagent.config import Config
+
+    dev = Device.__new__(Device)
+    dev.cfg = Config()
+    dev._size = (400, 800)
+    dev._d = MagicMock()
+    # takeScreenshot fails, adb screenshot returns black
+    dev._d.jsonrpc.takeScreenshot.side_effect = RuntimeError("jsonrpc failed")
+    dev._d.adb_device.screenshot.return_value = Image.new("RGB", (400, 800), color=(0, 0, 0))
+
+    recovered_frame = Image.new("RGB", (200, 400), color=(255, 100, 50))
+    monkeypatch.setattr("adbagent.device._host_window_screenshot", lambda: recovered_frame)
+
+    jpeg = dev.screenshot()
+    import io
+    result_img = Image.open(io.BytesIO(jpeg))
+    extrema = result_img.convert("L").getextrema()
+    # Should not be black
+    assert extrema[1] > 50
+
