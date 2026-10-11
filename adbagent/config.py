@@ -247,8 +247,9 @@ class SafetyConfig:
     unattended: bool = False
     #: Ask a second, small model before every send -- a message, a reply, a
     #: like -- whether it breaks the policy, and refuse it on a no or on no
-    #: answer. One call per send, on `llm.model_small`; see
-    #: `Agent._check_send` for what it caught that nothing else would have.
+    #: answer. One call per send, on `llm.model_small`, plus a read of the
+    #: screenshot on `llm.model_image` when the turn did not already make one;
+    #: see `Agent._check_send` for what it caught that nothing else would have.
     check_sends: bool = True
 
 
@@ -385,8 +386,8 @@ class WatchConfig:
     policies_dir: str = "policies"
     # `fail_closed` stood here: refuse to send when the conversation on screen
     # cannot be identified. It gated the send that no longer exists to gate --
-    # an unreadable thread now means `conversation_block` renders nothing, so the
-    # model decides with no thread in front of it rather than being refused.
+    # nothing in code identifies the conversation any more; the model reads the
+    # thread off the screen and decides, and the send check reads it again.
     #: Rolling spend ceiling. Unlike `safety.budget_usd`, hitting this pauses the
     #: watch until the window clears rather than ending it. 0 switches it off.
     max_usd_per_hour: float = 0.0

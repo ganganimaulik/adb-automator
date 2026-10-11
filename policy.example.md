@@ -35,6 +35,7 @@ If you are unsure whether something falls under one of those, do not reply.
   of those means not replying.
 - Run with `--draft` first. Replies get composed and recorded but never sent, so
   you can read what it *would* have said before it says it.
-- The harness will not let the same conversation be answered twice for the same
-  incoming message, whatever this file says. That guarantee is not yours to
-  weaken here — see the Watch section of the README.
+- Before replying, each pass reads who sent a conversation's newest message off
+  the screenshot, and a second model checks every send against this file. That
+  makes a second reply to the same message unlikely, not impossible — see "How
+  it avoids replying twice" in the README.

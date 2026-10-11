@@ -266,7 +266,10 @@ def test_a_send_waits_for_the_person_and_shows_what_it_says(cfg):
     try:
         turn = session.act([tap(element(turn, "Send"))])
         assert turn.pending is not None and turn.pending.kind == "send"
-        assert "khushi" in turn.pending.prompt
+        # The control, the app and the draft. Not the conversation's name: it
+        # was guessed off the tree, and the driver asking knows whose it is.
+        assert "'Send'" in turn.pending.prompt
+        assert "com.instagram.android" in turn.pending.prompt
         assert "see you at 7" in turn.pending.prompt
         assert not dev.taps
         turn = session.answer(turn.pending.id, True)

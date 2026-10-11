@@ -40,6 +40,7 @@ from . import conversation, prompts, runlog
 from .actions import POINT_ACTIONS, AgentAction
 from .agent import Agent, Recorder, RunState
 from .config import Config
+from .llm import ScreenAnalysis
 from .phonelock import PhoneLock
 from .safety import Aborted
 from .screen import Screen
@@ -273,21 +274,25 @@ class RemoteAgent(Agent):
         return True
 
     def _check_send(self, state: RunState, rec: Recorder, screen: Screen,
-                    action: AgentAction, control: str) -> str:
+                    action: AgentAction, control: str,
+                    analysis: Optional[ScreenAnalysis] = None) -> str:
         """The person, not a second model, says whether a send goes out.
 
         Fails closed like the model check it replaces: no answer is a no. A no
         is remembered against the frame, so the same send asked for again on
         the same screen is refused without asking the person twice.
+
+        `analysis` is the model check's evidence and has no use here: there is
+        no vision pass without a model, and the driver was shown the frame
+        itself. Nor does the prompt name the conversation -- that name came
+        from reading the thread off the tree, which nothing does any more (see
+        `conversation.py`); the driver asking the person knows whose it is.
         """
         key = f"{screen.exact_id}/{action.signature()}"
         if key in state.refused_sends:
             return state.refused_sends[key]
-        thread = conversation.thread_on(screen)
         draft = conversation.draft_in(action, screen)
         prompt = f"The agent wants to send with {control!r}"
-        if thread is not None and thread.title:
-            prompt += f" in the conversation with {thread.title}"
         prompt += f" ({screen.package})." if screen.package else "."
         if draft:
             prompt += f" It says: {draft!r}"

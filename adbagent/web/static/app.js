@@ -3214,7 +3214,7 @@ const CFG_SPEC = [
     ["unattended", "bool", { label: "Never prompt",
       help: "Refuse anything that would need a person rather than asking." }],
     ["check_sends", "bool", { label: "Check every send against the policy",
-      help: "Before a message, reply or like goes out, a second, small model reads the policy, the thread and the draft, and the send is refused unless it says yes. One call per send." }],
+      help: "Before a message, reply or like goes out, a second, small model reads the policy, the screen as read off its screenshot, and the draft, and the send is refused unless it says yes. One call per send, plus a screenshot read when the turn has not already made one." }],
   ]],
   ["run", [
     ["max_steps", "number", { label: "Max steps",

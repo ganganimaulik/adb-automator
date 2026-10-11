@@ -94,6 +94,12 @@ log = logging.getLogger("adbagent.watch")
 #: it sends, the two together produced a coin flip rather than a refusal. The
 #: default is still no: an operator who wants openers has to write that down,
 #: and the deferral is narrow enough that no other rule in this block moves.
+#:
+#: The rule on who sent the newest message is the only one that says where to
+#: look. The thread used to arrive already read, with a verdict, and reading it
+#: is the model's job now (see `conversation.py`) -- on the frame, because the
+#: element list neither lists messages in the order they are drawn nor tells
+#: them apart from the buttons beside the text field.
 ITERATION_CONTRACT = """\
 This is ONE PASS of a monitoring loop that runs continuously. Do this pass only,
 then stop:
@@ -108,6 +114,12 @@ then stop:
 
 Rules for this pass:
   - At most one reply per conversation. Never two.
+  - Before replying in a conversation, work out who sent its newest message.
+    Take it from the screenshot, or the image model's reading of it, when there
+    is one: the element list does not list messages in the order they are
+    drawn. Yours are on the sent side, normally the right; the buttons around
+    the text field, timestamps and an unsent draft are not messages. If the
+    newest message is yours, the conversation has been answered: leave it.
   - If a send is refused, do not retry it and do not rephrase it. Leave that
     item and move on -- the refusal is the harness holding the send back (draft
     mode, a send limit, or a check against the REPLY POLICY), and it is always
@@ -398,7 +410,8 @@ class Watch:
         the one thing that did: it was read back from disk each pass so that a
         thread answered in pass 3 was still known to be answered in pass 40.
         What a pass now knows about what earlier passes said is whatever is
-        visible in the thread on screen -- see `conversation.py`.
+        visible in the thread on screen, read off its screenshot -- see
+        `conversation.py`.
 
         No skill learning happens *per pass*, unlike `cmd_run`: rewriting the
         app's skill file every 45 seconds, mostly from passes that did nothing,

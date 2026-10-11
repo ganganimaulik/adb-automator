@@ -135,7 +135,7 @@ def save(cfg: Any, state: Any) -> None:
         "package_steps": state.package_steps,
         # What the run has sent. A resumed run that forgot it would start its
         # send limits from zero, and could send the sixth of five.
-        "sends": [{"step": s.step, "label": s.label, "thread": s.thread}
+        "sends": [{"step": s.step, "label": s.label}
                   for s in state.sends.sent],
         # A whole item ledger used to be persisted here -- per-item captions,
         # read flags, the set's size and which ends had been hit. None of it
@@ -261,10 +261,11 @@ def restore(state: Any, data: Dict[str, Any]) -> None:
     state.packages = set(data.get("packages") or [])
     state.package_steps = {str(k): int(v)
                            for k, v in (data.get("package_steps") or {}).items()}
+    # A checkpoint written before sends stopped carrying a thread name still
+    # has a `thread` on each; it is ignored rather than refused.
     for raw in data.get("sends") or []:
         if isinstance(raw, dict) and raw.get("label"):
-            state.sends.record(int(raw.get("step") or 0), str(raw["label"]),
-                               str(raw.get("thread") or ""))
+            state.sends.record(int(raw.get("step") or 0), str(raw["label"]))
 
     loops = data.get("loops") or {}
     state.loops.history = [tuple(pair) for pair in loops.get("history") or []]

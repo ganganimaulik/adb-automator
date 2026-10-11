@@ -26,7 +26,7 @@ $ adbagent run "turn on airplane mode"
 ## Key Capabilities
 
 - **Interactive Web UI (`adbagent ui`)**: Real-time goal execution, live phone screen streaming, visual history, model selector, config editor, skill generator, and watch policy editor.
-- **Accessibility Tree First**: Reads screen elements via Android accessibility tree rather than pixels, using vision/screenshots only when necessary (WebViews, image galleries, ambiguous controls).
+- **Accessibility Tree First**: Reads screen elements via Android accessibility tree rather than pixels, using vision/screenshots only when necessary (WebViews, image galleries, ambiguous controls, chat threads).
 - **Self-Improving App Skills**: Automatically learns workflows, UI quirks, and optimal interaction paths per app from every run.
 - **Safe Watch Mode**: Continuous monitoring and policy-guided replies with duplicate prevention gates and budget ceilings.
 - **Bring Your Own Agent (`adbagent mcp`)**: Claude Code, Codex or any MCP client drives the phone with its own model -- no API key -- while adbagent still verifies every action, puts sends and irreversible presses to the person, and records the session like any run.
@@ -55,7 +55,8 @@ the same block for a run recorded weeks ago.
 
 It reads the accessibility tree rather than pixels, and only pays for a
 screenshot when the tree cannot answer the question — a WebView, a gallery, a
-screen where two controls look identical. Everything that can be decided by
+screen where two controls look identical, a conversation whose messages the
+tree does not list in the order they are drawn. Everything that can be decided by
 ordinary code is: recognising the screen, dismissing a nag, judging whether an
 action worked, noticing a loop, paging through a photo album.
 
@@ -424,49 +425,54 @@ offers both ways out rather than choosing for you.
 ### How it avoids replying twice
 
 The failure that matters is not a wasted step, it is a second message to a real
-person. What prevents one is the model reading the thread it is about to answer.
+person. What prevents one is the model reading the thread it is about to answer
+— off the screenshot, because the accessibility tree is the wrong place to read
+a conversation from.
 
-Every turn that lands on a conversation, the prompt carries that conversation:
-the last twelve messages, newest last, each marked `us:` or `them:` — and then
-the reading, stated outright, because a model shown twelve lines of dialogue and
-left to infer whose turn it is will sometimes infer wrong:
+The tree lists messages in whatever order the app emits them — Hinge's thread
+dumps newest first — and puts the buttons around the text field right beside
+them. Reading the sides from its geometry, a bubble hugging the right edge being
+yours, was tried, and it needed a new rule for every app that broke it: a
+relative timestamp drawn against the left edge, a full-screen pager wrapped
+around the thread, and then a composer row whose camera, GIF and voice buttons
+were taken for messages, telling the model that a thread still waiting for a
+reply had been answered.
+
+So any screen with a text field brings its screenshot. A decider that can see
+(`llm.vision_in_decider`) reads the thread off the image itself; otherwise the
+image model's description of the frame carries it on a line of its own:
 
 ```
-THIS CONVERSATION (khushi) — newest last:
-  them:  hey
-  us:    you around?
-       · 2m
--> the last message in this thread is YOURS: you have already replied here.
-   Do NOT reply again. Leave this conversation and deal with another one.
+VISUAL SCREEN ANALYSIS (from image model):
+Last message: received: are you around later?
 ```
 
-Sides are read geometrically: an outgoing bubble hugs the right edge of the
-message list, an incoming one the left. A line whose margins are too close to
-call — a date separator, a security notice — belongs to nobody and is shown as
-such. So is thread chrome recognised by its resource id, which matters more than
-it sounds: a relative timestamp sits hard against the left edge, so on geometry
-alone it reads as *their* message, and a thread whose last real bubble is ours
-would then claim they spoke last. Order is geometric too — top to bottom, not
-the order the accessibility tree lists them in. Hinge's thread dumps newest
-first, and read in tree order every thread's oldest message looked like its
-newest.
+Each pass of a watch is told to work out who sent the newest message before it
+replies, and to leave a conversation whose newest message is its own. A search
+box or a form brings a screenshot too, which costs a capture and a vision read
+on a screen that did not need them.
 
 Before any send goes out — a reply, a comment, a like — a second, small model
-(`llm.model_small`) is shown the policy, that thread, the draft and what the pass
-has already sent, and asked one question: would this break a rule? A no, or no
-answer, and the send is refused and the model told why. It is the check that
-stops a decider which read the thread and still got it wrong: one was about to
-answer "Nvmm." with the reply the policy reserves for greetings. One call per
-send; `safety.check_sends` switches it off.
+(`llm.model_small`) is shown the policy, the screen and the image model's
+reading of it, the draft and what the pass has already sent, and asked one
+question: would this break a rule? A no, or no answer, and the send is refused
+and the model told why. It is the check that stops a decider which read the
+thread and still got it wrong: one was about to answer "Nvmm." with the reply
+the policy reserves for greetings. One call per send, plus a vision read when
+the turn has not already made one; `safety.check_sends` switches it off.
 
 **Be clear about what this is.** It is two models deciding, better informed. It
-is not a guarantee, and two things follow:
+is not a guarantee, and three things follow:
 
 - **Nothing survives the process.** A reply is knowable only because it is *on
-  the screen*. Scroll it out of the tail, or let the app fail to render it, and
+  the screen*. Scroll it out of the frame, or let the app fail to render it, and
   the evidence is gone — for the decider and the check alike.
-- **A send can still be wrong.** The check sees what the decider saw, so it
-  catches a misreading, not a thread nobody could see.
+- **A screen that cannot be captured leaves only the tree.** An app that sets
+  `FLAG_SECURE` captures as a blank frame on a real phone, and
+  `run.never_screenshot` takes no frame at all. Either way both models read the
+  thread from the element list, as well as it can be read from there.
+- **A send can still be wrong.** The check catches a misreading, not a thread
+  nobody could see.
 
 This replaced a harness gate that *was* a guarantee: an fsynced ledger
 (`watch-replies.jsonl`) of every thread's masked tail, consulted immediately

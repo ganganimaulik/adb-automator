@@ -681,6 +681,22 @@ def needs_screenshot(state: RunState, screen: Screen, cfg: Config) -> Tuple[bool
     if screen.ambiguous:
         return True, ("several elements look identical in the list; use the image "
                       "to tell them apart")
+    # A conversation is the commonest screen whose deciding fact lives in the
+    # layout rather than the text: who sent the newest message. The tree lists
+    # messages in whatever order the app emits them -- Hinge's newest first --
+    # and puts the buttons around the text field beside them, and reading sides
+    # off its bounds is what ``runs/425beba3ca6c`` got wrong. Keyed on the text
+    # field because every conversation has one; a search box or a form costs a
+    # screenshot it did not need, which is the cheap way to be wrong. Last, so
+    # any other reason's note wins the turn.
+    if conversation.has_text_field(screen):
+        # A blind decider is handed the vision pass's fields, not the frame.
+        source = ("the screenshot" if cfg.llm.decider_sees()
+                  else "the image model's \"Last message\" line")
+        return True, (f"there is a text field on this screen. If it is a "
+                      f"conversation, take who sent the newest message from "
+                      f"{source}, not from the element list -- the list's "
+                      f"order is not the screen's")
     return False, ""
 
 
@@ -1487,23 +1503,14 @@ class Agent:
             # `skill_note` is deliberately not in here: it goes to its own
             # message above the history instead, because it changes per app
             # rather than per turn. See `prompts.skill_block`.
-            # The thread on screen, if this screen is one: who said what, and
-            # whether the last word in it is already ours. This is the whole of
-            # what replaced the reply ledger and its gate -- the model decides
-            # whether a reply is owed, and this is the evidence it decides on.
             #
-            # Read every turn rather than only before a send, because the turn
-            # that matters is the one *choosing* the action: a model that can see
-            # its own reply at the bottom of the thread does not compose a second
-            # one. Gated on there being a composer on screen, which is one pass
-            # over the nodes -- a launcher or a feed pays that and nothing more.
+            # Nor is the thread on screen any more. A block read off the layout
+            # used to ride here, marking each message `us:` or `them:` and ending
+            # in a verdict on whether a reply was owed; when its reading was
+            # wrong the verdict overrode a model that could see the screen. A
+            # screen with a text field now brings its screenshot instead (see
+            # `needs_screenshot`), and the model reads the thread off that.
             #
-            # It rides in `notes` rather than beside the policy because it changes
-            # every turn, and this block is rebuilt every turn anyway.
-            convo_note = ""
-            if conversation.on_a_conversation(screen):
-                convo_note = prompts.conversation_block(
-                    conversation.read_conversation(screen))
             # Ordered least specific first, so specificity increases toward the
             # answer. It used to run the other way: `situational` -- the two
             # standing blocks of generic advice, 63% of all NOTE text across
@@ -1511,8 +1518,7 @@ class Agent:
             # i.e. the final thing read before answering, while `last_failure`,
             # the one sentence about what just happened on this screen, was
             # eighth of ten.
-            notes = "\n\n".join(filter(None, (situational, convo_note,
-                                             note, vision_note,
+            notes = "\n\n".join(filter(None, (situational, note, vision_note,
                                              pager_note, hint, elem_hint,
                                              ban_note, strategy_note,
                                              stall_text, state.last_failure)))
@@ -2052,8 +2058,11 @@ class Agent:
             # ---- 6a. the send check ------------------------------------
             # Last, after every guard above that could still stop the send, so
             # the call is paid only for a send that is otherwise going out.
+            # Handed this turn's vision pass, which read the very frame the
+            # send is about to land on.
             if sending and cfg.safety.check_sends and self._checks_sends:
-                refusal = self._check_send(state, rec, screen, action, sending)
+                refusal = self._check_send(state, rec, screen, action, sending,
+                                           analysis)
                 if refusal:
                     self._refuse_send(state, rec, screen, action, refusal)
                     continue
@@ -2195,19 +2204,18 @@ class Agent:
             # what lifted the thread out of the doubt the pre-send record left it
             # in. Both jobs belonged to the ledger and went with it. The screen
             # itself now carries the evidence -- our message is in the thread, on
-            # the sent side -- and `conversation_block` reads it back off the
-            # screen on the next turn that lands on this conversation.
+            # the sent side -- and the next turn that lands on this conversation
+            # reads it there, off the screenshot a text field brings.
             #
-            # What is kept is the count: a send `verify` saw land, against the
-            # thread it went into. Counted on `ok` alone -- a send that changed
-            # nothing did not go out, and one graded `soft_fail` might have,
-            # which is the side to count on.
+            # What is kept is the count: a send `verify` saw land. Counted on
+            # `ok` alone -- a send that changed nothing did not go out, and one
+            # graded `soft_fail` might have, which is the side to count on. It is
+            # no longer labelled with the thread it went into: that name was read
+            # off the header by the heuristics that read the thread, and went
+            # with them.
             if sending and outcome.ok:
-                thread = conversation.thread_on(screen)
-                state.sends.record(state.step, sending,
-                                   thread.title if thread else "")
+                state.sends.record(state.step, sending)
                 rec.event("sent", step=state.step, label=sending,
-                          thread=thread.title if thread else "",
                           total=len(state.sends))
 
             # ---- 8. learn (no LLM) --------------------------------------
@@ -2849,7 +2857,8 @@ class Agent:
             state.step, action, screen=screen, grade="refused", reason=reason))
 
     def _check_send(self, state: RunState, rec: Recorder, screen: Screen,
-                    action: AgentAction, control: str) -> str:
+                    action: AgentAction, control: str,
+                    analysis: Optional[ScreenAnalysis] = None) -> str:
         """Ask a second model whether this send breaks the policy. "" lets it go.
 
         The decider chose the send at whatever effort the turn got, with the
@@ -2860,13 +2869,30 @@ class Agent:
         ledger refused seven more: second replies to threads already answered,
         which nothing but the model stood in front of once it went.
 
+        Whether a thread was already answered is read off the frame, not the
+        tree (see `conversation.py`). `analysis` is this turn's vision pass over
+        `screen`, handed on so the same frame is not read twice; without a usable
+        one -- a decider that looked at the image itself, a read that failed --
+        the frame goes to the check and is read there.
+
         Fails closed. A send nobody could check is the one action that cannot
         be taken back, and holding it costs a pass at most.
         """
         key = f"{screen.exact_id}/{action.signature()}"
         if key in state.refused_sends:
             return state.refused_sends[key]
-        thread = conversation.thread_on(screen)
+        reading: Optional[str] = None
+        shot: Optional[bytes] = None
+        if analysis is not None and not analysis.unavailable:
+            reading = analysis.render()
+        elif not self.cfg.run.never_screenshot:
+            try:
+                shot = self._ensure_screenshot(screen)
+            except (DeviceTimeout, DeviceLost) as exc:
+                # Not a reason to hold the send: the check still has the tree,
+                # and its prompt says that no screenshot was read.
+                log.warning("step %d: no screenshot for the send check: %s",
+                            state.step, exc)
         model_name = self.llm.model_small if self.llm else ""
         self.on_event("llm_start", step=state.step, purpose="send_check",
                       model=model_name, screenshot=False)
@@ -2878,11 +2904,10 @@ class Agent:
             verdict = self.llm.check_send(                  ### LLM ###
                 goal=state.goal, policy=self.policy,
                 sent=state.sends.render(self.send_limits),
-                conversation=(prompts.conversation_block(thread)
-                              if thread else ""),
                 control=control, action=action.describe(),
                 draft=conversation.draft_in(action, screen),
                 history=state.history, rendered=render(screen),
+                screenshot=shot, image_analysis=reading,
                 step=state.step, recorder=rec, on_event=self.on_event)
         except BudgetExceeded:
             raise

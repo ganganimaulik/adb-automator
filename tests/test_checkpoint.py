@@ -70,7 +70,7 @@ def populated_state() -> RunState:
     state.strategy = "use the search box instead of the grid"
     state.replanned_at = 5
     state.sends.record(4, "Send priority like with message")
-    state.sends.record(6, "Send message", thread="Alex")
+    state.sends.record(6, "Send message")
     return state
 
 
@@ -168,6 +168,15 @@ def test_restore_tolerates_a_sparse_checkpoint(cfg):
     assert state.step == 3
     assert state.history == []
     assert len(state.scratchpad) == 0
+
+
+def test_restore_ignores_the_thread_an_older_checkpoint_named_a_send_by(cfg):
+    """Sends used to carry the conversation they went into, read off the screen
+    by a heuristic that is gone. The count is what a resume needs."""
+    state = RunState(goal=GOAL, run_id="r1", intent_id="i1")
+    checkpoint.restore(state, {"goal": GOAL, "sends": [
+        {"step": 6, "label": "Send message", "thread": "Alex"}]})
+    assert [(s.step, s.label) for s in state.sends.sent] == [(6, "Send message")]
 
 
 def test_latest_resumable_picks_the_newest_checkpoint(cfg, tmp_path):

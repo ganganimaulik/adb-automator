@@ -284,6 +284,9 @@ class FakeLLM:
         self.analyses = 0
         self.vision_reading = ""
         self.vision_label = ""
+        #: What the vision pass says about who sent a conversation's newest
+        #: message -- "received: ...", "sent: ...", or "" off a conversation.
+        self.vision_last_message = ""
         #: True to answer every vision pass as the real client does when the call
         #: fails: an empty analysis flagged `unavailable`.
         self.vision_fails = False
@@ -355,6 +358,7 @@ class FakeLLM:
             reading = self.vision_reading_after_reread
         return ScreenAnalysis(reading=reading,
                               item_label=self.vision_label,
+                              last_message=self.vision_last_message,
                               notable="fake visual analysis")
 
     def read_item(self, screenshot: bytes, *, goal: str = "", label: str = "",
@@ -444,8 +448,16 @@ class FakeLLM:
         Counted apart from `calls`, as the judge's vision read and the goal check
         are: a test asserting how many reasoning turns a goal took must not have
         a send's check folded into them.
+
+        A frame with no reading is read here, as the real client does, so a test
+        can count whether the check paid for a second look at the same screen.
         """
         self.send_checks += 1
+        if kwargs.get("screenshot") and kwargs.get("image_analysis") is None:
+            analysis = self.analyze_image(kwargs["screenshot"],
+                                          goal=kwargs.get("goal", ""))
+            if not analysis.unavailable:
+                kwargs = dict(kwargs, image_analysis=analysis.render())
         self.send_checks_seen.append(kwargs)
         self.ledger.record(Call(model=self.model_small, prompt_tokens=700,
                                 completion_tokens=40, purpose="send_check"))

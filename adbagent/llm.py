@@ -730,10 +730,10 @@ class ScreenAnalysis(BaseModel):
     to fill a slot. See :data:`prompts.IMAGE_ANALYSIS_SYSTEM` for why this
     replaced free prose.
 
-    Optional in *value*, not in presence: the four keys are all `required`, so
-    the model has to write `"notable": ""` rather than omit it. See
-    `harden_schema` and `answer_every_field` -- omission is what let a whole
-    class of blind steps through.
+    Optional in *value*, not in presence: every key is `required`, so the model
+    has to write `"notable": ""` rather than omit it. See `harden_schema` and
+    `answer_every_field` -- omission is what let a whole class of blind steps
+    through.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -748,6 +748,12 @@ class ScreenAnalysis(BaseModel):
                                             "shown, if visible.")
     blocking_dialog: str = Field("", description="Dialog or prompt covering the "
                                                  "screen, with its buttons.")
+    #: Who sent the newest message on a conversation, as "sent: ..." or
+    #: "received: ...". The one thing about a thread the tree cannot be trusted
+    #: with, and what a decider that cannot see decides "is a reply owed" on --
+    #: see `conversation.py`.
+    last_message: str = Field("", description="On a conversation: who sent the "
+                                              "newest message and what it says.")
     notable: str = Field("", description="Anything else visually important that "
                                          "the accessibility tree omits.")
 
@@ -772,7 +778,8 @@ class ScreenAnalysis(BaseModel):
     def render(self) -> str:
         """The lines worth putting in a prompt -- named, and only if filled."""
         labels = (("reading", "Reading"), ("item_label", "Item label"),
-                  ("blocking_dialog", "BLOCKING"), ("notable", "Also visible"))
+                  ("blocking_dialog", "BLOCKING"),
+                  ("last_message", "Last message"), ("notable", "Also visible"))
         lines = []
         for field_name, label in labels:
             value = " ".join(str(getattr(self, field_name) or "").split())
@@ -1713,27 +1720,45 @@ class LLMClient:
                                **kw)
 
     def check_send(self, *, goal: str, policy: str = "", sent: str = "",
-                   conversation: str = "", control: str = "", action: str = "",
+                   control: str = "", action: str = "",
                    draft: str = "", history: Sequence[str] = (),
-                   rendered: str = "", step: int = 0,
+                   rendered: str = "", screenshot: Optional[bytes] = None,
+                   image_analysis: Optional[str] = None, step: int = 0,
                    recorder: Optional[Any] = None,
                    on_event: Optional[Callable[..., None]] = None) -> "SendCheck":
         """Would this send break one of the owner's rules? Asked just before it.
 
         On `model_small` at the hard effort, as `judge` is: both are a verdict on
         what the deciding model did, and both are better asked of a model that
-        did not do it. No screenshot -- the question is about the rules and the
-        record, and the decider has already looked at the frame.
+        did not do it.
+
+        It is shown the frame, because one question it exists for -- has this
+        conversation already been answered? -- is one the element list cannot
+        settle (see `conversation.py`). Shown it the way the judge is, as
+        the vision model's reading and never as an image part: `model_small` is
+        the cheap text model in most configs, an image part fails a text-only
+        model's whole call, and a check that fails refuses the send.
+        `image_analysis` is that reading when the caller already has one for this
+        frame; otherwise `screenshot` is read here.
         """
         from . import prompts
 
+        if screenshot and image_analysis is None:
+            # `is None`, for the reason spelled out in `decide`. A read that
+            # failed stays None: "nobody looked" and "nothing seen" are worded
+            # apart in the prompt -- see `prompts.send_check_user`.
+            analysis = self.analyze_image(
+                screenshot, goal=goal, rendered=rendered, step=step,
+                recorder=recorder, on_event=on_event)
+            if not analysis.unavailable:
+                image_analysis = analysis.render()
         messages = [
             {"role": "system", "content": prompts.SEND_CHECK_SYSTEM},
             {"role": "user",
              "content": prompts.send_check_user(
-                 goal=goal, policy=policy, sent=sent,
-                 conversation=conversation, control=control, action=action,
-                 draft=draft, history=history, rendered=rendered)},
+                 goal=goal, policy=policy, sent=sent, control=control,
+                 action=action, draft=draft, history=history,
+                 rendered=rendered, image_analysis=image_analysis)},
         ]
         if recorder is not None:
             recorder.dump_messages(step, messages, purpose="send_check")

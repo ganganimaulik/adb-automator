@@ -913,6 +913,29 @@ def test_never_screenshot_wins(cfg):
     assert not want
 
 
+def test_screenshot_for_a_screen_with_a_text_field(cfg):
+    """Who sent a conversation's newest message is drawn, not listed: the tree
+    has the camera, GIF and voice controls of ``runs/425beba3ca6c`` beside the
+    messages, in no order the screen shows. The note names where a decider
+    finds the answer -- the frame itself, or the line the image model writes
+    when the decider cannot see."""
+    from adbagent.fingerprint import attach
+    from adbagent.screen import parse
+
+    screen = attach(parse(X.chat_with_composer_tools(), width=X.W, height=X.H))
+    state = RunState(goal="g", run_id="r", intent_id="i")
+    want, note = needs_screenshot(state, screen, cfg)
+    assert want and "text field" in note
+    assert "the image model's \"Last message\" line" in note
+
+    cfg.llm.vision_in_decider = True
+    _, note = needs_screenshot(state, screen, cfg)
+    assert "from the screenshot" in note
+
+    cfg.run.never_screenshot = True
+    assert needs_screenshot(state, screen, cfg) == (False, "")
+
+
 # ---------------------------------------------------------------------------
 # Artifacts
 # ---------------------------------------------------------------------------
@@ -2682,10 +2705,10 @@ def test_a_send_the_check_approves_goes_out_and_is_counted(cfg):
     seen = llm.send_checks_seen[0]
     assert seen["control"] == "Send"
     assert seen["draft"] == "on my way"
-    assert "THIS CONVERSATION (khushi)" in seen["conversation"]
-    assert [(s.label, s.thread) for s in state.sends.sent] == [("Send", "khushi")]
+    assert seen["image_analysis"] is not None      # the frame was read for it
+    assert [s.label for s in state.sends.sent] == ["Send"]
     # The decider is shown the harness's count from the next turn on...
-    assert '1 x "Send" in the conversation with khushi' in llm.budgets[-1]
+    assert '1 x "Send"' in llm.budgets[-1]
     # ...and so is the judge, which used to grade a `done` on the model's word.
     assert "SENT THIS RUN" in llm.judge_sent[-1]
 
@@ -2774,6 +2797,107 @@ def test_with_the_check_switched_off_a_send_asks_nobody(cfg):
     assert dev.state == "sent"
     assert llm.send_checks == 0
     assert len(state.sends) == 1
+
+
+# ---------------------------------------------------------------------------
+# A thread is read off the frame, never off the tree
+# ---------------------------------------------------------------------------
+#
+# ``runs/425beba3ca6c``: a thread whose text field sat among a camera, a GIF and
+# a voice control. The layout reader took all three for messages and put a
+# verdict under them -- "the last message in this thread is YOURS ... Do NOT
+# reply again" -- when the newest bubble was theirs. Nothing reads the tree into
+# a verdict now: a turn on a thread takes its screenshot, and who spoke last
+# reaches the decider and the send check from the image model.
+
+#: What the scripted image model reads off `X.chat_with_composer_tools`: the
+#: newest bubble there is theirs.
+THEIRS_LAST = f"received: {X.TOOLS_THREAD[-1]}"
+
+
+def _tools_app():
+    """That thread with a reply typed, so its Send button shows; tapping it
+    lands the reply at the bottom of the thread."""
+    reply = "sounds good, saturday?"
+    return {
+        "thread": fake.FakeScreen(
+            xml=X.chat_with_composer_tools(draft=reply),
+            taps={"Send": "sent"}),
+        "sent": fake.FakeScreen(
+            xml=X.chat_with_composer_tools(messages=X.TOOLS_THREAD + [reply])),
+    }
+
+
+def _reads_the_thread(dev):
+    llm = fake.FakeLLM(dev, _sends_then_done())
+    llm.vision_last_message = THEIRS_LAST
+    return llm
+
+
+def test_a_thread_reaches_the_decider_from_the_frame_and_without_a_verdict(cfg):
+    dev = fake.FakeDevice(cfg, start="thread", app=_tools_app())
+    llm = _reads_the_thread(dev)
+
+    Agent(dev, llm, cfg).run(GOAL)
+
+    # The first turn is on the thread: it took a screenshot, its note says
+    # where the answer is, and the answer is what the image model read.
+    assert llm.seen_screenshots >= 1
+    assert "there is a text field on this screen" in llm.notes[0]
+    assert f"Last message: {THEIRS_LAST}" in llm.analyses_seen[0]
+    for shown in llm.notes + llm.analyses_seen:
+        assert "THIS CONVERSATION" not in shown
+        assert "Do NOT reply again" not in shown
+        assert "Voice message" not in shown
+
+
+def test_the_send_check_is_handed_the_reading_of_the_frame_it_lands_on(cfg):
+    """The decide turn on this screen already had the frame read; reading it a
+    second time for the check would buy the same answer twice."""
+    dev = fake.FakeDevice(cfg, start="thread", app=_tools_app())
+    llm = _reads_the_thread(dev)
+
+    outcome, state = Agent(dev, llm, cfg).run(GOAL)
+
+    assert outcome == "success" and dev.state == "sent"
+    assert llm.send_checks == 1
+    seen = llm.send_checks_seen[0]
+    assert seen["screenshot"] is None
+    assert f"Last message: {THEIRS_LAST}" in seen["image_analysis"]
+    assert seen["draft"] == "sounds good, saturday?"
+
+
+def test_a_decider_that_looked_for_itself_leaves_the_check_to_read_the_frame(
+        cfg, monkeypatch):
+    """A seeing decider gets the image and no description of it, so the check
+    -- on the small model, which is text-only in most configs -- is handed the
+    frame and reads it through the image model."""
+    cfg.llm.vision_in_decider = True
+    monkeypatch.setattr(fake.FakeLLM, "needs_vision_pass",
+                        property(lambda self: False))
+    dev = fake.FakeDevice(cfg, start="thread", app=_tools_app())
+    llm = _reads_the_thread(dev)
+
+    Agent(dev, llm, cfg).run(GOAL)
+
+    assert "from the screenshot" in llm.notes[0]
+    seen = llm.send_checks_seen[0]
+    assert seen["screenshot"]
+    assert f"Last message: {THEIRS_LAST}" in seen["image_analysis"]
+
+
+def test_with_screenshots_off_the_check_has_only_the_tree(cfg):
+    """`run.never_screenshot` is the operator's call. The check is still asked,
+    and told that nothing was read off a frame -- not shown a reading of one."""
+    cfg.run.never_screenshot = True
+    dev = fake.FakeDevice(cfg, start="thread", app=_tools_app())
+    llm = _reads_the_thread(dev)
+
+    Agent(dev, llm, cfg).run(GOAL)
+
+    assert llm.seen_screenshots == 0
+    seen = llm.send_checks_seen[0]
+    assert seen["screenshot"] is None and seen["image_analysis"] is None
 
 
 

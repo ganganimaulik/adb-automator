@@ -287,6 +287,9 @@ def test_the_pass_goal_carries_the_iteration_contract(cfg, tmp_path):
     assert goal.startswith("watch instagram dms")
     assert "ONE PASS" in goal
     assert "At most one reply per conversation" in goal
+    # Who spoke last is the model's to read, and the list is the wrong place.
+    assert "who sent its newest message" in goal
+    assert "the element list does not list messages in the order" in goal
     assert "Finish on the screen you worked from" in goal
 
 

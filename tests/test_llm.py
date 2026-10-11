@@ -1388,14 +1388,32 @@ def test_the_ledger_survives_two_calls_settling_at_once():
 # ---------------------------------------------------------------------------
 #
 # Free prose ran 1,143 chars median and 2,284 at worst over the runs in `runs/`,
-# half of them spending a sentence on the Android nav bar. Four named fields ask
-# for the same facts without the padding.
+# half of them spending a sentence on the Android nav bar. Named fields ask for
+# the same facts without the padding.
 
-def test_the_vision_schema_asks_for_four_named_facts():
+def test_the_vision_schema_asks_for_named_facts():
     schema = harden_schema(ScreenAnalysis)
     assert set(schema["properties"]) == {
-        "reading", "item_label", "blocking_dialog", "notable"}
+        "reading", "item_label", "blocking_dialog", "last_message", "notable"}
     assert schema["additionalProperties"] is False
+
+
+def test_who_sent_the_newest_message_renders_on_a_line_of_its_own():
+    """What a decider that cannot see decides "is a reply owed" on, so it is
+    named the way the note and the send check refer to it."""
+    rendered = ScreenAnalysis(last_message="received: free saturday?").render()
+    assert rendered == "Last message: received: free saturday?"
+
+
+def test_the_vision_prompt_asks_who_sent_the_newest_message():
+    """And says what does not count, because the frame shows a draft in the text
+    field as plainly as it shows a message."""
+    from adbagent import prompts
+    text = prompts.IMAGE_ANALYSIS_SYSTEM
+    assert "- last_message:" in text
+    assert '"sent: <text>"' in text and '"received:' in text
+    assert "unsent draft" in text
+    assert "five fields" in text and "five fields" in prompts.image_analysis_user()
 
 
 def test_an_empty_field_renders_to_nothing():
@@ -2234,7 +2252,7 @@ def test_the_failure_flag_stays_out_of_the_schema_the_model_is_held_to():
     """A private attribute, so the model is never asked to fill it in."""
     schema = harden_schema(ScreenAnalysis)
     assert set(schema["properties"]) == {
-        "reading", "item_label", "blocking_dialog", "notable"}
+        "reading", "item_label", "blocking_dialog", "last_message", "notable"}
     assert "_failed" not in str(schema)
 
 
@@ -2296,7 +2314,7 @@ def test_the_vision_schema_requires_every_field(monkeypatch):
     leaves a field with a default out of it -- so `{}` was a valid answer."""
     schema = harden_schema(ScreenAnalysis)
     assert schema["required"] == [
-        "reading", "item_label", "blocking_dialog", "notable"]
+        "reading", "item_label", "blocking_dialog", "last_message", "notable"]
     assert harden_schema(Location)["required"] == ["x", "y"]
 
 
@@ -2424,7 +2442,8 @@ def test_a_blank_reply_after_long_thinking_is_refused(monkeypatch):
     """The same failure wearing the keys. Four empty strings after paragraphs of
     reasoning is an answer that was reached and then dropped."""
     client = _client(monkeypatch)
-    blank = ('{"reading":"","item_label":"","blocking_dialog":"","notable":""}')
+    blank = ('{"reading":"","item_label":"","blocking_dialog":"",'
+             '"last_message":"","notable":""}')
     calls = []
 
     def post(messages, *, model, schema, max_tokens, purpose, **kw):
@@ -2446,7 +2465,7 @@ def test_a_blank_reply_after_long_thinking_is_refused(monkeypatch):
 
 
 def test_a_prompt_answer_of_nothing_is_still_an_answer(monkeypatch):
-    """Not every blank is a bug. A model that writes all four keys empty without
+    """Not every blank is a bug. A model that writes every key empty without
     deliberating has looked and found the tree already said it all -- refusing
     that would buy two more calls and a false `unavailable` on a plain screen."""
     client = _client(monkeypatch)
@@ -2455,7 +2474,8 @@ def test_a_prompt_answer_of_nothing_is_still_an_answer(monkeypatch):
     def post(messages, *, model, schema, max_tokens, purpose, **kw):
         calls.append(messages)
         return ('{"reading":"","item_label":"","blocking_dialog":"",'
-                '"notable":""}'), Call(model=model, reasoning_chars=0)
+                '"last_message":"","notable":""}'), Call(model=model,
+                                                        reasoning_chars=0)
 
     monkeypatch.setattr(client, "_post", post)
     analysis = client.analyze_image(b"jpeg", goal="send a like")
@@ -2733,10 +2753,10 @@ def test_the_send_check_asks_the_small_model_with_the_rules_and_the_draft(
     monkeypatch.setattr(client, "_post", mock_post)
     verdict = client.check_send(
         goal="watch the inbox", policy="reply only to greetings",
-        conversation="THIS CONVERSATION (Alex): them: Nvmm.",
         control="Send message", action='tap #11 "Send message"',
         draft="up for a movie?", history=["1. tapped Alex"],
-        rendered="#11 [Button] Send message")
+        rendered="#11 [Button] Send message",
+        image_analysis="Last message: received: Nvmm.")
 
     assert verdict.send is False and "brush-off" in verdict.reason
     assert seen["model"] == client.model_small
@@ -2745,8 +2765,78 @@ def test_the_send_check_asks_the_small_model_with_the_rules_and_the_draft(
     user = seen["messages"][1]["content"]
     assert "reply only to greetings" in user
     assert '"up for a movie?"' in user
-    assert "Nvmm." in user
+    assert "Last message: received: Nvmm." in user
     assert "SENT THIS RUN: nothing yet." in user
+
+
+def test_the_send_check_reads_the_frame_through_the_image_model(monkeypatch):
+    """Whether a thread was already answered is drawn, not listed, so the check
+    is shown the frame -- as the image model's reading, the way the judge is.
+    The small model never gets an image part: it is the cheap text model in most
+    configs, an image fails such a model's whole call, and a check that fails
+    refuses the send."""
+    from adbagent.config import Config
+    from adbagent.llm import LLMClient
+
+    monkeypatch.setenv("FIREWORKS_API_KEY", "fw-key")
+    cfg = Config()
+    cfg.llm.model = "main-model"
+    cfg.llm.model_small = "small-model"
+    cfg.llm.model_image = "image-model"
+    client = LLMClient(cfg)
+    calls = []
+
+    def mock_post(messages, *, model, schema, max_tokens, purpose, **kw):
+        calls.append((purpose, model, messages))
+        if purpose == "analyze_image":
+            return ('{"reading":"","item_label":"","blocking_dialog":"",'
+                    '"last_message":"sent: on my way","notable":""}'), \
+                Call(model=model)
+        return ('{"send": false, "reason": "the newest message is already '
+                'the owner\'s"}'), Call(model=model)
+
+    monkeypatch.setattr(client, "_post", mock_post)
+    verdict = client.check_send(goal="reply to new messages",
+                                control="Send", action='tap #20 "Send"',
+                                draft="on my way!", screenshot=b"jpeg")
+
+    assert verdict.send is False
+    assert [(purpose, model) for purpose, model, _ in calls] == [
+        ("analyze_image", client.model_image),
+        ("send_check", client.model_small)]
+    user = calls[1][2][1]["content"]
+    assert isinstance(user, str)                      # text only, no image part
+    assert "SCREENSHOT, as an image model read it:" in user
+    assert "Last message: sent: on my way" in user
+
+
+def test_a_frame_the_image_model_could_not_read_is_not_passed_off_as_read(
+        monkeypatch):
+    client = _client(monkeypatch)
+    prompts_seen = []
+
+    def mock_post(messages, *, model, schema, max_tokens, purpose, **kw):
+        if purpose == "analyze_image":
+            raise LLMError("400: this model does not support image inputs")
+        prompts_seen.append(messages[1]["content"])
+        return '{"send": true, "reason": "fine"}', Call(model=model)
+
+    monkeypatch.setattr(client, "_post", mock_post)
+    assert client.check_send(goal="g", control="Send", screenshot=b"jpeg").send
+    assert "SCREENSHOT: none was read for this send" in prompts_seen[0]
+
+
+def test_the_send_check_prompt_tells_nothing_seen_from_nothing_looked_at():
+    from adbagent import prompts
+
+    def text(analysis):
+        return prompts.send_check_user(goal="g", control="Send",
+                                       image_analysis=analysis)
+
+    assert "SCREENSHOT: none was read for this send" in text(None)
+    assert "nothing the element list does not already say" in text("")
+    assert "Last message: received: hi" in text("Last message: received: hi")
+    assert '"Last message" line' in prompts.SEND_CHECK_SYSTEM
 
 
 def test_a_send_with_no_readable_draft_points_the_check_at_the_steps():
