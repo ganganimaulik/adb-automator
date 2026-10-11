@@ -751,6 +751,38 @@ class Agent:
         #: away the screen it was carrying.
         self._reobserve = False
 
+    # -- where a turn's decisions come from ----------------------------------
+    #
+    # Four seams, and nothing else in the loop knows who is deciding. The
+    # defaults are this process's own model and this terminal's person;
+    # `remote.RemoteAgent` overrides all four so that a coding agent connected
+    # over MCP decides instead, and the person approves through that agent's
+    # window -- while the guards, the verification, the stall ladder and the
+    # trace around them run exactly as they do here.
+
+    def _decider_name(self) -> str:
+        """What is choosing the actions, for the trace: a model id by default."""
+        return getattr(self.llm, "model", "") or ""
+
+    def _decide(self, state: RunState, rec: Recorder, screen: Screen,
+                **kwargs: Any) -> Optional[AgentAction]:
+        """This turn's action. `kwargs` are exactly `LLMClient.decide`'s.
+
+        None means the decider has nothing to say about this frame -- a person
+        has had the phone, say -- and the loop throws the frame away and looks
+        again rather than counting a failure.
+        """
+        return self.llm.decide(**kwargs)
+
+    def _confirm(self, prompt: str) -> bool:
+        """Whether an irreversible press may go ahead."""
+        return safety.confirm(prompt, self.cfg)
+
+    @property
+    def _checks_sends(self) -> bool:
+        """Whether there is anyone to ask before a send (see `_check_send`)."""
+        return self.llm is not None
+
     # -- perception helpers ------------------------------------------------
 
     def _ensure_screenshot(self, screen: Screen) -> bytes:
@@ -926,7 +958,7 @@ class Agent:
             # One directory per run still holds: the events of this sitting are
             # appended to the failed one's, with this event where they join.
             recorder.event("run_resume", goal=goal,
-                           model=getattr(self.llm, "model", ""),
+                           model=self._decider_name(),
                            resumed_at_step=state.step,
                            # *That* an answer was supplied, never what it said.
                            # `ask_user` is what the agent does instead of typing
@@ -941,7 +973,7 @@ class Agent:
                            **limits)
         else:
             recorder.event("run_start", goal=goal,
-                           model=getattr(self.llm, "model", ""), **limits)
+                           model=self._decider_name(), **limits)
 
         # Mirror the live LLM stream into the run directory as it happens, so
         # the web UI can show the model thinking rather than just its verdicts.
@@ -1490,7 +1522,7 @@ class Agent:
             if hard_because:
                 log.info("step %d: thinking harder (%s) because %s",
                          state.step, effort, hard_because)
-            model_name = self.llm.model if self.llm else ""
+            model_name = self._decider_name()
             # The frame reaches the decider itself only when the decider is the
             # model doing the looking. Otherwise the vision pass above is the call
             # that was shown it, and its own panel already carries the image.
@@ -1501,7 +1533,7 @@ class Agent:
                           hard_because=hard_because)
             t0_llm = time.monotonic()
             try:
-                action = self.llm.decide(                  ### LLM ###
+                action = self._decide(state, rec, screen,  ### LLM ###
                     goal=state.goal, rendered=render(screen),
                     history=state.history,
                     width=screen.width, height=screen.height,
@@ -1560,6 +1592,12 @@ class Agent:
                 state.remember(f"{state.step}. the model's reply could not be "
                                f"read as an action -> skipped")
                 self._maybe_give_up(state)
+                continue
+            if action is None:
+                # Look again before anyone decides anything -- see `_decide`.
+                self.on_event("llm_end", step=state.step, purpose="decide",
+                              elapsed=time.monotonic() - t0_llm, call=None)
+                screen = None
                 continue
             t_llm = time.monotonic() - t0_llm            # the decision alone
             t_step_llm = time.monotonic() - t0_step_llm  # + any vision pass
@@ -1777,9 +1815,9 @@ class Agent:
             label = safety.irreversible(action, screen)
             if label is not None:
                 self.on_event("safety_warning", message=f"step {state.step}: irreversible action {label!r} in {screen.package}")
-                if not safety.confirm(
+                if not self._confirm(
                         f"Step {state.step}: the agent wants to press {label!r} "
-                        f"in {screen.package}. This cannot be undone.", cfg):
+                        f"in {screen.package}. This cannot be undone."):
                     state.remember(
                         f"{state.step}. refused to press {label!r}"
                         + (f" in {screen.package}" if screen.package else "")
@@ -2014,7 +2052,7 @@ class Agent:
             # ---- 6a. the send check ------------------------------------
             # Last, after every guard above that could still stop the send, so
             # the call is paid only for a send that is otherwise going out.
-            if sending and self.llm is not None and cfg.safety.check_sends:
+            if sending and cfg.safety.check_sends and self._checks_sends:
                 refusal = self._check_send(state, rec, screen, action, sending)
                 if refusal:
                     self._refuse_send(state, rec, screen, action, refusal)

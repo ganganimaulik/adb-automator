@@ -569,6 +569,32 @@ def cmd_models(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# one driver per phone
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _holding_phone(cfg, who: str):
+    """Hold the phone for this command, or stop and say who has it.
+
+    The web UI keeps its own children from driving the phone together, but it
+    cannot see a run typed into a terminal or an MCP session a coding agent
+    started. See `phonelock`.
+    """
+    from .phonelock import PhoneBusy, PhoneLock
+
+    lock = PhoneLock(cfg.run.artifacts_dir, who)
+    try:
+        lock.acquire()
+    except PhoneBusy as exc:
+        raise RuntimeError(f"{exc}; wait for it to finish, or stop it, "
+                           f"before driving the phone") from None
+    try:
+        yield lock
+    finally:
+        lock.release()
+
+
+# ---------------------------------------------------------------------------
 # auto-pair when no device is connected
 # ---------------------------------------------------------------------------
 
@@ -642,7 +668,8 @@ def cmd_dump(args) -> int:
     out = Out()
     cfg = build_config(args)
     _ensure_device(args, cfg, out)
-    with Device(cfg, args.device or "") as dev:
+    with _holding_phone(cfg, "adbagent dump"), \
+            Device(cfg, args.device or "") as dev:
         screen = dev.observe()
         if args.detail is not None:
             element = screen.by_index(args.detail)
@@ -1230,7 +1257,8 @@ def cmd_run(args) -> int:
 
     exit_code = 0
     iteration = 0
-    with Device(cfg, args.device or "") as dev:
+    with _holding_phone(cfg, f"adbagent run: {goal}"), \
+            Device(cfg, args.device or "") as dev:
         # One client for the whole session, so --budget-usd bounds the *session*
         # rather than resetting on every iteration (which would make it useless
         # with --repeat inf).
@@ -1450,7 +1478,8 @@ def cmd_watch(args) -> int:
     reporter = _live_reporter(out, max_steps=cfg.watch.max_steps) \
         if args.verbose else None
 
-    with Device(cfg, args.device or "") as dev:
+    with _holding_phone(cfg, f"adbagent watch: {goal}"), \
+            Device(cfg, args.device or "") as dev:
         # One client for the whole watch, so the rolling spend ceiling sees the
         # session rather than a single pass.
         llm = LLMClient(cfg, run_id=f"watch-{int(time.time())}")
@@ -1911,7 +1940,8 @@ def cmd_apps(args) -> int:
     cfg = build_config(args)
     _ensure_device(args, cfg, out)
 
-    with Device(cfg, args.device or "") as dev:
+    with _holding_phone(cfg, "adbagent apps"), \
+            Device(cfg, args.device or "") as dev:
         query = getattr(args, "search", "") or ""
         third_party = getattr(args, "third_party", False)
         pkgs = dev.list_apps(query=query, third_party_only=third_party)
@@ -2033,7 +2063,8 @@ def cmd_skills(args) -> int:
 
         llm = LLMClient(cfg, run_id=f"skill-{int(time.time())}")
         try:
-            with Device(cfg, getattr(args, "device", "") or "") as dev:
+            with _holding_phone(cfg, "adbagent skills generate"), \
+                    Device(cfg, getattr(args, "device", "") or "") as dev:
                 exp = skillmod.explore_app(
                     dev, llm, cfg, query=app_target, tasks=user_tasks,
                     on_event=_live_reporter(out, max_steps=cfg.run.max_steps))
@@ -2147,6 +2178,42 @@ def _reexec() -> int:
     sys.stderr.flush()
     os.execv(sys.executable, [sys.executable, *argv])
     return 0  # not reached
+
+
+def cmd_mcp(args) -> int:
+    """Serve the phone over MCP on stdio, for a coding agent to drive.
+
+    Nothing may be printed to stdout here: it is the protocol channel. The SDK's
+    stdio transport moves fd 1 to stderr while it runs, which covers stray
+    output from adb and anything else, and logging already goes to stderr.
+    """
+    try:
+        import mcp  # noqa: F401 - only checking it is there
+    except ImportError:
+        print("error: `adbagent mcp` needs the MCP SDK: pip install 'mcp>=2.3'",
+              file=sys.stderr)
+        return 1
+    from .config import find_config_file
+    from .mcp_server import serve
+
+    cfg = build_config(args)
+    if args.no_send_approval:
+        cfg.safety.check_sends = False
+    # A client starts this server from wherever the client happens to be
+    # running, so relative directories are taken from the config file's own
+    # directory rather than from there. Otherwise every project a coding agent
+    # is opened in would grow a `runs/` of its own -- invisible to `adbagent ui`
+    # -- and miss the app skills learned everywhere else.
+    found = find_config_file(getattr(args, "config", None))
+    if found is not None:
+        for section, name in (("run", "artifacts_dir"),
+                              ("skills", "skills_dir"),
+                              ("watch", "policies_dir")):
+            part = getattr(cfg, section)
+            value = getattr(part, name)
+            if value and not Path(value).expanduser().is_absolute():
+                setattr(part, name, str(found.parent / value))
+    return serve(cfg, idle_timeout_s=max(1.0, args.idle_timeout) * 60)
 
 
 def cmd_ui(args) -> int:
@@ -2446,6 +2513,34 @@ def build_parser() -> argparse.ArgumentParser:
                    help="never watch files or restart on a change")
     _add_common(p)
     p.set_defaults(func=cmd_ui)
+
+    p = sub.add_parser(
+        "mcp", help="serve the phone over MCP (stdio) for a coding agent to drive",
+        description="Let Claude Code, Codex, Cursor or any MCP client drive the "
+                    "phone, deciding each step with its own model -- no API key "
+                    "needed here. Add it to the client, e.g. "
+                    "`claude mcp add adbagent -- adbagent mcp`.")
+    p.add_argument("--draft", dest="watch_draft", action="store_true",
+                   default=None,
+                   help="compose sends but never send them")
+    p.add_argument("--allow-destructive", dest="allow_destructive",
+                   action="store_true", default=None,
+                   help="irreversible presses go ahead without asking the person")
+    p.add_argument("--no-send-approval", dest="no_send_approval",
+                   action="store_true",
+                   help="sends go out without asking the person (draft mode "
+                        "and send limits still apply)")
+    p.add_argument("--idle-timeout", dest="idle_timeout", type=float, default=15,
+                   help="minutes without a call before a session gives the "
+                        "phone back (default 15)")
+    p.add_argument("--max-steps", dest="max_steps", type=int,
+                   help="step budget for each session")
+    p.add_argument("--artifacts-dir", dest="artifacts_dir",
+                   help="where sessions are recorded (default: config's "
+                        "run.artifacts_dir)")
+    _add_common(p)
+    _add_device(p)
+    p.set_defaults(func=cmd_mcp)
 
     p = sub.add_parser("skills", help="manage app skills (list, view, create, generate)")
     p.add_argument("skills_action", nargs="?", choices=["list", "view", "create", "generate"],

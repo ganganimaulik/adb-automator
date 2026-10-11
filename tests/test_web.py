@@ -852,6 +852,18 @@ def test_screenshot_refused_while_running(web, monkeypatch):
     assert web.get("/api/devices/screenshot").status_code == 409
 
 
+def test_a_driver_outside_the_ui_holds_the_phone_too(web, tmp_path):
+    """A run typed into a terminal, or an MCP session, is not one of the UI's
+    children; the lock is how the UI knows about it."""
+    from adbagent.phonelock import PhoneLock
+
+    with PhoneLock(tmp_path / "runs", "an MCP session (claude-code): x"):
+        res = web.get("/api/devices/screenshot")
+        assert res.status_code == 409
+        assert "MCP session" in res.json()["detail"]
+        assert web.post("/api/runs", json={"goal": "y"}).status_code == 409
+
+
 def test_screenshot_returns_jpeg(web, monkeypatch):
     from adbagent import device as devmod
 

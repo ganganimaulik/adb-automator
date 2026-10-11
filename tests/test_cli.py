@@ -34,8 +34,35 @@ def test_every_subcommand_parses():
         ["replay", "runs/abc", "--rebuild-system", "--limit", "10"],
         ["replay", "runs/abc", "--steps", "4", "7", "--json"],
         ["apps", "--search", "whatsapp", "-3"],
+        ["mcp"],
+        ["mcp", "--draft", "--idle-timeout", "5", "-d", "emulator-5554"],
     ):
         assert parse(argv).func is not None
+
+
+def test_mcp_flags_reach_the_config():
+    args = parse(["mcp", "--draft", "--allow-destructive", "--max-steps", "40"])
+    cfg = build_config(args)
+    assert cfg.watch.draft is True
+    assert cfg.safety.allow_destructive is True
+    assert cfg.run.max_steps == 40
+    # Unset flags leave the config alone rather than writing False over it.
+    cfg = build_config(parse(["mcp"]))
+    assert cfg.watch.draft is False and cfg.safety.allow_destructive is False
+
+
+def test_a_command_that_drives_the_phone_says_who_has_it(tmp_path):
+    from adbagent.cli import _holding_phone
+    from adbagent.phonelock import PhoneLock
+
+    cfg = build_config(parse(["run", "x", "--artifacts-dir", str(tmp_path)]))
+    with PhoneLock(tmp_path, "an MCP session (claude-code): read my messages"):
+        with pytest.raises(RuntimeError, match="MCP session .claude-code."):
+            with _holding_phone(cfg, "adbagent run: x"):
+                pass
+    with _holding_phone(cfg, "adbagent run: x") as lock:
+        assert lock.held
+    assert not lock.held
 
 
 def test_a_goal_is_required(tmp_path, capsys):
@@ -510,10 +537,13 @@ def test_service_tier_cli_and_env_precedence(monkeypatch, tmp_path):
     assert cfg.llm.service_tier == "default"
 
 
-def test_cmd_apps(monkeypatch, capsys):
+def test_cmd_apps(monkeypatch, capsys, tmp_path):
     from unittest.mock import MagicMock
     from adbagent.cli import cmd_apps
 
+    # The command holds the phone lock in `run.artifacts_dir`, "runs" under the
+    # working directory -- which must not be this checkout's own.
+    monkeypatch.chdir(tmp_path)
     mock_dev = MagicMock()
     mock_dev.list_apps.return_value = ["com.whatsapp", "com.whatsapp.w4b"]
     mock_dev.__enter__.return_value = mock_dev

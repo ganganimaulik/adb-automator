@@ -496,7 +496,9 @@ def test_cli_skills_generate_explores_with_the_skill_model(tmp_path, monkeypatch
     config.write_text(json.dumps({"llm": {
         "model": "main-model", "model_skill": "skill-writer",
         "model_image": "sees-things", "api_key": "k",
-    }}), encoding="utf-8")
+    # The command holds the phone lock in the artifacts directory, which must
+    # not be this checkout's own `runs/`.
+    }, "run": {"artifacts_dir": str(tmp_path / "runs")}}), encoding="utf-8")
 
     class Nothing:
         def __init__(self, *a, **kw):

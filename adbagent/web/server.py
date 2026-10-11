@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from .. import phonelock
 from .. import policies as policymod
 from ..config import Config, _set_path, find_config_file, load_config
 from ..policies import same_file as _same_file
@@ -267,7 +268,10 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         job = jobs.active()
         if job is not None:
             return f"a skill is being generated (job {job.id}); the phone is busy"
-        return ""
+        # Last, because it is the only one about a process this server did not
+        # start: a run typed into a terminal, or an MCP session a coding agent
+        # opened. See `phonelock`.
+        return phonelock.holder(runs_dir)
 
     def load_cfg() -> Config:
         return load_config(config_path or None).config

@@ -29,12 +29,14 @@ $ adbagent run "turn on airplane mode"
 - **Accessibility Tree First**: Reads screen elements via Android accessibility tree rather than pixels, using vision/screenshots only when necessary (WebViews, image galleries, ambiguous controls).
 - **Self-Improving App Skills**: Automatically learns workflows, UI quirks, and optimal interaction paths per app from every run.
 - **Safe Watch Mode**: Continuous monitoring and policy-guided replies with duplicate prevention gates and budget ceilings.
+- **Bring Your Own Agent (`adbagent mcp`)**: Claude Code, Codex or any MCP client drives the phone with its own model -- no API key -- while adbagent still verifies every action, puts sends and irreversible presses to the person, and records the session like any run.
 
 ## Table of Contents
 
 - [Install](#install)
 - [Connect a Phone](#connect-a-phone)
 - [Choose a Model](#choose-a-model)
+- [Drive It from a Coding Agent (MCP)](#drive-it-from-a-coding-agent-mcp)
 - [Web UI](#web-ui)
 - [Run (CLI)](#run)
 - [Watch](#watch)
@@ -141,6 +143,132 @@ with `llm.model_skill_image` — and the screenshot goes straight into the decid
 call: the model reading the picture is the model deciding, so describing it first
 is a round trip spent having it tell itself what it is looking at. That is
 `llm.vision_in_decider` without the checkbox, and `adbagent doctor` says so.
+
+## Drive it from a coding agent (MCP)
+
+`adbagent run` decides every step with a model it calls itself, which needs an
+API key. `adbagent mcp` turns that around: it serves the phone over MCP, and the
+coding agent you already use -- Claude Code, Codex, Cursor, opencode -- decides
+each step with its own model, on the plan you already pay for. No API key is
+needed here.
+
+```bash
+adbagent mcp -c ~/adb/config.json     # stdio: the client starts it, not you
+adbagent mcp --draft                  # compose sends, never send them
+```
+
+Register it with the client once:
+
+```bash
+claude mcp add --scope user adbagent -- adbagent mcp -c ~/adb/config.json
+```
+
+For Codex, in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.adbagent]
+command = "adbagent"
+args = ["mcp", "-c", "/home/you/adb/config.json"]
+```
+
+Any other client takes the same command; use `python -m adbagent mcp` where the
+`adbagent` script is not on the client's PATH. Then ask the agent for something
+on the phone.
+
+Give it `-c`. The client starts the server from wherever the client is running,
+so the relative directories in the config -- `runs/`, `skills/`, `policies/` --
+are taken from the config file's own directory: every session lands in the same
+history and finds the same app skills, whichever project the agent was opened
+in.
+
+### What the agent is given
+
+| tool | what it does |
+|---|---|
+| `start_session(goal, policy, send_limits)` | takes the phone and returns the first screen; with `policy` the session is one pass of that watch -- its instructions verbatim, its goal, its caps |
+| `act(actions)` | one or more actions; returns what happened and the new screen |
+| `look(grid)` | the current screen with a screenshot; `grid` draws a labeled 10% grid to read x/y off |
+| `approve(request_id)` | asks the person whether a pending action may go ahead |
+| `hand_over(reason)` | gives the phone to the person -- a login, a code -- and takes it back after |
+| `end_session(summary)` | records the answer and gives the phone back |
+
+The screen is the element list `adbagent dump` prints and the actions are the
+vocabulary a model answers with; the server's instructions tell the agent how to
+read one and use the other. A batch stops at the first action that does not
+work, and before an action that names an element once the screen has changed
+under it -- its `#N` was read off a screen that is gone -- unless the element is
+named by a key that is still on screen.
+
+A `policy` (a name from `watch.policies_dir`, as `watch --policy` takes it)
+turns a session into one pass of that watch: the agent is shown the policy
+verbatim and the pass contract a watch runs under, the policy's goal stands when
+none is given, and its `send_limits` hold. `send_limits` on the call can add
+caps -- `like=3, rose=0` -- and only ever tighten the policy's. The watch's
+supervisor -- resting on `snooze`, sweeping on a clock -- is not part of a
+session: one session is one pass.
+
+### Only the decision moved
+
+A session is an ordinary run whose decide call is answered from outside
+(`Agent._decide`, overridden in `remote.py`), so everything else a step involves
+still happens here, unchanged: dismissing nags, waiting for the screen to settle
+and for a blank screen to draw, verifying every action, the per-screen ban list,
+refusing a scroll that revealed nothing, the stall ladder, the sensitive-screen
+hand-over, and the trace in `runs/<id>/` -- a session shows up in History and
+`adbagent report` reads it like any run. The agent is shown what the model would
+have been shown, less what it already has: the history arrives as the lines
+added since its last call, and the standing advice blocks once per session.
+
+What the models did, the agent or the person does instead:
+
+| in a run | in an MCP session |
+|---|---|
+| `llm.model` decides | the agent decides |
+| `llm.model_image` reads screenshots and places `tap_at` controls | the agent is shown the screenshots and gives x/y itself |
+| `llm.model_small` judges a `done` | the agent's `done` stands |
+| `llm.model_small` checks each send against the policy | the person approves each send |
+| a replan call when the run stalls | the stall note in the turn's notes |
+| the app's skill is updated afterwards | not yet: sessions are not learned from |
+
+The pager sweep is off in a session: it has a vision model read every item it
+pages to, and there is none.
+
+### What only the person may decide
+
+An irreversible press (delete, buy, uninstall, sign out...) and every send (a
+message, a reply, a like) stop with `APPROVAL NEEDED`; the agent calls
+`approve`, and the person answers in the agent's own window, through MCP
+elicitation. The agent cannot answer for them: any call other than `approve`
+declines it, and a client that cannot elicit has the action declined rather than
+taken without anyone asked.
+
+| flag | what it changes |
+|---|---|
+| `--draft` | sends are composed and refused, before anyone is asked |
+| `--no-send-approval` | sends go out without asking; draft mode and `send_limits` still apply |
+| `--allow-destructive` | irreversible presses go ahead without asking |
+| `--idle-timeout` | minutes without a call before a session gives the phone back (15) |
+
+A password, PIN, one-time-code or payment screen ends the session without being
+shown, as it ends a run. `hand_over` is the way through one without ending.
+
+### One phone, one driver
+
+A session holds the phone for as long as it runs, and so do `run`, `watch`,
+`skills generate`, `dump` and `apps`. The lock is an OS file lock in the
+artifacts directory, so whichever process has the phone -- a session a coding
+agent opened, a run in another terminal, a watch started from the browser -- the
+others refuse with its name instead of driving it underneath, and the web UI
+answers 409 with that name. A holder that crashes cannot leave it held: the lock
+goes with the process.
+
+### Why the agent decides
+
+The other arrangement -- this server keeping its own loop and borrowing the
+client's model through MCP *sampling* -- would have left the loop exactly as it
+is. It is not available: Claude Code never implemented sampling, Codex declined
+it, and the 2026-07-28 revision of the protocol deprecated it. So the client is
+the decider.
 
 ## Run
 
