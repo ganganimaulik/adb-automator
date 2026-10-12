@@ -520,3 +520,129 @@ def test_a_policy_is_shown_once_and_its_send_caps_hold(cfg):
         assert "REPLY POLICY" not in turn.render()       # said once
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# Several policies, one pass of each in turn
+# ---------------------------------------------------------------------------
+
+def _legs(**caps):
+    from adbagent.remote import Leg
+    return [Leg(goal="open the Wi-Fi settings", policy="Policy one says this.",
+                send_limits=caps.get("one", {}), name="One"),
+            Leg(goal="open the Bluetooth settings",
+                policy="Policy two says that.",
+                send_limits=caps.get("two", {}), name="Two")]
+
+
+def _start_several(cfg, dev, legs):
+    session = Session(cfg, open_device=lambda _cfg: dev, driver="test",
+                      idle_timeout_s=30, legs=legs)
+    return session, session.start("")
+
+
+def test_several_policies_take_turns_in_one_session(cfg):
+    dev = fake.FakeDevice(cfg)
+    session, turn = _start_several(cfg, dev, _legs())
+    try:
+        first = turn.render()
+        assert "POLICY 1 of 2: One" in first
+        assert "GOAL:\nopen the Wi-Fi settings" in first
+        assert "Policy one says this." in first
+        assert "test" in phonelock.holder(cfg.run.artifacts_dir)
+
+        turn = session.act([tap(element(turn, "Wi-Fi"))])
+        assert turn.leg == 1 and not turn.outcome
+        turn = session.end("Wi-Fi is open")
+
+        # Not the end of the session: the next policy's first turn.
+        assert not turn.outcome and turn.leg == 2
+        second = turn.render()
+        assert "POLICY 2 of 2: Two" in second
+        assert "GOAL:\nopen the Bluetooth settings" in second
+        assert "Policy two says that." in second
+        assert "Policy one says this." not in second
+        assert any("policy 1 of 2 (One) ended: success -- Wi-Fi is open" in line
+                   for line in turn.happened)
+        assert any("policy 2 of 2 (Two) starts now" in line
+                   for line in turn.happened)
+        # The phone was never let go in between.
+        assert "test" in phonelock.holder(cfg.run.artifacts_dir)
+
+        turn = session.end("Bluetooth is open")
+        assert turn.outcome == "success"
+        ended = turn.render()
+        assert "SESSION ENDED: success" in ended
+        assert "policy 1 of 2 (One) ended: success" in ended
+        assert "policy 2 of 2 (Two) ended: success" in ended
+    finally:
+        session.close()
+    assert phonelock.holder(cfg.run.artifacts_dir) == ""
+    assert dev.closes == 1                 # one device session for the two
+    runs = [p for p in Path(cfg.run.artifacts_dir).iterdir() if p.is_dir()]
+    assert len(runs) == 2                  # and a run of its own for each
+
+
+def test_each_policy_brings_its_own_send_caps(cfg):
+    """Policy one forbids the send; policy two leaves it to the person."""
+    dev = _chat(cfg)
+    session, turn = _start_several(cfg, dev, _legs(one={"send": 0}))
+    try:
+        turn = session.act([tap(element(turn, "Send"))])
+        assert turn.pending is None and not dev.taps      # capped, not asked
+        turn = session.end("nothing to send here")
+        assert turn.leg == 2
+        turn = session.act([tap(element(turn, "Send"))])
+        assert turn.pending is not None                     # asked this time
+    finally:
+        session.close()
+
+
+def test_a_failed_pass_still_hands_on_to_the_next_policy(cfg):
+    dev = fake.FakeDevice(cfg)
+    session, _ = _start_several(cfg, dev, _legs())
+    try:
+        turn = session.end("Wi-Fi is managed by the admin", failed=True)
+        assert not turn.outcome and turn.leg == 2
+        assert any("policy 1 of 2 (One) ended: failed" in line
+                   for line in turn.happened)
+    finally:
+        session.close()
+
+
+def test_skip_remaining_ends_the_session_with_the_pass_in_hand(cfg):
+    dev = fake.FakeDevice(cfg)
+    session, _ = _start_several(cfg, dev, _legs())
+    turn = session.end("that will do", skip_remaining=True)
+    assert turn.outcome == "success"
+    assert "not run: Two -- end_session skipped them" in turn.render()
+    assert phonelock.holder(cfg.run.artifacts_dir) == ""
+    runs = [p for p in Path(cfg.run.artifacts_dir).iterdir() if p.is_dir()]
+    assert len(runs) == 1
+
+
+def test_a_batch_stops_where_a_policys_pass_ends(cfg):
+    """What was left of the batch was planned for the last policy's app."""
+    cfg.run.max_steps = 2
+    dev = fake.FakeDevice(cfg)
+    session, turn = _start_several(cfg, dev, _legs())
+    try:
+        turn = session.act([tap(element(turn, "Wi-Fi")), back(), back()])
+        assert turn.leg == 2 and not turn.outcome
+        assert dev.actions.count("press(back)") == 1
+        assert any("stopped before the remaining 1 action(s)" in line
+                   for line in turn.happened)
+        assert any("policy 1 of 2 (One) ended: failed" in line
+                   for line in turn.happened)
+    finally:
+        session.close()
+
+
+def test_closing_mid_chain_runs_none_of_the_rest(cfg):
+    dev = fake.FakeDevice(cfg)
+    session, _ = _start_several(cfg, dev, _legs())
+    session.close("the client went away")
+    assert session.last.outcome == "aborted"
+    assert "not run: Two -- the session ended" in session.last.render()
+    runs = [p for p in Path(cfg.run.artifacts_dir).iterdir() if p.is_dir()]
+    assert len(runs) == 1

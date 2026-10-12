@@ -1112,3 +1112,145 @@ def test_a_snooze_rule_that_does_not_parse_stops_the_watch(tmp_path, monkeypatch
     assert code == 1
     assert not seen
     assert "snooze" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# watch: several policies, one after another
+# ---------------------------------------------------------------------------
+
+def _two_policies(tmp_path, **override):
+    """Two policies in a policies directory, each carrying its own goal."""
+    from adbagent import policies
+
+    folder = tmp_path / "policies"
+    folder.mkdir(exist_ok=True)
+    metas = {
+        "hinge": {"goal": "reply on hinge, then like a few", "title": "Hinge",
+                  "send_limits": "like=5, rose=0",
+                  "snooze": "You've seen everyone for now = 15m"},
+        "bumble": {"goal": "open chats with new matches on bumble",
+                   "title": "Bumble", "send_limits": "superswipe=0"},
+    }
+    for name, meta in metas.items():
+        meta.update(override.get(name, {}))
+        (folder / f"{name}.md").write_text(
+            policies.with_front_matter(meta, f"- the {name} rules"),
+            encoding="utf-8")
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"watch": {"policies_dir": str(folder)}}), encoding="utf-8")
+
+
+def _watch_several(tmp_path, monkeypatch, argv):
+    """Run `cmd_watch` as far as the banner; return its code and the banner's
+    keyword arguments (empty if it never got there)."""
+    from adbagent import cli
+
+    seen = {}
+
+    def banner(out, cfg, goal, policy, **kw):
+        seen.update(kw, goal=goal, configured=cfg.watch.policy)
+        raise _Banner(goal, cfg.watch.policy, kw.get("goal_from_policy", False))
+
+    monkeypatch.setattr(cli, "_ensure_device", lambda args, cfg, out: None)
+    monkeypatch.setattr(cli, "_watch_banner", banner)
+    code = None
+    try:
+        code = cli.cmd_watch(parse(argv + ["-c", str(tmp_path / "config.json"),
+                                           "--model", "m"]))
+    except _Banner:
+        pass
+    return code, seen
+
+
+def test_watch_takes_several_policies_in_the_order_given(tmp_path, monkeypatch):
+    _two_policies(tmp_path)
+    code, seen = _watch_several(tmp_path, monkeypatch,
+                                ["watch", "--policy", "hinge",
+                                 "--policy", "bumble"])
+    assert code is None                     # reached the banner
+    plan = seen["plan"]
+    assert [p.name for p in plan] == ["Hinge", "Bumble"]
+    # Each under its own goal, with its own caps and rests.
+    assert plan[0].goal == "reply on hinge, then like a few"
+    assert plan[1].goal == "open chats with new matches on bumble"
+    assert plan[0].send_limits == {"like": 5, "rose": 0}
+    assert plan[1].send_limits == {"superswipe": 0}
+    assert [r.phrase for r in plan[0].snooze] == ["You've seen everyone for now"]
+    assert plan[1].snooze == []
+    assert plan[0].policy == "- the hinge rules"     # front matter stripped
+    assert seen["configured"].endswith("hinge.md")   # the first, as resolved
+
+
+def test_a_goal_typed_beside_several_policies_is_refused(tmp_path, monkeypatch,
+                                                         capsys):
+    """One goal for several sets of instructions is wrong for all but one."""
+    _two_policies(tmp_path)
+    code, seen = _watch_several(tmp_path, monkeypatch,
+                                ["watch", "watch everything", "--policy",
+                                 "hinge", "--policy", "bumble"])
+    assert code == 1 and not seen
+    assert "each runs under the goal saved with it" in capsys.readouterr().out
+
+
+def test_one_of_several_without_a_goal_of_its_own_is_refused(tmp_path,
+                                                            monkeypatch, capsys):
+    _two_policies(tmp_path, bumble={"goal": ""})
+    code, seen = _watch_several(tmp_path, monkeypatch,
+                                ["watch", "--policy", "hinge",
+                                 "--policy", "bumble"])
+    assert code == 1 and not seen
+    out = capsys.readouterr().out
+    assert "bumble.md has no goal saved with it" in out
+
+
+def test_the_same_policy_twice_is_refused(tmp_path, monkeypatch, capsys):
+    _two_policies(tmp_path)
+    code, seen = _watch_several(
+        tmp_path, monkeypatch,
+        ["watch", "--policy", "hinge", "--policy",
+         str(tmp_path / "policies" / "hinge.md")])
+    assert code == 1 and not seen
+    assert "named twice" in capsys.readouterr().out
+
+
+def test_a_cap_that_does_not_parse_in_any_of_several_stops_the_watch(
+        tmp_path, monkeypatch, capsys):
+    _two_policies(tmp_path, bumble={"send_limits": "no swiping please"})
+    code, seen = _watch_several(tmp_path, monkeypatch,
+                                ["watch", "--policy", "hinge",
+                                 "--policy", "bumble"])
+    assert code == 1 and not seen
+    assert "send_limits in" in capsys.readouterr().out
+
+
+def test_one_policy_given_once_is_still_a_watch_of_one(tmp_path, monkeypatch):
+    _two_policies(tmp_path)
+    code, seen = _watch_several(tmp_path, monkeypatch,
+                                ["watch", "--policy", "bumble"])
+    assert code is None
+    assert seen["plan"] == []
+    assert seen["goal"] == "open chats with new matches on bumble"
+
+
+def test_the_banner_names_each_policy_and_the_round(tmp_path, capsys):
+    from adbagent import cli
+    from adbagent.config import Config
+    from adbagent.watch import WatchPolicy, parse_snooze
+
+    cfg = Config()
+    cfg.watch.draft = True
+    plan = [WatchPolicy(goal="reply on hinge\nthen like", policy="x",
+                        send_limits={"like": 5}, name="Hinge", path="h.md",
+                        snooze=parse_snooze("seen everyone = 15m")),
+            WatchPolicy(goal="message bumble matches", policy="y",
+                        name="Bumble", path="b.md")]
+    cli._watch_banner(cli.Out(), cfg, "", "", plan=plan)
+    out = capsys.readouterr().out
+    assert "2 policies, in turn" in out
+    assert "1. Hinge: reply on hinge" in out
+    assert "2. Bumble: message bumble matches" in out
+    assert "send limits per pass: like=5" in out
+    # Hinge is not the last, so its screen cannot be watched between rounds.
+    assert "sitting out the rounds" in out
+    assert "goes round them all every 15m" in out
+    assert "DRAFT MODE" in out

@@ -2281,3 +2281,92 @@ def test_the_density_toggle_only_offers_the_two_densities():
     # And the default the page ships in, so a reader who never touches it gets
     # the quiet view rather than the full trace.
     assert '<body data-density="story">' in html
+
+
+# ---------------------------------------------------------------------------
+# watch: several policies, one after another
+# ---------------------------------------------------------------------------
+
+def _several(tmp_path, bumble_goal="message new bumble matches"):
+    """Two policies in the configured directory, each with a goal of its own."""
+    from adbagent import policies
+
+    folder = tmp_path / "policies"
+    folder.mkdir(exist_ok=True)
+    hinge = folder / "hinge.md"
+    hinge.write_text(policies.with_front_matter(
+        {"goal": "reply on hinge", "title": "Hinge"}, "- hinge rules"),
+        encoding="utf-8")
+    bumble = folder / "bumble.md"
+    bumble.write_text(policies.with_front_matter(
+        {"goal": bumble_goal, "title": "Bumble"}, "- bumble rules"),
+        encoding="utf-8")
+    _configure_watch(tmp_path, policy=str(hinge))
+    return str(hinge), str(bumble)
+
+
+def _spawned(monkeypatch):
+    spawned = []
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: spawned.append(
+                            FakeProc(argv, stay_running=True, **kw))
+                        or spawned[-1])
+    return spawned
+
+
+def test_a_watch_can_work_through_several_policies(web, tmp_path, monkeypatch):
+    hinge, bumble = _several(tmp_path)
+    spawned = _spawned(monkeypatch)
+
+    res = web.post("/api/watch", json={"policies": [hinge, bumble],
+                                       "draft": True})
+    assert res.status_code == 200
+    argv = spawned[0].argv
+    # One --policy per policy, in the order chosen, and no goal of its own:
+    # each runs under the one saved with it.
+    flags = [argv[i + 1] for i, a in enumerate(argv) if a == "--policy"]
+    assert flags == [hinge, bumble]
+    assert argv[argv.index("watch") + 1] == "--policy"
+    assert "--draft" in argv
+
+    active = web.get("/api/watch").json()["active"]
+    assert active["policies"] == [hinge, bumble]
+    assert active["policy"] == hinge
+    assert active["title"] == "Hinge → Bumble"
+    web.post("/api/watch/stop")
+
+
+def test_one_policy_in_the_list_is_a_watch_of_one(web, tmp_path, monkeypatch):
+    hinge, bumble = _several(tmp_path)
+    spawned = _spawned(monkeypatch)
+    res = web.post("/api/watch", json={"policies": [bumble], "goal": ""})
+    assert res.status_code == 200
+    argv = spawned[0].argv
+    # Its saved goal, as a watch of one is always started.
+    assert "message new bumble matches" in argv
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--policy"] == [bumble]
+    web.post("/api/watch/stop")
+
+
+@pytest.mark.parametrize("body, says", [
+    ({"goal": "watch everything"}, "send no goal"),
+    ({"twice": True}, "named twice"),
+])
+def test_what_a_watch_of_several_will_not_take(web, tmp_path, monkeypatch,
+                                               body, says):
+    hinge, bumble = _several(tmp_path)
+    spawned = _spawned(monkeypatch)
+    policies = [hinge, hinge] if body.pop("twice", False) else [hinge, bumble]
+    res = web.post("/api/watch", json={"policies": policies, **body})
+    assert res.status_code == 400
+    assert says in res.json()["detail"]
+    assert not spawned
+
+
+def test_each_of_several_needs_a_goal_saved_with_it(web, tmp_path, monkeypatch):
+    hinge, bumble = _several(tmp_path, bumble_goal="")
+    spawned = _spawned(monkeypatch)
+    res = web.post("/api/watch", json={"policies": [hinge, bumble]})
+    assert res.status_code == 400
+    assert "bumble.md has no goal saved with it" in res.json()["detail"]
+    assert not spawned

@@ -103,6 +103,10 @@ class WatchRequest(BaseModel):
     #: Path to the reply policy. Required -- there is no default policy, for the
     #: same reason the CLI has none.
     policy: str = ""
+    #: Several policies to work through in turn, in this order, each under the
+    #: goal saved with it -- so `goal` must be empty when there is more than
+    #: one. Takes the place of `policy` when given.
+    policies: List[str] = []
     draft: bool = False
     no_learn: bool = False
     interval_s: Optional[float] = None
@@ -1000,25 +1004,59 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
     # `runs/<id>/events.jsonl`, which the run feed already reads -- and the
     # guarantee is now the model's reading of each thread on screen.
 
-    @app.post("/api/watch")
-    def start_watch(req: WatchRequest) -> Dict[str, Any]:
-        cfg = load_cfg()
-        policy = _policy_path(req.policy)
-        if not policy:
+    def _watch_policies(req: WatchRequest) -> List[str]:
+        """The policy files a watch request names, resolved, in order.
+
+        `policies` when it names any, else `policy`, else the configured one.
+        Every one has to exist, and none may come twice: a round takes each
+        policy once.
+        """
+        refs = [ref for ref in req.policies if ref.strip()] or [req.policy]
+        paths = [_policy_path(ref) for ref in refs]
+        if not all(paths):
             raise HTTPException(
                 status_code=400,
                 detail="a watch needs a policy file: the instructions that "
                        "decide what gets replied to and what it says")
-        if not Path(policy).is_file():
-            raise HTTPException(status_code=400,
-                                detail=f"no policy file at {policy}")
-        # Resolved before the goal is checked, because a policy carries the goal
-        # it was written for and that is the one to run it under. The page fills
-        # the box in on selection, so this is the fallback for a box that was
-        # cleared -- and for anything driving the API directly.
-        goal = req.goal.strip() or policymod.read(policy).goal
-        if not goal:
-            raise HTTPException(status_code=400, detail="goal is required")
+        for i, path in enumerate(paths):
+            if not Path(path).is_file():
+                raise HTTPException(status_code=400,
+                                    detail=f"no policy file at {path}")
+            if any(_same_file(path, earlier) for earlier in paths[:i]):
+                raise HTTPException(status_code=400,
+                                    detail=f"{path} is named twice; a round "
+                                           f"takes each policy once")
+        return paths
+
+    @app.post("/api/watch")
+    def start_watch(req: WatchRequest) -> Dict[str, Any]:
+        cfg = load_cfg()
+        paths = _watch_policies(req)
+        policy = paths[0]
+        if len(paths) > 1:
+            # Each runs under the goal saved with it. A goal sent beside them
+            # would be right for one at most, so it is refused rather than
+            # quietly given to the first -- the page sends none.
+            if req.goal.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="watching several policies, each runs under the "
+                           "goal saved with it; send no goal")
+            missing = [p for p in paths if not policymod.read(p).goal]
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{missing[0]} has no goal saved with it; save one "
+                           f"before watching it alongside others")
+            goal = ""
+        else:
+            # Resolved before the goal is checked, because a policy carries the
+            # goal it was written for and that is the one to run it under. The
+            # page fills the box in on selection, so this is the fallback for a
+            # box that was cleared -- and for anything driving the API directly.
+            goal = req.goal.strip() or policymod.read(policy).goal
+            if not goal:
+                raise HTTPException(status_code=400, detail="goal is required")
         if not cfg.llm.model:
             raise HTTPException(status_code=400, detail="no model configured")
         busy = phone_busy()
@@ -1026,7 +1064,10 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             raise HTTPException(status_code=409, detail=busy)
         try:
             return watcher.start(
-                goal, policy=policy, draft=req.draft, no_learn=req.no_learn,
+                goal, policy=policy, policies=paths, draft=req.draft,
+                title=" → ".join(policymod.read(p).label for p in paths)
+                if len(paths) > 1 else "",
+                no_learn=req.no_learn,
                 interval_s=req.interval_s, sweep_s=req.sweep_s,
                 max_steps=req.max_steps, usd_per_hour=req.usd_per_hour,
                 serial=req.serial)

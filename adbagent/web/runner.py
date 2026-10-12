@@ -473,6 +473,8 @@ class WatchManager(ChildProcess):
         self._goal = ""
         self._draft = False
         self._policy = ""
+        self._policies: List[str] = []
+        self._title = ""
 
     def state(self) -> Dict[str, Any]:
         state = super().state()
@@ -480,6 +482,11 @@ class WatchManager(ChildProcess):
             state["goal"] = self._goal
             state["draft"] = self._draft
             state["policy"] = self._policy
+            # Every policy it works through, in order; one entry for a watch of
+            # one. `goal` is empty for several -- each runs under its own -- so
+            # `title` is what to call the watch on screen.
+            state["policies"] = list(self._policies)
+            state["title"] = self._title or self._goal
             # Passes, not iterations: the word the CLI and the docs both use.
             state["passes"] = len(self._run_dirs)
         return state
@@ -504,13 +511,22 @@ class WatchManager(ChildProcess):
               sweep_s: Optional[float] = None,
               max_steps: Optional[int] = None,
               usd_per_hour: Optional[float] = None,
-              serial: str = "") -> Dict[str, Any]:
+              serial: str = "",
+              policies: Optional[List[str]] = None,
+              title: str = "") -> Dict[str, Any]:
+        """Start `adbagent watch`. `policies`, when it names more than one, is
+        worked through in that order, each under its own goal -- so no goal
+        goes on the command line, where it would be refused."""
+        policies = list(policies or [policy])
         with self._lock:
             if self.running():
                 raise RuntimeError("a watch is already running")
 
-            argv = [sys.executable, "-m", "adbagent", "watch", goal,
-                    "--policy", policy]
+            argv = [sys.executable, "-m", "adbagent", "watch"]
+            if goal:
+                argv.append(goal)
+            for each in policies:
+                argv += ["--policy", each]
             if draft:
                 argv.append("--draft")
             if no_learn:
@@ -530,7 +546,9 @@ class WatchManager(ChildProcess):
 
             self._goal = goal
             self._draft = draft
-            self._policy = policy
+            self._policy = policies[0]
+            self._policies = policies
+            self._title = title
             proc = self._spawn(argv)
             return {"pid": proc.pid, "argv": argv}
 

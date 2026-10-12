@@ -1319,10 +1319,16 @@ class Device:
     # -- actions -----------------------------------------------------------
 
     def _log_action(self, msg: str) -> None:
-        log.info("%s", msg)
+        try:
+            log.info("%s", msg)
+        except (OSError, UnicodeEncodeError):
+            try:
+                log.info("%s", msg.encode("ascii", "backslashreplace").decode("ascii"))
+            except Exception:
+                pass
         try:
             print(msg)
-        except (OSError, UnicodeEncodeError):
+        except Exception:
             pass
 
     def tap(self, x: int, y: int) -> None:

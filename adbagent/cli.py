@@ -163,7 +163,8 @@ OVERRIDES = {
     "watch_sweep": "watch.sweep_s",
     "watch_max_steps": "watch.max_steps",
     "watch_draft": "watch.draft",
-    "watch_policy": "watch.policy",
+    # `--policy` is not here: it can be given more than once, and `cmd_watch`
+    # resolves the list itself -- `watch.policy` is the one it falls back on.
     "watch_usd_per_hour": "watch.max_usd_per_hour",
 }
 
@@ -1335,10 +1336,30 @@ def cmd_run(args) -> int:
 # watch
 # ---------------------------------------------------------------------------
 
+def _say_caps(out: Out, send_limits: Optional[Dict[str, int]],
+              snooze: Sequence[Any], *, indent: str,
+              watched: bool = True) -> None:
+    """One policy's send caps and rests, a line each.
+
+    `watched` is whether the probe can see the screen this policy's passes end
+    on -- false for any but the last of several, whose rest is then the rule's
+    time alone (see `watch.Watch._between`).
+    """
+    if send_limits:
+        out.say(out.dim(f"{indent}send limits per pass: " + ", ".join(
+            f"{word}={most}" for word, most in send_limits.items())))
+    for rule in snooze:
+        out.say(out.dim(
+            f"{indent}rest {rule.seconds / 60:g}m when \"{rule.phrase}\" is on "
+            f"screen after a pass" + (", or until the screen changes" if watched
+                                      else ", sitting out the rounds")))
+
+
 def _watch_banner(out: Out, cfg, goal: str, policy: str,
                   goal_from_policy: bool = False,
                   send_limits: Optional[Dict[str, int]] = None,
-                  snooze: Sequence[Any] = ()) -> None:
+                  snooze: Sequence[Any] = (),
+                  plan: Sequence[Any] = ()) -> None:
     """Say exactly what is about to happen, in the loudest terms available.
 
     A watch is unattended and it sends messages to real people. The one thing
@@ -1351,10 +1372,17 @@ def _watch_banner(out: Out, cfg, goal: str, policy: str,
     the model reading the thread on screen and, unless it is switched off, a
     second model checking each send against the policy. The LIVE line says
     which of the two is standing.
+
+    `plan` is the `WatchPolicy` list of a watch of several, each said with its
+    own goal, caps and rests; `goal`, `policy`, `send_limits` and `snooze` are
+    a watch of one's.
     """
+    from . import watch as watchmod
+
     w = cfg.watch
     out.say()
-    out.say(f"  {out.bold('WATCH')}  {goal}")
+    out.say(f"  {out.bold('WATCH')}  "
+            + (f"{len(plan)} policies, in turn" if plan else goal))
     if w.draft:
         out.say(f"  {out.green('DRAFT MODE')} -- replies are composed and "
                 f"recorded, and never sent.")
@@ -1366,18 +1394,33 @@ def _watch_banner(out: Out, cfg, goal: str, policy: str,
         out.say(f"  {out.red('LIVE')} -- replies WILL be sent to real people "
                 f"from this device. Nothing but the model's own reading of each "
                 f"thread stops it answering one twice.")
-    out.say(out.dim(f"  policy: {w.policy} ({len(policy)} chars)"
-                    + ("; the goal above is the one saved with it"
-                       if goal_from_policy else "")))
-    if send_limits:
-        out.say(out.dim("  send limits per pass: " + ", ".join(
-            f"{word}={most}" for word, most in send_limits.items())))
-    for rule in snooze:
-        out.say(out.dim(f"  rest {rule.seconds / 60:g}m when \"{rule.phrase}\" "
-                        f"is on screen after a pass, or until the screen changes"))
+    if plan:
+        for n, p in enumerate(plan, 1):
+            first = next((line.strip() for line in p.goal.splitlines()
+                          if line.strip()), "")
+            out.say(f"  {n}. {p.name}: {first}")
+            out.say(out.dim(f"     policy: {p.path} ({len(p.policy)} chars), "
+                            f"under the goal saved with it"))
+            _say_caps(out, p.send_limits, p.snooze, indent="     ",
+                      watched=n == len(plan))
+    else:
+        out.say(out.dim(f"  policy: {w.policy} ({len(policy)} chars)"
+                        + ("; the goal above is the one saved with it"
+                           if goal_from_policy else "")))
+        _say_caps(out, send_limits, snooze, indent="  ")
     out.say(out.dim(
         f"  every {w.interval_s:g}s | <={w.max_steps} steps/pass"))
-    if w.sweep_s > 0:
+    if plan:
+        # The one thing a watch of several does that a watch of one does not:
+        # it spends a round on the clock, because only the last app's screen
+        # can be watched in between.
+        every = w.sweep_s if w.sweep_s > 0 else watchmod.ROUND_S
+        out.say(out.dim(
+            f"  a round is a pass of each, in this order. In between it watches "
+            f"the screen {plan[-1].name} ends on -- a change there runs "
+            f"{plan[-1].name} again -- and goes round them all every "
+            f"{watchmod._duration(every)}"))
+    elif w.sweep_s > 0:
         # Said on its own line because it changes what the loop costs: without
         # it a quiet app spends nothing, with it a pass runs on the clock
         # whether or not anything arrived.
@@ -1411,7 +1454,10 @@ def cmd_watch(args) -> int:
     if not cfg.llm.model:
         out.bad("no model chosen. Run `adbagent models` and pass --model.")
         return 1
-    if not cfg.watch.policy:
+    refs = [r for r in (getattr(args, "watch_policies", None) or []) if r.strip()]
+    if not refs and cfg.watch.policy:
+        refs = [cfg.watch.policy]
+    if not refs:
         out.bad("a watch needs --policy FILE: the instructions that decide what "
                 "gets replied to and what it says. There is no default -- a "
                 "default policy is one nobody wrote.")
@@ -1420,44 +1466,69 @@ def cmd_watch(args) -> int:
     # whatsapp_policy.md` that named a real file from the wrong directory means that
     # file. Resolved back into cfg so the banner and the run log say which file
     # was actually read rather than what was typed.
-    cfg.watch.policy = policymod.store_for(cfg).resolve(cfg.watch.policy)
-    try:
-        policy = load_policy(cfg.watch.policy)
-    except (OSError, ValueError) as exc:
-        out.bad(str(exc))
-        return 1
+    store = policymod.store_for(cfg)
+    paths = [store.resolve(ref) for ref in refs]
+    for i, path in enumerate(paths):
+        if any(policymod.same_file(path, earlier) for earlier in paths[:i]):
+            out.bad(f"{refs[i]} is named twice; a round takes each policy once")
+            return 1
+    cfg.watch.policy = paths[0]
 
-    # A policy carries the goal it was written for, so `--goal` is optional once
-    # one has been saved: the pairing is the point -- these instructions are only
-    # correct under that goal -- and retyping it per start is how a watch ends up
-    # running the WhatsApp policy under the goal left over from Instagram.
-    meta = policymod.read(cfg.watch.policy)
-    goal = (args.goal or "").strip()
-    goal_from_policy = False
-    if not goal:
-        goal = meta.goal
-        goal_from_policy = bool(goal)
-    if not goal:
-        out.bad("no goal given -- say what to watch, e.g. "
-                "\"watch my instagram direct messages\", or save a goal with "
-                f"the policy in {cfg.watch.policy}")
-        return 1
-    # The policy's caps on what one pass may send, e.g. `send_limits: like=5`.
-    # A cap that does not parse is refused here rather than ignored: a limit
-    # that is silently not there is found out about after the sixth send.
-    try:
-        send_limits = conversation.parse_send_limits(
-            meta.extra.get("send_limits", ""))
-    except ValueError as exc:
-        out.bad(f"send_limits in {cfg.watch.policy}: {exc}")
-        return 1
-    # ...and the screens that mean the work has run dry for now, e.g.
-    # `snooze: You've seen everyone for now = 15m`. Refused the same way.
-    try:
-        snooze = watchmod.parse_snooze(meta.extra.get("snooze", ""))
-    except ValueError as exc:
-        out.bad(f"snooze in {cfg.watch.policy}: {exc}")
-        return 1
+    plan: List[Any] = []
+    if len(paths) > 1:
+        # Each runs under the goal saved with it, so one typed here would be
+        # wrong for all but one of them -- the reason a policy carries its goal.
+        if (args.goal or "").strip():
+            out.bad("a goal given here belongs to one policy. Watching several, "
+                    "each runs under the goal saved with it -- drop the goal, or "
+                    "watch the policy it is for on its own")
+            return 1
+        plan = _watch_plan(out, paths)
+        if not plan:
+            return 1
+        goal = policy = ""
+        goal_from_policy = True
+        send_limits, snooze = {}, []
+    else:
+        try:
+            policy = load_policy(cfg.watch.policy)
+        except (OSError, ValueError) as exc:
+            out.bad(str(exc))
+            return 1
+
+        # A policy carries the goal it was written for, so `--goal` is optional
+        # once one has been saved: the pairing is the point -- these
+        # instructions are only correct under that goal -- and retyping it per
+        # start is how a watch ends up running the WhatsApp policy under the
+        # goal left over from Instagram.
+        meta = policymod.read(cfg.watch.policy)
+        goal = (args.goal or "").strip()
+        goal_from_policy = False
+        if not goal:
+            goal = meta.goal
+            goal_from_policy = bool(goal)
+        if not goal:
+            out.bad("no goal given -- say what to watch, e.g. "
+                    "\"watch my instagram direct messages\", or save a goal with "
+                    f"the policy in {cfg.watch.policy}")
+            return 1
+        # The policy's caps on what one pass may send, e.g. `send_limits:
+        # like=5`. A cap that does not parse is refused here rather than
+        # ignored: a limit that is silently not there is found out about after
+        # the sixth send.
+        try:
+            send_limits = conversation.parse_send_limits(
+                meta.extra.get("send_limits", ""))
+        except ValueError as exc:
+            out.bad(f"send_limits in {cfg.watch.policy}: {exc}")
+            return 1
+        # ...and the screens that mean the work has run dry for now, e.g.
+        # `snooze: You've seen everyone for now = 15m`. Refused the same way.
+        try:
+            snooze = watchmod.parse_snooze(meta.extra.get("snooze", ""))
+        except ValueError as exc:
+            out.bad(f"snooze in {cfg.watch.policy}: {exc}")
+            return 1
 
     # A watch is unattended by definition: it runs for days with nobody at the
     # terminal. Left as it comes, `safety.confirm` would reach `input()` the
@@ -1471,14 +1542,20 @@ def cmd_watch(args) -> int:
     _ensure_device(args, cfg, out)
 
     _watch_banner(out, cfg, goal, policy, goal_from_policy=goal_from_policy,
-                  send_limits=send_limits, snooze=snooze)
+                  send_limits=send_limits, snooze=snooze, plan=plan)
 
     # Per-step reporting only under -v. One line per pass is what a loop meant to
     # run for days should print; the full step trace is megabytes by morning.
     reporter = _live_reporter(out, max_steps=cfg.watch.max_steps) \
         if args.verbose else None
 
-    with _holding_phone(cfg, f"adbagent watch: {goal}"), \
+    # What the phone lock says is driving it, and what the skill write-up on the
+    # way out is told the watch was for: every policy's goal, since a trace over
+    # several apps teaches each of them.
+    title = " -> ".join(p.name for p in plan) if plan else goal
+    tasks = "\n\n".join(p.goal for p in plan) if plan else goal
+
+    with _holding_phone(cfg, f"adbagent watch: {title}"), \
             Device(cfg, args.device or "") as dev:
         # One client for the whole watch, so the rolling spend ceiling sees the
         # session rather than a single pass.
@@ -1489,10 +1566,14 @@ def cmd_watch(args) -> int:
         # passes over an inbox and its threads is a far better tour of the app
         # than any single pass, so the trade is all upside.
         trace = skillmod.TraceCollector(
-            dev, skillmod.AppTrace(tasks=goal), on_event=reporter,
+            dev, skillmod.AppTrace(tasks=tasks), on_event=reporter,
             max_actions=WATCH_TRACE_ACTIONS)
-        watch = Watch(dev, llm, cfg, policy=policy, send_limits=send_limits,
-                      snooze=snooze, say=out.say, on_event=trace)
+        if plan:
+            watch = Watch(dev, llm, cfg, policies=plan, say=out.say,
+                          on_event=trace)
+        else:
+            watch = Watch(dev, llm, cfg, policy=policy, send_limits=send_limits,
+                          snooze=snooze, say=out.say, on_event=trace)
         try:
             watch.run(goal)
         except KeyboardInterrupt:
@@ -1507,8 +1588,51 @@ def cmd_watch(args) -> int:
             # trace being closed off here is the whole watch's.
             trace.finish("stopped", watch.last_state,
                          took_over=watch.took_over)
-            _learn(out, trace.app_traces(), llm, cfg, goal)
+            _learn(out, trace.app_traces(), llm, cfg, tasks)
     return 0
+
+
+def _watch_plan(out: Out, paths: Sequence[str]) -> List[Any]:
+    """The `WatchPolicy` list a watch of several runs, or [] having said why not.
+
+    Everything a watch of one checks before it starts, checked for each: the
+    file is there and says something, its caps and rests parse. And one thing a
+    watch of one does not need: a goal saved with it, because there is nowhere
+    else for that policy's goal to come from.
+    """
+    from . import conversation
+    from . import policies as policymod
+    from . import watch as watchmod
+
+    plan = []
+    for path in paths:
+        try:
+            text = watchmod.load_policy(path)
+        except (OSError, ValueError) as exc:
+            out.bad(str(exc))
+            return []
+        meta = policymod.read(path)
+        if not meta.goal:
+            out.bad(f"{path} has no goal saved with it. Watching several "
+                    f"policies, each runs under its own -- save one into it "
+                    f"(Save policy in the Watch tab does), or watch it on its "
+                    f"own with a goal")
+            return []
+        try:
+            limits = conversation.parse_send_limits(
+                meta.extra.get("send_limits", ""))
+        except ValueError as exc:
+            out.bad(f"send_limits in {path}: {exc}")
+            return []
+        try:
+            rules = watchmod.parse_snooze(meta.extra.get("snooze", ""))
+        except ValueError as exc:
+            out.bad(f"snooze in {path}: {exc}")
+            return []
+        plan.append(watchmod.WatchPolicy(
+            goal=meta.goal, policy=text, send_limits=limits, snooze=rules,
+            name=meta.label, path=str(path)))
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -2188,6 +2312,10 @@ def cmd_mcp(args) -> int:
     output from adb and anything else, and logging already goes to stderr.
     """
     try:
+        sys.stderr.reconfigure(errors='backslashreplace')
+    except Exception:
+        pass
+    try:
         import mcp  # noqa: F401 - only checking it is there
     except ImportError:
         print("error: `adbagent mcp` needs the MCP SDK: pip install 'mcp>=2.3'",
@@ -2424,10 +2552,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="what to watch, in plain language, e.g. "
                         "\"watch my instagram direct messages\". Optional when "
                         "the policy has a goal saved with it")
-    p.add_argument("--policy", dest="watch_policy", metavar="FILE",
+    p.add_argument("--policy", dest="watch_policies", metavar="FILE",
+                   action="append",
                    help="required: file holding the reply instructions -- what "
                         "to answer, what to ignore, and what to say. A bare name "
-                        "means that policy in watch.policies_dir")
+                        "means that policy in watch.policies_dir. Give it more "
+                        "than once to work several policies in turn, in that "
+                        "order, each under the goal saved with it")
     p.add_argument("--draft", dest="watch_draft", action="store_true",
                    default=None,
                    help="compose and record replies but never send them; run "

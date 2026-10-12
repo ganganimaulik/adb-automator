@@ -49,6 +49,15 @@ count on a tab, and a rest that never looked would sit on it for the full time.
 **Failure is a pause, never an exit.** A failed pass doubles a backoff and the
 loop continues. Only a keyboard interrupt stops it. A watch that exits because
 the phone dropped off Wi-Fi for a minute is not a watch.
+
+**Several policies take turns.** A watch can be given more than one policy --
+each with its own goal, caps and rests, usually one per app -- and works them in
+the order given: a *round* is one pass of each. Only one app can be on screen,
+so the probe watches the screen the round finished on, and a change there runs
+that policy again straight away; the others cannot be seen from there, so a full
+round also runs on the clock -- `sweep_s`, or `ROUND_S` when that is off. A
+policy whose pass ended on a screen its own `snooze` rule names sits out the
+rounds until that rest is over. One policy is the watch it always was.
 """
 
 from __future__ import annotations
@@ -313,6 +322,38 @@ def _duration(seconds: float) -> str:
     return f"{seconds:g}s"
 
 
+#: How often a watch over several policies goes round all of them when
+#: `watch.sweep_s` is off. Off is the right default for one policy, whose screen
+#: the probe can see; with several, only the last one's screen is on the phone
+#: between rounds, and a purely reactive watch would never go back to the
+#: others. Fifteen minutes is the rest the dating policies already ask for when
+#: their work runs dry.
+ROUND_S = 15 * 60.0
+
+
+@dataclass
+class WatchPolicy:
+    """One policy a watch works through: its instructions, the goal they are
+    for, what one pass may send, and when its work has run dry.
+
+    A watch of one is built from the constructor's `policy`, `send_limits` and
+    `snooze` and the goal `run` is given, as it always was. A watch of several
+    takes a list of these, each carrying its own goal: the pairing is the point
+    of a policy (see `policies.py`), and one goal typed beside several sets of
+    instructions would be wrong for all but one of them.
+    """
+
+    goal: str
+    #: The instructions, front matter stripped: what reaches the prompt.
+    policy: str
+    send_limits: Dict[str, int] = field(default_factory=dict)
+    snooze: List[Snooze] = field(default_factory=list)
+    #: What to call it in the log -- the policy's title, else its file's name.
+    name: str = ""
+    #: Where it was read from, for the banner. Nothing reads the file again.
+    path: str = ""
+
+
 @dataclass
 class Stats:
     """What the watch has done, for the periodic status line."""
@@ -329,6 +370,9 @@ class Stats:
     #: Rests cut short because the screen changed under them. Read next to
     #: `snoozed`: how often the app had work again before the rule's time was up.
     woken: int = 0
+    #: With several policies: how many times the watch went round all of them,
+    #: as opposed to re-running the last one because its screen changed.
+    rounds: int = 0
     failures: int = 0
     usd: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
@@ -342,9 +386,10 @@ class Watch:
     """Supervises bounded agent passes forever."""
 
     def __init__(self, dev: Device, llm: LLMClient, cfg: Config,
-                 *, policy: str,
+                 *, policy: str = "",
                  send_limits: Optional[Dict[str, int]] = None,
                  snooze: Sequence[Snooze] = (),
+                 policies: Sequence[WatchPolicy] = (),
                  say: Optional[Callable[[str], None]] = None,
                  on_event: Optional[Callable[..., None]] = None,
                  make_agent: Optional[Callable[..., Agent]] = None,
@@ -359,6 +404,18 @@ class Watch:
         self.send_limits: Dict[str, int] = dict(send_limits or {})
         #: The policy's `snooze` rules: see `Snooze`.
         self.snooze: List[Snooze] = list(snooze)
+        #: Several policies to take in turn, each with its own goal, caps and
+        #: rests. Empty for a watch of one, which uses the three fields above.
+        self.policies: List[WatchPolicy] = list(policies)
+        #: The policy the pass in flight belongs to, for `_default_agent`.
+        self._current: Optional[WatchPolicy] = None
+        #: Which policy's pass left the screen the watch is anchored on. A
+        #: change on that screen is that policy's business alone.
+        self._front: Optional[int] = None
+        #: Policies sitting out rounds on a `snooze` rule of their own, and
+        #: until when. Only ever ones whose screen the probe cannot see.
+        self._resting: Dict[int, float] = {}
+        self._several = False
         self.say = say or (lambda msg: None)
         self.on_event = on_event
         # Injected so the loop can be tested without a device or a model. The
@@ -392,8 +449,11 @@ class Watch:
         self.took_over = False
         #: (finished_at, usd) per pass, for the rolling spend ceiling.
         self._spend: List[Tuple[float, float]] = []
-        #: When the last pass finished, for the sweep. None until one has.
+        #: When the last pass finished. None until one has.
         self._last_pass_at: Optional[float] = None
+        #: When the last round finished, for the sweep: a pass of every policy
+        #: there is -- which, for a watch of one, is every pass.
+        self._last_round_at: Optional[float] = None
         #: The rest the loop is in, if a `snooze` rule put it in one.
         self._rest: Optional[_Rest] = None
         self._stop = False
@@ -420,9 +480,15 @@ class Watch:
         see `cli.cmd_watch`. That is strictly the better trace anyway: fifty
         passes over an inbox and its threads tour the app far more thoroughly
         than any one of them does.
+
+        With several policies, the pass is the one `_current` names, and so are
+        its instructions and its caps.
         """
-        return Agent(self.dev, self.llm, self.cfg, policy=self.policy,
-                     send_limits=self.send_limits, on_event=self._pass_event)
+        current = self._current
+        policy = current.policy if current is not None else self.policy
+        limits = current.send_limits if current is not None else self.send_limits
+        return Agent(self.dev, self.llm, self.cfg, policy=policy,
+                     send_limits=limits, on_event=self._pass_event)
 
     def _pass_event(self, kind: str, **kw: Any) -> None:
         """Latch watch-wide facts before forwarding one pass's event.
@@ -442,13 +508,18 @@ class Watch:
         """Ask the loop to finish the pass it is on and return."""
         self._stop = True
 
-    def run(self, goal: str, max_passes: int = 0) -> Stats:
+    def run(self, goal: str = "", max_passes: int = 0) -> Stats:
         """Watch until interrupted. `max_passes` bounds it, for tests.
 
         Returns the stats rather than an exit code: the caller decides what a
         stopped watch means.
+
+        `goal` is the goal of a watch of one. A watch of several `policies`
+        runs each under its own and takes none from here.
         """
-        full_goal = f"{goal.strip()}\n\n{ITERATION_CONTRACT}"
+        order = self._order(goal)
+        several = self._several = len(order) > 1
+        goals = [f"{p.goal.strip()}\n\n{ITERATION_CONTRACT}" for p in order]
         consecutive_failures = 0
         w = self.cfg.watch
 
@@ -468,6 +539,10 @@ class Watch:
                 self._sleep(delay)
                 continue
 
+            # Why a pass is owed, which with several policies says whose it is:
+            # a change on screen belongs to the policy whose pass left the
+            # screen there, and the clock is everybody's. See `_batch`.
+            why = "start"
             rest = self._rest
             if self.anchor.matches(screen):
                 if rest is not None:
@@ -480,7 +555,7 @@ class Watch:
                         continue
                     log.debug("the rest is over; a pass runs whatever the "
                               "screen says")
-                elif not self._sweep_due():
+                elif not self._round_due(several):
                     self.stats.skipped += 1
                     log.debug("nothing new on %s; sleeping %.0fs",
                               screen.package, w.interval_s)
@@ -488,8 +563,11 @@ class Watch:
                     continue
                 else:
                     log.debug("nothing new on %s, but the %.0fs sweep is due",
-                              screen.package, w.sweep_s)
-            elif rest is not None:
+                              screen.package, self._round_every(several))
+                why = "time"
+            elif rest is not None or self.anchor.package:
+                why = "change"
+            if why == "change" and rest is not None:
                 # The screen changed while the watch rested. The app said there
                 # was nothing to do *on that screen*; whatever it has written
                 # since -- an unread count, a banner, another app in front -- is
@@ -520,23 +598,46 @@ class Watch:
                 self._sleep(paused)
                 continue
 
-            # -- one bounded pass ------------------------------------------
-            outcome, usd = self._one_pass(full_goal)
-            self.stats.passes += 1
-            self.stats.usd += usd
-            self._spend.append((self._now(), usd))
-            # Set for a failed pass too: the sweep says how often to *try*, and a
-            # pass that failed already has the backoff deciding when to try next.
-            self._last_pass_at = self._now()
+            batch = self._batch(order, why)
+            if not batch:
+                # Every policy is sitting out on a rule of its own. Nothing is
+                # owed until the first of those rests is over.
+                self.stats.skipped += 1
+                self._sleep(w.interval_s)
+                continue
+
+            # -- the bounded passes it owes --------------------------------
+            for n, i in enumerate(batch):
+                if n and self._stop:
+                    break       # Stop between policies, not after all of them
+                outcome, usd = self._one_pass(goals[i], order[i])
+                self.stats.passes += 1
+                self.stats.usd += usd
+                self._spend.append((self._now(), usd))
+                # Set for a failed pass too: the sweep says how often to *try*,
+                # and a pass that failed already has the backoff deciding when
+                # to try next.
+                self._last_pass_at = self._now()
+                self._front = i
+                if n < len(batch) - 1:
+                    self._between(order[i], i, outcome)
+            if why != "change" or not several:
+                self._last_round_at = self._now()
+                self.stats.rounds += several
+            current = order[self._front]
+            rules = current.snooze
+            # Which policy the line is about, once there is more than one.
+            label = f" ({current.name or f'policy {self._front + 1}'})" \
+                if several else ""
 
             # The screen the pass left, read once. After a success it is the
             # next anchor, as it always was; after a failure it is read only
             # when a snooze rule has a question for it, so a watch without one
             # touches the phone exactly as often as it did.
             after = None
-            if outcome in ("success", "needs_user") or self.snooze:
+            if outcome in ("success", "needs_user") or rules:
                 after = self._screen_after_pass()
-            rule = snooze_for(after, self.snooze) if after is not None else None
+            rule = snooze_for(after, rules) if after is not None else None
             if rule is not None:
                 # The app has said the work has run dry. That is not a failure
                 # to back off from, and not "nothing new" either -- the screen
@@ -555,7 +656,7 @@ class Watch:
                 self.anchor = Anchor.of(after)
                 self._rest = _Rest(started=now, until=now + rule.seconds,
                                    screen=after)
-                self.say(f"  pass {self.stats.passes}: {outcome}; "
+                self.say(f"  pass {self.stats.passes}{label}: {outcome}; "
                          f"\"{rule.phrase}\" is on screen -- resting "
                          f"{_duration(rule.seconds)}, or until it changes")
                 log.info("%r is on screen after pass %d; resting %.0fs, or "
@@ -570,7 +671,7 @@ class Watch:
                 # has to describe the screen as it is *now*, or the next probe
                 # compares against something already stale.
                 self.anchor = Anchor.of(after) if after is not None else Anchor()
-                self.say(f"  pass {self.stats.passes}: {outcome} "
+                self.say(f"  pass {self.stats.passes}{label}: {outcome} "
                          f"(${self.stats.usd:.4f})")
                 # What the pass concluded. A watch prints one line per pass by
                 # default, so without this the only thing a night of watching
@@ -590,8 +691,8 @@ class Watch:
                 consecutive_failures += 1
                 self.stats.failures += 1
                 delay = self._backoff(consecutive_failures)
-                self.say(f"  pass {outcome} ({consecutive_failures} in a row); "
-                         f"retrying in {delay:.0f}s")
+                self.say(f"  pass{label} {outcome} ({consecutive_failures} in a "
+                         f"row); retrying in {delay:.0f}s")
                 log.warning("pass %s; %d consecutive failure(s), backing off "
                             "%.0fs", outcome, consecutive_failures, delay)
                 # The anchor is dropped on failure on purpose: a failed pass left
@@ -604,9 +705,75 @@ class Watch:
 
     # -- one pass ----------------------------------------------------------
 
-    def _one_pass(self, full_goal: str) -> Tuple[Outcome, float]:
+    def _order(self, goal: str) -> List[WatchPolicy]:
+        """The policies this watch works through, in the order it takes them."""
+        if not self.policies:
+            return [WatchPolicy(goal=goal, policy=self.policy,
+                                send_limits=self.send_limits,
+                                snooze=self.snooze)]
+        if goal.strip():
+            raise ValueError("a watch of several policies runs each under the "
+                             "goal saved with it; it takes no goal of its own")
+        return self.policies
+
+    def _batch(self, order: Sequence[WatchPolicy], why: str) -> List[int]:
+        """Which policies the pass now owed is owed by, in the order to run them.
+
+        A change on screen is the business of the policy whose pass left the
+        screen there, and of nobody else: the others' apps are not on screen,
+        so nothing new can have been seen about them. Anything else -- the first
+        look, the clock, a rest that ran out, a failure that left the screen
+        somewhere unknown -- goes round them all, less any sitting out on a
+        rule of their own. With one policy both answers are the same.
+        """
+        if why == "change" and self._front is not None:
+            return [self._front]
+        now = self._now()
+        for i, until in list(self._resting.items()):
+            if until <= now:
+                del self._resting[i]
+        return [i for i in range(len(order)) if i not in self._resting]
+
+    def _between(self, policy: WatchPolicy, i: int, outcome: Outcome) -> None:
+        """Close off a pass another policy's pass is about to follow.
+
+        Its screen is about to be replaced by another app's, so it is never the
+        anchor, never rested on and never backed off from -- the next policy's
+        pass is owed regardless. What is left is to say how it went, and
+        whether the screen it ended on is one its own `snooze` rule names: that
+        policy then sits out the rounds for the rule's time, since nobody can
+        see its screen change in the meantime.
+        """
+        name = policy.name or f"policy {i + 1}"
+        ok = outcome in ("success", "needs_user")
+        if not ok:
+            self.stats.failures += 1
+        self.say(f"  pass {self.stats.passes} ({name}): {outcome}"
+                 + (f" (${self.stats.usd:.4f})" if ok else ""))
+        answer = getattr(self.last_state, "result", "") if ok else ""
+        if answer:
+            self.say(f"    {answer}")
+        if outcome == "needs_user":
+            self.say("  a pass stopped and asked for a human; going on to the "
+                     "next policy")
+        if not policy.snooze:
+            return
+        after = self._screen_after_pass()
+        rule = snooze_for(after, policy.snooze) if after is not None else None
+        if rule is None:
+            return
+        self._resting[i] = self._now() + rule.seconds
+        self.stats.snoozed += 1
+        self.say(f"  {name}: \"{rule.phrase}\" is on screen -- leaving it out "
+                 f"of rounds for {_duration(rule.seconds)}")
+        log.info("%s ended on %r; out of rounds for %.0fs", name, rule.phrase,
+                 rule.seconds)
+
+    def _one_pass(self, full_goal: str,
+                  policy: Optional[WatchPolicy] = None) -> Tuple[Outcome, float]:
         """Run one bounded agent pass. Never raises for an ordinary failure."""
         before = self.llm.ledger.total_usd
+        self._current = policy
         agent = self._make_agent()
         try:
             outcome, state = agent.run(full_goal)
@@ -647,19 +814,27 @@ class Watch:
         delay = w.backoff_initial_s * (2 ** max(0, consecutive - 1))
         return float(min(delay, w.backoff_max_s))
 
-    def _sweep_due(self) -> bool:
-        """Is a pass owed on time alone, whatever the screen says?
-
-        Off unless the operator asked for it. The first probe of a watch is never
-        held back by this -- an empty anchor never matches, so the loop is already
-        past the check by the time it is asked.
-        """
+    def _round_every(self, several: bool) -> float:
+        """How often a round is owed on time alone. 0 for never."""
         every = self.cfg.watch.sweep_s
+        if every > 0:
+            return every
+        return ROUND_S if several else 0.0
+
+    def _round_due(self, several: bool) -> bool:
+        """Is a round owed on time alone, whatever the screen says?
+
+        Off for one policy unless the operator asked for it; on for several,
+        whose other screens nobody can see (see `ROUND_S`). The first probe of a
+        watch is never held back by this -- an empty anchor never matches, so
+        the loop is already past the check by the time it is asked.
+        """
+        every = self._round_every(several)
         if every <= 0:
             return False
-        if self._last_pass_at is None:
+        if self._last_round_at is None:
             return True
-        return self._now() - self._last_pass_at >= every
+        return self._now() - self._last_round_at >= every
 
     def _spend_pause(self) -> float:
         """Seconds to wait before spending again, or 0."""
@@ -686,7 +861,10 @@ class Watch:
         supervisor reads back.
         """
         s = self.stats
-        bits = [f"{s.passes} pass(es)", f"{s.skipped} skipped"]
+        bits = [f"{s.passes} pass(es)"]
+        if self._several:
+            bits.append(f"{s.rounds} round(s)")
+        bits.append(f"{s.skipped} skipped")
         if s.paused:
             bits.append(f"{s.paused} paused")
         if s.snoozed:

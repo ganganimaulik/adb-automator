@@ -23,6 +23,12 @@ The approvals that ask the person at a terminal -- an irreversible press, and a
 send (`Agent._check_send`, a second model's job when the model decides) -- are
 put to the person through the client instead: the turn comes back with a
 `pending` approval, and the client asks them (`mcp_server.approve`).
+
+A session can work through several policies, one pass of each in turn (`Leg`),
+the way a watch of several goes round them. Each pass is a run of its own, in
+its own `runs/<id>/`, under its own goal, instructions and caps; the phone and
+its lock are held across all of them. The driver ends each with `end`, and the
+answer to that call is the next one's first screen.
 """
 
 from __future__ import annotations
@@ -111,6 +117,11 @@ class Turn:
     result: str = ""
     evidence: str = ""
     run_dir: str = ""
+    #: In a session of several policies: which one this turn belongs to
+    #: (1-based), of how many, and what it is called. 0 in a session of one.
+    leg: int = 0
+    legs: int = 0
+    leg_name: str = ""
 
     def render(self) -> str:
         """The turn as text, in the order the loop's own prompt puts it."""
@@ -134,6 +145,9 @@ class Turn:
                 f"to ask the person. Any other call declines it.")
         if self.outcome:
             return "\n\n".join(parts)
+        if self.goal and self.legs > 1:
+            parts.append(f"POLICY {self.leg} of {self.legs}: "
+                         f"{self.leg_name or f'policy {self.leg}'}")
         if self.goal:
             parts.append(f"GOAL:\n{self.goal}")
         if self.policy:
@@ -148,6 +162,22 @@ class Turn:
         if self.budget:
             parts.append(self.budget)
         return "\n\n".join(parts)
+
+
+@dataclass
+class Leg:
+    """One policy's pass in a session that works through several.
+
+    `goal` is the whole of what the run pursues -- the policy's goal with the
+    watch's pass contract under it, as `mcp_server.Phone` builds it.
+    """
+
+    goal: str
+    #: The instructions, front matter stripped.
+    policy: str = ""
+    send_limits: Dict[str, int] = field(default_factory=dict)
+    #: What to call it to the driver: the policy's title, else its name.
+    name: str = ""
 
 
 def remote_config(cfg: Config) -> Config:
@@ -199,12 +229,19 @@ class RemoteAgent(Agent):
     def __init__(self, dev: Any, cfg: Config, *, inbox: "queue.Queue",
                  outbox: "queue.Queue", driver: str = "",
                  idle_timeout_s: float = IDLE_TIMEOUT_S, policy: str = "",
-                 send_limits: Optional[Dict[str, int]] = None):
+                 send_limits: Optional[Dict[str, int]] = None,
+                 leg: int = 0, legs: int = 0, leg_name: str = "",
+                 intro: Sequence[str] = ()):
         super().__init__(dev, None, cfg, on_event=self._heard, policy=policy,
                          send_limits=send_limits)
         self._inbox = inbox
         self._outbox = outbox
         self.driver = driver
+        #: Which policy of a session of several this run is the pass of.
+        self.leg, self.legs, self.leg_name = leg, legs, leg_name
+        #: What the driver has to hear before this run's first screen: how the
+        #: previous policy's pass ended, when this run follows one.
+        self._intro = list(intro)
         self.idle_timeout_s = idle_timeout_s
         self._state: Optional[RunState] = None
         self._last_turn = Turn()
@@ -444,6 +481,7 @@ class RemoteAgent(Agent):
             self._briefed = True
             goal = kwargs.get("goal") or ""
             policy = prompts.policy_block(kwargs.get("policy") or "")
+            happened = self._intro + happened
         return Turn(step=state.step, package=screen.package,
                     skeleton=screen.skeleton_id,
                     screen=kwargs.get("rendered") or "",
@@ -453,7 +491,8 @@ class RemoteAgent(Agent):
                     skill=fresh_skill,
                     happened=happened,
                     screenshot=screenshot,
-                    failure=state.last_failure)
+                    failure=state.last_failure,
+                    leg=self.leg, legs=self.legs, leg_name=self.leg_name)
 
 
 def open_phone(cfg: Config) -> Any:
@@ -483,13 +522,22 @@ class Session:
                  open_device: Callable[[Config], Any] = open_phone,
                  driver: str = "", idle_timeout_s: float = IDLE_TIMEOUT_S,
                  policy: str = "",
-                 send_limits: Optional[Dict[str, int]] = None):
+                 send_limits: Optional[Dict[str, int]] = None,
+                 legs: Sequence[Leg] = ()):
         self.cfg = remote_config(cfg)
         self.driver = driver
+        #: Several policies' passes to work through in turn, each a run of its
+        #: own. Empty for a session of one, which `policy` and `send_limits`
+        #: describe -- as do the first leg's, for a session of several.
+        self.legs: List[Leg] = list(legs)
+        if self.legs:
+            policy, send_limits = self.legs[0].policy, self.legs[0].send_limits
         #: The operator's instructions, verbatim, and the caps on what one
         #: session may send -- carried the way a watch pass carries them.
         self.policy = policy
         self.send_limits = dict(send_limits or {})
+        #: Set by `end(skip_remaining=True)`: no further policy's pass starts.
+        self._skip_rest = False
         self.idle_timeout_s = idle_timeout_s
         self._open_device = open_device
         self._inbox: "queue.Queue" = queue.Queue()
@@ -528,8 +576,9 @@ class Session:
         with self._calls:
             if self._thread is not None:
                 raise SessionError("this session has already started")
-            self.goal = goal
-            self.lock.who = f"an MCP session ({self.driver or 'client'}): {goal}"
+            self.goal = goal or " -> ".join(leg.name for leg in self.legs)
+            self.lock.who = (f"an MCP session ({self.driver or 'client'}): "
+                             f"{self.goal}")
             self.lock.acquire()
             self._thread = threading.Thread(target=self._run, args=(goal,),
                                              name="adbagent-session",
@@ -555,6 +604,7 @@ class Session:
             if turn.outcome:
                 return turn
             planned_on = turn.skeleton
+            leg = turn.leg
             for i, action in enumerate(actions):
                 names_something = (action.target is not None
                                    or action.action in POINT_ACTIONS)
@@ -574,6 +624,17 @@ class Session:
                 turn = self._exchange(("act", action))
                 _merge(happened, turn.happened)
                 if turn.outcome or turn.pending is not None or turn.failure:
+                    break
+                if turn.leg != leg:
+                    # That policy's pass ended under the batch -- its budget,
+                    # its own `done` -- and the next one's run has started.
+                    # What was left was planned for the other app.
+                    if i < len(actions) - 1:
+                        happened.append(
+                            f"stopped before the remaining "
+                            f"{len(actions) - i - 1} action(s): that policy's "
+                            f"pass is over, and the next one's first screen is "
+                            f"below")
                     break
             return replace(turn, happened=happened)
 
@@ -614,13 +675,23 @@ class Session:
             self._released = False
             return self._exchange(("reclaim",))
 
-    def end(self, summary: str, failed: bool = False) -> Turn:
-        """Finish the run with `done` (or `fail`) and hand the phone back."""
+    def end(self, summary: str, failed: bool = False,
+            skip_remaining: bool = False) -> Turn:
+        """Finish the run with `done` (or `fail`) and hand the phone back.
+
+        In a session of several policies this finishes the pass in hand, and
+        what comes back is the next policy's first turn -- failed or not, as a
+        watch of several goes on to its next policy. The phone goes back after
+        the last, or now with `skip_remaining`.
+        """
         action = AgentAction(observation="", reasoning="",
                              action="fail" if failed else "done",
                              text=summary or None)
+        if skip_remaining:
+            self._skip_rest = True
+        before = self._last.leg if self._last is not None else 0
         turn = self.act([action])
-        if not turn.outcome:
+        if not turn.outcome and turn.leg == before:
             # A `done` the harness would not take -- an assertion that still
             # fails -- leaves the run going. Ending is what was asked for.
             self.close("the driver ended the session")
@@ -709,20 +780,65 @@ class Session:
         return agent.last_warning or state.last_failure
 
     def _run(self, goal: str) -> None:
+        """The run, or the runs: one pass per policy, in turn, on one device.
+
+        The next policy's run starts the moment the last one ends, and its first
+        turn -- what it is shown, opening with how the last one went -- is the
+        answer to whichever call ended the last. A pass that fails does not stop
+        the ones after it, as in a watch; an abort does (the session closed, the
+        driver went quiet, the person kept the phone), and so does
+        `end(skip_remaining=True)`.
+        """
         final = Turn(outcome="aborted")
         dev = None
+        legs = self.legs or [Leg(goal=goal, policy=self.policy,
+                                 send_limits=self.send_limits)]
+        total = len(legs) if len(legs) > 1 else 0
         try:
             dev = self._open_device(self.cfg)
-            agent = RemoteAgent(dev, self.cfg, inbox=self._inbox,
-                                outbox=self._outbox, driver=self.driver,
-                                idle_timeout_s=self.idle_timeout_s,
-                                policy=self.policy,
-                                send_limits=self.send_limits)
-            outcome, state = agent.run(goal)
-            final = Turn(outcome=outcome, step=state.step, result=state.result,
-                         evidence=self._why_it_ended(outcome, state, agent),
-                         happened=agent._delta(state),
-                         run_dir=str(runlog.run_dir(self.cfg, state.run_id)))
+            intro: List[str] = []
+            recap: List[str] = []
+            # Standing advice is said once per session, not once per policy.
+            advised: set = set()
+            for n, leg in enumerate(legs, 1):
+                agent = RemoteAgent(dev, self.cfg, inbox=self._inbox,
+                                    outbox=self._outbox, driver=self.driver,
+                                    idle_timeout_s=self.idle_timeout_s,
+                                    policy=leg.policy,
+                                    send_limits=leg.send_limits,
+                                    leg=n if total else 0, legs=total,
+                                    leg_name=leg.name, intro=intro)
+                agent._advised = advised
+                outcome, state = agent.run(leg.goal)
+                final = Turn(outcome=outcome, step=state.step,
+                             result=state.result,
+                             evidence=self._why_it_ended(outcome, state, agent),
+                             happened=agent._delta(state),
+                             run_dir=str(runlog.run_dir(self.cfg, state.run_id)),
+                             leg=n if total else 0, legs=total,
+                             leg_name=leg.name)
+                if not total:
+                    break
+                said = state.result or final.evidence
+                recap.append(f"policy {n} of {total} ({leg.name}) ended: "
+                             f"{outcome}" + (f" -- {said}" if said else "")
+                             + f" [trace: {final.run_dir}]")
+                rest = legs[n:]
+                why_not = ("" if not rest
+                           else "the session ended" if outcome == "aborted"
+                           else "end_session skipped them" if self._skip_rest
+                           else "")
+                if not rest or why_not:
+                    if rest:
+                        recap.append(f"not run: "
+                                     f"{', '.join(r.name for r in rest)} -- "
+                                     f"{why_not}")
+                    final.happened = final.happened + recap
+                    break
+                intro = final.happened + [
+                    recap[-1],
+                    f"policy {n + 1} of {total} ({rest[0].name}) starts now, as "
+                    f"a run of its own: its goal and its policy are below"]
         except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
             log.exception("the session's run failed")
             final = Turn(outcome="aborted",

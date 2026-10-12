@@ -275,6 +275,17 @@
             <select id="watch-policy-select"></select></label>
           <button type="button" class="ghost" id="btn-policy-new">New…</button>
         </fieldset>
+        <!-- Which policies a start runs, in the order they were ticked. One is
+             the watch this tab always started -- the policy picked beside it,
+             under the goal in the box -- and while only one is ticked it
+             follows the picker. Several take turns, each under the goal saved
+             with it, so the box sits that out. -->
+        <fieldset class="optgroup runlist-group">
+          <legend>Run, in order</legend>
+          <div class="runlist" id="watch-run-list" role="group"
+               aria-label="policies to run, in the order they were ticked"></div>
+          <p class="small runlist-note" id="watch-run-note"></p>
+        </fieldset>
         <fieldset class="optgroup guard">
           <legend>Mode</legend>
           <label class="check"><input type="checkbox" id="watch-draft" checked>
@@ -337,6 +348,8 @@
         <div class="readout-rest">
           <span>run <b class="mono" id="w-runid">—</b></span>
           <span id="w-iter-wrap" hidden>pass <b id="w-iter">1</b></span>
+          <!-- Which of several policies the pass in view belongs to. -->
+          <span id="w-policy-wrap" hidden>policy <b id="w-policy">—</b></span>
           <span>llm calls <b id="w-calls">0</b></span>
           <span>elapsed <b id="w-elapsed">0s</b></span>
           <span>status <b id="w-state">running</b></span>

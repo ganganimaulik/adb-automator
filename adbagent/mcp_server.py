@@ -28,7 +28,8 @@ import base64
 import logging
 import sys
 import threading
-from typing import Annotated, Any, Callable, Dict, List, Optional, Tuple
+from typing import (Annotated, Any, Callable, Dict, List, Optional, Sequence,
+                    Tuple)
 
 import mcp_types as types
 from mcp.server.mcpserver import (AcceptedElicitation, Context,
@@ -44,7 +45,8 @@ from .config import Config
 from .conversation import parse_send_limits
 from .llm import _grid_overlay
 from .phonelock import PhoneBusy
-from .remote import IDLE_TIMEOUT_S, Session, SessionError, Turn, open_phone
+from .remote import (IDLE_TIMEOUT_S, Leg, Session, SessionError, Turn,
+                     open_phone)
 from .watch import ITERATION_CONTRACT, load_policy
 
 log = logging.getLogger("adbagent.mcp")
@@ -65,6 +67,15 @@ be -- which gives the phone back.
 look() adds a screenshot of the current screen. approve(request_id) asks the \
 person before anything irreversible or any send. hand_over(reason) gives the \
 phone to the person for something only they can do, then takes it back.
+
+POLICIES
+The owner's policies are the instructions their watches run under; \
+list_policies() names them. start_session(policy=name) makes the session one \
+pass of that watch, under the goal saved with it. \
+start_session(policies=[a, b]) is one pass of each, in that order: each \
+starts at POLICY n of N with its own goal and instructions, and end_session \
+finishes the one in hand and returns the next one's first screen, until the \
+last gives the phone back. skip_remaining=true ends the session there instead.
 
 THE SCREEN
 One element per line: #N [Kind] "label" id=... @zone k=key flags. Target an \
@@ -172,18 +183,66 @@ class Phone:
         self._lock = threading.Lock()
 
     def start(self, goal: str, driver: str, *, policy: str = "",
-              send_limits: str = "") -> Turn:
+              send_limits: str = "", policies: Sequence[str] = ()) -> Turn:
         with self._lock:
             if self.session is not None and self.session.live:
                 raise SessionError(
                     f"a session is already running ({self.session.goal!r}); "
                     f"end_session first")
-            text, goal, limits = self._brief(goal, policy, send_limits)
+            legs = self._plan(goal, policy, policies, send_limits)
+            if len(legs) == 1:
+                leg = legs[0]
+                self.session = Session(self.cfg, open_device=self.open_device,
+                                       driver=driver,
+                                       idle_timeout_s=self.idle_timeout_s,
+                                       policy=leg.policy,
+                                       send_limits=leg.send_limits)
+                return self.session.start(leg.goal)
             self.session = Session(self.cfg, open_device=self.open_device,
                                    driver=driver,
                                    idle_timeout_s=self.idle_timeout_s,
-                                   policy=text, send_limits=limits)
-            return self.session.start(goal)
+                                   legs=legs)
+            return self.session.start("")
+
+    def _plan(self, goal: str, policy: str, policies: Sequence[str],
+              extra_limits: str) -> List[Leg]:
+        """The pass a session makes, or the passes, one per policy in turn.
+
+        Several policies are several passes of their watches, each under the
+        goal saved with it -- so a goal given beside them would be wrong for
+        all but one, and a policy with none saved has nowhere to take one
+        from. Both are refused rather than guessed at.
+        """
+        refs = [ref.strip() for ref in policies or () if ref and ref.strip()]
+        if policy.strip():
+            if refs:
+                raise SessionError("give `policy` or `policies`, not both")
+            refs = [policy.strip()]
+        if len(refs) <= 1:
+            text, full, limits = self._brief(goal, refs[0] if refs else "",
+                                             extra_limits)
+            return [Leg(goal=full, policy=text, send_limits=limits)]
+        if goal.strip():
+            raise SessionError("each of several policies runs under the goal "
+                               "saved with it; leave `goal` empty, or start "
+                               "one policy at a time")
+        store = policymod.store_for(self.cfg)
+        paths = [store.resolve(ref) for ref in refs]
+        legs = []
+        for i, (ref, path) in enumerate(zip(refs, paths)):
+            if any(policymod.same_file(path, earlier) for earlier in paths[:i]):
+                raise SessionError(f"{ref!r} is named twice; each policy gets "
+                                   f"one pass")
+            meta = policymod.read(path)
+            if meta.exists and not meta.goal:
+                raise SessionError(
+                    f"the policy {ref!r} carries no goal, and among several "
+                    f"each runs under its own: save one with it, or start it "
+                    f"on its own with a goal")
+            text, full, limits = self._brief("", ref, extra_limits)
+            legs.append(Leg(goal=full, policy=text, send_limits=limits,
+                            name=meta.label or ref))
+        return legs
 
     def _brief(self, goal: str, ref: str,
                extra_limits: str) -> Tuple[str, str, Dict[str, int]]:
@@ -272,14 +331,22 @@ def build_server(cfg: Config, *, open_device: Callable[[Config], Any] = open_pho
 
     @server.tool()
     def start_session(ctx: Context, goal: str = "", policy: str = "",
-                      send_limits: str = "") -> types.CallToolResult:
+                      send_limits: str = "",
+                      policies: Optional[List[str]] = None
+                      ) -> types.CallToolResult:
         """Take the phone and start working on `goal`.
 
-        `policy` names one of the owner's policies (as `adbagent watch --policy`
-        takes it): the session becomes one pass of that watch, its instructions
-        are shown to you verbatim, its goal stands when `goal` is empty, and its
-        send caps hold. `send_limits` adds caps such as "like=3, rose=0"; it can
-        only tighten them.
+        `policy` names one of the owner's policies (list_policies shows them,
+        and `adbagent watch --policy` takes the same names): the session
+        becomes one pass of that watch, its instructions are shown to you
+        verbatim, its goal stands when `goal` is empty, and its send caps hold.
+        `send_limits` adds caps such as "like=3, rose=0"; it can only tighten
+        them.
+
+        `policies` names several, to work through in that order: one pass of
+        each, under the goal saved with each -- so give no `goal`. Each starts
+        at "POLICY n of N" with its own goal and instructions; end_session
+        finishes the one in hand and returns the next one's first screen.
 
         Returns the first screen. The phone stays yours until end_session, an
         ending the run reaches on its own (a password screen, the step budget),
@@ -287,7 +354,37 @@ def build_server(cfg: Config, *, open_device: Callable[[Config], Any] = open_pho
         started with another --idle-timeout).
         """
         return answer(call(lambda: phone.start(
-            goal, client_name(ctx), policy=policy, send_limits=send_limits)))
+            goal, client_name(ctx), policy=policy, send_limits=send_limits,
+            policies=policies or ())))
+
+    @server.tool(annotations=types.ToolAnnotations(read_only_hint=True))
+    def list_policies() -> types.CallToolResult:
+        """The owner's policies: the names start_session takes, and what each is for.
+
+        Each line is a name, then the goal saved with it -- the goal its session
+        runs under -- and its send caps when it has any. A policy with no goal
+        saved can only be started on its own, with a goal given.
+        """
+        store = policymod.store_for(cfg)
+        lines = []
+        for found in store.list():
+            if not found.exists:
+                continue
+            first = next((line.strip() for line in found.goal.splitlines()
+                          if line.strip()), "")
+            line = f"- {found.name}"
+            if found.title and found.title != found.name:
+                line += f" ({found.title})"
+            line += (f": {first}" if first
+                     else ": no goal saved -- start it on its own, with a goal")
+            caps = found.extra.get("send_limits", "").strip()
+            if caps:
+                line += f" [send_limits: {caps}]"
+            lines.append(line)
+        if not lines:
+            lines = [f"no policies in {store.dir or 'watch.policies_dir'} yet"]
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text="\n".join(lines))])
 
     @server.tool()
     def act(actions: Annotated[List[Step], Field(
@@ -371,13 +468,19 @@ def build_server(cfg: Config, *, open_device: Callable[[Config], Any] = open_pho
         return answer(session.last or Turn(outcome="aborted"))
 
     @server.tool()
-    def end_session(summary: str, failed: bool = False) -> types.CallToolResult:
+    def end_session(summary: str, failed: bool = False,
+                    skip_remaining: bool = False) -> types.CallToolResult:
         """Finish: record `summary` as the answer and give the phone back.
 
         failed=true when the goal cannot be done; say why in `summary`.
+
+        In a session of several policies this finishes the pass in hand, failed
+        or not, and returns the next policy's first screen; the phone goes back
+        after the last. skip_remaining=true ends the whole session here.
         """
         session = call(phone.current)
-        return answer(call(lambda: session.end(summary, failed=failed)))
+        return answer(call(lambda: session.end(
+            summary, failed=failed, skip_remaining=skip_remaining)))
 
     # What `tools/list` advertises; the arguments are still validated against
     # the full `Step` model. Through the SDK's registry, which has no public

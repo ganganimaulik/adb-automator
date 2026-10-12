@@ -91,7 +91,8 @@ def test_the_tools_a_client_is_offered(cfg):
 
     tools = {t.name: t for t in drive(cfg, fake.FakeDevice(cfg), script)}
     assert set(tools) == {"start_session", "act", "look", "approve",
-                          "hand_over", "end_session"}
+                          "hand_over", "end_session", "list_policies"}
+    assert tools["list_policies"].annotations.read_only_hint is True
     schema = json.dumps(tools["act"].input_schema)
     # The action vocabulary reaches the client as an enum...
     assert '"tap_at"' in schema and '"scroll_to_edge"' in schema
@@ -104,7 +105,7 @@ def test_the_tools_a_client_is_offered(cfg):
 
 def test_the_instructions_name_every_tool():
     for name in ("start_session", "act", "end_session", "look", "approve",
-                 "hand_over"):
+                 "hand_over", "list_policies"):
         assert name in INSTRUCTIONS
 
 
@@ -408,3 +409,104 @@ def test_a_session_needs_a_goal_from_somewhere(cfg):
 
     result = drive(cfg, fake.FakeDevice(cfg), script)
     assert result.is_error and "give a goal" in text(result)
+
+
+# ---------------------------------------------------------------------------
+# Several policies, one pass of each in turn
+# ---------------------------------------------------------------------------
+
+def _two_policies(cfg, tmp_path, second_goal="open the Bluetooth settings"):
+    cfg.watch.policies_dir = str(tmp_path / "policies")
+    folder = tmp_path / "policies"
+    folder.mkdir()
+    (folder / "wifi.md").write_text(
+        "---\ngoal: open the Wi-Fi settings\ntitle: Wi-Fi\n"
+        "send_limits: like=5\n---\n\n# Wi-Fi\n- Never reply twice.\n",
+        encoding="utf-8")
+    goal_line = f"goal: {second_goal}\n" if second_goal else ""
+    (folder / "bluetooth.md").write_text(
+        f"---\n{goal_line}title: Bluetooth\n---\n\n# Bluetooth\n"
+        f"- Only ever say hi.\n", encoding="utf-8")
+
+
+def test_several_policies_are_a_pass_each_in_one_session(cfg, tmp_path):
+    _two_policies(cfg, tmp_path)
+    dev = fake.FakeDevice(cfg)
+
+    async def script(client):
+        started = text(await client.call_tool(
+            "start_session", {"policies": ["wifi", "bluetooth"]}))
+        handed_on = text(await client.call_tool(
+            "end_session", {"summary": "Wi-Fi is open"}))
+        ended = text(await client.call_tool(
+            "end_session", {"summary": "Bluetooth is open"}))
+        return started, handed_on, ended
+
+    started, handed_on, ended = drive(cfg, dev, script)
+    assert "POLICY 1 of 2: Wi-Fi" in started
+    assert "GOAL:\nopen the Wi-Fi settings" in started
+    assert "ONE PASS" in started                 # each is a pass of its watch
+    assert "Never reply twice." in started
+    assert "POLICY 2 of 2: Bluetooth" in handed_on
+    assert "GOAL:\nopen the Bluetooth settings" in handed_on
+    assert "Only ever say hi." in handed_on
+    assert "policy 1 of 2 (Wi-Fi) ended: success -- Wi-Fi is open" in handed_on
+    assert ended.startswith("SESSION ENDED: success")
+    assert "policy 2 of 2 (Bluetooth) ended: success" in ended
+    assert phonelock.holder(cfg.run.artifacts_dir) == ""
+
+
+def test_skip_remaining_gives_the_phone_back_early(cfg, tmp_path):
+    _two_policies(cfg, tmp_path)
+
+    async def script(client):
+        await client.call_tool("start_session",
+                               {"policies": ["wifi", "bluetooth"]})
+        return text(await client.call_tool(
+            "end_session", {"summary": "enough", "skip_remaining": True}))
+
+    ended = drive(cfg, fake.FakeDevice(cfg), script)
+    assert ended.startswith("SESSION ENDED: success")
+    assert "not run: Bluetooth -- end_session skipped them" in ended
+    assert phonelock.holder(cfg.run.artifacts_dir) == ""
+
+
+def test_list_policies_names_each_with_the_goal_it_runs_under(cfg, tmp_path):
+    _two_policies(cfg, tmp_path, second_goal="")
+
+    async def script(client):
+        return text(await client.call_tool("list_policies", {}))
+
+    listed = drive(cfg, fake.FakeDevice(cfg), script)
+    assert "- wifi (Wi-Fi): open the Wi-Fi settings [send_limits: like=5]" \
+        in listed
+    assert "- bluetooth (Bluetooth): no goal saved" in listed
+
+
+@pytest.mark.parametrize("args, says", [
+    ({"policies": ["wifi", "bluetooth"], "goal": "do it all"},
+     "leave `goal` empty"),
+    ({"policies": ["wifi", "bluetooth"], "policy": "wifi"},
+     "not both"),
+    ({"policies": ["wifi", "wifi"]}, "named twice"),
+])
+def test_what_several_policies_will_not_take(cfg, tmp_path, args, says):
+    _two_policies(cfg, tmp_path)
+
+    async def script(client):
+        return await client.call_tool("start_session", args)
+
+    result = drive(cfg, fake.FakeDevice(cfg), script)
+    assert result.is_error and says in text(result)
+    assert phonelock.holder(cfg.run.artifacts_dir) == ""
+
+
+def test_one_of_several_with_no_goal_saved_is_refused(cfg, tmp_path):
+    _two_policies(cfg, tmp_path, second_goal="")
+
+    async def script(client):
+        return await client.call_tool("start_session",
+                                      {"policies": ["wifi", "bluetooth"]})
+
+    result = drive(cfg, fake.FakeDevice(cfg), script)
+    assert result.is_error and "carries no goal" in text(result)

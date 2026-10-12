@@ -2111,8 +2111,8 @@ async function refreshStatus() {
       parts.push(st.watch.stopping
         ? `<span class="st warn live">● stopping the watch — writing up what it learned</span>`
         : st.watch.draft
-        ? `<span class="st ok live">● watching (draft): ${esc(goalTitle(st.watch.goal))}</span>`
-        : `<span class="st bad live">● watching LIVE: ${esc(goalTitle(st.watch.goal))}</span>`);
+        ? `<span class="st ok live">● watching (draft): ${esc(goalTitle(st.watch.title || st.watch.goal))}</span>`
+        : `<span class="st bad live">● watching LIVE: ${esc(goalTitle(st.watch.title || st.watch.goal))}</span>`);
     }
     if (st.job) parts.push(`<span class="st ok live">● generating a skill</span>`);
     $("status").innerHTML = parts.join("");
@@ -2201,6 +2201,9 @@ watchLive.setRunning = (running, stopping) => {
   $("btn-policy-save").disabled = running;
   $("btn-policy-new").disabled = running;
   $("watch-policy-select").disabled = running;
+  // And the run list with it: what is ticked is what is running.
+  watchRunning = running;
+  paintRunList();
   paintWatchBanner(running, stopping);
 };
 watchLive.onEvent = (ev) => {
@@ -2212,6 +2215,9 @@ watchLive.onEvent = (ev) => {
   // reply-ledger table. There is no table and no such events: a send leaves a
   // `decide` in this pass's feed and a message in the thread, and nothing else.
   if (ev.kind === "control") paintHold(watchLive, ev.mode, ev.mode);
+  // Which policy this pass is a pass of, when the watch takes several in turn.
+  // Read off the goal it started under, which opens with that policy's own.
+  if (ev.kind === "run_start") paintPassPolicy(String(ev.goal || ""));
 };
 watchLive.onEnd = () => { $("watch-hint").textContent = ""; };
 
@@ -2243,11 +2249,18 @@ function watchOptions() {
     const n = int ? parseInt(raw, 10) : parseFloat(raw);
     return isNaN(n) ? null : n;
   };
+  // Nothing ticked starts the policy picked above, as this tab always did.
+  const run = RUN_LIST.length ? RUN_LIST.slice() : [policyPath];
+  // The box holds the picked policy's goal, so it goes with a start of that
+  // policy alone. Any other start runs each policy under the goal saved with
+  // it, and the server refuses a goal sent beside several.
+  const boxApplies = run.length === 1 && run[0] === policyPath;
   return {
-    goal: $("watch-goal").value.trim(),
+    goal: boxApplies ? $("watch-goal").value.trim() : "",
     // Which policy, said explicitly rather than left to config: the tab may be
     // pointed at any of them, and the one on screen is the one to start.
-    policy: policyPath,
+    policy: run[0],
+    policies: run,
     draft: $("watch-draft").checked,
     no_learn: $("watch-no-learn").checked,
     serial: $("watch-serial").value.trim(),
@@ -2307,6 +2320,8 @@ async function loadPolicies() {
   policyPath = wanted.find((p) => p && policyAt(p))
     || (POLICIES[0] ? POLICIES[0].path : "");
   paintPolicySelect();
+  syncRunList();
+  paintRunList();
   return data;
 }
 
@@ -2405,8 +2420,114 @@ async function selectPolicy(path) {
   policyPath = path || "";
   saveValue(POLICY_KEY, policyPath);
   paintPolicySelect();
+  // A run list of one follows the picker, so picking and starting is still
+  // one decision. Several ticked are left alone: picking one is then only
+  // opening it to read or edit.
+  if (RUN_LIST.length <= 1 && policyPath) {
+    RUN_LIST = [policyPath];
+    saveRunList();
+  }
+  paintRunList();
   await loadPolicy();
   applyPolicyGoal();
+}
+
+/* ------------------------------------------------------------ run list
+
+   Which policies Start runs, in the order they were ticked. One is the watch
+   this tab always started: the picked policy under the goal in the box. Several
+   take turns -- a pass of each per round, each under the goal saved with it --
+   and between rounds the watch looks at the screen the last one ended on, so a
+   change there is answered at once while the others come round on a clock. */
+
+const RUN_KEY = "adbagent.watch-run";
+let RUN_LIST = [];          // policy paths, in the order they run
+let runListLoaded = false;  // read from this browser's storage yet?
+let watchRunning = false;   // a running watch pins the list it started with
+let watchPolicies = [];     // what the running watch works through
+
+/* Keep the list to policies that still exist, and never empty while there is
+   a picked policy to fall back on -- which is exactly what an empty list starts
+   anyway, so an empty one would only be a list that says less than it does. */
+function syncRunList() {
+  if (!runListLoaded) {
+    runListLoaded = true;
+    try {
+      const saved = JSON.parse(loadValue(RUN_KEY) || "[]");
+      if (Array.isArray(saved)) RUN_LIST = saved.map(String);
+    } catch (err) { RUN_LIST = []; }
+  }
+  RUN_LIST = RUN_LIST.filter((p, i) => policyAt(p) && RUN_LIST.indexOf(p) === i);
+  if (!RUN_LIST.length && policyPath) RUN_LIST = [policyPath];
+}
+
+function saveRunList() { saveValue(RUN_KEY, JSON.stringify(RUN_LIST)); }
+
+function paintRunList() {
+  const box = $("watch-run-list");
+  if (!box) return;
+  // Ticked first, in the order they run, so the list reads top to bottom as
+  // the watch will; the rest after, as the picker lists them.
+  const ticked = RUN_LIST.map(policyAt).filter((p) => p && p.exists);
+  const rest = POLICIES.filter((p) => p.exists && !RUN_LIST.includes(p.path));
+  const rows = ticked.concat(rest).map((p) => {
+    const at = RUN_LIST.indexOf(p.path);
+    const what = p.goal ? trunc(goalTitle(p.goal), 64) : "no goal saved";
+    return `<label class="check runrow${at >= 0 ? " on" : ""}"` +
+      ` title="${esc(p.path)}">` +
+      `<input type="checkbox" data-path="${esc(p.path)}"` +
+      `${at >= 0 ? " checked" : ""}${watchRunning ? " disabled" : ""}>` +
+      `<span class="order">${at >= 0 ? at + 1 : ""}</span>` +
+      `<b>${esc(p.title || p.name)}</b>` +
+      `<span class="what${p.goal ? "" : " warn"}">${esc(what)}</span></label>`;
+  });
+  box.innerHTML = rows.join("") ||
+    `<span class="small">no policies yet — New… writes one</span>`;
+  paintRunNote();
+}
+
+function paintRunNote() {
+  const el = $("watch-run-note");
+  if (!el) return;
+  if (RUN_LIST.length <= 1) {
+    // One ticked that is not the one picked: the box is the picked one's goal,
+    // so a start runs the ticked one under its own -- worth saying, since the
+    // goal on screen is then not the goal that will run.
+    const only = policyAt(RUN_LIST[0]);
+    el.innerHTML = only && RUN_LIST[0] !== policyPath
+      ? `Starts <b>${esc(only.title || only.name)}</b> under the goal saved with `
+        + `it — the box above belongs to the policy picked beside this.`
+      : "Tick more than one to work through several in turn.";
+    return;
+  }
+  const sweep = parseFloat($("watch-sweep").value) || watchDefaults.sweep_s || 0;
+  const every = sweep > 0
+    ? (sweep % 60 ? `${sweep}s` : `${sweep / 60}m`) : "15m";
+  const last = policyAt(RUN_LIST[RUN_LIST.length - 1]);
+  const missing = RUN_LIST.map(policyAt).filter((p) => p && !p.goal);
+  el.innerHTML = `Runs ${RUN_LIST.length} in turn, each under the goal saved `
+    + `with it — the box above is only saved, not run. Between rounds it `
+    + `watches ${esc(last ? last.title || last.name : "the last one")}'s screen `
+    + `and goes round them all every ${every}.`
+    + (missing.length
+      ? ` <span class="warn">${esc(missing[0].title || missing[0].name)} has no `
+        + `goal saved — pick it, write one in the box, Save policy.</span>`
+      : "");
+}
+
+/* Name the policy a pass belongs to, off the goal it started under. */
+function paintPassPolicy(goal) {
+  const wrap = $("w-policy-wrap");
+  if (watchPolicies.length < 2) { wrap.hidden = true; return; }
+  const at = watchPolicies.findIndex((path) => {
+    const p = policyAt(path);
+    return p && p.goal && goal.startsWith(p.goal.trim());
+  });
+  if (at < 0) return;
+  const p = policyAt(watchPolicies[at]);
+  $("w-policy").textContent =
+    `${p.title || p.name} (${at + 1} of ${watchPolicies.length})`;
+  wrap.hidden = false;
 }
 
 async function loadWatch() {
@@ -2427,6 +2548,12 @@ async function loadWatch() {
   // A running watch pins the policy it was started with; nothing else here has
   // a claim on the selection, so the remembered one stands.
   if (active.running && active.policy) policyPath = active.policy;
+  // ...and the run list it was started with: what is ticked is what is running.
+  watchPolicies = active.running ? (active.policies || [active.policy]) : [];
+  if (active.running && watchPolicies.length) {
+    runListLoaded = true;
+    RUN_LIST = watchPolicies.slice();
+  }
   await loadPolicies();
   await loadPolicy();
   // Unconditionally, including over an empty box: the goal belongs to the policy
@@ -2434,8 +2561,9 @@ async function loadWatch() {
   // Nothing is discarded that was not already recoverable by switching back.
   applyPolicyGoal();
   // An active watch's goal is the last prompt that actually ran, so it wins over
-  // both -- what is on screen should be what the phone is doing.
-  if (active.goal) {
+  // both -- what is on screen should be what the phone is doing. A watch of
+  // several has none of its own: each policy ran under the one saved with it.
+  if (active.goal && watchPolicies.length < 2) {
     $("watch-goal").value = active.goal;
     paintPolicyGoalNote();
   }
@@ -2475,6 +2603,21 @@ $("watch-goal").addEventListener("input", () => {
 $("watch-policy-select").addEventListener("change", (e) => {
   selectPolicy(e.target.value).catch((err) => notice(err.message));
 });
+
+// Ticking appends, so the order is the order they were ticked; unticking takes
+// one out and the rest close up behind it.
+$("watch-run-list").addEventListener("change", (e) => {
+  const path = e.target.dataset && e.target.dataset.path;
+  if (!path) return;
+  const at = RUN_LIST.indexOf(path);
+  if (e.target.checked && at < 0) RUN_LIST.push(path);
+  if (!e.target.checked && at >= 0) RUN_LIST.splice(at, 1);
+  saveRunList();
+  paintRunList();
+});
+
+// The note says how often the others come round, which is the sweep.
+$("watch-sweep").addEventListener("input", paintRunNote);
 
 $("policy-goal-note").addEventListener("click", (e) => {
   if (e.target.dataset && e.target.dataset.act === "use-goal") useSavedGoal();
@@ -2530,14 +2673,27 @@ $("btn-policy-save").addEventListener("click", async () => {
 $("watch-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const body = watchOptions();
-  if (!body.goal) { notice("say what to watch"); return; }
-  rememberGoal(body.goal);
+  if (body.policies.length > 1 || body.policy !== policyPath) {
+    // Each runs under the goal saved with it, so each needs one -- said here,
+    // by name, rather than as the server's refusal of the first one missing.
+    const missing = body.policies.map(policyAt).find((p) => !p || !p.goal);
+    if (missing !== undefined) {
+      notice(`${missing ? missing.title || missing.name : "a ticked policy"} `
+        + `has no goal saved — pick it, write its goal in the box, Save policy`);
+      return;
+    }
+  } else {
+    if (!body.goal) { notice("say what to watch"); return; }
+    rememberGoal(body.goal);
+  }
   if (!body.draft &&
       !confirm("This will send real replies from this device.\n\n" +
                "Have you read what it drafts first?")) return;
   try {
     await api("/api/watch", { method: "POST", body: JSON.stringify(body) });
   } catch (err) { notice(err.message); return; }
+  watchPolicies = body.policies.slice();
+  $("w-policy-wrap").hidden = true;
   $("watch-hint").textContent = "";
   // The same clean slate a run gets, including the ledger and the notes panels:
   // a watch starting is not a continuation of the last one.

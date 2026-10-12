@@ -805,3 +805,175 @@ def test_what_changed_says_what_went_when_nothing_came():
     # A long line is clipped: it may be somebody's whole message.
     said = what_changed(ran_dry(), ran_dry(banner="x" * 200))
     assert said == '"' + "x" * 57 + '..." appeared'
+
+
+# -- several policies, one after another ------------------------------------
+
+def two_apps(**snooze):
+    """Two policies, each with a goal, instructions and caps of its own.
+
+    `snooze` maps a policy's name to the rules it rests on."""
+    from adbagent.watch import WatchPolicy, parse_snooze
+    return [WatchPolicy(goal="reply on app one", policy="be brief in one",
+                        send_limits={"like": 5}, name="One",
+                        snooze=parse_snooze(snooze.get("One", ""))),
+            WatchPolicy(goal="reply on app two", policy="be kind in two",
+                        send_limits={"like": 0}, name="Two",
+                        snooze=parse_snooze(snooze.get("Two", "")))]
+
+
+def build_several(cfg, frames, outcomes=(), policies=None, on_run=None):
+    """A Watch over several policies, wired to stubs.
+
+    Returns the watch, what it slept, the goals each pass was given, and which
+    policy each pass's agent was built for -- name, instructions and caps."""
+    llm = StubLLM()
+    clock, goals, built = FakeClock(), [], []
+    agent = StubAgent(list(outcomes), goals, llm=llm)
+    watch = Watch(StubDevice(frames), llm, cfg,
+                  policies=policies or two_apps(),
+                  sleep=clock.sleep, clock=clock)
+
+    def make():
+        current = watch._current
+        built.append((current.name, current.policy, dict(current.send_limits)))
+        if on_run is not None:
+            on_run(watch)
+        return agent
+
+    watch._make_agent = make
+    return watch, clock.slept, goals, built
+
+
+def whose(goals):
+    """Which policy each goal belongs to, by the goal it opened with."""
+    return ["one" if g.startswith("reply on app one") else "two" for g in goals]
+
+
+def test_several_policies_take_turns_each_under_its_own_goal(cfg):
+    watch, slept, goals, built = build_several(cfg, [chat()])
+    said = []
+    watch.say = said.append
+
+    watch.run(max_passes=2)
+
+    assert whose(goals) == ["one", "two"]
+    # Each pass is still one pass of a watch, under its own goal.
+    assert all("ONE PASS" in g for g in goals)
+    assert built == [("One", "be brief in one", {"like": 5}),
+                     ("Two", "be kind in two", {"like": 0})]
+    assert watch.stats.rounds == 1
+    assert "1 round(s)" in watch.status()
+    # Every line says which policy it is about.
+    assert any(line.startswith("  pass 1 (One): success") for line in said)
+    assert any(line.startswith("  pass 2 (Two): success") for line in said)
+
+
+def test_each_policy_hands_its_pass_its_own_instructions_and_caps(tmp_path):
+    cfg = Config()
+    cfg.skills.skills_dir = str(tmp_path / "skills")
+    policies = two_apps()
+    watch = Watch(StubDevice([chat()]), StubLLM(), cfg, policies=policies)
+    watch._current = policies[1]
+    agent = watch._default_agent()
+    assert agent.policy == "be kind in two"
+    assert agent.send_limits == {"like": 0}
+
+
+def test_a_change_on_screen_reruns_only_the_policy_that_left_it(cfg):
+    """The other apps are not on screen, so nothing new was seen about them."""
+    frames = [chat(), chat(), chat(messages=["hey", "you around?", "hello?"])]
+    watch, slept, goals, built = build_several(cfg, frames)
+
+    watch.run(max_passes=3)
+
+    assert whose(goals) == ["one", "two", "two"]
+    assert watch.stats.rounds == 1           # the third pass was not a round
+
+
+def test_the_others_come_round_on_a_clock_of_their_own(cfg):
+    """Off for one policy; for several the others' screens cannot be watched,
+    so with the sweep off a round still comes every `ROUND_S`."""
+    from adbagent.watch import ROUND_S
+    assert cfg.watch.sweep_s == 0
+    watch, slept, goals, built = build_several(cfg, [chat()])
+
+    # A round, nineteen looks at 45s, and the round owed at 15 minutes.
+    watch.run(max_passes=2 + 19 + 2)
+
+    assert whose(goals) == ["one", "two", "one", "two"]
+    assert watch.stats.rounds == 2
+    assert watch._last_round_at == ROUND_S == 900
+
+
+def test_the_sweep_sets_how_often_the_rounds_come(cfg):
+    cfg.watch.sweep_s = 120.0
+    watch, slept, goals, built = build_several(cfg, [chat()])
+
+    # 45s between looks: rounds at t=0 and t=135, two looks in between.
+    watch.run(max_passes=2 + 2 + 2)
+
+    assert whose(goals) == ["one", "two", "one", "two"]
+    assert watch.stats.skipped == 2
+
+
+def test_a_policy_whose_work_ran_dry_sits_out_rounds_until_its_rest_is_over(cfg):
+    """Nobody can see its screen change while another app is in front, so the
+    rule's time is the only thing that can bring it back."""
+    frames = [chat(),          # the first look
+              ran_dry(),       # where One's pass ended
+              chat()]          # where Two's ended, and every look after
+    policies = two_apps(One="Nobody new for now = 30m")
+    watch, slept, goals, built = build_several(cfg, frames, policies=policies)
+    said = []
+    watch.say = said.append
+
+    # Round 1 at t=0; at t=900 One is still out, so Two alone; at t=1800 both.
+    watch.run(max_passes=2 + 19 + 1 + 19 + 2)
+
+    assert whose(goals) == ["one", "two", "two", "one", "two"]
+    assert watch.stats.snoozed == 1
+    assert watch.stats.rounds == 3
+    assert any("One: \"Nobody new for now\" is on screen -- leaving it out of "
+               "rounds for 30m" in line for line in said)
+
+
+def test_the_last_policy_rests_on_its_own_rule_and_wakes_on_a_change(cfg):
+    """The screen the round ends on is the one the probe can see, so the last
+    policy's rest works as a watch of one's does -- and its waking is its own."""
+    frames = [chat(),                              # the first look
+              ran_dry(),                           # where Two's pass ended
+              ran_dry(),                           # 45s into the rest
+              ran_dry(chats="Chats, 1 unread")]    # 90s in
+    policies = two_apps(Two="Nobody new for now = 15m")
+    watch, slept, goals, built = build_several(cfg, frames, policies=policies)
+
+    watch.run(max_passes=2 + 1 + 1)
+
+    assert whose(goals) == ["one", "two", "two"]
+    assert watch.stats.woken == 1
+
+
+def test_a_failed_pass_does_not_cost_the_policies_after_it_their_turn(cfg):
+    watch, slept, goals, built = build_several(cfg, distinct(4),
+                                               ["failed", "success"])
+
+    watch.run(max_passes=2)
+
+    assert whose(goals) == ["one", "two"]
+    assert watch.stats.failures == 1
+    assert watch.anchor.package                 # anchored on Two's screen
+    assert slept == [cfg.watch.interval_s]      # no backoff: the round ended well
+
+
+def test_stop_lands_between_policies_not_after_the_round(cfg):
+    watch, slept, goals, built = build_several(cfg, [chat()],
+                                               on_run=lambda w: w.stop())
+    watch.run()
+    assert whose(goals) == ["one"]
+
+
+def test_a_watch_of_several_takes_no_goal_of_its_own(cfg):
+    watch, slept, goals, built = build_several(cfg, [chat()])
+    with pytest.raises(ValueError, match="goal saved with it"):
+        watch.run("watch everything")

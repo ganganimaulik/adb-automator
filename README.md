@@ -28,7 +28,7 @@ $ adbagent run "turn on airplane mode"
 - **Interactive Web UI (`adbagent ui`)**: Real-time goal execution, live phone screen streaming, visual history, model selector, config editor, skill generator, and watch policy editor.
 - **Accessibility Tree First**: Reads screen elements via Android accessibility tree rather than pixels, using vision/screenshots only when necessary (WebViews, image galleries, ambiguous controls, chat threads).
 - **Self-Improving App Skills**: Automatically learns workflows, UI quirks, and optimal interaction paths per app from every run.
-- **Safe Watch Mode**: Continuous monitoring and policy-guided replies with duplicate prevention gates and budget ceilings.
+- **Safe Watch Mode**: Continuous monitoring and policy-guided replies with duplicate prevention gates and budget ceilings -- one app's policy, or several worked through in turn.
 - **Bring Your Own Agent (`adbagent mcp`)**: Claude Code, Codex or any MCP client drives the phone with its own model -- no API key -- while adbagent still verifies every action, puts sends and irreversible presses to the person, and records the session like any run.
 
 ## Table of Contents
@@ -187,12 +187,13 @@ in.
 
 | tool | what it does |
 |---|---|
-| `start_session(goal, policy, send_limits)` | takes the phone and returns the first screen; with `policy` the session is one pass of that watch -- its instructions verbatim, its goal, its caps |
+| `start_session(goal, policy, policies, send_limits)` | takes the phone and returns the first screen; with `policy` the session is one pass of that watch -- its instructions verbatim, its goal, its caps; with `policies` it is one pass of each, in turn |
 | `act(actions)` | one or more actions; returns what happened and the new screen |
 | `look(grid)` | the current screen with a screenshot; `grid` draws a labeled 10% grid to read x/y off |
 | `approve(request_id)` | asks the person whether a pending action may go ahead |
 | `hand_over(reason)` | gives the phone to the person -- a login, a code -- and takes it back after |
-| `end_session(summary)` | records the answer and gives the phone back |
+| `end_session(summary, failed, skip_remaining)` | records the answer and gives the phone back -- or, with policies still to go, hands on to the next |
+| `list_policies()` | the owner's policies by name, with the goal each runs under and its caps |
 
 The screen is the element list `adbagent dump` prints and the actions are the
 vocabulary a model answers with; the server's instructions tell the agent how to
@@ -208,6 +209,17 @@ none is given, and its `send_limits` hold. `send_limits` on the call can add
 caps -- `like=3, rose=0` -- and only ever tighten the policy's. The watch's
 supervisor -- resting on `snooze`, sweeping on a clock -- is not part of a
 session: one session is one pass.
+
+`policies` names several, and the session makes one pass of each in that
+order, the way a [watch of several](#several-policies-in-turn) goes round them.
+Each pass is a run of its own -- its own `runs/<id>/`, its own goal (the one
+saved with it, so the call takes no `goal`), its instructions and its caps --
+and the phone is held across all of them. Each begins at `POLICY n of N`;
+`end_session` finishes the pass in hand, failed or not, and its answer is the
+next policy's first screen, opening with how the last one ended. After the
+last, the phone goes back; `skip_remaining=true` gives it back sooner. A batch
+that outlives its policy's pass -- the step budget ran out under it -- stops at
+the boundary rather than carrying actions planned for one app into the next.
 
 ### Only the decision moved
 
@@ -422,6 +434,39 @@ The Watch tab picks between them from a dropdown, and choosing one loads its
 instructions into the editor *and* puts its goal in the goal box. When the two
 drift apart — a one-off start under a different goal — the editor says so and
 offers both ways out rather than choosing for you.
+
+### Several policies, in turn
+
+One phone runs one watch, so two apps are watched by one watch working through
+both policies. Give `--policy` more than once, in the order to run them:
+
+```bash
+adbagent watch --policy hinge_policy --policy bumble_policy --draft
+```
+
+A *round* is one pass of each, in that order, and each pass is exactly the pass
+a watch of that policy alone would run: its own goal (the one saved with it —
+so there is no goal argument, and a policy without one saved is refused), its
+instructions, its `send_limits`. Only one app is on screen at a time, which
+decides what happens between rounds:
+
+- **The last policy's screen is watched.** The probe looks at the screen the
+  round ended on, as a watch of one does, and a change there runs *that* policy
+  again at once — a reply arriving on the last app is answered in seconds,
+  without a pass over the others first. Its `snooze` rules rest on that screen
+  and wake on a change, as they always have.
+- **The others come round on the clock.** Their screens cannot be seen, so a
+  full round also runs every `--sweep` seconds — fifteen minutes when that is
+  off, which for a watch of one means never.
+- **A policy whose pass ended where its own work ran dry sits out the rounds**
+  for its `snooze` rule's time: nobody can see that screen change while another
+  app is in front, so the rule's time is the only thing that brings it back.
+
+A pass that fails does not cost the policies after it their turn, and Stop lands
+between two policies' passes rather than after the round. Put the policy whose
+messages most need a quick answer last. The Watch tab does the same with a
+**Run, in order** list beside the picker: tick policies in the order they should
+run, and the run list follows the picker while only one is ticked.
 
 ### How it avoids replying twice
 
@@ -1097,7 +1142,7 @@ buttons cost — and Stop appears only when there is something to stop.
 ### Watching from the browser
 
 The **Watch** tab starts a watch, picks and edits its policy, and shows what has
-been sent. Four things about it are deliberate:
+been sent. Five things about it are deliberate:
 
 - **The goal box is a view of the selected policy.** Every policy in
   `watch.policies_dir` is offered with the goal it was written for, and choosing
@@ -1109,6 +1154,15 @@ been sent. Four things about it are deliberate:
   policy. **New…** writes a fresh policy there, starting from whatever goal is in
   the box. A save always stores both halves — instructions and goal — because
   saving one and not the other is how the pair comes apart.
+
+- **Run, in order** lists every policy, ticked ones first in the order they run.
+  One ticked is the watch this tab always started — the picked policy under the
+  goal in the box — and while only one is ticked it follows the picker. Tick
+  more and Start runs [several in turn](#several-policies-in-turn), each under
+  the goal saved with it; the box is then only saved, never run, and the list
+  says so — as it does when the one ticked policy is not the one picked. A
+  policy with no goal saved is named before anything starts. While the watch
+  runs, the live pass says which policy it belongs to (`Hinge (1 of 2)`).
 
 - **The mode banner is first and filled.** Green for draft, red for live. It is
   the one fact nobody should have to hunt for, and it is repeated in the header
