@@ -191,7 +191,12 @@ class FakeDevice:
         elif key == "home":
             self.state = "launcher"
 
-    def input_text(self, text: str, clear: bool = True, press_enter: bool = False) -> None:
+    def input_text(self, text: str, clear: bool = True, press_enter: bool = False,
+                   at: Optional[Tuple[int, int]] = None) -> None:
+        # The real device taps the field itself; this one cannot read a field
+        # back, so it returns no `Typed` and typing is graded on the tree.
+        if at is not None:
+            self.tap(*at)
         self.actions.append(f"input_text({text!r},clear={clear},press_enter={press_enter})")
         if press_enter:
             self.actions.append("press(enter)")

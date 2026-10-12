@@ -37,6 +37,19 @@ def test_parse_bounds():
     assert parse_bounds("garbage") == (0, 0, 0, 0)
 
 
+@pytest.mark.parametrize("typed,dumped", [
+    ("Hey 🔥", "Hey .."),        # one emoji, two UTF-16 units, two dots
+    ("👍🏽 ok", ".... ok"),       # a skin tone is a second astral character
+    ("Hey ❤️", "Hey ❤️"),        # U+2764 U+FE0F: both in the BMP, kept
+    ("tab\there", "tab\there"),  # XML can carry a tab
+    ("bell\x07", "bell."),
+    ("plain text", "plain text"),
+])
+def test_as_dumped_matches_what_the_dumper_writes(typed, dumped):
+    from adbagent.screen import as_dumped
+    assert as_dumped(typed) == dumped
+
+
 def test_ime_window_is_dropped_but_flagged():
     plain, typed = s(X.settings_screen()), s(X.settings_screen(keyboard=True))
     assert not plain.keyboard_open

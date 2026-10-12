@@ -43,6 +43,7 @@ $ adbagent run "turn on airplane mode"
 - [Safety](#safety)
 - [When It Stops Getting Anywhere](#when-it-stops-getting-anywhere)
 - [Galleries and Carousels](#galleries-and-carousels)
+- [Typing](#typing)
 - [What a Run Keeps](#what-a-run-keeps)
 - [Reports & Replay](#reports)
 - [App Skills](#app-skills)
@@ -666,6 +667,33 @@ The per-item read is the model's choice, not a fixed cost: setting
 analysing each screen — for paging through a long feed to reach something, when
 the in-between content does not matter. The pixels still decide whether the
 content moved, so the repeat stops at the end of the content either way.
+
+## Typing
+
+uiautomator2 types without naming a field. Where its own keyboard is installed
+it broadcasts the text to that keyboard; everywhere else it puts the text on the
+clipboard and injects Ctrl+V. Either way the text goes to whatever holds input
+focus when it arrives, and focus follows a tap by a few hundred milliseconds — a
+React Native field asks its JS thread first. Typed straight after the tap, the
+text went nowhere and the field kept its placeholder with the keyboard up, which
+one app's skill recorded as "a first input_text into the composer can silently
+fail".
+
+So `input_text` taps the field, waits until a field has taken focus (at most 2s,
+usually a single read), types, and then reads the field back through the server.
+It reads the field live, not from the tree, which draws every emoji as two dots.
+A miss is retried once, by a route that cannot type the text twice. Replacing
+text is set outright through accessibility, which carries an emoji intact, and
+setting it twice is the same as setting it once. Appending text is pasted, and
+only while the field is exactly as it was. Enter is never pressed on a field
+that reads wrong.
+
+What the field reads goes into the step's history line, so the model sees
+`'Hey 🔥'` where the element list shows `'Hey ..'`. A field that already held the
+text is graded a success rather than "the field never took focus" — retyping it
+leaves the tree byte-identical, which is also what a tap that focused nothing
+leaves. A field that cannot be read back (nothing took focus, focus moved on to
+the next box, a password's mask) is graded on the tree, as it always was.
 
 ## What a run keeps
 

@@ -72,6 +72,32 @@ def short_rid(raw: str) -> str:
     return raw.rsplit("/", 1)[-1]
 
 
+def as_dumped(text: str) -> str:
+    """`text` the way the on-device dumper writes it into the tree.
+
+    The dumper (`stripInvalidXMLChars` in u2's server) walks a string one UTF-16
+    unit at a time and writes ``.`` for each unit XML cannot carry -- and both
+    halves of a surrogate pair are such units, so every character outside the
+    Basic Multilingual Plane, which is nearly every emoji, arrives as two dots:
+    a field holding 'Hey 🔥' dumps as 'Hey ..'. The character is gone before the
+    XML is parsed, so text compared against the tree has to be put through the
+    same substitution first.
+    """
+    out = []
+    for ch in text:
+        cp = ord(ch)
+        if cp > 0xFFFF:
+            out.append("..")
+        elif (cp <= 0x8 or 0xB <= cp <= 0xC or 0xE <= cp <= 0x1F
+              or 0x7F <= cp <= 0x84 or 0x86 <= cp <= 0x9F
+              or 0xD800 <= cp <= 0xDFFF or 0xFDD0 <= cp <= 0xFDDF
+              or cp >= 0xFFFE):
+            out.append(".")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 @dataclass
 class Element:
     """One node of the accessibility tree."""

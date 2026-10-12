@@ -341,6 +341,102 @@ def test_input_text_that_lands_is_success():
     assert verify(action, before, after, post).grade == "success"
 
 
+def test_typed_emoji_matches_the_two_dots_the_tree_draws_for_it():
+    """The dumper writes each half of a surrogate pair as '.', so a field
+    holding 'Hey 🔥' dumps as 'Hey ..'. Compared as typed, every emoji that
+    landed in a field with a resource-id was graded a failure."""
+    before = s(X.chat_thread(draft=""))
+    after = s(X.chat_thread(draft="Hey .."))      # how 'Hey 🔥' comes back
+    field = next(e for e in before.elements if e.editable)
+    action = act(action="input_text", target=Target(index=field.index),
+                 text="Hey 🔥")
+    post = synthesise_postcondition(action, field)
+    outcome = verify(action, before, after, post)
+    assert outcome.grade == "success", outcome.reason
+
+
+def _typed(**kw):
+    from adbagent.device import Typed
+    return Typed(**kw)
+
+
+def test_a_field_read_back_holding_the_text_is_success_on_an_identical_tree():
+    """Typing into a field that already held the text leaves the tree byte-
+    identical, which is also what a tap that focused nothing leaves. The
+    device's read-back tells them apart; `runs/6d63b2127408` was graded "the
+    field never took focus" and banned from typing beside a button reading
+    "Send priority like with message"."""
+    from adbagent.actions import typing_report
+
+    action = act(action="input_text", target=Target(index=1), text="Hey 🔥")
+    typed = _typed(landed=True, reads="Hey 🔥", via="keys")
+    setattr(action, "_typed", typed)
+    setattr(action, "_result_summary", typing_report(typed))
+
+    outcome = verify(action, BASE, BASE)
+    assert outcome.grade == "success"
+    # ...and the reason carries the field as it really reads, emoji and all --
+    # the only place the model can see it, since the tree shows two dots.
+    assert "'Hey 🔥'" in outcome.reason
+
+
+def test_a_field_read_back_without_the_text_is_a_failure_naming_what_it_reads():
+    from adbagent.actions import typing_report
+
+    action = act(action="input_text", target=Target(index=1), text="Hey 🔥",
+                 press_enter=True)
+    typed = _typed(landed=False, reads="Add a comment",
+                   note="enter was not pressed")
+    setattr(action, "_typed", typed)
+    setattr(action, "_result_summary", typing_report(typed))
+
+    moved = verify(action, BASE, s(X.detail_screen()))
+    assert moved.grade == "hard_fail"
+    assert "did not land" in moved.reason
+    assert "'Add a comment'" in moved.reason
+    assert "enter was not pressed" in moved.reason
+    # Nothing on screen moved either: the grade that bans it on this screen.
+    assert verify(action, BASE, BASE).grade == "no_change"
+
+
+def test_the_models_own_expectation_still_judges_typing_that_landed():
+    """`expect_text` is about what the typing led to -- a sent message, a
+    search result -- which a field read-back cannot answer."""
+    action = act(action="input_text", target=Target(index=1), text="hello",
+                 press_enter=True, expect_text="Bluetooth pairing")
+    setattr(action, "_typed", _typed(landed=True, reads="hello", via="keys"))
+    post = synthesise_postcondition(action, None)
+    assert post.kind == "text_present"
+
+    outcome = verify(action, BASE, s(X.detail_screen()), post)
+    assert outcome.grade == "hard_fail"
+    assert "Bluetooth pairing" in outcome.reason
+
+
+def test_a_field_that_could_not_be_read_back_is_graded_on_the_tree():
+    """landed=None is "unknown", never "no": the old rules apply unchanged."""
+    action = act(action="input_text", target=Target(index=1), text="hello")
+    setattr(action, "_typed", _typed(landed=None))
+    outcome = verify(action, BASE, BASE)
+    assert outcome.grade == "no_change"
+    assert "never took focus" in outcome.reason
+
+
+def test_typing_report():
+    from adbagent.actions import typing_report
+
+    assert typing_report(None) == ""
+    assert typing_report(_typed(landed=None, reads="x")) == ""
+    assert typing_report(_typed(landed=True, reads="Hey 🔥", via="keys")) \
+        == "the field reads 'Hey 🔥'"
+    assert typing_report(_typed(landed=True, reads="Hey 🔥", via="set_text")) \
+        == "the keys missed, so the field was set directly; " \
+           "the field reads 'Hey 🔥'"
+    assert typing_report(_typed(landed=False, reads="Hey",
+                                note="enter was not pressed")) \
+        == "the field reads 'Hey'; enter was not pressed"
+
+
 def test_successful_navigation():
     outcome = verify(act(action="tap", target=Target(index=1)), BASE, s(X.detail_screen()))
     assert outcome.grade == "success" and outcome.ok
@@ -857,7 +953,9 @@ def test_smarter_input_text():
     action = act(action="input_text", target=Target(index=1), text="search query", clear=False, press_enter=True)
     execute(dev, action, screen)
 
-    dev.input_text.assert_called_once_with("search query", clear=False, press_enter=True)
+    target = resolve_target(Target(index=1), screen)
+    dev.input_text.assert_called_once_with("search query", clear=False,
+                                           press_enter=True, at=target.center)
 
 
 def test_input_target_is_container():
@@ -888,7 +986,8 @@ def test_input_target_is_container():
 
 def test_input_text_taps_the_located_focus_point():
     """When the loop's vision locate placed the field, the focus tap goes to
-    that point rather than the (container) target's centre."""
+    that point rather than the (container) target's centre. The device makes
+    the tap itself, so it can wait for focus to follow it."""
     from unittest.mock import MagicMock
     from adbagent.actions import execute
 
@@ -901,16 +1000,18 @@ def test_input_text_taps_the_located_focus_point():
     setattr(action, "_focus_point", (0.42, 0.86))
     execute(dev, action, screen)
 
-    dev.tap.assert_called_once_with(int(0.42 * X.W), int(0.86 * X.H))
-    assert dev.tap.call_args.args != scroller.center
-    dev.input_text.assert_called_once_with("hello", clear=True, press_enter=False)
+    at = (int(0.42 * X.W), int(0.86 * X.H))
+    dev.input_text.assert_called_once_with("hello", clear=True,
+                                           press_enter=False, at=at)
+    assert at != scroller.center
+    dev.tap.assert_not_called()
 
-    # Without the override the target's own centre is tapped, as before.
+    # Without the override the target's own centre is the field, as before.
     dev2 = MagicMock()
     plain = act(action="input_text", target=Target(index=scroller.index),
                 text="hello")
     execute(dev2, plain, screen)
-    dev2.tap.assert_called_once_with(*scroller.center)
+    assert dev2.input_text.call_args.kwargs["at"] == scroller.center
 
 
 def test_condition_based_wait():

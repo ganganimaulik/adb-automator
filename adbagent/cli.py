@@ -2608,9 +2608,30 @@ def _catch_windows_break() -> None:
         log.debug("could not install a SIGBREAK handler", exc_info=True)
 
 
+def _forgiving_console() -> None:
+    """Make printing text the console cannot encode degrade instead of raise.
+
+    Everything the agent prints can carry text off the phone -- a profile, a
+    message, an emoji in a reason handed to the person. Redirected on Windows,
+    stdout and stderr encode with the ANSI code page, and the first character
+    outside it is a `UnicodeEncodeError` from whatever `print()` met it,
+    mid-run. Only the error handler changes: whoever reads the stream keeps the
+    encoding it expects, and the odd character arrives as an escape.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="backslashreplace")
+        except (ValueError, OSError):
+            log.debug("could not reconfigure %r", stream, exc_info=True)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _forgiving_console()
     setup_logging(getattr(args, "verbose", 0))
     _catch_windows_break()
     with prevent_sleep():

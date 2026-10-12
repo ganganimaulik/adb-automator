@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "adbagent": {
+      "command": "C:\\Users\\ganga\\AppData\\Local\\Programs\\Python\\Python314\\python.exe",
+      "args": [
+        "-m",
+        "adbagent",
+        "mcp",
+        "-c",
+        "C:\\Users\\ganga\\Desktop\\adb\\config.json"
+      ]
+    }
+  }
+}

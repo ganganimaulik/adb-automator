@@ -26,10 +26,10 @@ from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal,
 from pydantic import (BaseModel, ConfigDict, Field, field_validator,
                       model_validator)
 
-from .screen import Element, Screen
+from .screen import Element, Screen, as_dumped
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle only matters for typing
-    from .device import Device
+    from .device import Device, Typed
 
 log = logging.getLogger("adbagent.actions")
 
@@ -894,6 +894,31 @@ def _point(action: "AgentAction", screen: Screen,
             min(max(1, int(fy * screen.height)), screen.height - 1))
 
 
+def typing_report(typed: Optional["Typed"]) -> str:
+    """What the device read back from the field it typed into, for the step's
+    history line; "" when it could not read the field.
+
+    The only place the model sees an emoji it typed. The tree draws one as two
+    dots, so a field already holding 'Hey 🔥' read as 'Hey ..', and the model
+    typed it in again -- and again.
+    """
+    landed = getattr(typed, "landed", None)
+    reads = getattr(typed, "reads", None)
+    if not isinstance(landed, bool) or not isinstance(reads, str):
+        return ""
+    via = getattr(typed, "via", "")
+    parts = []
+    if landed and via == "set_text":
+        parts.append("the keys missed, so the field was set directly")
+    elif landed and via == "paste":
+        parts.append("the keys missed, so it was pasted")
+    parts.append(f"the field reads {reads!r}")
+    note = getattr(typed, "note", "")
+    if isinstance(note, str) and note:
+        parts.append(note)
+    return "; ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Execution
 # ---------------------------------------------------------------------------
@@ -930,20 +955,27 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
         dev.long_press(*element.center, duration=action.duration or 0.6)
     elif action.action == "input_text":
         assert element is not None
-        # Focus the field first; the IME broadcast path types into whatever has
-        # focus, not into a selector. `_focus_point` is the harness's override:
-        # set when the agent loop's vision locate placed the field because the
-        # target was a container whose centre focuses nothing.
+        # Where the field is. `_focus_point` is the harness's override: set when
+        # the agent loop's vision locate placed the field because the target was
+        # a container whose centre focuses nothing.
         focus = getattr(action, "_focus_point", None)
         if focus is not None and screen.width > 0 and screen.height > 0:
-            px = min(max(1, int(focus[0] * screen.width)), screen.width - 1)
-            py = min(max(1, int(focus[1] * screen.height)), screen.height - 1)
-            dev.tap(px, py)
+            at = (min(max(1, int(focus[0] * screen.width)), screen.width - 1),
+                  min(max(1, int(focus[1] * screen.height)), screen.height - 1))
         else:
-            dev.tap(*element.center)
+            at = element.center
         should_clear = action.clear if action.clear is not None else True
         should_enter = bool(action.press_enter)
-        dev.input_text(action.text or "", clear=should_clear, press_enter=should_enter)
+        # The device taps the field itself and waits for it to take focus
+        # before typing: the keys go to whatever has focus, not to a selector,
+        # and focus lags the tap. It then reads the field back, and what it
+        # read outranks the tree in `verify`.
+        typed = dev.input_text(action.text or "", clear=should_clear,
+                               press_enter=should_enter, at=at)
+        setattr(action, "_typed", typed)
+        report = typing_report(typed)
+        if report:
+            setattr(action, "_result_summary", report)
     elif action.action == "press_key":
         dev.press(action.key or "back")
     elif action.action in ("scroll", "swipe"):
@@ -1195,7 +1227,12 @@ def check_postcondition(post: Postcondition, before: Screen,
         else:
             actual = el.best_text
         if post.field == "text":
-            if (post.value or "") in actual:
+            wanted = post.value or ""
+            # Also as the tree can show it: the dumper writes every emoji as
+            # two dots, so typed text with one in it never matched the field
+            # it had landed in -- one of the two false dead ends "What it
+            # remembers" in the README describes.
+            if wanted in actual or as_dumped(wanted) in actual:
                 return True, ""
             return False, f"field reads {actual!r}, expected {post.value!r}"
         if actual == (post.value or ""):
@@ -1433,19 +1470,43 @@ def verify(action: AgentAction, before: Screen, after: Screen,
         # through to it. It can still fail -- as a `hard_fail`, which states
         # something about that condition and does not ban the action.
 
-    # The typing half of the check above. A dump that is byte-identical after
-    # an input_text means the tap that was meant to focus the field landed on
-    # nothing that takes focus -- the centre of a scroller, say -- and the
-    # keys went nowhere. It must be caught here, before the postcondition,
-    # because the element_state condition cannot: it passes vacuously whenever
-    # the field has no resource-id to find (`_find` answers None and a missing
-    # element is inconclusive-but-passing), which graded "nothing was typed" a
-    # success and let the run proceed as if the text were in.
-    if action.action == "input_text" and after.exact_id == before.exact_id:
-        return VerifyOutcome(
-            grade="no_change",
-            reason="nothing on screen changed -- the field never took focus, "
-                   "so nothing was typed")
+    # Typing is graded on what the device read back from the field, when it
+    # could read it. The tree answers neither question this needs: it renders
+    # an emoji as two dots, and a field that already held the text is
+    # byte-identical to one that never took focus. `runs/2be9d2bf5401` and
+    # `runs/6d63b2127408` each typed 'Hey 🔥' into a field already holding it
+    # -- beside a button already reading "Send priority like with message" --
+    # and both were graded "the field never took focus" and banned from typing
+    # on that screen for the rest of the run.
+    report = ""
+    if action.action == "input_text":
+        landed = getattr(getattr(action, "_typed", None), "landed", None)
+        if isinstance(landed, bool):
+            report = getattr(action, "_result_summary", "") or ""
+            if not landed:
+                return VerifyOutcome(
+                    grade=("no_change" if after.exact_id == before.exact_id
+                           else "hard_fail"),
+                    reason=f"the text did not land -- {report}")
+            if condition.kind == "element_state":
+                return VerifyOutcome(grade="success", reason=report)
+            # A condition of the model's own (`expect_text`) is still judged
+            # on the tree below -- it is about what the typing led to.
+        elif after.exact_id == before.exact_id:
+            # The typing half of the check above, for a field that could not
+            # be read back. A dump that is byte-identical after an input_text
+            # means the tap that was meant to focus the field landed on nothing
+            # that takes focus -- the centre of a scroller, say -- and the keys
+            # went nowhere. It must be caught here, before the postcondition,
+            # because the element_state condition cannot: it passes vacuously
+            # whenever the field has no resource-id to find (`_find` answers
+            # None and a missing element is inconclusive-but-passing), which
+            # graded "nothing was typed" a success and let the run proceed as
+            # if the text were in.
+            return VerifyOutcome(
+                grade="no_change",
+                reason="nothing on screen changed -- the field never took "
+                       "focus, so nothing was typed")
 
     passed, why = check_postcondition(condition, before, after)
     if not passed:
@@ -1457,4 +1518,4 @@ def verify(action: AgentAction, before: Screen, after: Screen,
         return VerifyOutcome(grade="soft_fail",
                              reason="landed on an unexpected screen")
 
-    return VerifyOutcome(grade="success")
+    return VerifyOutcome(grade="success", reason=report)

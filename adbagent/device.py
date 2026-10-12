@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import date as _date
 from typing import Callable, List, Optional, Sequence, Tuple, TypeVar
@@ -668,6 +669,124 @@ def _host_window_screenshot() -> Optional[Image.Image]:
     return result[0] if result else None
 
 
+# ---------------------------------------------------------------------------
+# Typing
+# ---------------------------------------------------------------------------
+
+#: How long `Device.input_text` waits after its tap for a field to take input
+#: focus. Focus does not arrive with the tap: a View-system field takes it as
+#: the touch is released, but a React Native field asks its JS thread first, a
+#: Compose one recomposes, and the keyboard animates up meanwhile -- 150-300ms
+#: on an idle phone, more on a busy one. The wait ends as soon as focus is seen,
+#: so it is only spent in full on a tap that focused nothing.
+FOCUS_WAIT_S = 2.0
+
+#: How long a read-back keeps looking for the typed text before calling the
+#: attempt a miss. Both of uiautomator2's routes are asynchronous: the clipboard
+#: route injects Ctrl+V as a key event and returns before the app has handled
+#: it, and the keyboard route is a broadcast the IME acts on in its own time.
+TYPED_WAIT_S = 1.5
+
+#: Between two reads of the focused field. Each read is two RPCs, so this is a
+#: floor on the interval rather than the interval.
+TYPING_POLL_S = 0.1
+
+#: Ceiling on one read of the focused field. A read is advice: one that stalls
+#: counts as "nothing has focus", and the typing it was advising surfaces a
+#: dead link on its own.
+_PROBE_TIMEOUT_S = 5.0
+
+#: The class a focused text field reports through accessibility. Nearly every
+#: kind of field reports ``android.widget.EditText`` -- a View-system EditText
+#: and its subclasses, a Compose or Flutter text field, an ``<input>`` in a
+#: WebView -- so a suffix covers them all. Any other focused node (the WebView
+#: around the input, a list row holding keyboard focus) has no text to read.
+_FIELD_CLASSES = r".*(EditText|AutoCompleteTextView)"
+
+#: What a password field reads back as: its mask, never its text.
+_MASK_CHARS = frozenset("•●*")
+
+
+@dataclass
+class Typed:
+    """What `Device.input_text` found in the field after typing into it.
+
+    Read off the field itself, live, rather than off the tree: the tree renders
+    every emoji as two dots (`screen.as_dumped`), and it cannot tell a field
+    that already held the text from one that never took focus -- both leave it
+    byte-identical.
+    """
+
+    #: Is the text in the field? True or False when the field could be read
+    #: back; None when it could not -- nothing held focus, focus moved on before
+    #: the read, the field masks what it holds, or there was nothing to type.
+    #: None is "unknown", never "no".
+    landed: Optional[bool] = None
+    #: The field's text at the last read; None when it was never read.
+    reads: Optional[str] = None
+    #: What put the text there: "keys" (uiautomator2's own route -- its
+    #: keyboard's broadcast, or the clipboard and Ctrl+V), "set_text" or
+    #: "paste". Empty unless `landed`.
+    via: str = ""
+    #: Whether enter was pressed afterwards.
+    entered: bool = False
+    #: What went wrong on the way, when something did.
+    note: str = ""
+
+
+def _field_text(info: Optional[dict]) -> str:
+    return str((info or {}).get("text") or "")
+
+
+def _same_field(a: Optional[dict], b: Optional[dict]) -> bool:
+    """Whether two reads of the focused field are reads of one field.
+
+    Compared on class, resource-id and left edge, because that is all a field
+    keeps while text goes into it: a composer grows a line taller and moves up
+    as the keyboard rises under it, and a search field narrows when its clear
+    button appears. Fields side by side -- one-time-code boxes that pass focus
+    along as each digit lands -- differ exactly where this looks.
+    """
+    if not a or not b:
+        return False
+    return (a.get("className") == b.get("className")
+            and (a.get("resourceName") or "") == (b.get("resourceName") or "")
+            and (a.get("bounds") or {}).get("left")
+            == (b.get("bounds") or {}).get("left"))
+
+
+def _contains(info: dict, x: int, y: int) -> bool:
+    b = info.get("bounds") or {}
+    try:
+        return b["left"] <= x <= b["right"] and b["top"] <= y <= b["bottom"]
+    except (KeyError, TypeError):
+        return False
+
+
+def _loose(text: str) -> str:
+    """`text` reduced to what a field does not reformat.
+
+    Letters, digits and symbols -- emoji are symbols -- case-folded, with
+    spacing, punctuation, joiners and the emoji-presentation selector dropped.
+    So a number the field groups as it is typed, a field drawn in capitals
+    (`textAllCaps` is applied before accessibility reads the text) or a heart
+    whose U+FE0F the app discarded still compares equal, while a dropped emoji,
+    a lost word or a stray letter does not.
+    """
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    return "".join(ch for ch in folded if unicodedata.category(ch)[0] in "LNS")
+
+
+def _compare(reads: str, text: str) -> Tuple[bool, bool]:
+    """(holds, exact): whether a field reading `reads` holds `text`, and only it."""
+    got, want = _loose(reads), _loose(text)
+    if not want:
+        # Text that is nothing but punctuation ("?", "...") has nothing loose
+        # left to compare, so it is compared as typed, spacing aside.
+        got, want = " ".join(reads.split()), " ".join(text.split())
+    return want in got, got == want
+
+
 class Device:
     """A guarded uiautomator2 session."""
 
@@ -1203,7 +1322,7 @@ class Device:
         log.info("%s", msg)
         try:
             print(msg)
-        except OSError:
+        except (OSError, UnicodeEncodeError):
             pass
 
     def tap(self, x: int, y: int) -> None:
@@ -1380,11 +1499,226 @@ class Device:
         self._log_action(f"Press key {key!r}")
         self._act(lambda: self.u2.press(key), "press")
 
-    def input_text(self, text: str, clear: bool = True, press_enter: bool = False) -> None:
+    def input_text(self, text: str, clear: bool = True, press_enter: bool = False,
+                   at: Optional[Tuple[int, int]] = None) -> Typed:
+        """Type `text` into a field, then read the field back to see it landed.
+
+        `at` is the field: it is tapped, and the typing waits until a field has
+        taken input focus (`_await_focus`). Without `at` the text goes to
+        whatever has focus already.
+
+        The text goes in by uiautomator2's own route first -- its keyboard's
+        broadcast where that keyboard is installed, the clipboard and Ctrl+V
+        everywhere else -- and the field is then read back through the server.
+        A miss is retried once, by a route that cannot type the text twice:
+
+        * replacing (`clear`): the field's text is set outright through
+          accessibility. The string travels as JSON rather than as key events
+          or a broadcast, so an emoji arrives whole, and setting it twice is
+          the same as setting it once.
+        * appending: a paste from the clipboard, and only while the field is
+          exactly as it was before typing -- on top of a partial landing it
+          would type the text twice.
+
+        Enter is pressed unless the field is known not to hold the text:
+        submitting a field that reads wrong sends something nobody asked for.
+        """
         self._log_action(f"Input text {text!r} (clear={clear}, press_enter={press_enter})")
-        self._act(lambda: self.u2.send_keys(text, clear=clear), "input_text")
+        held: Optional[dict] = None
+        if at is not None:
+            held = self._focused_field()
+            self.tap(*at)
+        field = self._await_focus(at, held)
+        before = _field_text(field) if field is not None else None
+
+        typed = Typed()
+        try:
+            self._act(lambda: self.u2.send_keys(text, clear=clear), "input_text")
+        except (DeviceTimeout, DeviceLost):
+            raise
+        except Exception as exc:  # noqa: BLE001 - a dropped attempt, not a lost phone
+            # uiautomator2's own failures: its keyboard refusing the broadcast
+            # three times, then finding no focused node for its fallback. They
+            # derive from neither ValueError nor anything the loop catches, so
+            # they used to end the run rather than the step.
+            log.warning("input_text: send_keys failed: %s", exc)
+            typed.note = f"the keyboard route failed ({type(exc).__name__})"
+
+        if field is None:
+            # Focus can arrive after the wait gave up on it: too late for the
+            # keys, not too late to read the field and retry. But not the field
+            # that held focus before the tap -- that one proves nothing.
+            late = self._focused_field()
+            if late is not None and not _same_field(late, held):
+                field = late
+        if field is not None and text.strip():
+            self._confirm(typed, field, text, clear, before)
+        if typed.landed is None:
+            log.info("input_text: could not read the field back")
+        else:
+            log.info("input_text: %s via %s; the field reads %r",
+                     "landed" if typed.landed else "did NOT land",
+                     typed.via or "nothing", typed.reads)
+
         if press_enter:
-            self.press("enter")
+            if typed.landed is False:
+                typed.note = "; ".join(filter(None, (typed.note,
+                                                     "enter was not pressed")))
+                log.warning("input_text: not pressing enter on a field that "
+                            "reads %r", typed.reads)
+            else:
+                self.press("enter")
+                typed.entered = True
+        return typed
+
+    def _focused_field(self) -> Optional[dict]:
+        """The text field holding input focus, read live, or None.
+
+        `exists` first and `info` only after it: `info` on a selector that
+        matches nothing does not fail fast -- the server falls back to a
+        UiSelector lookup that waits out its own selector timeout first.
+        """
+        def probe() -> Optional[dict]:
+            node = self.u2(focused=True, classNameMatches=_FIELD_CLASSES)
+            if not node.exists:
+                return None
+            info = node.info
+            return info if isinstance(info, dict) else None
+
+        try:
+            return _guard(probe, _PROBE_TIMEOUT_S, "focused_field")
+        except Exception as exc:  # noqa: BLE001 - a probe is advice, never a failure
+            log.debug("focused-field probe failed: %s", exc)
+            return None
+
+    def _await_focus(self, at: Optional[Tuple[int, int]],
+                     held: Optional[dict]) -> Optional[dict]:
+        """The field holding input focus once the tap at `at` has given it.
+
+        Waited for because neither of uiautomator2's routes types into a field:
+        the clipboard route injects Ctrl+A, Del and Ctrl+V as key events, and
+        the keyboard route broadcasts to the IME's input connection, and both
+        reach whatever holds focus when they are dispatched. Sent straight
+        after the tap they reached nothing, and the field was left showing its
+        placeholder with the keyboard up -- which the Hinge skill recorded as
+        "a first input_text into the composer can silently fail", and which
+        the next attempt always fixed, because by then the field had focus.
+
+        A field that already had focus before the tap (`held`) is not evidence
+        the tap landed, so it is accepted at once only when the tap was inside
+        it, and otherwise once the wait runs out -- the keys would go to it
+        regardless. None when nothing takes focus within `FOCUS_WAIT_S`.
+        """
+        deadline = time.monotonic() + FOCUS_WAIT_S
+        while True:
+            field = self._focused_field()
+            if field is not None and (at is None or held is None
+                                      or _contains(field, *at)
+                                      or not _same_field(field, held)):
+                return field
+            if time.monotonic() >= deadline:
+                return field
+            time.sleep(TYPING_POLL_S)
+
+    def _read_field(self, field: dict, done: Callable[[str], bool]) -> Optional[str]:
+        """`field`'s text once `done` accepts it, else as it reads at the end
+        of `TYPED_WAIT_S`. None when it cannot be read: focus has moved on.
+
+        Another field holding focus ends the wait at once -- that is focus
+        passed along, not a gap. No field at all is waited through, since an
+        app that rebuilds its field as the text changes drops focus for a beat.
+        """
+        deadline = time.monotonic() + TYPED_WAIT_S
+        while True:
+            now = self._focused_field()
+            if now is not None and not _same_field(now, field):
+                return None
+            reads = _field_text(now) if now is not None else None
+            if reads is not None and done(reads):
+                return reads
+            if time.monotonic() >= deadline:
+                return reads
+            time.sleep(TYPING_POLL_S)
+
+    def _confirm(self, typed: Typed, field: dict, text: str, clear: bool,
+                 before: Optional[str]) -> None:
+        """Read `field` back into `typed`, retrying once by another route on a miss."""
+        def wanted(reads: str) -> bool:
+            holds, exact = _compare(reads, text)
+            if clear:
+                return exact
+            return holds and reads != before
+
+        reads = self._read_field(field, wanted)
+        typed.reads = reads
+        if reads is None or (reads and set(reads) <= _MASK_CHARS):
+            return  # focus moved on, or the field masks its text: unknown
+        if wanted(reads):
+            typed.landed, typed.via = True, "keys"
+            return
+
+        via = ""
+        if clear:
+            # Also what puts right a field the keys left holding more than was
+            # asked for: a leftover draft the clear missed, a stray key.
+            self._log_action(f"Set text {text!r} on the focused field "
+                             f"(it read {reads!r})")
+            if self._set_field_text(field, text):
+                via = "set_text"
+        elif reads == before:
+            self._log_action(f"Paste {text!r} into the focused field "
+                             f"(it still read {reads!r})")
+            if self._paste(text):
+                via = "paste"
+        # ...and an append that changed the field into something else is left
+        # alone: what landed is not known, and a paste on top could double it.
+        if via:
+            again = self._read_field(field, wanted)
+            if again is None:
+                typed.reads = None
+                return
+            reads = typed.reads = again
+            if wanted(again):
+                typed.landed, typed.via = True, via
+                return
+
+        # Still not exactly the text. Held, with more around it, is how a field
+        # that completes what is typed -- inline autocomplete, a formatter's
+        # suffix -- reads after every route, and is what the caller asked for.
+        holds, _ = _compare(reads, text)
+        typed.landed = holds and (clear or reads != before)
+        if typed.landed:
+            typed.via = via or "keys"
+
+    def _set_field_text(self, field: dict, text: str) -> bool:
+        """Replace the focused field's text through accessibility (ACTION_SET_TEXT)."""
+        def run() -> bool:
+            node = self.u2(focused=True, classNameMatches=_FIELD_CLASSES)
+            if not node.exists or not _same_field(node.info, field):
+                return False
+            return bool(node.set_text(text))
+
+        try:
+            return bool(_guard(run, self.cfg.device.watchdog_s, "set_text"))
+        except (DeviceTimeout, DeviceLost):
+            raise
+        except Exception as exc:  # noqa: BLE001 - a failed retry, not a lost phone
+            log.warning("input_text: set_text failed: %s", exc)
+            return False
+
+    def _paste(self, text: str) -> bool:
+        """Put `text` on the clipboard and paste it at the cursor (Ctrl+V)."""
+        try:
+            _guard(lambda: self.u2.set_clipboard(text),
+                   self.cfg.device.watchdog_s, "set_clipboard")
+            _guard(lambda: self.u2.jsonrpc.pasteClipboard(),
+                   self.cfg.device.watchdog_s, "paste")
+            return True
+        except (DeviceTimeout, DeviceLost):
+            raise
+        except Exception as exc:  # noqa: BLE001 - a failed retry, not a lost phone
+            log.warning("input_text: paste failed: %s", exc)
+            return False
 
     def get_clipboard(self) -> str:
         try:
