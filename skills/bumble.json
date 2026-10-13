@@ -1,0 +1,51 @@
+{
+  "name": "Bumble",
+  "packages": [
+    "com.bumble.app"
+  ],
+  "aliases": [
+    "bumble",
+    "Bumble dating"
+  ],
+  "description": "Bumble is a dating app. Bottom nav, left to right: Profile, Discover, People (the swipe deck, where Bumble usually opens), Liked You (paid Beeline), Chats. All messaging lives on Chats: a 'Your matches' row of round avatars (new matches, each ringed in yellow as its time runs down) above the conversation list. Either person can message first now -- the Chats list itself says 'We're sunsetting Opening Moves. Now either person can message first, and a reply opens the chat.' -- but a new match's chat takes ONE message until the other person replies. On this phone Bumble often freezes and Android shows 'Bumble isn't responding'; tap 'Wait'.",
+  "workflows": [
+    {
+      "name": "open_chats",
+      "steps": "open_app com.bumble.app. It usually lands on People, the swipe deck: the element list shows the profile card scroller (id=encountersGridProfile_list), or, when the deck is empty, 'You've seen everyone nearby' with an 'Adjust your filters' button. Touch nothing there. Tap 'Chats' in the bottom nav -- the rightmost tab, listed as [Button] 'Chats Chats' (it becomes plain [Text] 'Chats' once selected). The Chats screen reads, top to bottom: the title 'Chats' with a 'Search' icon; 'Your matches' (id=connections_expiringConnectionsTitle) above one [Button] '<name>, Date, match' per new match (id=connectionItem_ringView); a 'Chats' header with 'Recent' and the filter icon 'Conversations are filtered by Recent'; sometimes a promo card; then one [Button] per conversation (id=connectionItem) labelled '<name>, Date, match <name> <last message>', with 'Your move' before the last message when the match wrote last; then 'Older chats (N)'."
+    },
+    {
+      "name": "send_opener_to_new_match",
+      "steps": "Tap a '<name>, Date, match' avatar under 'Your matches'. The chat (activity .chat.conversation.ConversationActivity) opens on an empty state: their photo, '<name>, <age>' (id=profileInfo_name), '<N> hours left to message', and a tip card 'You get one message to start' / 'Try making it personal, ask about their:' with topic chips such as 'Hidden talents', 'Pet-peeves', 'Next availability'. No [Button] id=message_bubble anywhere means nobody has written yet. The input row at the bottom holds 'Camera' (id=chatInput_button_attach), the text field [Input] 'Aa' (id=chatInput_text -- 'Aa' is its placeholder, not a draft), 'GIF', an unlabelled video-message button (id=chatInput_button_right_extra_tertiary_action) and 'Voice message' (the mic). Type into the 'Aa' field with input_text, verify the text on the next turn, then tap [Button] 'Send message' (id=chatInput_button_send): it takes the mic's place at the right end of the input row once the field has focus, and stays disabled until the field holds text. Then tap 'Back' (top-left) to return to Chats."
+    },
+    {
+      "name": "read_and_reply_in_conversation",
+      "steps": "Tap a conversation row (id=connectionItem). Messages are [Button] id=message_bubble, listed oldest first: @top-right ones are yours (yellow bubbles on the right of the screenshot) and @top-left ones are the match's (grey bubbles on the left). 'Today' / 'Yesterday' (id=timestamp_text) are date dividers, and 'Delivered' (id=status_text) under your newest bubble is a delivery status -- neither is a message. The newest message is the lowest bubble. The input row is the same as in a new match's chat: type into 'Aa', verify, tap 'Send message'. Leave with the 'Back' chevron at top-left, which returns to the Chats list."
+    },
+    {
+      "name": "handle_not_responding",
+      "steps": "Android's 'Bumble isn't responding' dialog (package android: [Text] id=alertTitle, [Button] 'Close app' id=aerr_close, [Button] 'Wait' id=aerr_wait) comes up often on this phone -- when a chat opens or closes, or when Bumble loses focus to another app. Tap 'Wait': Bumble recovers and the screen underneath is as it was. 'Close app' kills Bumble and loses your place (open_app brings it back on People). The dialog can return several times in a row; tap 'Wait' each time."
+    }
+  ],
+  "nuances": [
+    "The element list renders emoji as '..' (every character outside the Basic Multilingual Plane becomes two dots): a bubble reading 'Hey ..' is 'Hey 🔥', and a row preview 'Same here ..' ends in an emoji. Read emoji off the screenshot, never off the element list.",
+    "Chat screens are FLAG_SECURE, so a plain adb screencap of one is black; adbagent recovers the frame from the emulator host window automatically.",
+    "Bumble keeps unsent text in the 'Aa' field across app restarts: a draft typed and never sent is still sitting there the next time that chat opens.",
+    "'You get one message to start' means exactly that: a new match's chat takes one message from you, and the chat opens properly once they reply.",
+    "The People tab is the swipe deck. A horizontal swipe on a card likes or passes that profile, and cannot be undone. Its cards carry 'Send a compliment' (paid), 'Send SuperSwipe' (paid, id=profile_details_badgeSuperSwipe) and 'Recommend to a friend' (shares the profile). The main pager (id=mainApp_viewPager) scrolls horizontally too, so never swipe sideways anywhere in Bumble; change tabs with the bottom nav.",
+    "Liked You (Beeline) is paywalled and Discover is another profile-browsing surface; neither has anything to do with messaging.",
+    "An expired conversation reads 'Conversation expired N days ago', with 'Expired match' in its row label and a grey ring. Reviving one is paid (Rematch / Extend).",
+    "The 'Your move' badge (id=connectionItem_badge) sits at the right of a row whose newest message is the match's. A row without it ends in your own message.",
+    "In a new match's chat the toolbar's 'Voice call' and 'Video call' are disabled; in an open conversation they are live. 'Options' (three dots, top-right) holds unmatch and report.",
+    "The conversation list is sorted by 'Recent' (filter icon 'Conversations are filtered by Recent'), so a conversation with a new message moves to the top; 'Older chats (N)' is collapsed history.",
+    "A promo card can sit at the top of the conversation list (observed: 'We're sunsetting Opening Moves. Now either person can message first, and a reply opens the chat.', id=connections_chatStickyPromoEntryPoint). It is not a conversation.",
+    "Opening a chat can show a blank white screen with a yellow loading spinner for a second or two before the messages draw; wait for it rather than tapping."
+  ],
+  "recommendations": [
+    "Every pass: open_app com.bumble.app, tap 'Chats' in the bottom nav straight away, and work only on the Chats screen and the chats it opens.",
+    "Decide what to open from the 'Your matches' row and the 'Your move' badge; skip rows without 'Your move' and expired rows.",
+    "Before sending, read who wrote the newest bubble off the screenshot (yellow on the right = yours, grey on the left = theirs), and read emoji off the screenshot too.",
+    "Return to the Chats list with the 'Back' chevron after each chat, and end the pass there.",
+    "On 'Bumble isn't responding', tap 'Wait' -- never 'Close app'."
+  ],
+  "custom_prompt": ""
+}

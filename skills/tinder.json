@@ -1,0 +1,52 @@
+{
+  "name": "Tinder",
+  "packages": [
+    "com.android.chrome"
+  ],
+  "aliases": [
+    "tinder",
+    "tinder.com",
+    "Tinder web"
+  ],
+  "description": "Tinder on this phone is the website tinder.com, logged in inside Chrome (com.android.chrome) -- there is no Tinder app installed. Chrome runs in its tablet layout: a tab strip, then a toolbar of Home, 'Go back', 'Go forward', 'Reload this page', the address bar (id=url_bar, e.g. 'tinder.com/app/matches'), 'Translate', 'See 1 tab' and the Chrome menu. Everything below the toolbar is the Tinder page. Its bottom nav, left to right: 'Tinder' (the swipe deck), 'Explore', 'Likes You' (paid), 'Messages', 'My Profile'. All messaging lives on Messages (tinder.com/app/matches): a 'New matches' row of photo tiles above a 'Messages' list of conversations.",
+  "workflows": [
+    {
+      "name": "open_messages",
+      "steps": "open_app com.android.chrome. The Tinder tab is normally still open where it was left; the address bar (id=url_bar) says which page: 'tinder.com/app/matches' is the Messages screen, 'tinder.com/app/messages/<id>' a chat, '.../profile/<id>' a match's profile, 'tinder.com/app/recs' the swipe deck. To reach Messages, tap [Button] 'Messages' in Tinder's bottom nav (fourth from the left, a speech-bubble icon) -- not Chrome's toolbar. Only when no Tinder tab is open at all, open_url https://tinder.com/app/matches (every open_url opens a NEW Chrome tab, so do not use it to switch pages). The Messages screen reads, top to bottom: the TINDER logo with 'Safety Toolkit' (shield, top-right); 'New matches' above a horizontal row (Scroller, scrollable-h) whose first tile is [Button] 'Get Likes' (id=likes-you, paid -- not a match) followed by one [Button] '<name> <name>' per new match ('<name> <name> Verified!' when they carry the blue verified tick); then 'Messages' above one row per conversation, listed as [Scroller] '<name> Report Unmatch' (scrollable-h)."
+    },
+    {
+      "name": "send_opener_to_new_match",
+      "steps": "Tap a '<name> <name>' tile under 'New matches'. The chat (tinder.com/app/messages/<id>) shows a header of [Button] 'Back' (red chevron, top-left), [Button] '<name> <name>' (their small photo and name, top-centre) and [Button] 'Match options' (three dots, top-right); then 'Conversation history with <name>', and for an empty chat only 'You Matched with <name>', '<N> weeks ago' and a big round photo. No 'You:' or '<name>:' text anywhere means nobody has written. At the bottom: [Button] 'GIF', the placeholder text 'Type a message' over the message field [Input] (no label of its own), and [Button] 'Send message' (the round 'Send' button, bottom-right), disabled until the field holds text. Before sending, check the profile (workflow check_profile), then tap the [Input] and type, verify the text on the next turn, and tap 'Send message'. Leave with the red 'Back' chevron at top-left, which returns to Messages."
+    },
+    {
+      "name": "check_profile",
+      "steps": "In a chat, tap the header [Button] '<name> <name>' (top-centre). The profile opens on the same tab (URL ends '/profile/<id>'): '<name> <age> years' as the title, [Button] 'Back' (a round black down-arrow at top-right -- it closes the profile and returns to the chat), then the photo, with thin bars across its top edge, one per photo (four bars = four photos; the white one is the photo showing). The photos are not in the element list -- read them off the screenshot. Tap the RIGHT half of the photo (tap_at, e.g. x=760 y=800 on this 900x1600 screen) to show the next photo, the left half for the previous one; the bars show how far along you are. Scroll the page down for the details: 'Looking for', then 'Essentials', whose first line is the distance as [Text] '<N> kilometers away' (e.g. '27 kilometers away'), followed by gender, orientation, 'Basics', 'Lifestyle' and so on. Tap the down-arrow 'Back' (scroll back up first if it is off screen) to return to the chat."
+    },
+    {
+      "name": "read_and_reply_in_conversation",
+      "steps": "Tap a conversation row under 'Messages'. The thread lists every message as a sender line then its text: [Text] 'You:' followed by your message (dark maroon bubbles on the right of the screenshot), or [Text] '<name>:' followed by theirs (light grey bubbles on the left, with their small photo). Each has a 'Sent at <time>' line before it; 'Sent' under your newest bubble is a delivery status; 'You matched with <name> on <date>' at the top is the match note. None of those are messages. Oldest is at the top, the newest is the lowest. Every message of theirs has a heart [Button] 'Like' to its right, and some carry a [Button] whose label is a long hex id (their photo) -- neither is part of replying. The input row is the same as in a new match's chat: tap the [Input] over 'Type a message', type, verify, tap 'Send message'. Leave with the red 'Back' chevron at top-left."
+    }
+  ],
+  "nuances": [
+    "Tinder here is a web page, so its elements come from Chrome's accessibility tree. Right after Chrome comes to the front, the element list can show nothing of the page but a bare [Text] 'Web View' under Chrome's toolbar; wait one step and look again -- the page's elements appear once Chrome has filled the tree in.",
+    "In a thread the element list names the author of every message: [Text] 'You:' before yours and [Text] '<name>:' before theirs. That is more reliable than bubble colour; read the text of each message from the line that follows it.",
+    "The element list renders emoji as '..' (every character outside the Basic Multilingual Plane becomes two dots): a message reading 'Hey hottie ..' ends in an emoji. Read emoji off the screenshot.",
+    "On the Messages list, the element list gives each conversation only as '<name> Report Unmatch' -- the preview of the newest message is visible only in the screenshot, under the name. A preview that starts with a small curved reply arrow (↩) is YOUR message, i.e. the match has not answered; a preview with no arrow is the match's message.",
+    "Each conversation row on the Messages list is a horizontal scroller: swiping it sideways slides the row over and uncovers a red 'Report' button and a grey 'Unmatch' button. Unmatching deletes the match and the whole chat; it cannot be undone. Never swipe a row sideways, and if a row is ever showing Report / Unmatch, do not tap anywhere on that row -- tap a different row, or tap 'Reload this page' in Chrome's toolbar to close it. Scroll the Messages list only vertically.",
+    "The 'New matches' row also scrolls sideways (it is a horizontal list of tiles, not a swipe deck): swiping it left shows more new matches. That is the only horizontal swipe that is safe on Tinder.",
+    "The 'Tinder' tab in the bottom nav (flame icon, tinder.com/app/recs) is the swipe deck: a swipe or a tap on its heart / X / star buttons likes, passes or Super Likes a profile and cannot be undone. 'Explore' is another browsing surface, 'Likes You' and the 'Get Likes' tile are paid (Tinder Gold), and 'My Profile' is your own profile.",
+    "The heart [Button] 'Like' beside each of the match's messages reacts to that message with a heart. It is visible to them; it is not a way of replying.",
+    "'Match options' (three dots, top-right of a chat) holds Unmatch, Report and Block.",
+    "A profile's distance is in the 'Essentials' section as '<N> kilometers away' (or 'Less than a kilometer away'). A profile that hides its distance has no such line.",
+    "Tinder web may put up overlays -- a Tinder Gold / Platinum upsell, 'Turn on notifications', Chrome's own 'Add to Home screen' or Translate prompts. Dismiss them with their close X, 'No thanks', 'Maybe later' or 'Not now'; never subscribe, purchase or allow notifications.",
+    "If the page shows a login screen ('Log in', 'Create account', a phone-number or Google sign-in prompt), the Tinder session has expired. Do not try to log in; stop the pass and say so."
+  ],
+  "recommendations": [
+    "Every pass: open_app com.android.chrome, tap 'Messages' in Tinder's bottom nav, and work only on the Messages screen and the chats and profiles it opens.",
+    "Decide which conversations to open from the screenshot: rows whose preview has no ↩ arrow are waiting on you; rows with ↩ end in your own message.",
+    "In a thread, read who wrote the newest message from its 'You:' / '<name>:' line, and read emoji off the screenshot.",
+    "To check a match before messaging, open their profile from the chat header, tap through every photo on its right half, and scroll to 'Essentials' for the distance; close it with the down-arrow 'Back'.",
+    "Return to Messages with the page's red 'Back' chevron (top-left of a chat) after each chat, and end the pass on Messages."
+  ],
+  "custom_prompt": ""
+}
