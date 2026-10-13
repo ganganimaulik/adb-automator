@@ -13,10 +13,11 @@ implemented sampling, Codex declined it, and the 2026-07-28 revision of the
 protocol deprecated it. So the client is the decider, and `remote.py` is where
 its decisions enter the loop.
 
-One session at a time, because there is one phone. Approvals and the hand-over
-are put to the person through MCP elicitation, so the client shows them in its
-own window; a client that cannot elicit gets the actions that need a person
-declined rather than taken without one.
+One session at a time, because there is one phone, and only whoever started it
+may drive it or end it (`Phone`). Approvals and the hand-over are put to the
+person through MCP elicitation, so the client shows them in its own window; a
+client that cannot elicit gets the actions that need a person declined rather
+than taken without one.
 
 No `from __future__ import annotations` here, unlike everywhere else: the SDK
 reads each tool's signature to build its schema, and `approve` and `hand_over`
@@ -28,6 +29,7 @@ import base64
 import logging
 import sys
 import threading
+import time
 from typing import (Annotated, Any, Callable, Dict, List, Optional, Sequence,
                     Tuple)
 
@@ -58,15 +60,24 @@ refuses what is known to go nowhere. Every session is recorded like any \
 adbagent run (`adbagent ui`, History).
 
 A SESSION
-1. start_session(goal) takes the phone and returns the first screen.
-2. act(actions) runs one or more actions and returns WHAT HAPPENED and the new \
-screen. Read WHAT HAPPENED and NOTE before every choice: they say what failed, \
-what was refused and why.
-3. end_session(summary) when the goal is done -- failed=true when it cannot \
-be -- which gives the phone back.
+1. start_session(goal) takes the phone and returns the first screen, headed by \
+the SESSION id. Every later call gives that id as session_id: it is what makes \
+the session yours.
+2. act(session_id, actions) runs one or more actions and returns WHAT HAPPENED \
+and the new screen. Read WHAT HAPPENED and NOTE before every choice: they say \
+what failed, what was refused and why.
+3. end_session(session_id, summary) when the goal is done -- failed=true when \
+it cannot be -- which gives the phone back.
 look() adds a screenshot of the current screen. approve(request_id) asks the \
 person before anything irreversible or any send. hand_over(reason) gives the \
 phone to the person for something only they can do, then takes it back.
+
+ONE PHONE
+There is one session at a time, and only whoever started it can act in it or \
+end it. When start_session says the phone is in use, someone else has it -- \
+another conversation, a scheduled run: never end or drive a session you did \
+not start. Stop and report that the phone was busy, or try again once it is \
+free.
 
 POLICIES
 The owner's policies are the instructions their watches run under; \
@@ -116,6 +127,12 @@ session ends, or use hand_over so the person can do it.
 and approve(request_id) asks them. Never approve on their behalf by any other \
 route.
 """
+
+
+#: Every call after start_session names the session it is for (`Phone.own`).
+SessionId = Annotated[str, Field(description="The SESSION id start_session "
+                                             "returned. Only the session you "
+                                             "started is yours.")]
 
 
 class Step(AgentAction):
@@ -171,7 +188,21 @@ def client_name(ctx: Any) -> str:
 
 
 class Phone:
-    """The one session this server holds at a time."""
+    """The one session this server holds at a time, and whose it is.
+
+    One server can serve several conversations at once. A client may start one
+    `adbagent mcp` for all of its chats -- Antigravity does -- and then two of
+    its runs that overlap reach the same `Phone`, where the phone lock cannot
+    tell them apart: they are one process. Seen: a scheduled run was told a
+    session was "already running; end_session first", and ended another
+    conversation's session halfway through its pass to start its own.
+
+    So a session belongs to whoever started it. start_session hands back its
+    id, every later call names it, and a call that names any other is refused:
+    a second conversation can neither act in the first one's session nor end
+    it. A session whose driver has gone away still gives the phone back after
+    the idle timeout.
+    """
 
     def __init__(self, cfg: Config, *,
                  open_device: Callable[[Config], Any] = open_phone,
@@ -186,9 +217,7 @@ class Phone:
               send_limits: str = "", policies: Sequence[str] = ()) -> Turn:
         with self._lock:
             if self.session is not None and self.session.live:
-                raise SessionError(
-                    f"a session is already running ({self.session.goal!r}); "
-                    f"end_session first")
+                raise SessionError(self._in_use())
             legs = self._plan(goal, policy, policies, send_limits)
             if len(legs) == 1:
                 leg = legs[0]
@@ -279,11 +308,36 @@ class Phone:
             raise SessionError(f"the policy {ref!r} carries no goal; give one")
         return text, f"{goal}\n\n{ITERATION_CONTRACT}", limits
 
-    def current(self) -> Session:
+    def own(self, session_id: str) -> Session:
+        """The session `session_id` names, which has to be the one in hand."""
         session = self.session
         if session is None:
             raise SessionError("no session: call start_session first")
+        if session_id.strip() != session.id:
+            if session.live:
+                raise SessionError(self._in_use())
+            raise SessionError(f"no session {session_id!r} is running; call "
+                               f"start_session")
         return session
+
+    def _in_use(self) -> str:
+        """Who has the phone, told to a caller that may not take it from them.
+
+        Never the session's id: that is what would let them.
+        """
+        session = self.session
+        assert session is not None
+        what = next((line.strip() for line in session.goal.splitlines()
+                     if line.strip()), "")
+        if len(what) > 80:
+            what = what[:77] + "..."
+        since = time.strftime("%H:%M", time.localtime(session.started))
+        return (f"the phone is in use by another session, started at {since} "
+                f"by {session.driver or 'a client'} for {what!r}. Only whoever "
+                f"started a session can act in it or end it, so leave it "
+                f"alone: stop here and report that the phone was busy, or try "
+                f"again once it is free. It ends when its driver ends it, or "
+                f"after {self.idle_timeout_s / 60:g} minutes without a call.")
 
     def close(self) -> None:
         session = self.session
@@ -315,9 +369,8 @@ def build_server(cfg: Config, *, open_device: Callable[[Config], Any] = open_pho
         except (SessionError, PhoneBusy) as exc:
             raise ToolError(str(exc)) from exc
 
-    def without_person(turn: Turn, ctx: Context) -> Turn:
+    def without_person(session: Session, turn: Turn, ctx: Context) -> Turn:
         """Decline an approval nobody can be asked for, and say what changes that."""
-        session = phone.current()
         while turn.pending is not None and not can_elicit(ctx):
             flag = ("--allow-destructive" if turn.pending.kind == "irreversible"
                     else "--no-send-approval")
@@ -348,10 +401,12 @@ def build_server(cfg: Config, *, open_device: Callable[[Config], Any] = open_pho
         at "POLICY n of N" with its own goal and instructions; end_session
         finishes the one in hand and returns the next one's first screen.
 
-        Returns the first screen. The phone stays yours until end_session, an
+        Returns the first screen, headed by the SESSION id that every later
+        call gives as `session_id`. The phone stays yours until end_session, an
         ending the run reaches on its own (a password screen, the step budget),
         or a long stretch without any call (15 minutes unless the server was
-        started with another --idle-timeout).
+        started with another --idle-timeout). While another session has it,
+        this is refused: that session is not yours to end.
         """
         return answer(call(lambda: phone.start(
             goal, client_name(ctx), policy=policy, send_limits=send_limits,
@@ -387,7 +442,8 @@ def build_server(cfg: Config, *, open_device: Callable[[Config], Any] = open_pho
             content=[types.TextContent(type="text", text="\n".join(lines))])
 
     @server.tool()
-    def act(actions: Annotated[List[Step], Field(
+    def act(session_id: SessionId,
+            actions: Annotated[List[Step], Field(
                 description="Actions to do in order; usually one, or several "
                             "that belong to the same screen.")],
             ctx: Context) -> types.CallToolResult:
@@ -396,22 +452,23 @@ def build_server(cfg: Config, *, open_device: Callable[[Config], Any] = open_pho
         Stops at the first action that fails or is refused, and before an
         action that names an element once the screen has changed.
         """
-        session = call(phone.current)
+        session = call(lambda: phone.own(session_id))
         turn = call(lambda: session.act(actions))
-        return answer(without_person(turn, ctx))
+        return answer(without_person(session, turn, ctx))
 
     @server.tool(annotations=types.ToolAnnotations(read_only_hint=True))
-    def look(ctx: Context, grid: bool = False) -> types.CallToolResult:
+    def look(session_id: SessionId, ctx: Context,
+             grid: bool = False) -> types.CallToolResult:
         """The current screen with a screenshot.
 
         grid=true draws a labeled 10% grid over it, for reading the x and y of a
         control the element list does not name.
         """
-        session = call(phone.current)
+        session = call(lambda: phone.own(session_id))
         return answer(call(session.look), grid=grid)
 
-    def ask_person(request_id: int, ctx: Context):
-        session = call(phone.current)
+    def ask_person(session_id: str, request_id: int, ctx: Context):
+        session = call(lambda: phone.own(session_id))
         pending = session.pending
         if pending is None or pending.id != request_id:
             raise ToolError(f"no approval {request_id} is waiting")
@@ -420,7 +477,7 @@ def build_server(cfg: Config, *, open_device: Callable[[Config], Any] = open_pho
         return Elicit(f"{pending.prompt}\n\nAllow it?", Allow)
 
     @server.tool()
-    def approve(request_id: int,
+    def approve(session_id: SessionId, request_id: int,
                 decision: Annotated[ElicitationResult[Allow], Resolve(ask_person)],
                 ctx: Context) -> types.CallToolResult:
         """Ask the person whether a pending action may go ahead, then carry on.
@@ -428,16 +485,16 @@ def build_server(cfg: Config, *, open_device: Callable[[Config], Any] = open_pho
         The person answers in this client's own window. Only they can approve;
         the action stays undone unless they accept.
         """
-        session = call(phone.current)
+        session = call(lambda: phone.own(session_id))
         allowed = isinstance(decision, AcceptedElicitation)
         turn = call(lambda: session.answer(request_id, allowed))
         if not can_elicit(ctx):
             turn.happened.insert(0, f"approval {request_id} was declined: this "
                                     f"client cannot ask the person")
-        return answer(without_person(turn, ctx))
+        return answer(without_person(session, turn, ctx))
 
-    def release_to_person(reason: str, ctx: Context):
-        session = call(phone.current)
+    def release_to_person(session_id: str, reason: str, ctx: Context):
+        session = call(lambda: phone.own(session_id))
         if not can_elicit(ctx):
             raise ToolError("this client cannot ask the person anything (no "
                             "MCP elicitation); tell them in chat what to do on "
@@ -452,7 +509,7 @@ def build_server(cfg: Config, *, open_device: Callable[[Config], Any] = open_pho
             f"agent; decline to end the session.", HandBack)
 
     @server.tool()
-    def hand_over(reason: str,
+    def hand_over(session_id: SessionId, reason: str,
                   decision: Annotated[ElicitationResult[HandBack],
                                       Resolve(release_to_person)],
                   ) -> types.CallToolResult:
@@ -461,14 +518,14 @@ def build_server(cfg: Config, *, open_device: Callable[[Config], Any] = open_pho
         For a login, a one-time code, a captcha, a choice that is theirs to make.
         Returns the screen as they left it.
         """
-        session = call(phone.current)
+        session = call(lambda: phone.own(session_id))
         if isinstance(decision, AcceptedElicitation):
             return answer(call(session.reclaim))
         session.close("the person kept the phone")
         return answer(session.last or Turn(outcome="aborted"))
 
     @server.tool()
-    def end_session(summary: str, failed: bool = False,
+    def end_session(session_id: SessionId, summary: str, failed: bool = False,
                     skip_remaining: bool = False) -> types.CallToolResult:
         """Finish: record `summary` as the answer and give the phone back.
 
@@ -477,8 +534,11 @@ def build_server(cfg: Config, *, open_device: Callable[[Config], Any] = open_pho
         In a session of several policies this finishes the pass in hand, failed
         or not, and returns the next policy's first screen; the phone goes back
         after the last. skip_remaining=true ends the whole session here.
+
+        Only ever your own session: one that start_session refused you is
+        someone else's.
         """
-        session = call(phone.current)
+        session = call(lambda: phone.own(session_id))
         return answer(call(lambda: session.end(
             summary, failed=failed, skip_remaining=skip_remaining)))
 

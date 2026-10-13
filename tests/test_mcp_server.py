@@ -45,8 +45,14 @@ def index_of(screen: str, label: str) -> int:
     raise AssertionError(f"{label!r} not on screen:\n{screen}")
 
 
-def tap(index: int) -> dict:
-    return {"actions": [{"action": "tap", "target": {"index": index}}]}
+def session_of(started: str) -> str:
+    """The SESSION id a start_session answer is headed by."""
+    return re.search(r"^SESSION (\w+)", started, re.M).group(1)
+
+
+def tap(session_id: str, index: int) -> dict:
+    return {"session_id": session_id,
+            "actions": [{"action": "tap", "target": {"index": index}}]}
 
 
 class Person:
@@ -101,6 +107,9 @@ def test_the_tools_a_client_is_offered(cfg):
     # Filled by the server from the person, never by the model.
     assert "decision" not in json.dumps(tools["approve"].input_schema)
     assert tools["look"].annotations.read_only_hint is True
+    # Everything after start_session names the session it is for.
+    for name in ("act", "look", "approve", "hand_over", "end_session"):
+        assert "session_id" in tools[name].input_schema["required"], name
 
 
 def test_the_instructions_name_every_tool():
@@ -132,11 +141,13 @@ def test_a_session_from_start_to_end(cfg, mode):
     async def script(client):
         started = text(await client.call_tool(
             "start_session", {"goal": "open the Wi-Fi settings"}))
+        sid = session_of(started)
         acted = text(await client.call_tool(
-            "act", tap(index_of(started, "Wi-Fi"))))
+            "act", tap(sid, index_of(started, "Wi-Fi"))))
         ended = text(await client.call_tool(
-            "end_session", {"summary": "Wi-Fi settings are open"}))
-        late = await client.call_tool("act", {"actions": [
+            "end_session", {"session_id": sid,
+                            "summary": "Wi-Fi settings are open"}))
+        late = await client.call_tool("act", {"session_id": sid, "actions": [
             {"action": "press_key", "key": "back"}]})
         return started, acted, ended, late
 
@@ -152,8 +163,10 @@ def test_a_session_from_start_to_end(cfg, mode):
 
 def test_a_bad_action_is_an_error_the_client_can_read(cfg):
     async def script(client):
-        await client.call_tool("start_session", {"goal": "x"})
-        return await client.call_tool("act", {"actions": [{"action": "tap"}]})
+        sid = session_of(text(await client.call_tool("start_session",
+                                                     {"goal": "x"})))
+        return await client.call_tool("act", {"session_id": sid,
+                                              "actions": [{"action": "tap"}]})
 
     result = drive(cfg, fake.FakeDevice(cfg), script)
     assert result.is_error and "requires a target" in text(result)
@@ -161,8 +174,9 @@ def test_a_bad_action_is_an_error_the_client_can_read(cfg):
 
 def test_look_comes_with_a_screenshot(cfg):
     async def script(client):
-        await client.call_tool("start_session", {"goal": "x"})
-        return await client.call_tool("look", {"grid": True})
+        sid = session_of(text(await client.call_tool("start_session",
+                                                     {"goal": "x"})))
+        return await client.call_tool("look", {"session_id": sid, "grid": True})
 
     result = drive(cfg, fake.FakeDevice(cfg), script)
     kinds = [block.type for block in result.content]
@@ -185,6 +199,81 @@ def test_a_second_driver_is_turned_away(cfg):
     assert "adbagent watch: reply to new chats" in text(result)
 
 
+def test_a_second_conversation_can_neither_drive_nor_end_the_session(cfg):
+    """Seen with Antigravity, which runs one server for all of its chats: a
+    scheduled run found the phone taken, was told "end_session first", and
+    ended another conversation's session halfway through its pass. Both come
+    down one connection here too, as they did there."""
+    dev = fake.FakeDevice(cfg)
+
+    async def script(client):
+        started = text(await client.call_tool(
+            "start_session", {"goal": "open the Wi-Fi settings"}))
+        mine = session_of(started)
+        wifi = index_of(started, "Wi-Fi")
+        refused = await client.call_tool("start_session",
+                                         {"goal": "something else"})
+        theirs = []
+        for guess in ("", "0" * 8):
+            theirs += [
+                await client.call_tool("act", tap(guess, wifi)),
+                await client.call_tool("look", {"session_id": guess}),
+                await client.call_tool("end_session", {
+                    "session_id": guess, "skip_remaining": True,
+                    "summary": "Ended previous leftover session to start a "
+                               "clean pass."}),
+            ]
+        acted = text(await client.call_tool("act", tap(mine, wifi)))
+        ended = text(await client.call_tool(
+            "end_session", {"session_id": mine,
+                            "summary": "Wi-Fi settings are open"}))
+        after = text(await client.call_tool("start_session",
+                                            {"goal": "something else"}))
+        stale = await client.call_tool("act", {"session_id": mine, "actions": [
+            {"action": "press_key", "key": "back"}]})
+        return mine, refused, theirs, acted, ended, after, stale
+
+    mine, refused, theirs, acted, ended, after, stale = drive(cfg, dev, script)
+    said = text(refused)
+    assert refused.is_error and "in use by another session" in said
+    assert "open the Wi-Fi settings" in said
+    assert "end_session first" not in said
+    for result in [refused] + theirs:
+        assert result.is_error and "in use by another session" in text(result)
+        assert mine not in text(result)       # the id is what would let them in
+    assert "-> success" in acted and dev.state == "wifi"
+    assert len(dev.taps) == 1                 # the owner's, and nobody else's
+    assert ended.startswith("SESSION ENDED: success")
+    assert "Wi-Fi settings are open" in ended
+    # Once it is over the phone is free, and the old id opens nothing new.
+    assert session_of(after) != mine
+    assert stale.is_error and "in use by another session" in text(stale)
+    assert phonelock.holder(cfg.run.artifacts_dir) == ""
+
+
+@pytest.mark.parametrize("mode", ERAS)
+def test_only_the_owner_can_put_an_approval_to_the_person(cfg, mode):
+    dev = fake.FakeDevice(cfg)
+    person = Person("accept")
+
+    async def script(client):
+        started = text(await client.call_tool("start_session",
+                                              {"goal": "forget the network"}))
+        mine = session_of(started)
+        wifi = text(await client.call_tool(
+            "act", tap(mine, index_of(started, "Wi-Fi"))))
+        asked = text(await client.call_tool(
+            "act", tap(mine, index_of(wifi, "Forget network"))))
+        request = int(re.search(r"request_id (\d+)", asked).group(1))
+        return await client.call_tool("approve", {"session_id": "0" * 8,
+                                                  "request_id": request})
+
+    theirs = drive(cfg, dev, script, mode=mode, person=person)
+    assert theirs.is_error and "in use by another session" in text(theirs)
+    assert person.asked == []                 # nobody asked on their say-so
+    assert len(dev.taps) == 1                 # and nothing pressed
+
+
 # ---------------------------------------------------------------------------
 # Approvals
 # ---------------------------------------------------------------------------
@@ -195,14 +284,16 @@ def _forget(person, mode, cfg):
     async def script(client):
         started = text(await client.call_tool("start_session",
                                               {"goal": "forget the network"}))
+        sid = session_of(started)
         wifi = text(await client.call_tool(
-            "act", tap(index_of(started, "Wi-Fi"))))
+            "act", tap(sid, index_of(started, "Wi-Fi"))))
         asked = text(await client.call_tool(
-            "act", tap(index_of(wifi, "Forget network"))))
+            "act", tap(sid, index_of(wifi, "Forget network"))))
         if "APPROVAL NEEDED" not in asked:
             return asked, ""
         request = int(re.search(r"request_id (\d+)", asked).group(1))
-        approved = await client.call_tool("approve", {"request_id": request})
+        approved = await client.call_tool("approve", {"session_id": sid,
+                                                      "request_id": request})
         return asked, text(approved)
 
     asked, approved = drive(cfg, dev, script, mode=mode, person=person)
@@ -244,9 +335,11 @@ def test_hand_over_gives_the_phone_back_when_the_person_is_done(cfg, mode):
     person = Person("accept")
 
     async def script(client):
-        await client.call_tool("start_session", {"goal": "x"})
+        sid = session_of(text(await client.call_tool("start_session",
+                                                     {"goal": "x"})))
         return text(await client.call_tool(
-            "hand_over", {"reason": "enter the one-time code"}))
+            "hand_over", {"session_id": sid,
+                          "reason": "enter the one-time code"}))
 
     back = drive(cfg, dev, script, mode=mode, person=person)
     assert len(person.asked) == 1
@@ -260,9 +353,10 @@ def test_hand_over_declined_ends_the_session(cfg):
     dev = fake.FakeDevice(cfg)
 
     async def script(client):
-        await client.call_tool("start_session", {"goal": "x"})
+        sid = session_of(text(await client.call_tool("start_session",
+                                                     {"goal": "x"})))
         return text(await client.call_tool(
-            "hand_over", {"reason": "pick an account"}))
+            "hand_over", {"session_id": sid, "reason": "pick an account"}))
 
     ended = drive(cfg, dev, script, person=Person("decline"))
     assert ended.startswith("SESSION ENDED: aborted")
@@ -274,8 +368,10 @@ def test_hand_over_needs_a_client_that_can_ask(cfg):
     dev = fake.FakeDevice(cfg)
 
     async def script(client):
-        await client.call_tool("start_session", {"goal": "x"})
-        return await client.call_tool("hand_over", {"reason": "log in"})
+        sid = session_of(text(await client.call_tool("start_session",
+                                                     {"goal": "x"})))
+        return await client.call_tool("hand_over", {"session_id": sid,
+                                                    "reason": "log in"})
 
     result = drive(cfg, dev, script, person=None)
     assert result.is_error and "cannot ask the person" in text(result)
@@ -326,9 +422,12 @@ def test_a_print_from_the_phone_never_reaches_the_protocol(tmp_path, caplog):
             async with Client(stdio_client(params, errlog=err)) as client:
                 started = text(await client.call_tool("start_session",
                                                       {"goal": "x"}))
-                await client.call_tool("act", tap(index_of(started, "Wi-Fi")))
+                sid = session_of(started)
+                await client.call_tool("act",
+                                       tap(sid, index_of(started, "Wi-Fi")))
                 during = errlog.read_text(encoding="utf-8")
-                await client.call_tool("end_session", {"summary": "done"})
+                await client.call_tool("end_session", {"session_id": sid,
+                                                       "summary": "done"})
         return during
 
     with caplog.at_level("ERROR"):
@@ -436,10 +535,11 @@ def test_several_policies_are_a_pass_each_in_one_session(cfg, tmp_path):
     async def script(client):
         started = text(await client.call_tool(
             "start_session", {"policies": ["wifi", "bluetooth"]}))
+        sid = session_of(started)
         handed_on = text(await client.call_tool(
-            "end_session", {"summary": "Wi-Fi is open"}))
+            "end_session", {"session_id": sid, "summary": "Wi-Fi is open"}))
         ended = text(await client.call_tool(
-            "end_session", {"summary": "Bluetooth is open"}))
+            "end_session", {"session_id": sid, "summary": "Bluetooth is open"}))
         return started, handed_on, ended
 
     started, handed_on, ended = drive(cfg, dev, script)
@@ -460,10 +560,11 @@ def test_skip_remaining_gives_the_phone_back_early(cfg, tmp_path):
     _two_policies(cfg, tmp_path)
 
     async def script(client):
-        await client.call_tool("start_session",
-                               {"policies": ["wifi", "bluetooth"]})
+        sid = session_of(text(await client.call_tool(
+            "start_session", {"policies": ["wifi", "bluetooth"]})))
         return text(await client.call_tool(
-            "end_session", {"summary": "enough", "skip_remaining": True}))
+            "end_session", {"session_id": sid, "summary": "enough",
+                            "skip_remaining": True}))
 
     ended = drive(cfg, fake.FakeDevice(cfg), script)
     assert ended.startswith("SESSION ENDED: success")

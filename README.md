@@ -187,12 +187,12 @@ in.
 
 | tool | what it does |
 |---|---|
-| `start_session(goal, policy, policies, send_limits)` | takes the phone and returns the first screen; with `policy` the session is one pass of that watch -- its instructions verbatim, its goal, its caps; with `policies` it is one pass of each, in turn |
-| `act(actions)` | one or more actions; returns what happened and the new screen |
-| `look(grid)` | the current screen with a screenshot; `grid` draws a labeled 10% grid to read x/y off |
-| `approve(request_id)` | asks the person whether a pending action may go ahead |
-| `hand_over(reason)` | gives the phone to the person -- a login, a code -- and takes it back after |
-| `end_session(summary, failed, skip_remaining)` | records the answer and gives the phone back -- or, with policies still to go, hands on to the next |
+| `start_session(goal, policy, policies, send_limits)` | takes the phone and returns the first screen, headed by the session's id; with `policy` the session is one pass of that watch -- its instructions verbatim, its goal, its caps; with `policies` it is one pass of each, in turn |
+| `act(session_id, actions)` | one or more actions; returns what happened and the new screen |
+| `look(session_id, grid)` | the current screen with a screenshot; `grid` draws a labeled 10% grid to read x/y off |
+| `approve(session_id, request_id)` | asks the person whether a pending action may go ahead |
+| `hand_over(session_id, reason)` | gives the phone to the person -- a login, a code -- and takes it back after |
+| `end_session(session_id, summary, failed, skip_remaining)` | records the answer and gives the phone back -- or, with policies still to go, hands on to the next |
 | `list_policies()` | the owner's policies by name, with the goal each runs under and its caps |
 
 The screen is the element list `adbagent dump` prints and the actions are the
@@ -275,6 +275,15 @@ agent opened, a run in another terminal, a watch started from the browser -- the
 others refuse with its name instead of driving it underneath, and the web UI
 answers 409 with that name. A holder that crashes cannot leave it held: the lock
 goes with the process.
+
+The lock cannot tell apart two conversations that share one server process.
+Some clients start one `adbagent mcp` for all of their chats -- Antigravity
+does -- so two of its scheduled runs that overlap reach the same server. So a
+session also belongs to whoever started it: `start_session` returns its id,
+every later call gives it as `session_id`, and a call with any other id is
+refused. A second conversation is told the phone is in use and by whom, and can
+neither act in the first one's session nor end it. A session whose driver went
+away still gives the phone back after `--idle-timeout`.
 
 ### Why the agent decides
 

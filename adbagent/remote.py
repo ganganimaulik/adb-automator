@@ -37,6 +37,7 @@ import copy
 import logging
 import queue
 import re
+import secrets
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -122,10 +123,16 @@ class Turn:
     leg: int = 0
     legs: int = 0
     leg_name: str = ""
+    #: The session's id, on the first turn only: every later call names it.
+    session: str = ""
 
     def render(self) -> str:
         """The turn as text, in the order the loop's own prompt puts it."""
         parts: List[str] = []
+        if self.session and not self.outcome:
+            parts.append(f"SESSION {self.session} -- the phone is yours until "
+                         f"it ends. Give session_id=\"{self.session}\" to act, "
+                         f"look, approve, hand_over and end_session.")
         if self.outcome:
             ended = f"SESSION ENDED: {self.outcome}"
             if self.result:
@@ -549,6 +556,12 @@ class Session:
         self.goal = ""
         self.lock = PhoneLock(self.cfg.run.artifacts_dir,
                               f"an MCP session ({driver or 'client'})")
+        #: What its driver names it by on every call after `start`. Random, and
+        #: told to nobody else: one server can serve several conversations at
+        #: once, and this is what keeps each to its own (`mcp_server.Phone`).
+        self.id = secrets.token_hex(4)
+        #: When it took the phone, to tell anyone else who has it.
+        self.started = 0.0
 
     # -- state ---------------------------------------------------------------
 
@@ -580,11 +593,12 @@ class Session:
             self.lock.who = (f"an MCP session ({self.driver or 'client'}): "
                              f"{self.goal}")
             self.lock.acquire()
+            self.started = time.time()
             self._thread = threading.Thread(target=self._run, args=(goal,),
                                              name="adbagent-session",
                                              daemon=True)
             self._thread.start()
-            return self._receive()
+            return replace(self._receive(), session=self.id)
 
     def act(self, actions: Sequence[AgentAction]) -> Turn:
         """Do `actions` in order, stopping at the first that does not work.
