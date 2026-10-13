@@ -7,7 +7,9 @@
         "adbagent",
         "mcp",
         "-c",
-        "C:\\Users\\ganga\\Desktop\\adb\\config.json"
+        "C:\\Users\\ganga\\Desktop\\adb\\config.json",
+        "--no-send-approval",
+        "--allow-destructive"
       ]
     }
   }
