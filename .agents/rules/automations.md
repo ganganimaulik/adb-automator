@@ -10,3 +10,8 @@ All automations and phone control policies executed in Antigravity operate fully
 2. **Policy Enforcement**:
    - Actions must strictly abide by the active policy instructions (e.g., greeting gate, caps, rate limits, navigation).
    - If a send is refused by the harness (e.g., quota limit reached or policy violation), do not retry; record and proceed.
+
+3. **Session ID Ownership**:
+   - `start_session` returns a SESSION id at the top of its response.
+   - Every subsequent call (`act`, `look`, `approve`, `hand_over`, `end_session`) must provide `session_id` to prove ownership of the session.
+
