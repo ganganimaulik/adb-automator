@@ -2,11 +2,11 @@
 goal: |
   Watch Hinge (co.hinge.app): reply to matches who have written back, then like new profiles on Discover.
   Check Matches first every pass — someone waiting on a reply matters more than another like. Then work
-  Discover and like at most 5 new profiles per pass, so a pass finishes cleanly instead of being cut off
+  Discover and like at most 108-207 new profiles per pass, so a pass finishes cleanly instead of being cut off
   part-way through one. Leave the phone on the Discover or Matches list, never inside a profile or a chat.
 title: Hinge
 snooze: You've seen everyone for now = 15m
-send_limits: like=5, rose=0
+send_limits: like=207, rose=0
 ---
 
 # Hinge Automation Policy

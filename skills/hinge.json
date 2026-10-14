@@ -78,7 +78,7 @@
     "In the composer, if 'Send priority like with message' is present, the comment is loaded. Do not repeat input_text if the button already confirms the message is attached.",
     "Use bottom nav (Discover, Matches) for navigation; avoid press_key back inside Hinge -- from the Matches list it can drop you into a chat thread.",
     "When Discover shows 'You've seen everyone for now', stop liking for the pass and leave the phone on the Discover or Matches list -- never inside a profile or a chat.",
-    "Cap each Discover pass at 5 new likes so the pass finishes cleanly; after the cap, stop and leave the phone on a list screen.",
+    "Cap each Discover pass at the policy limit (up to 207 new likes) so the pass finishes cleanly; after the cap, stop and leave the phone on a list screen.",
     "Fast return to 1st photo: use scroll_to_edge with direction='up' on the profile scroller, and be prepared to issue it twice -- verify with the name header (plus pronouns if the profile renders them), not with the action's success.",
     "Video cards are likeable via 'Like video' with the same composer flow as photos; the same first-card and comment-verification rules apply.",
     "To send a like comment or reply: type text via input_text into 'Edit comment' (composer) or 'Send a message' (chat) with confidence='low', then confirm via the element list ('Send priority like with message') or screenshot before tapping the send control by its #N. If the button already reads 'with message', do not re-type. Never use the keyboard suggestion strip to enter the comment.",
