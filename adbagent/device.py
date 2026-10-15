@@ -63,6 +63,17 @@ class IntentRefused(RuntimeError):
     """
 
 
+class FlingFailed(RuntimeError):
+    """`fling_to_edge` could not fling anything: nothing moved.
+
+    Raised rather than papered over. A fallback used to stand in for the fling
+    with five swipes of its own and report success whatever they did -- and the
+    commonest failure is that UiAutomator found no scrollable there at all, so
+    the swipes landed on whatever was drawn instead. On a card deck a swipe is a
+    decision about the card. The loop tells the model, which can scroll itself.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Shell blocklist
 # ---------------------------------------------------------------------------
@@ -1434,15 +1445,13 @@ class Device:
                 fling._vertical = vertical
                 fling.action = "toBeginning" if to_beginning else "toEnd"
                 return bool(fling(max_swipes=max_swipes))
-            except Exception as exc:
-                log.warning("fling_to_edge uiautomator fling failed: %s; falling back to swipes", exc)
-                try:
-                    for _ in range(5):
-                        self.scroll(direction, scale=0.8, box=box)
-                    return True
-                except Exception as e2:
-                    log.warning("fallback scrolls failed: %s", e2)
-                    return False
+            except Exception as exc:  # noqa: BLE001 -- sorted just below
+                if _is_connection_error(exc):
+                    raise          # the device, not the fling: recovery's job
+                log.warning("fling_to_edge: the fling failed: %s", exc)
+                raise FlingFailed(
+                    f"no scrollable list could be flung there "
+                    f"({type(exc).__name__}); nothing moved") from exc
 
         return bool(self._act(run, "fling_to_edge"))
 
@@ -1878,13 +1887,16 @@ class Device:
         return "mDreamingLockscreen=true" in out
 
     def wake(self) -> None:
-        """Wake and swipe up. A PIN or pattern still needs a human."""
+        """Turn the screen on. Nothing is swiped.
+
+        This used to swipe up as well, whenever `dumpsys` said the lockscreen was
+        showing -- a gesture on whatever was drawn if that reading was wrong,
+        and on a card deck a swipe up can be a decision about the card. A lock
+        screen is a screen like any other: the model sees it and can swipe, and
+        a PIN or a pattern still needs a human.
+        """
         if not self.is_awake():
             self._safe(lambda: self.u2.screen_on())
-        if self.is_locked():
-            w, h = self._size
-            self._safe(lambda: self.u2.swipe(w // 2, int(h * 0.85),
-                                             w // 2, int(h * 0.25), duration=0.2))
 
     def recover(self, tier: int = 1) -> bool:
         """Escalating recovery. Returns True when the device answers again."""

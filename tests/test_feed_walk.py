@@ -12,10 +12,11 @@ a post. Three things in the old pager conspired:
   clock pattern and matched the *status bar* -- so the ledger filled with items
   named after the minute they were seen in.
 
-None of those questions is asked any more. The fixture keeps the layout that
-provoked them -- the tab pager is deliberately larger than the content pager,
-and there is no caption anywhere in the tree -- so that a design that started
-guessing again would fail here.
+None of those questions is asked any more, and nothing pages the feed in code
+either: every swipe is the model's, one turn each. The fixture keeps the layout
+that provoked the old failures -- the tab pager is deliberately larger than the
+content pager, and there is no caption anywhere in the tree -- so that a design
+that started guessing again would fail here.
 """
 
 from __future__ import annotations
@@ -38,9 +39,13 @@ from . import xmlgen as X
 
 GOAL = "scroll the reels feed and tell me what the first few are about"
 
-#: Long enough that the sweep cap, not the content, is what stops it -- an
-#: endless feed is the point.
+#: Longer than any walk here gets through -- an endless feed is the point.
 AUTHORS = [f"creator{i}" for i in range(40)]
+
+#: How many reels the scripted model watches before it reports. More than the
+#: nine repeats that make one action on one screen count as a loop, so a walk
+#: this long would be called one if paging were not exempt.
+REELS = 12
 
 
 def _png(seed: int) -> bytes:
@@ -79,13 +84,15 @@ class FeedDevice(fake.FakeDevice):
 
 
 def feed_walker():
-    """Swipe up, and stop once the harness says the run has seen enough."""
+    """Swipe up, one reel per turn, and report after `REELS` of them."""
+    swiped = {"n": 0}
+
     def policy(screen: Screen, llm: fake.FakeLLM) -> AgentAction:
-        note = llm.notes[-1] if llm.notes else ""
-        if "YOU REPEATED" in note:
+        if swiped["n"] >= REELS:
             return AgentAction(observation="the feed has been sampled",
                                reasoning="enough reels seen",
                                action="done", text="described the reels")
+        swiped["n"] += 1
         target = next((e for e in screen.elements
                        if e.resource_id == "clips_viewer_view_pager"), None)
         return AgentAction(
@@ -123,17 +130,19 @@ def _events(cfg, run_id):
 
 # ---------------------------------------------------------------------------
 
-def test_a_vertical_feed_is_swept(cfg):
-    """The headline. The old gate accepted only left/right, so this feed -- the
-    surface where most real swiping happens -- was never swept at all."""
+def test_a_vertical_feed_is_paged_one_model_decision_per_swipe(cfg):
+    """Every swipe that reaches the phone is one the model chose. The harness
+    used to go on swiping in code once a swipe had moved the content."""
     dev, llm, outcome, state = walk(cfg)
-    sweeps = [e for e in _events(cfg, state.run_id) if e["kind"] == "sweep"]
-    assert sweeps, "an upward-paging feed authorised no sweep"
-    assert all(e["gesture"] == "swipe up" for e in sweeps), sweeps
-    assert dev.index > 1, "the feed never advanced"
+    swipes = [a for a in dev.actions if a.startswith("scroll(")]
+    assert outcome == "success"
+    assert dev.index == REELS, "the feed did not advance once per swipe"
+    assert swipes == ["scroll(up)"] * REELS
+    kinds = {e["kind"] for e in _events(cfg, state.run_id)}
+    assert not kinds & {"sweep", "sweep_step", "pager_retry"}, kinds
 
 
-def test_the_sweep_never_flings_sideways_on_a_feed_that_pages_up(cfg):
+def test_the_agent_never_flings_sideways_on_a_feed_that_pages_up(cfg):
     """The old code retargeted horizontal swipes onto the largest horizontal
     scroller -- here the tab strip -- so "next reel" became "next tab"."""
     dev, _, _, _ = walk(cfg)
@@ -141,34 +150,19 @@ def test_the_sweep_never_flings_sideways_on_a_feed_that_pages_up(cfg):
     assert "scroll(right)" not in dev.actions
 
 
-def test_an_endless_feed_is_capped_and_never_called_finished(cfg):
+def test_an_endless_feed_is_never_called_finished(cfg):
     """A feed has no end, so nothing may claim it reached one."""
-    cfg.run.pager_sweep_max = 5
-    _, llm, _, state = walk(cfg)
-    sweeps = [e for e in _events(cfg, state.run_id) if e["kind"] == "sweep"]
-    assert sweeps
-    assert all(e["swept"] <= 5 for e in sweeps), sweeps
-    assert any("limit was reached" in e["reason"] for e in sweeps)
-
+    _, llm, _, _ = walk(cfg)
     handed_back = "\n".join(llm.notes)
     for claim in ("LAST item", "Every item", "complete", "STILL NOT READ"):
         assert claim not in handed_back, claim
 
 
-def test_the_status_bar_clock_names_nothing_on_a_captionless_feed(cfg):
-    """There is no caption anywhere in this tree. The old code fell through to a
-    bare clock pattern and matched the status bar, so every frame was "an item"
-    named after the minute it was seen in."""
-    _, llm, _, state = walk(cfg)
-    readings = [e for e in _events(cfg, state.run_id)
-                if e["kind"] == "item_reading"]
-    assert readings, "nothing was read"
-    assert all("position" in e for e in readings)
-    assert not any("9:41" in json.dumps(e) for e in readings)
-
-
-def test_the_loop_detector_does_not_eject_the_agent_from_the_feed(cfg):
-    """Every reel has the same `exact_id`, so a loop detector counting that
-    alone concludes the agent is stuck and presses back."""
-    dev, _, outcome, _ = walk(cfg)
+def test_paging_a_feed_is_not_called_a_loop(cfg):
+    """Every reel has the same `exact_id` and the same skeleton, and the walk is
+    one swipe repeated more than nine times. That is browsing: no back press,
+    and no telling the model it is repeating itself."""
+    dev, llm, outcome, _ = walk(cfg)
+    assert outcome == "success"
     assert "press(back)" not in dev.actions
+    assert not any("You are repeating yourself" in note for note in llm.notes)

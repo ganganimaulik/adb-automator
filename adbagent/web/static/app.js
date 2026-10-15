@@ -346,6 +346,9 @@ const GRADE_CLASSES = { worked: "worked", success: "worked", no_change: "no_chan
    remembered or retried. Real value when the agent is what is being debugged,
    noise when reading what a run did, so it lives inside the step's own fold. */
 const NOTE_LINES = {
+  loop_detected: (e) => `stuck on ${e.exact_id} — told the model to change approach`,
+  // Older runs only. The harness no longer acts on the phone on its own: it
+  // does not repeat or re-send a gesture, dismiss a popup, or press back.
   sweep_step: (e) => `repeated \`${e.gesture || "the gesture"}\` · ` +
     `${e.read_count || 0} read` + (e.moved === false ? " · did not move" : ""),
   pager_retry: (e) => `retry harder: ${e.action || "the same gesture"}`,
@@ -355,6 +358,7 @@ const NOTE_LINES = {
   loop_break: (e) => `stuck on ${e.exact_id} — going back`,
   back_loop_escape: (e) =>
     `${e.consecutive_backs} backs in a row — asking for another approach`,
+  // ---
   scroll_rejected: (e) => `scroll rejected: ${e.action}`,
   refused: (e) => `refused ${e.label} — needs "allow destructive"`,
   stall_block: (e) =>
@@ -3396,13 +3400,8 @@ const CFG_SPEC = [
       help: "Steps between asking a model whether the goal is already satisfied. 0 switches it off." }],
     ["goal_check_hits", "number", { label: "Satisfied verdicts needed",
       help: "Consecutive satisfied verdicts before the run ends. One sample is how a run that still had work gets cut off." }],
-    ["pager_sweep", "bool", { label: "Sweep carousels in code",
-      help: "Page through a carousel without a model call per item, once the model has chosen to." }],
-    ["pager_sweep_max", "number", { label: "Items per sweep",
-      help: "Before control returns to the model." }],
     ["always_screenshot", "bool", { label: "Always pay for vision" }],
-    ["never_screenshot", "bool", { label: "Never pay for vision",
-      help: "Disables sweeping, which needs to read items." }],
+    ["never_screenshot", "bool", { label: "Never pay for vision" }],
     ["dry_run", "bool", { label: "Dry run",
       help: "Decide everything, touch nothing." }],
   ]],

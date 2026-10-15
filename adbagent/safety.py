@@ -98,63 +98,11 @@ def irreversible(action: AgentAction, screen: Screen) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Interstitials
-# ---------------------------------------------------------------------------
-
-#: Buttons that only ever *decline* or *acknowledge* noise -- rating nags,
-#: feature tours, "what's new" cards. Tapping one can turn an offer down; it
-#: cannot advance a flow or throw work away.
-#:
-#: Deliberately excludes "Allow", "Accept" and "Agree": granting a permission or
-#: accepting terms is a decision, not noise, so it goes to the model (and to the
-#: user, if it is irreversible) rather than being auto-tapped.
-#:
-#: "Continue", "Next" and "Close" used to be here and are decisions by that same
-#: test. They are the primary control of an onboarding wizard, a checkout step or
-#: a permission rationale, so an app that opens on one had its CTA pressed on
-#: every turn until the step budget ran out, without the model being consulted
-#: once. "Close" was worse than wasted steps: a compose screen whose X is
-#: described as "Close" offers exactly one dismiss-shaped candidate, so the
-#: single-candidate rule below fired and discarded the draft -- and `irreversible`
-#: never saw it, because that only grades actions the *model* chose. The model
-#: can press any of the three itself when it wants them.
-DISMISS_LABELS = re.compile(
-    r"^\s*(?:no thanks|no, thanks|not now|maybe later|later|remind me later|"
-    r"don't show again|skip|skip for now|dismiss|got it|ok, got it)\s*$",
-    re.I,
-)
-
-INTERSTITIAL_PACKAGES = {
-    "com.android.vending",          # Play Store rating nags
-    "com.google.android.gms",
-}
-
-
-def find_interstitial(screen: Screen, target_package: str = "") -> Optional[Element]:
-    """A dismiss button on a dialog that is in the way but not part of the task."""
-    if not screen.has_system_dialog() and not any(
-            p in INTERSTITIAL_PACKAGES for p in screen.packages):
-        # Also allow in-app nags, but only when the label is unambiguous noise.
-        candidates = [el for el in screen.actionable
-                      if DISMISS_LABELS.match(el.best_text or "")]
-        return candidates[0] if len(candidates) == 1 else None
-
-    for el in screen.actionable:
-        if el.package == target_package:
-            continue
-        if DISMISS_LABELS.match(el.best_text or ""):
-            return el
-    return None
-
-
-
-
-# ---------------------------------------------------------------------------
 # Loop detection
 # ---------------------------------------------------------------------------
 
 REPEAT_HINT_AT = 6
-FORCE_BACK_AT = 9
+REPEAT_STUCK_AT = 9
 WINDOW = 20
 
 _SCROLL_OPPOSITES = {"up": "down", "down": "up", "left": "right", "right": "left"}
@@ -210,11 +158,6 @@ class LoopDetector:
     #: new items loaded, a refresh, a navigation away and back -- re-arms the
     #: gesture with no bookkeeping here.
     dead_scrolls: Dict[str, str] = field(default_factory=dict)
-    #: Consecutive forced-back presses without an intervening real action.
-    #: When this reaches the cap the agent stops pressing back and lets the
-    #: LLM try a different approach.
-    consecutive_backs: int = 0
-    _BACK_LOOP_CAP: int = field(default=2, repr=False)
 
     def record(self, screen_id: str, signature: str) -> None:
         self.history.append((screen_id, signature))
@@ -234,7 +177,7 @@ class LoopDetector:
     def tried_on(self, screen_id: str) -> List[Tuple[str, int]]:
         """Distinct actions tried on this screen, most-repeated first."""
         rows = [(sig, n) for (sid, sig), n in self.attempts.items()
-                if sid == screen_id and sig != "forced-back"]
+                if sid == screen_id]
         return sorted(rows, key=lambda row: (-row[1], row[0]))
 
     def record_element_action(self, skeleton_id: str, step: int, signature: str, action_desc: str) -> None:
@@ -306,42 +249,46 @@ class LoopDetector:
         """Whether repeating this signature on one screen means anything.
 
         Repeated scrolls do not: a scroll stall means end-of-list, not that the
-        agent is bouncing between screens. Horizontal swipes do not either --
-        paging a carousel is browsing, and the remedy here (a back press) ejects
-        the agent from the set it was working through. "forced-back" does not,
-        because it is this class's own intervention, and counting it created a
-        positive-feedback loop where each forced back made the next fire sooner.
+        agent is bouncing between screens. Swipes do not either, in any
+        direction -- paging a carousel or a vertical feed is browsing, and being
+        told to change approach in the middle of it pushes the agent out of the
+        set it was working through. A swipe that stops moving anything is
+        refused on the frame it failed on (`scroll_dead`), so it cannot spin.
+
+        Vertical swipes used to count. Nothing noticed while a sweep did the
+        paging in code; once every swipe is the model's own, a reels feed would
+        have been called a loop after nine of them.
         """
         if signature.startswith("scroll/"):
             return False
         if (signature.startswith("swipe/")
-                and signature.rsplit("/", 1)[-1] in ("left", "right")):
+                and signature.rsplit("/", 1)[-1] in ("left", "right",
+                                                    "up", "down")):
             return False
-        return signature != "forced-back"
+        return True
 
-    def should_force_back(self, screen_id: str) -> bool:
-        """True when one action has been repeated on one screen to no effect.
+    def repeating_in_place(self, screen_id: str) -> bool:
+        """True when the agent is still repeating one action on one screen.
 
         Counts *per signature* rather than totalling every action taken here.
         The total cannot tell a stuck agent from a working one: opening ten grid
         items in turn puts ten taps on the grid's ``skeleton_id``, and totalling
-        them would press back in the middle of legitimate work. Repeating the
-        *same* tap nine times is unambiguous.
+        them would call legitimate work a loop. Repeating the *same* tap nine
+        times is unambiguous.
+
+        Asked of the latest action taken here, not of the window as a whole:
+        the window remembers twenty steps, and an agent that has already moved
+        on to something else should not be told for another eleven turns that
+        it is repeating itself.
         """
         counts: Dict[str, int] = {}
+        last = ""
         for sid, sig in self.history:
             if sid != screen_id or not self._counts_as_repetition(sig):
                 continue
             counts[sig] = counts.get(sig, 0) + 1
-        return max(counts.values(), default=0) >= FORCE_BACK_AT
-
-    def in_back_loop(self) -> bool:
-        """True when pressing back is itself the problem.
-
-        After ``_BACK_LOOP_CAP`` consecutive forced-backs, the caller
-        should stop pressing back and let the LLM try something else.
-        """
-        return self.consecutive_backs >= self._BACK_LOOP_CAP
+            last = sig
+        return bool(last) and counts[last] >= REPEAT_STUCK_AT
 
     def oscillating(self) -> bool:
         """A repeating 2- or 3-step cycle that has persisted for 5 full
@@ -354,24 +301,20 @@ class LoopDetector:
         bounces between the same two screens working through a list. The action
         is the only part that differs, so the action has to be in the key.
 
-        Ignores forced-back entries, because those are a symptom of *this* guard
-        firing repeatedly rather than of the agent misbehaving.
         """
         MIN_REPS = 5  # cycle must repeat this many times
-        real = [(h, s) for h, s in self.history if s != "forced-back"]
         for period in (2, 3):
             needed = period * MIN_REPS
-            if len(real) >= needed:
-                tail = real[-needed:]
+            if len(self.history) >= needed:
+                tail = self.history[-needed:]
                 cycle = tail[:period]
                 # A cycle has to have somewhere to go and come back from. Doing
                 # one thing over and over -- ``[A,A,A,A,...]`` -- satisfies the
                 # period-2 and period-3 patterns trivially, and used to be
                 # reported here as oscillation: paging an album is exactly that
-                # shape, and the remedy this triggers is a back press that ejects
-                # the agent from the album it was halfway through. Repetition of
-                # a single action is `should_force_back`'s question, and that one
-                # knows which gestures are browsing rather than thrashing.
+                # shape. Repetition of a single action is `repeating_in_place`'s
+                # question, and that one knows which gestures are browsing rather
+                # than thrashing.
                 if len(set(cycle)) < 2:
                     continue
                 if all(tail[i * period:(i + 1) * period] == cycle
@@ -425,9 +368,8 @@ class LoopDetector:
     def mark_scroll_exhausted(self) -> None:
         """Record that the last scroll logged had nothing left to reveal.
 
-        Called when the harness learns the gesture stopped advancing -- either
-        the action came back ``no_change``, or a mechanical sweep repeated it
-        until the content stopped moving. `direction_reversals` reads this to
+        Called when the harness learns the gesture stopped advancing: the
+        action came back ``no_change``. `direction_reversals` reads this to
         tell "it changed its mind" from "it reached the end".
         """
         if not self.scroll_dir_log:
@@ -475,9 +417,8 @@ class LoopDetector:
 
         A reversal away from a gesture that had already run out of content does
         not count. There is nothing left that way, so the opposite direction is
-        the only move on that axis -- and the harness says as much itself, both
-        in `last_failure` ("Try the opposite direction") and in the sweep, which
-        is "browsing, not thrashing" and already exempt from the loop detector.
+        the only move on that axis -- and the harness says as much itself, in
+        `last_failure` ("Try the opposite direction").
 
         Counting them was not free. In ``runs/a7ef4e0e45e9`` the policy's own
         loop is one scroll to the bottom of a profile and one back to the top,

@@ -50,7 +50,6 @@ def populated_state() -> RunState:
     state.loops.mark_scroll_exhausted()
     state.loops.record_scroll("up")
     state.loops.mark_scroll_dead("skel1", "down", "exact1")
-    state.loops.consecutive_backs = 1
     state.want_screenshot = True
     state.last_failure = "tap #4 failed: nothing changed"
     state.scroll_warnings = 1
@@ -61,10 +60,6 @@ def populated_state() -> RunState:
     state.plan.update([{"id": "read", "status": "done"}], step=5)
     state.packages.add("com.android.settings")
     state.package_steps["com.android.settings"] = 6
-    state.sweep.start("swipe left")
-    state.sweep.add("a cat on a scale, 4.2 kg")
-    state.sweep.add("a bowl of oats, 101 g")
-    state.sweep.repeats = 2
     state.steps_since_progress = 6
     state.last_progress = "it recorded 1 new data record(s)"
     state.strategy = "use the search box instead of the grid"
@@ -105,7 +100,6 @@ def test_round_trip_preserves_everything_the_loop_needs(cfg):
     assert fresh.loops.scroll_exhausted == [0]
     assert fresh.loops.total_scroll_count == 2
     assert fresh.loops.dead_scrolls == {"skel1/down": "exact1"}
-    assert fresh.loops.consecutive_backs == 1
     assert fresh.want_screenshot is True
     assert fresh.last_failure == state.last_failure
     assert fresh.scroll_warnings == 1
@@ -126,14 +120,6 @@ def test_round_trip_preserves_everything_the_loop_needs(cfg):
     rendered = fresh.scratchpad.plain()
     assert "9:30: water 280g" in rendered
     assert "water 275g" in rendered          # the superseded reading survives
-
-    # A sweep in flight keeps its readings, in order. There is no item ledger to
-    # restore any more -- the captions, totals and set membership it persisted
-    # were never knowable; see `pager.py`.
-    assert fresh.sweep.gesture == "swipe left"
-    assert fresh.sweep.readings == ["a cat on a scale, 4.2 kg",
-                                    "a bowl of oats, 101 g"]
-    assert fresh.sweep.repeats == 2
 
     # The stall ladder. Dropping these would restart a resumed run at tier zero,
     # so it would spend another eight steps rediscovering the stall it stopped
@@ -463,3 +449,23 @@ def test_history_counts_a_resumed_runs_packages_once():
          "package_steps": {"com.a": 10, "com.b": 30}},
     ]
     assert packages_in(events) == {"com.a", "com.b"}
+
+
+def test_a_checkpoint_from_before_the_sweep_went_still_restores(tmp_path):
+    """Older checkpoints carry a `sweep` block and a `consecutive_backs` count
+    for machinery that no longer exists. They are ignored, not an error -- a
+    run must not lose its resume over a key nothing reads any more."""
+    cfg = Config()
+    cfg.run.artifacts_dir = str(tmp_path)
+    state = RunState(goal="g", run_id="old", intent_id="i")
+    state.step = 4
+    checkpoint.save(cfg, state)
+    path = tmp_path / "old" / checkpoint.NAME
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["sweep"] = {"gesture": "swipe left", "readings": ["x"], "repeats": 2}
+    data["loops"]["consecutive_backs"] = 1
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    fresh = RunState(goal="g", run_id="old", intent_id="i")
+    checkpoint.restore(fresh, checkpoint.load(tmp_path / "old"))
+    assert fresh.step == 4

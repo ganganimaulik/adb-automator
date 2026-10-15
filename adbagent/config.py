@@ -58,7 +58,7 @@ class LLMConfig:
     #: literal. Reasoning models spend most of their output thinking, so a
     #: ceiling that fits a bare answer truncates a thought.
     max_tokens: int = 10000
-    #: Output ceiling for image model calls (analyze_image, read_item). The
+    #: Output ceiling for image model calls (analyze_image, locate). The
     #: image model is often a different family with a different output limit,
     #: and a single ceiling that fits a reasoning model's chain of thought can
     #: truncate a vision transcription. Set to 0 to fall back to `max_tokens`.
@@ -112,7 +112,7 @@ class LLMConfig:
     #: reasoning: "what does this scale read" and "where is the send button" have
     #: no chain of thought worth paying for, and the answer is four short strings
     #: or a coordinate pair.
-    VISION_PURPOSES = ("analyze_image", "read_item", "locate")
+    VISION_PURPOSES = ("analyze_image", "locate")
 
     def effort_for(self, purpose: str = "decide", hard: bool = False) -> str:
         """Reasoning depth for one call. Empty means "send nothing".
@@ -268,15 +268,6 @@ class RunConfig:
     #: of that union is rendered back -- the oldest records go first, and the
     #: block says how many it left out.
     scratchpad_max_chars: int = 50_000
-    #: After the model swipes through a carousel and the item verifiably moves,
-    #: keep swiping and reading in code rather than paying a full reasoning turn
-    #: to be told "swipe left" again. 71 of 127 steps in the run that motivated
-    #: this were exactly that one gesture.
-    pager_sweep: bool = True
-    #: Items per sweep before control returns to the model. The sweep stops on
-    #: its own at an edge, a hidden caption or a full ledger; this is the cap for
-    #: when none of those arrive, so an endless feed cannot run away with the run.
-    pager_sweep_max: int = 12
 
     # -- the stall ladder --------------------------------------------------
     #
@@ -454,7 +445,6 @@ _ENV_MAP = {
     "ADBAGENT_MAX_TOKENS_IMAGE": "llm.max_tokens_image",
     "ADBAGENT_BUDGET_USD": "safety.budget_usd",
     "ADBAGENT_MAX_STEPS": "run.max_steps",
-    "ADBAGENT_PAGER_SWEEP": "run.pager_sweep",
     "ADBAGENT_VISION_IN_DECIDER": "llm.vision_in_decider",
     "ADBAGENT_SKILLS_DIR": "skills.skills_dir",
     "ADBAGENT_WATCH_INTERVAL": "watch.interval_s",
@@ -493,6 +483,17 @@ def _set_path(cfg: Config, dotted: str, raw: Any) -> None:
     setattr(section, key, _coerce(getattr(section, key), raw))
 
 
+#: Keys that used to configure something the harness no longer does. A config
+#: file written before they went still carries them, and they are skipped
+#: without a word: there is nothing left for them to set, and a warning on
+#: every run about a setting nobody can act on is only noise.
+#:
+#: `run.pager_sweep` and `run.pager_sweep_max` drove the gesture sweep, which
+#: repeated the model's swipe in code -- on a card deck, likes and passes the
+#: model never made.
+RETIRED_KEYS = frozenset({"run.pager_sweep", "run.pager_sweep_max"})
+
+
 def _apply_mapping(cfg: Config, data: Dict[str, Any], origin: str) -> List[str]:
     """Apply a nested {section: {key: value}} mapping. Returns warnings."""
     warnings: List[str] = []
@@ -501,6 +502,8 @@ def _apply_mapping(cfg: Config, data: Dict[str, Any], origin: str) -> List[str]:
             warnings.append(f"{origin}: ignoring non-object entry {section_name!r}")
             continue
         for key, value in values.items():
+            if f"{section_name}.{key}" in RETIRED_KEYS:
+                continue
             try:
                 section = getattr(cfg, section_name, None)
                 if section and hasattr(section, key):

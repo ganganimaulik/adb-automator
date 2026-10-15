@@ -1,57 +1,39 @@
-"""Repeating a gesture that has been observed to work.
+"""Did the app's content change? Asked of the pixels, never acted on.
 
-Walking a set of items is the one thing an agent does that is genuinely
-mechanical. Every turn of it asks the same question -- is there another item,
-and what does it say -- and answers it with the same gesture. In the run this
-module was first written for, 71 of 127 steps were the single action
-``swipe #4 left``, each paid for with a full reasoning turn at 26s median.
-
-So once the model has chosen to page and the content verifiably moved, the loop
-keeps paging in code. The model is not being second-guessed; its decision is
-being *repeated* for as long as the situation stays the one it decided about.
+A swipe through a photo album or a feed often leaves the accessibility tree
+exactly as it was -- the same viewer, the same controls -- while the bitmap
+changes completely. So whether a gesture moved anything is answered here, from
+a perceptual hash of the content band of two frames, and `verify` and the loop
+read the answer.
 
 What this module deliberately does NOT do
 -----------------------------------------
 
-It used to model carousels. It classified a screen as a pager from the largest
-full-bleed horizontal scroller, minted a per-item identity from the app's
-caption, and kept a ledger of a *set* -- how many items it held, which had been
-read, which ends had been reached, whether it was complete.
+It no longer repeats a gesture. It used to: once the model had swiped and the
+content moved, a sweep went on swiping in code -- up to twelve times, with a
+vision read of each item in place of a decision -- on the theory that the
+model's choice was merely being repeated while the situation stayed the one it
+had decided about. On a card deck it is not the same situation twice: each
+swipe is a decision about a different card, a like or a pass, and every repeat
+was one the model never made. ``runs/3c94258b5fc6`` showed what an unreviewed
+action on a deck costs. Every gesture is the model's now, one turn each.
 
-Every one of those was an assumption dressed as a fact, and each one held for
-the WhatsApp media album it was written against and broke elsewhere:
+Before that it modelled carousels: it classified a screen as a pager from the
+largest full-bleed horizontal scroller, minted a per-item identity from the
+app's caption, and kept a ledger of a *set*. Each of those was an assumption
+dressed as a fact -- the largest scroller was Instagram's tab strip, ViewPager2
+pages vertically on every short-video feed, a feed has no ends, and the caption
+search matched the status-bar clock -- so the set model went first.
 
-* **The largest scroller is the content pager.** On Instagram it picked
-  ``swipeable_tab_view_pager`` -- the Home/Search/Reels/Profile tab strip -- on
-  every screen of a 45-step run, never the reel. Flinging it changes tab.
-* **A ViewPager pages horizontally.** ``ViewPager2`` also pages vertically, and
-  Reels, Shorts and TikTok all use it that way. The orientation is not in the
-  accessibility dump, so the class name was the only evidence, and it is wrong
-  for every short-video feed.
-* **A set is finite and has two ends.** A feed has neither, so "you have reached
-  the LAST item of this set" could only ever be false on one.
-* **Items carry captions.** Feeds do not, and the caption search fell through to
-  a bare clock pattern -- which matched the *status bar*, renaming every item
-  once a minute and filling the ledger with phantoms.
-
-Measured over ``runs/``: the machinery engaged in 13 runs, saved steps in 3, and
-in one cost 45 steps and the goal. So the set model is gone. What is left is the
-one thing that was ever provable -- *did the app's content change* -- and a
-sweep built on nothing but that. No captions, no totals, no ends, no axis: a
-vertical feed repeats exactly like a horizontal album, because neither is being
-classified.
-
-Remembering *which* items were seen is now the model's job, in ``notes`` and
-``progress``, which it is already instructed to keep. A harness that cannot tell
-one photo from another should say so by staying quiet, not by inventing names
-for them.
+What is left is the one thing that was ever provable: *did the app's content
+change*. Remembering which items were seen is the model's job, in ``notes`` and
+``progress``.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from .screen import Element, Screen
@@ -95,10 +77,9 @@ def content_box(screen: Screen) -> Optional[Tuple[float, float, float, float]]:
 def content_hash(screen: Screen) -> Optional[int]:
     """Perceptual hash of the app's content. ``None`` without a screenshot.
 
-    Memoised on the frame. The answer is asked for several times per step now
-    -- grading the action, deciding whether the step was progress, and deciding
-    whether a sweep may continue -- and it is a JPEG decode each time on pixels
-    that are fixed once captured. The memo is only taken when there *is* a
+    Memoised on the frame. The answer is asked for several times per step --
+    grading the action, and deciding whether the step was progress -- and it is
+    a JPEG decode each time on pixels that are fixed once captured. The memo is only taken when there *is* a
     screenshot, because one can be attached to a frame after the first ask.
     """
     if not screen.screenshot:
@@ -214,8 +195,7 @@ def video_only_drift(before: Screen, after: Screen) -> bool:
     `content_moved` compares bitmaps, so a video playing inside an otherwise
     static screen reads as "the content moved" on every gesture -- including
     the scroll that hit the end of the list and moved nothing. That kept the
-    sweep alive and the dead-scroll ledger empty for as long as the video
-    played. The tree is the tiebreak: a gesture that reveals content the tree
+    dead-scroll ledger empty for as long as the video played. The tree is the tiebreak: a gesture that reveals content the tree
     describes changes the tree, so a byte-identical tree with a video on it
     means the motion is the video, not the gesture.
 
@@ -233,207 +213,6 @@ def video_only_drift(before: Screen, after: Screen) -> bool:
         return True
     covered = min(1.0, _union_area(regions) / total)
     return covered < _VIDEO_FULL_BLEED
-
-
-# ---------------------------------------------------------------------------
-# The sweep
-# ---------------------------------------------------------------------------
-#
-# The gesture the sweep issues is the one the model just issued, repeated. It
-# never taps, types, navigates or presses a key, so there is no action it can
-# take that the model did not already authorise.
-
-MAX_SWEEP_RENDER = 40
-MAX_DETAIL_CHARS = 110
-
-
-@dataclass
-class SweepLog:
-    """What repeating a gesture turned up, in the order it turned up.
-
-    Deliberately a list and not a set model. It has no notion of how many items
-    exist, which ones remain, or whether the end has been reached, because none
-    of that is observable -- and stating it anyway is what made the old ledger
-    tell the agent, with total confidence, that a set it had never seen was
-    fully read.
-
-    Positions are the order things were read in, not identities. A reading is
-    "the third thing this sweep saw", which is true, rather than "item 3 of 15",
-    which was usually not.
-    """
-
-    #: The gesture being repeated, e.g. "swipe left" -- for the render only.
-    gesture: str = ""
-    #: One entry per item read, in sweep order.
-    readings: List[str] = field(default_factory=list)
-    #: Gestures issued, which is >= len(readings) when a frame was not read.
-    repeats: int = 0
-    #: Why the repeat handed back, for the block the model reads next turn.
-    reason: str = ""
-
-    def start(self, gesture: str) -> None:
-        """Begin a fresh sweep. Prior readings belong to a finished one."""
-        self.gesture = gesture
-        self.readings = []
-        self.repeats = 0
-        self.reason = ""
-
-    def add(self, reading: str) -> None:
-        text = " ".join((reading or "").split())[:MAX_DETAIL_CHARS]
-        if text:
-            self.readings.append(text)
-
-    @property
-    def read_count(self) -> int:
-        return len(self.readings)
-
-    def render(self, reason: str = "") -> str:
-        """The block handed to the model after a sweep hands back."""
-        why = reason or self.reason
-        if not self.readings and not why:
-            return ""
-        if self.readings:
-            lines = [f"YOU REPEATED `{self.gesture}` {self.repeats} time(s) and "
-                     f"read, in order:"]
-            shown = self.readings
-            if len(shown) > MAX_SWEEP_RENDER:
-                dropped = len(shown) - MAX_SWEEP_RENDER
-                lines.append(f"  (... {dropped} earlier reading(s) omitted)")
-                shown = shown[-MAX_SWEEP_RENDER:]
-            start = len(self.readings) - len(shown) + 1
-            for position, reading in enumerate(shown, start=start):
-                lines.append(f"  {position}. {reading}")
-        else:
-            # A `read_each=false` sweep used to render nothing at all: the whole
-            # block was gated on readings, so the one thing such a sweep does
-            # establish -- where on the content it stopped -- was left entirely
-            # to the model's memory of its own gestures. See `landed_at`.
-            lines = [f"YOU REPEATED `{self.gesture}` {self.repeats} time(s) "
-                     f"without reading the frames in between."]
-        if why:
-            lines.append(f"The repeat stopped because {why}.")
-            landed = landed_at(self.gesture, why)
-            if landed:
-                lines.append(landed)
-        # No claim about what remains: nothing here knows.
-        if self.readings:
-            lines.append("Record anything you need from these in `notes` -- this "
-                         "list is not kept for you.")
-        return "\n".join(lines)
-
-
-def can_repeat(*, action: str, direction: str, moved: Optional[bool]) -> bool:
-    """Whether the gesture that just ran may be repeated mechanically.
-
-    Requires a directional gesture that *demonstrably* moved the content. That
-    last condition is the whole safety argument on an unfamiliar app: a screen
-    where the swipe does nothing, or where the direction means something other
-    than "next", never earns a second automatic gesture.
-
-    Note ``moved`` must be ``True``. ``None`` means no screenshot was taken and
-    nothing is known, which is not permission.
-    """
-    if action not in ("swipe", "scroll"):
-        return False
-    if not direction:
-        return False
-    return moved is True
-
-
-def stop_repeating(after: Screen, *, package: str = "",
-                   moved: Optional[bool] = None) -> str:
-    """Why the sweep should hand back, or ``""`` to keep going.
-
-    Short by design. The old version had six reasons, four of which were about a
-    set model that no longer exists ("every item has been read", "the left end
-    of the set has been reached", "this is no longer a carousel", "the caption is
-    hidden"). What is left is what can actually be seen: the app changed, or the
-    gesture stopped moving anything. Budgets are the caller's, since only it
-    knows the step and clock it is spending.
-    """
-    if package and after.package and after.package != package:
-        return f"the foreground app changed to {after.package}"
-    if moved is False:
-        return "the content stopped changing, so the gesture no longer advances"
-    if moved is None:
-        return "there is no screenshot, so it cannot be told whether it advanced"
-    return ""
-
-
-# ---------------------------------------------------------------------------
-# Where a sweep left the screen
-# ---------------------------------------------------------------------------
-#
-# `stop_repeating` says *why* the gesture handed back. That is not the same as
-# where it left the content, and the difference cost a run: in
-# ``runs/9b9c69095095`` a `scroll down` sweep ran an Instagram profile to its last
-# photo, and the next step tapped the like button there while observing "profile
-# S at the first photo". Nothing in the prompt contradicted it -- the sweep had
-# `read_each=false`, so `SweepLog.render` returned "", and the history line said
-# only that the content stopped changing, never which end it stopped against.
-#
-# Position is the one thing a sweep that ran out of road genuinely establishes,
-# and it is a fact about the gesture, not a claim about the set: what is on
-# screen is as far as that direction reaches. Saying it is inside the line
-# `SweepLog` draws; saying what is *in* the list would not be.
-
-#: Which end of the content each direction runs toward. "left" is the next
-#: photo/card and "right" the previous one -- the swipe semantics THE ACTIONS
-#: hands the model -- so they pair with down and up.
-_END_REACHED = {
-    "down": "the BOTTOM",
-    "up": "the TOP",
-    "left": "the FAR end",
-    "right": "the START",
-}
-
-#: The directions that run away from the start, and so the ones worth an extra
-#: sentence: mistaking the far end for the start is what the note is for.
-_AWAY_FROM_START = ("down", "left")
-
-
-def _end_reached(gesture: str, reason: str) -> str:
-    """Which end the sweep stopped against, or ``""`` when that is not known.
-
-    Only a sweep that ran out of content says anything about position. An app
-    switch or a missing screenshot stops the repeat without establishing where
-    the content sits, so those get nothing.
-    """
-    if "stopped changing" not in (reason or ""):
-        return ""
-    words = (gesture or "").split()
-    if not words:
-        return ""
-    return _END_REACHED.get(words[-1].lower(), "")
-
-
-def landed_at(gesture: str, reason: str) -> str:
-    """Where a sweep that ran out of road has left the screen, in prose."""
-    end = _end_reached(gesture, reason)
-    if not end:
-        return ""
-    note = f"That leaves the screen at {end} of what `{gesture}` reaches."
-    if (gesture or "").split()[-1].lower() in _AWAY_FROM_START:
-        note += (" It is not the start of the content -- you are back there "
-                 "only after gesturing the other way until that stops "
-                 "advancing too.")
-    return note
-
-
-def sweep_summary(first_step: int, last_step: int, gesture: str,
-                  swept: int, read: int, reason: str) -> str:
-    """One history line for a whole sweep, so it costs one entry not N."""
-    span = f"steps {first_step}-{last_step}" if last_step > first_step \
-        else f"step {first_step}"
-    line = (f"{span}: repeated `{gesture}` {swept} time(s), read {read} "
-            f"-> stopped because {reason}")
-    # Carried in the history line as well as the hand-back block, because the
-    # block is handed over once and dropped while the history line is what a
-    # decision three turns later still has to go on.
-    end = _end_reached(gesture, reason)
-    if end:
-        line += f", leaving the screen at {end}"
-    return line
 
 
 # A `loop_id` used to live here: `exact_id` plus the content hash, so that the

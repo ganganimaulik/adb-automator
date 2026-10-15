@@ -47,8 +47,6 @@
     "always_screenshot": false,
     "never_screenshot": false,
     "scratchpad_max_chars": 50000,
-    "pager_sweep": true,
-    "pager_sweep_max": 12,
     "stall_nudge_at": 3,
     "stall_block_at": 5,
     "stall_replan_at": 8,

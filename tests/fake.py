@@ -283,8 +283,6 @@ class FakeLLM:
         #: The budget line each turn was shown -- where the run stood against its
         #: ceilings. Nothing carried this before; see `prompts.budget_line`.
         self.budgets: List[str] = []
-        #: Item labels the sweep asked to have read, in order.
-        self.reads_requested: List[str] = []
         #: How many separate vision passes were made, and what they return.
         self.analyses = 0
         self.vision_reading = ""
@@ -298,10 +296,6 @@ class FakeLLM:
         #: The frames each vision pass was handed, in order, so a test can assert
         #: a re-read was given different pixels rather than the same ones twice.
         self.frames_seen: List[bytes] = []
-        #: The frames each *item* read was handed. Kept apart from `frames_seen`
-        #: because the two calls are shown different pixels on purpose: a screen
-        #: analysis gets the whole frame, an item read gets the item.
-        self.item_frames_seen: List[bytes] = []
         #: Reading for the second and later passes. A sharper capture that answers
         #: what the downscaled one could not is the whole point of re-reading.
         self.vision_reading_after_reread: Optional[str] = None
@@ -365,20 +359,6 @@ class FakeLLM:
                               item_label=self.vision_label,
                               last_message=self.vision_last_message,
                               notable="fake visual analysis")
-
-    def read_item(self, screenshot: bytes, *, goal: str = "", label: str = "",
-                  **kwargs) -> str:
-        """One compact reading of one gallery item, as the sweep asks for.
-
-        Counted separately from `calls`: the point of sweeping is that these
-        replace *decide* calls, so a test that asserts the saving needs the two
-        numbers apart.
-        """
-        self.reads_requested.append(label)
-        self.item_frames_seen.append(screenshot)
-        self.ledger.record(Call(model=self.model_image, prompt_tokens=400,
-                                completion_tokens=30, purpose="read_item"))
-        return f"reading of {label or 'an unlabelled item'}"
 
     def locate(self, screenshot: bytes, description: str, *, goal: str = "",
                step: int = 0, misses=(), **kwargs) -> Optional[Tuple[float, float]]:

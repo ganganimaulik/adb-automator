@@ -1,4 +1,4 @@
-"""Guardrails: credentials, irreversible actions, interstitials, scope, loops,
+"""Guardrails: credentials, irreversible actions, scope, loops,
 and the read-only classification that keeps explore mode honest.
 """
 
@@ -109,80 +109,6 @@ def test_allow_destructive_skips_the_prompt():
 
 
 # ---------------------------------------------------------------------------
-# Interstitials
-# ---------------------------------------------------------------------------
-
-def test_a_rating_nag_is_dismissable():
-    screen = with_extra(X.N("android.widget.FrameLayout", (60, 800, 1020, 1400),
-                            package="com.android.vending", rid="nag", children=[
-                                X.N("android.widget.TextView", (100, 860, 980, 980),
-                                    package="com.android.vending",
-                                    text="Enjoying the app?"),
-                                X.N("android.widget.Button", (620, 1240, 980, 1380),
-                                    package="com.android.vending", text="Not now",
-                                    rid="dismiss", clickable=True)]))
-    found = safety.find_interstitial(screen, "com.android.settings")
-    assert found is not None and found.best_text == "Not now"
-
-
-def test_permission_dialogs_are_left_to_the_model():
-    """Granting a permission is a decision, not noise -- never auto-tapped."""
-    screen = with_extra(X.permission_dialog())
-    assert safety.find_interstitial(screen, "com.android.settings") is None
-
-
-def _lone_button(text: str, package: str = X.PKG):
-    """A screen whose only dismiss-shaped candidate reads `text`."""
-    return with_extra(X.N("android.widget.FrameLayout", (60, 800, 1020, 1400),
-                          package=package, rid="overlay", children=[
-                              X.N("android.widget.Button", (620, 1240, 980, 1380),
-                                  package=package, text=text, rid="cta",
-                                  clickable=True)]))
-
-
-@pytest.mark.parametrize("label", ["Continue", "Next", "Close"])
-def test_a_flow_control_is_left_to_the_model(label):
-    """These advance or exit a flow rather than declining an offer.
-
-    An app opening on an onboarding screen had its CTA pressed on every turn
-    until the step budget ran out, with the model never consulted.
-    """
-    assert safety.find_interstitial(_lone_button(label), X.PKG) is None
-
-
-def test_a_compose_screens_close_button_is_not_auto_tapped():
-    """The sharpest case: one X described as "Close" next to a "Send" is a
-    single dismiss-shaped candidate, so the old rule fired and discarded the
-    draft -- and `irreversible` never saw it, since that grades only the actions
-    the model chose."""
-    screen = with_extra(X.N("android.widget.FrameLayout", (0, 600, X.W, 900),
-                            rid="compose", children=[
-                                X.N("android.widget.ImageButton", (24, 620, 144, 740),
-                                    desc="Close", rid="close", clickable=True),
-                                X.N("android.widget.Button", (860, 620, 1040, 740),
-                                    text="Send", rid="send", clickable=True)]))
-    assert safety.find_interstitial(screen, X.PKG) is None
-
-
-@pytest.mark.parametrize("label", ["Not now", "No thanks", "Skip", "Got it",
-                                   "Maybe later", "Don't show again"])
-def test_declines_and_acknowledgements_are_still_dismissed(label):
-    found = safety.find_interstitial(_lone_button(label), X.PKG)
-    assert found is not None and found.best_text == label
-
-
-def test_a_flow_control_from_another_package_is_left_alone_too():
-    """The cross-package branch skips the foreground app's own controls, so a
-    Play billing sheet's "Continue" was reachable there as well."""
-    screen = _lone_button("Continue", package="com.android.vending")
-    assert safety.find_interstitial(screen, X.PKG) is None
-
-
-def test_nothing_to_dismiss_on_a_normal_screen():
-    assert safety.find_interstitial(BASE, "com.android.settings") is None
-
-
-# ---------------------------------------------------------------------------
 # Scope
 # ---------------------------------------------------------------------------
 
@@ -191,7 +117,7 @@ def test_nothing_to_dismiss_on_a_normal_screen():
 # Loop detection
 # ---------------------------------------------------------------------------
 
-def test_repeats_produce_a_hint_then_a_forced_back():
+def test_repeats_produce_a_hint_then_a_loop_verdict():
     loops = safety.LoopDetector()
     for _ in range(5):
         loops.record("screen-a", "tap/#1")
@@ -199,11 +125,26 @@ def test_repeats_produce_a_hint_then_a_forced_back():
 
     loops.record("screen-a", "tap/#1")
     assert "6 times" in (loops.hint("screen-a") or "")
-    assert not loops.should_force_back("screen-a")
+    assert not loops.repeating_in_place("screen-a")
 
     for _ in range(3):
         loops.record("screen-a", "tap/#1")
-    assert loops.should_force_back("screen-a")
+    assert loops.repeating_in_place("screen-a")
+
+
+def test_the_loop_verdict_ends_when_the_agent_moves_on():
+    """Asked of the latest action here, not of the whole window.
+
+    The window remembers twenty steps. An agent that has already changed
+    approach should not be told for another eleven turns that it is repeating
+    itself -- that is how a working approach gets abandoned."""
+    loops = safety.LoopDetector()
+    for _ in range(9):
+        loops.record("screen-a", "tap/#1")
+    assert loops.repeating_in_place("screen-a")
+
+    loops.record("screen-a", "tap/#2")
+    assert not loops.repeating_in_place("screen-a")
 
 
 def test_oscillation_between_two_screens_is_detected():
@@ -242,37 +183,37 @@ def test_paging_one_gesture_is_not_oscillation():
 
     ``[A,A,A,A,...]`` satisfies the period-2 and period-3 patterns trivially, so
     without the distinct-entries rule an album walk -- twelve identical swipes
-    on one screen -- was reported as oscillation. The remedy that fires on it is
-    a back press, which ejects the agent from the album it is halfway through.
+    on one screen -- was reported as oscillation, and the agent told to change
+    approach halfway through the album.
 
-    Repeating one action is `should_force_back`'s question, and that one knows
+    Repeating one action is `repeating_in_place`'s question, and that one knows
     a browsing gesture from a thrashing one.
     """
     loops = safety.LoopDetector()
     for _ in range(12):
         loops.record("album", "swipe/#4/left")
     assert not loops.oscillating()
-    assert not loops.should_force_back("album")
+    assert not loops.repeating_in_place("album")
 
     # Vertical feeds page the same way and are excluded on the same grounds.
     feed = safety.LoopDetector()
     for _ in range(12):
         feed.record("reels", "scroll/up")
     assert not feed.oscillating()
-    assert not feed.should_force_back("reels")
+    assert not feed.repeating_in_place("reels")
 
 
-def test_force_back_counts_one_action_not_every_action():
+def test_a_loop_counts_one_action_not_every_action():
     """Nine different taps on a hub screen are work; nine identical ones are not."""
     working = safety.LoopDetector()
     for i in range(1, 10):
         working.record("hub", f"tap/#{i}")
-    assert not working.should_force_back("hub")
+    assert not working.repeating_in_place("hub")
 
     stuck = safety.LoopDetector()
     for _ in range(9):
         stuck.record("hub", "tap/#3")
-    assert stuck.should_force_back("hub")
+    assert stuck.repeating_in_place("hub")
 
 
 def test_attempts_outlive_the_ring_buffer():

@@ -272,11 +272,6 @@ class AgentAction(BaseModel):
     base_scale: Optional[float] = Field(
         None, description="For scroll: base drag scale per step (default 0.6, range 0.1 to 1.0; use 0.8 for larger page coverage per swipe).",
         ge=0.1, le=1.0)
-    read_each: Optional[bool] = Field(
-        None, description="For scroll/swipe: when the harness repeats this gesture for you, whether to "
-                          "analyse each new screen with the vision model (default true). Set false to keep "
-                          "paging without reading the screens in between -- e.g. skipping through a long "
-                          "feed to reach something, when the in-between content does not matter.")
     duration: Optional[float] = Field(
         None, description="For swipe/scroll/wait/sleep: duration in seconds (e.g. 0.15 for fast flick, 0.3 for scroll, 1.0 for wait/sleep). "
                           "For long_press/long_press_at: how long to hold (default 0.6; use 1.5 or more for press-and-hold controls such as a voice-note button). "
@@ -356,6 +351,20 @@ class AgentAction(BaseModel):
         from .plan import as_steps
         return [{"id": sid, "text": text, "status": status or None}
                 for sid, text, status in as_steps(value)] or None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired_fields(cls, data: object) -> object:
+        """Accept, and ignore, fields this schema no longer has.
+
+        `read_each` steered the gesture sweep, which is gone. A driver whose
+        tool schema was cached before that -- an MCP client that has not
+        restarted its server -- still sends it, often as an explicit null, and
+        `extra="forbid"` would turn every such action into a schema rejection.
+        """
+        if isinstance(data, dict) and "read_each" in data:
+            data = {k: v for k, v in data.items() if k != "read_each"}
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -495,8 +504,6 @@ class AgentAction(BaseModel):
                 bits.append(f"amount={self.scroll_amount}")
             if self.base_scale is not None:
                 bits.append(f"base_scale={self.base_scale}")
-            if self.read_each is False:
-                bits.append("read_each=false")
         if self.action in ("long_press", "long_press_at") \
                 and self.duration is not None:
             bits.append(f"hold={self.duration:.2f}s")
@@ -623,7 +630,7 @@ _HIST_COUNT = re.compile(r"\s*\[x(\d+)\]")
 _HIST_DROPPED = re.compile(r"^\.\.\.\s*\+(\d+)\s+more$")
 
 #: How many distinct readings a folded line keeps, and how much room they get.
-#: Enough to see what a sweep collected; not so much that the fold costs more
+#: Enough to see what was collected; not so much that the fold costs more
 #: than the lines it replaced. Both bounds are enforced in one place, and what
 #: they drop is stated rather than quietly disappearing.
 MAX_FOLDED_READINGS = 6

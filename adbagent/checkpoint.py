@@ -96,7 +96,6 @@ def save(cfg: Any, state: Any) -> None:
             "scroll_exhausted": state.loops.scroll_exhausted,
             "total_scroll_count": state.loops.total_scroll_count,
             "dead_scrolls": state.loops.dead_scrolls,
-            "consecutive_backs": state.loops.consecutive_backs,
         },
         "want_screenshot": state.want_screenshot,
         "last_failure": state.last_failure,
@@ -137,16 +136,6 @@ def save(cfg: Any, state: Any) -> None:
         # send limits from zero, and could send the sixth of five.
         "sends": [{"step": s.step, "label": s.label}
                   for s in state.sends.sent],
-        # A whole item ledger used to be persisted here -- per-item captions,
-        # read flags, the set's size and which ends had been hit. None of it
-        # survives, because none of it was knowable; see `pager.py`. What is
-        # left is the readings of a sweep still in flight, which are lost
-        # anyway if the process dies mid-sweep.
-        "sweep": {
-            "gesture": state.sweep.gesture,
-            "readings": list(state.sweep.readings),
-            "repeats": state.sweep.repeats,
-        },
     }
     try:
         path = _path(cfg, state.run_id)
@@ -290,7 +279,6 @@ def restore(state: Any, data: Dict[str, Any]) -> None:
     state.loops.total_scroll_count = int(loops.get("total_scroll_count") or 0)
     state.loops.dead_scrolls = {str(k): str(v)
                                 for k, v in (loops.get("dead_scrolls") or {}).items()}
-    state.loops.consecutive_backs = int(loops.get("consecutive_backs") or 0)
 
     scratch = data.get("scratchpad") or {}
     for raw in scratch.get("entries") or []:
@@ -303,11 +291,6 @@ def restore(state: Any, data: Dict[str, Any]) -> None:
             last_step=int(raw.get("last_step") or 0),
             superseded=[str(v) for v in raw.get("superseded") or []])
     state.scratchpad.evicted = int(scratch.get("evicted") or 0)
-
-    sweep = data.get("sweep") or {}
-    state.sweep.gesture = str(sweep.get("gesture") or "")
-    state.sweep.readings = [str(r) for r in sweep.get("readings") or []]
-    state.sweep.repeats = int(sweep.get("repeats") or 0)
 
     # The answer to whatever the run stopped to ask, as the last thing that
     # happened -- which is what it is. It enters as history rather than through

@@ -58,8 +58,10 @@ It reads the accessibility tree rather than pixels, and only pays for a
 screenshot when the tree cannot answer the question — a WebView, a gallery, a
 screen where two controls look identical, a conversation whose messages the
 tree does not list in the order they are drawn. Everything that can be decided by
-ordinary code is: recognising the screen, dismissing a nag, judging whether an
-action worked, noticing a loop, paging through a photo album.
+ordinary code is: recognising the screen, judging whether an action worked,
+noticing a loop. Acting on the phone is not one of them. Every tap, swipe and key
+press is one the model chose: the harness dismisses no popup, presses no back and
+repeats no gesture on its own.
 
 ## Install
 
@@ -225,8 +227,8 @@ the boundary rather than carrying actions planned for one app into the next.
 
 A session is an ordinary run whose decide call is answered from outside
 (`Agent._decide`, overridden in `remote.py`), so everything else a step involves
-still happens here, unchanged: dismissing nags, waiting for the screen to settle
-and for a blank screen to draw, verifying every action, the per-screen ban list,
+still happens here, unchanged: waiting for the screen to settle and for a
+blank screen to draw, verifying every action, the per-screen ban list,
 refusing a scroll that revealed nothing, the stall ladder, the sensitive-screen
 hand-over, and the trace in `runs/<id>/` -- a session shows up in History and
 `adbagent report` reads it like any run. The agent is shown what the model would
@@ -243,9 +245,6 @@ What the models did, the agent or the person does instead:
 | `llm.model_small` checks each send against the policy | the person approves each send |
 | a replan call when the run stalls | the stall note in the turn's notes |
 | the app's skill is updated afterwards | not yet: sessions are not learned from |
-
-The pager sweep is off in a session: it has a vision model read every item it
-pages to, and there is none.
 
 ### What only the person may decide
 
@@ -660,10 +659,10 @@ into it again, twenty times over, with every action verified as having worked.
 A counter of failed actions cannot see that, and for a long time nothing here
 could either.
 
-So the loop also counts **steps since it last learned something**. Six things
+So the loop also counts **steps since it last learned something**. Five things
 reset that counter, and they are all facts rather than opinions: reaching a
 screen it had not seen, entering a new app, writing a data record, a gesture
-that moved content, changing something on the device, or a sweep reading items.
+that moved content, or changing something on the device.
 When none of them has happened for a while, the harness escalates:
 
 | stalled for | what happens |
@@ -688,39 +687,29 @@ runs (`scroll_refused`), instead of being re-advised against one
 shape, so a feed that has since loaded more content re-arms the gesture on its
 own: end-of-list is a property of the content.
 
-## Galleries and carousels
+## Galleries, carousels and decks
 
 A photo viewer breaks screen identity: photo 7 and photo 8 are structurally the
-same screen, so a swipe cannot be verified, the loop detector sees one screen
-fifteen times and presses back, and nothing records which photos were looked at.
+same screen, so the accessibility tree cannot say whether a swipe moved anything.
+That is asked of the pixels instead -- a perceptual hash of the content band of
+the frame before the gesture and the frame after it, chrome cropped off
+(`pager.py`). `verify` grades the swipe on it, and the loop detector uses it to
+tell a screen being paged from one being thrashed.
 
-So items get their own identity — the caption the app already shows (`"Today,
-9:33 am"`, `"3 of 15"`), falling back to a perceptual hash of the item's own
-pixels with the chrome bands cropped off. On top of that the loop keeps a ledger
-of every item seen, whether the agent had vision on it, and what was read off it.
-The ledger is maintained by code and shown to the model each turn, so it cannot be
-forgotten.
+Every gesture is the model's, one turn each. The harness used to keep paging in
+code once a swipe had moved the content -- up to twelve repeats, with a vision
+read of each item standing in for a decision. That is gone, because on a card
+deck each swipe *is* a decision, a like or a pass, and every repeat was one the
+model never made. Nothing else acts on its own either: in `runs/3c94258b5fc6` a
+"Skip" that read like a popup's dismiss button was pressed on twenty profiles in
+thirteen seconds by the harness's popup dismisser, and the model was never asked.
+No popup is dismissed, no back is pressed to break a loop (the model is told it
+is looping instead), and no dropped swipe is re-sent.
 
-Once the model has chosen to page forward **and the item verifiably moved**, the
-loop keeps paging in code: read the item, fling, verify, repeat. Paging is the one
-genuinely mechanical thing the agent does — in the run this was built for, 71 of
-127 steps were the single action `swipe #4 left`, each one a full reasoning turn.
-Sweeping turns those into one short vision read each, started before the fling so
-it overlaps the gesture.
-
-The sweep repeats a decision rather than making one. A gesture that did not move
-the item never authorises a second, so on an app where the fling gets dropped or
-"left" is not "next", the first gesture is the only automatic one. It can only
-swipe, in the direction asked for, on the pager element — never tap, type or
-navigate. And it hands back at either end of the set, on a full ledger, on a
-hidden caption, on a dialog, on an app switch, or after `run.pager_sweep_max`
-items.
-
-The per-item read is the model's choice, not a fixed cost: setting
-`read_each=false` on a scroll or swipe keeps the mechanical repeat but skips
-analysing each screen — for paging through a long feed to reach something, when
-the in-between content does not matter. The pixels still decide whether the
-content moved, so the repeat stops at the end of the content either way.
+A ViewPager does drop a fling it judges too short or too slow. So on a screen that
+has been paging, the first swipe that moves nothing is not taken as the end: the
+gesture stays open and the model is told to try once more, faster. A second miss
+in the same direction closes it.
 
 ## Typing
 
@@ -784,8 +773,8 @@ adbagent scratchpad              # what the latest run collected
 
 Everything else a run keeps is the harness's own and derived from watching the
 device rather than from anything the model says: the step history, the per-screen
-ban list and loop detector, the stall counters, the paging evidence, the in-run
-[locate cache](#what-it-remembers), and which apps it has been in. A run that
+ban list and loop detector, the stall counters, the paging evidence, and which
+apps it has been in. A run that
 stops with unfinished business writes all of it to `runs/<id>/checkpoint.json`,
 which is what `--resume` reads back.
 
@@ -812,8 +801,8 @@ at each step, and the screenshots that were *submitted* to a model —
 `step_004_analyze_image_9f3c1a20.jpg`, named by the step, the call that was shown
 it, and a digest of the bytes, so one frame shown twice is one file. Only
 submitted frames are kept: the screen read on the ~fifth of turns that take a
-screenshot, one per item a sweep reads, and the decision itself when the decider
-is the model doing the looking. The web UI shows each beside the call that saw it.
+screenshot, a locate's frame, and the decision itself when the decider is the
+model doing the looking. The web UI shows each beside the call that saw it.
 `report` replays the events as a readable trace and
 ends with where the time went:
 
@@ -824,15 +813,11 @@ ends with where the time went:
   prompt tokens     5500 median   374000 total       67% served from cache
   output tokens     4400 median   299200 total
   of which think    4200 median   285600 total       95% of output
-  sweep reads (13)
-  latency/step      1.6s median      1.8s p90         21s total
 ```
 
 Almost all of a run's wall clock is the model thinking — 26s median per step
 against 3.4s to act, settle and verify — so the reasoning line is the one worth
-attacking. Sweep reads are counted separately: at ~25 output tokens against a
-reasoning turn's ~4,400, pooling them would drag the median to 25 and hide the
-turns that actually cost something.
+attacking.
 
 ### The run log
 
@@ -1032,11 +1017,11 @@ what the model observed, the outcome chip, and a `stalled N` chip once the run
 has gone N steps without learning anything, which is the number the harness
 escalates on. The verification is folded into the row it graded rather than
 trailing it as a card of its own. Under the row go the frames that step was
-shown and whatever a sweep read there. **Trace** puts back everything else, in
+shown. **Trace** puts back everything else, in
 place: the model's reasoning and its plan, what the step cost in tokens and how
 much of that prompt was cached, the raw thinking-and-response stream per call,
 the delta ledger, and every line the harness wrote to itself — the actions it
-banned on a screen, the ones it refused, the gestures it retried. Nothing is deleted
+banned on a screen and the ones it refused. Nothing is deleted
 for story; it is one class away, and the toggle is remembered.
 
 While a call is in flight its raw stream is shown live in a panel per call (from
@@ -1045,11 +1030,7 @@ leaves the step row as the record. A call that was handed a screenshot shows it,
 thumbnailed on the step and full size on click — and the thumbnail stays at story
 density, because a vision read you cannot check against the frame it read is only
 half the record. It appears on the call that was actually shown the pixels: the
-vision read, or the decision itself when the decider is the one looking. A
-sweep's per-item reads have no panel — each is prefetched on another thread, and
-streaming several of those into one view interleaves them — so each arrives as a
-row carrying the line the model read and the frame it read it from, which on a
-carousel is most of the run's vision calls.
+vision read, or the decision itself when the decider is the one looking.
 
 *Result.* The answer, large and first, in its own block above the machinery that
 produced it — then a new run, the same goal again, or a resume from the
@@ -1408,25 +1389,20 @@ emoji as two dots). Both actions had worked, and in `runs/c1d57cc79d9c` the
 false entry was replayed into the prompt on steps 18, 20 and 22 of one run.
 
 **Located controls.** When `tap_at` names a control the accessibility tree does
-not list, a vision model places it on a screenshot — the most expensive thing a
-turn can do short of deciding. That answer is still cached, but only for the run
-that paid for it (`RunState.locates`), keyed on the content-free screen hash and
-the control's name. Measured over the 169 runs in `runs/`: 577 `tap_at` actions
-named a control and they resolve to 94 distinct (screen, name) pairs — **37%
-repeat one already located earlier in the same run**, which is the share still
-saved, and 84% one located in an *earlier* run, which is the share that went
-with the database. A single "send message" pill was located 134 separate times.
+not list, a vision model places it on a screenshot of the screen the tap is about
+to land on -- every time. It used to be cached for the run, keyed on the
+content-free screen hash so every profile in a feed shared one point, and that is
+exactly the risk: the point holds until the keyboard opens or a comment wraps and
+the sheet moves, and then it lands on whatever moved into it, which on a like
+sheet can be the paid button beside the free one. A wrong tap that *does*
+something is never caught by the no-change check that was meant to evict it.
 
-A `tap_at` naming a control the tree *does* list is tapped by that control's
-index instead — no locate, and no turn spent being told to use the index. A name
-that fits more than one listed control is refused with all of them, because the
-shortest match is not a safe guess: on a dating app's like sheet, "Send" fits
-both the like button and the paid one beside it.
-
-Keying on the screen hash means every profile in a feed shares one entry — which
-is what makes it worth having, and is also the risk it takes. A tap at a cached
-point that changes nothing drops the entry immediately, so a layout that does
-move with its content costs one turn to discover rather than a run of wrong taps.
+A `tap_at` whose text is the full label of a control the tree *does* list is tapped
+by that control's index instead -- no locate, and no turn spent being told to use
+the index. A text that only partly matches a listed label is refused with the
+match named, and so is one that fits more than one listed control: the shortest
+match is not a safe guess, and on a dating app's like sheet "Send" fits both the
+like button and the paid one beside it.
 
 ## Tuning
 
@@ -1511,8 +1487,6 @@ adbagent report runs/<id>        # did the reasoning tokens actually drop?
 | `llm.reasoning_effort` | `""` | Depth for a routine turn: `none`, `low`, `medium`, `high`. Empty switches the whole feature off. |
 | `llm.reasoning_effort_hard` | `high` | Depth for a turn the loop can see is hard. |
 | `llm.reasoning_style` | `auto` | Which wire convention to use: `auto`, `effort`, `thinking`, `off`. |
-| `run.pager_sweep` | `true` | Page through carousels in code once the model has chosen to. See above. |
-| `run.pager_sweep_max` | `12` | Items per sweep before control returns to the model. |
 | `run.stall_nudge_at` | `3` | Steps without learning anything before the model is told so, shown a screenshot and made to think harder. `0` switches the tier off. |
 | `run.stall_block_at` | `5` | Steps before the harness starts refusing actions already tried twice on this screen. |
 | `run.stall_replan_at` | `8` | Steps before one call is spent asking for a different approach. |
@@ -1522,7 +1496,7 @@ adbagent report runs/<id>        # did the reasoning tokens actually drop?
 | `run.goal_check_hits` | `2` | Consecutive satisfied verdicts before the run ends. This is the only guard that stops a run on a model's say-so without the model having asked to stop, and a single sample is how a run that still had work to do gets cut off. The second opinion lands in the next step's device round trip, so it is free. |
 | `llm.vision_in_decider` | `false` | Set when `llm.model` itself accepts images: the screenshot then goes straight to the deciding call instead of being described first by `llm.model_image` — one round trip per screenshot turn instead of two. Leave off for a text-only model; an image part would fail the whole call. Only ever *asserts* the saving: pointing `llm.model` and `llm.model_image` at one model asserts it too, and needs no flag. |
 | `run.always_screenshot` | `false` | Pay for vision on every turn. |
-| `run.never_screenshot` | `false` | Never pay for vision. Disables sweeping, which needs to read items. |
+| `run.never_screenshot` | `false` | Never pay for vision. |
 | `device.settle_budget_s` | `6.0` | Hard ceiling on one settle. It bounds the re-dumping; it does not decide that the screen has settled — `device.settle_quiet_s` does. It was `2.0`, which is less than a single observation over wireless adb, so the comparison never ran and 95 of ~100 settling observations logged "screen never settled". Raising it costs nothing on a screen that is already still, because that screen returns on its first comparison. Also caps the re-dumping of a frame that holds nothing but the status and nav bars, which is what a dump taken mid-transition returns. |
 | `device.settle_quiet_s` | `0.5` | How long two dumps must agree before the screen counts as settled. Agreement alone is not enough: a screen that has drawn its chrome and not yet its content agrees with itself 0.18s later, and handing that frame over is what the model used to answer with a `wait` action (13 of 103 turns, ~254s across `runs/`). Measured in wall clock, so it is self-calibrating — over a slow link the dumps themselves span the window and it costs nothing. |
 | `device.blank_wait_s` | `8.0` | How long to keep looking, with no model call, when an action leaves the app showing nothing — the white flash after a send, a feed reloading. The settle cannot see it: the blank window agrees with itself, so two blank dumps used to certify it as settled, and the model was handed it 502 times across `runs/` and answered `wait` every time. Only an action that turned a drawn screen blank waits; a screen that is always blank (a canvas, a game) does not. `0` hands the blank over at once. |
@@ -1545,5 +1519,5 @@ explicit table of what does and does not count as the same screen — a ticking
 clock does, a scrolled list does, a flipped toggle does; a sibling tab does not, a
 rotated screen does not, and a "Delete account?" confirmation is hard-blocked.
 `tests/test_album_walk.py` walks a scripted fifteen-photo album whose captions
-repeat, whose chrome fades, and whose ViewPager drops flings, and asserts every
-photo is read exactly once.
+repeat, whose chrome fades, and whose ViewPager drops flings, and asserts the walk
+reaches the last photo with every swipe on the phone one the model chose.

@@ -1284,44 +1284,6 @@ def test_analyze_image_uses_image_max_tokens(monkeypatch):
     assert captured["max_tokens"] == 2000               # image-specific, not 9000
 
 
-def test_reading_one_item_asks_for_a_fact_not_a_screen_description(monkeypatch):
-    client = _client(monkeypatch, max_tokens=2222, max_tokens_image=2222)
-    captured = {}
-
-    def post(messages, *, model, schema, max_tokens, purpose, **kw):
-        captured.update(messages=messages, model=model, purpose=purpose,
-                        max_tokens=max_tokens)
-        return "  chicken breast on scale, 428 g\n", Call(model=model)
-
-    monkeypatch.setattr(client, "_post", post)
-    reading = client.read_item(b"jpeg", goal="read the weight",
-                               label="Today, 9:52 am")
-
-    assert reading == "chicken breast on scale, 428 g"   # collapsed, stripped
-    assert captured["model"] == client.model_image       # fully qualified
-    assert captured["model"].endswith("vision-model")
-    assert captured["purpose"] == "read_item"
-    assert captured["max_tokens"] == 2222                # config, not a literal
-    assert "read the weight" in captured["messages"][1]["content"][0]["text"]
-    assert "Today, 9:52 am" in captured["messages"][1]["content"][0]["text"]
-    assert len(_image_parts(captured["messages"])) == 1
-
-
-def test_read_item_uses_image_max_tokens(monkeypatch):
-    """max_tokens_image, when set, overrides max_tokens for read_item too."""
-    client = _client(monkeypatch, max_tokens=2222, max_tokens_image=800)
-    captured = {}
-
-    def post(messages, *, model, schema, max_tokens, purpose, **kw):
-        captured.update(max_tokens=max_tokens, purpose=purpose)
-        return "  chicken breast on scale, 428 g\n", Call(model=model)
-
-    monkeypatch.setattr(client, "_post", post)
-    client.read_item(b"jpeg", goal="read the weight", label="Today, 9:52 am")
-
-    assert captured["max_tokens"] == 800                # image-specific, not 2222
-
-
 # ---------------------------------------------------------------------------
 # Prefetch
 # ---------------------------------------------------------------------------
@@ -1446,9 +1408,8 @@ def test_the_vision_prompt_forbids_the_chrome_it_kept_describing():
     assert "Never describe" in prompts.IMAGE_ANALYSIS_SYSTEM
 
 
-@pytest.mark.parametrize("prompt_name", ["IMAGE_ANALYSIS_SYSTEM",
-                                         "ITEM_READING_SYSTEM"])
-def test_both_vision_prompts_rule_out_the_clock_as_an_answer(prompt_name):
+@pytest.mark.parametrize("prompt_name", ["IMAGE_ANALYSIS_SYSTEM"])
+def test_the_vision_prompt_rules_out_the_clock_as_an_answer(prompt_name):
     """Against a real phone the vision model returned "3:51 PM, 71%, 1" as the
     reading and the whole tab bar as the item. Both are Android's, not the app's.
     The tree side of this was fixed by `screen.content_elements`; the pixels kept
@@ -1610,9 +1571,8 @@ def test_the_system_prompt_no_longer_carries_the_situational_blocks():
     # notes: a last resort should be revealed by failure, not advertised on
     # every healthy turn.
     # 7,735 with the `read_each` rule -- 247 characters, about 60 tokens, telling
-    # the model it can sweep without the per-item vision read. One 12-item
-    # sweep's reads are 12 image calls; skipping them when the in-between
-    # content does not matter saves that whole bill.
+    # the model it can sweep without the per-item vision read. The rule went
+    # with the sweep: nothing repeats the model's gestures any more.
     assert len(prompts.SYSTEM) < 7800
 
 
@@ -1859,7 +1819,7 @@ def test_vision_calls_never_pay_for_reasoning():
     """"What does this scale read" has no chain of thought worth buying, so a
     transcription is pinned to the floor even when the run is struggling."""
     cfg = cfg_with(effort="high", hard="high")
-    for purpose in ("analyze_image", "read_item", "locate"):
+    for purpose in ("analyze_image", "locate"):
         assert cfg.llm.effort_for(purpose) == "none"
         assert cfg.llm.effort_for(purpose, hard=True) == "none"
 
@@ -1884,7 +1844,7 @@ def test_a_vision_call_is_capped_without_the_caller_threading_it(monkeypatch):
     with pytest.raises(Exception):
         client._post([{"role": "user", "content": "hi"}],
                      model=client.model_image, schema=None, max_tokens=100,
-                     purpose="read_item")
+                     purpose="locate")
     assert seen["extra_body"]["reasoning_effort"] == "none"
 
 

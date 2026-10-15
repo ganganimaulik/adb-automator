@@ -1476,36 +1476,6 @@ class LLMClient:
             recorder.event("image_analysis", step=step, model=self.model_image, result=result)
         return analysis
 
-    def read_item(self, screenshot: bytes, *, goal: str = "", label: str = "",
-                  step: int = 0, recorder: Optional[Any] = None,
-                  on_event: Optional[Callable[..., None]] = None) -> str:
-        """One short line answering the goal for the item in `screenshot`.
-
-        `analyze_image` describes a *screen* -- layout, dialogs, navigation --
-        which is the right job when the question is "what am I looking at" and
-        the wrong one when the question is "what does this scale read". Its
-        answers run ~1,100 characters, most of it restating the Android nav bar,
-        against a ledger that keeps 110 per item. This asks for the fact instead.
-        """
-        from . import prompts
-
-        messages = [
-            {"role": "system", "content": prompts.ITEM_READING_SYSTEM},
-            {"role": "user", "content": [
-                text_part(prompts.item_reading_user(goal=goal, label=label)),
-                image_part(screenshot),
-            ]},
-        ]
-        if recorder is not None:
-            recorder.dump_messages(step, messages, purpose="read_item")
-        kw = {}
-        if on_event is not None:
-            kw["on_event"] = on_event
-        raw, _ = self._post(messages, model=self.model_image, schema=None,
-                            max_tokens=self.cfg.llm.image_max_tokens(),
-                            purpose="read_item", **kw)
-        return " ".join(raw.split())
-
     def locate(self, screenshot: bytes, description: str, *, goal: str = "",
                step: int = 0, recorder: Optional[Any] = None,
                on_event: Optional[Callable[..., None]] = None,

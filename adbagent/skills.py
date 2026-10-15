@@ -735,8 +735,8 @@ def ready_for_exploration(dev: Any) -> str:
     except Exception as exc:  # noqa: BLE001 - a wake that fails is not fatal yet
         log.warning("could not wake the phone: %s", exc)
     if dev.is_locked():
-        return ("the phone is on the lock screen. A PIN, pattern or fingerprint "
-                "is yours to enter -- unlock it and run this again")
+        return ("the phone is on the lock screen. Unlocking it is yours to do "
+                "-- unlock it and run this again")
     return ""
 
 

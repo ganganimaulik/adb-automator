@@ -4,9 +4,8 @@
 call is all `RemoteAgent` changes: it hands the turn to whoever is driving the
 session -- a coding agent connected over MCP (`mcp_server.py`) -- and waits for
 the action to come back. Everything around that call still runs here: the
-interstitial dismissals, the sensitive-screen hand-over, the guards, the
-verification, the stall ladder, and the trace in `runs/<id>/` that the web UI
-and `adbagent report` read. Nothing about a run depends on who decided it, so
+sensitive-screen hand-over, the guards, the verification, the stall ladder,
+and the trace in `runs/<id>/` that the web UI and `adbagent report` read. Nothing about a run depends on who decided it, so
 nothing had to be written twice.
 
 The run is an ordinary `Agent.run` on a thread of its own. `Session` talks to it
@@ -194,9 +193,6 @@ def remote_config(cfg: Config) -> Config:
     # at, so the notes offer the x/y form of `tap_at` and the frame is kept
     # beside the step that saw it, as for a model that sees.
     cfg.llm.vision_in_decider = True
-    # The sweep repeats a gesture in code and has a vision model read each item
-    # it lands on. There is no model here to read them.
-    cfg.run.pager_sweep = False
     return cfg
 
 

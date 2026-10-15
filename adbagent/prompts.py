@@ -100,9 +100,6 @@ they block progress.
 - If a field needs a password, PIN, one-time code or payment detail, use \
 ask_user. Never type credentials yourself.
 - If you cannot see what you need, scroll before concluding it is absent.
-- When a scroll or swipe verifiably moves the content, the harness repeats it \
-in code, analysing each new screen. Set `read_each=false` to keep paging \
-without those analyses when the in-between content does not matter.
 - Set confidence to "low" when you are guessing; you will be given a screenshot \
 on the next turn.
 - When an action has a silent failure mode -- a send, a save, a submit that may \
@@ -152,8 +149,8 @@ You must reply with a JSON object matching this schema:
 
 #: Property names whose `description` survives into the prompt copy of the
 #: schema. Everything else in `THE ACTIONS` already says what the description
-#: says -- `scroll_amount`, `base_scale`, `read_each`, `clear`, `press_enter`
-#: and `confidence` are all documented there in prose, and `notes` has its own
+#: says -- `scroll_amount`, `base_scale`, `clear`, `press_enter` and
+#: `confidence` are all documented there in prose, and `notes` has its own
 #: section. These four are not: `text` is the dispatch table for what the field
 #: means per action, and `x`/`y`/`resource_id` are the fallback targeting forms
 #: that `THE ACTIONS` never lists.
@@ -990,38 +987,6 @@ disabled button.
 Never describe the app's ordinary buttons. Never suggest an action. Be terse: \
 clauses, not sentences.
 """
-
-
-ITEM_READING_SYSTEM = """\
-You are reading ONE item of a gallery -- a photo, a card, a slide -- to answer a \
-specific question about it.
-
-Reply with a single short line: the fact the goal asks for, as read off the \
-image. A number, a name, a price, a weight, a date. Nothing else.
-
-- If the item does not contain what the goal asks for, say what it does show, in \
-one clause.
-- If the value is present but unreadable -- glare, blur, a covered display -- say \
-"unreadable" and why, in a few words.
-- Never guess a number you cannot actually see, and never describe the app's \
-own buttons or navigation.
-- The clock, the battery percentage and the signal bars belong to Android, not to \
-the item. They are never the answer, however plainly they are readable.
-
-Good: "chicken breast on scale, 428 g"
-Good: "scale display covered by plastic film, unreadable"
-Bad:  "The screen shows a photo opened in the media viewer. At the top left \
-there is a Back arrow..."
-Bad:  "3:51 PM, 71%, 428 g" -- the first two are the status bar, not the item.
-"""
-
-
-def item_reading_user(goal: str = "", label: str = "") -> str:
-    parts = [f"GOAL: {goal}" if goal else "GOAL: describe this item"]
-    if label:
-        parts.append(f'The app labels this item "{label}".')
-    parts.append("Read this item and reply with the one line described above.")
-    return "\n\n".join(parts)
 
 
 def image_analysis_user(goal: str = "", rendered: str = "") -> str:

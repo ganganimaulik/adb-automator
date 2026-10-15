@@ -11,7 +11,7 @@ import json
 import pytest
 
 from adbagent.actions import AgentAction, Target
-from adbagent.agent import (Agent, Oracle, Recorder, RunState, _locate_key,
+from adbagent.agent import (Agent, Oracle, Recorder, RunState,
                             needs_screenshot)
 from adbagent.config import Config
 from adbagent.device import DeviceTimeout
@@ -122,7 +122,7 @@ def test_a_named_tap_at_is_grounded_by_the_vision_locate(cfg):
 
 
 def _locator(cfg, dev, location):
-    """An agent, a state and a recorder, for calling `_locate_cached` directly."""
+    """An agent, a state and a recorder, for calling `_locate` directly."""
     from adbagent.agent import Recorder
 
     llm = fake.FakeLLM(dev, lambda *a: None)
@@ -132,117 +132,33 @@ def _locator(cfg, dev, location):
             Recorder(cfg, "r"))
 
 
-def test_the_second_locate_of_the_same_control_is_free(cfg):
-    """A locate is a screenshot plus a vision call, and it is asked the same
-    question over and over: across ``runs/``, 577 named `tap_at`s resolve to 94
-    distinct (skeleton, name) pairs, and "send message" on one WhatsApp
-    skeleton was located 134 separate times."""
+def test_every_locate_reads_the_frame_the_tap_will_land_on(cfg):
+    """No point is reused from an earlier frame, even for the same control on a
+    screen of the same shape.
+
+    The cache that used to answer the second ask was keyed on the content-free
+    `skeleton_id`, so every card of a feed shared one point -- and a like sheet
+    whose keyboard has opened, or whose comment wrapped, has the same skeleton
+    with its buttons somewhere else. The remembered point then lands on whatever
+    moved into it, and a wrong tap that *does* something is never caught by the
+    no-change check that was meant to evict it."""
     dev = fake.FakeDevice(cfg)
     screen = dev.observe()
     agent, llm, state, rec = _locator(cfg, dev, (0.5, 0.9))
     try:
-        first = agent._locate_cached(state, rec, screen, "the send pill")
-        second = agent._locate_cached(state, rec, screen, "the send pill")
-        # Case and inner spacing are not a different control.
-        third = agent._locate_cached(state, rec, screen, "The  Send  Pill")
-    finally:
-        rec.close()
-
-    assert first == second == third == (0.5, 0.9)
-    assert llm.locates == 1
-
-
-def test_a_different_control_or_screen_is_located_afresh(cfg):
-    dev = fake.FakeDevice(cfg)
-    screen = dev.observe()
-    agent, llm, state, rec = _locator(cfg, dev, (0.5, 0.9))
-    try:
-        agent._locate_cached(state, rec, screen, "the send pill")
-        agent._locate_cached(state, rec, screen, "the attach button")
-        assert llm.locates == 2                     # a different name
+        first = agent._locate(state, rec, screen, "the send pill")
+        second = agent._locate(state, rec, screen, "the send pill")
+        agent._locate(state, rec, screen, "the attach button")
         dev.state = "wifi"
         other = dev.observe()
-        assert other.skeleton_id != screen.skeleton_id
-        agent._locate_cached(state, rec, other, "the send pill")
-        assert llm.locates == 3                     # a different screen
+        agent._locate(state, rec, other, "the send pill")
     finally:
         rec.close()
 
-
-def test_a_locate_that_misses_is_not_cached(cfg):
-    """There is nothing to remember, and caching "not found" would stop the
-    next turn looking on a screen that may since have drawn the control."""
-    dev = fake.FakeDevice(cfg)
-    screen = dev.observe()
-    agent, llm, state, rec = _locator(cfg, dev, None)
-    try:
-        assert agent._locate_cached(state, rec, screen, "the send pill") is None
-        assert agent._locate_cached(state, rec, screen, "the send pill") is None
-    finally:
-        rec.close()
-    assert llm.locates == 2
-    assert _locate_key(screen, "the send pill") not in state.locates
-
-
-def test_a_located_point_that_taps_nothing_is_forgotten(cfg):
-    """The invalidation half. Without it the cache is worse than paying for the
-    locate: a vision call that misses costs one turn, a cached miss would cost
-    every remaining turn in the run that named the same control.
-
-    The cache is per-run now (`RunState.locates`) rather than a table keyed by
-    screen and surviving a day, so this drives it through a real run instead of
-    seeding a database: the locate is paid, the point is cached, the tap on it
-    changes nothing, and the entry is gone by the time the run ends.
-    """
-    dev = fake.FakeDevice(cfg)
-    screen = dev.observe()
-    tries = []
-
-    def policy(scr, llm):
-        if len(tries) >= 1:
-            return AgentAction(observation="that did nothing",
-                               reasoning="give up on it", action="done",
-                               text="the point was dead")
-        tries.append(True)
-        # A point on bare canvas: tapping it changes nothing on the scripted
-        # phone, which is what makes the step grade `no_change`.
-        llm.location = (0.5, 0.97)
-        return AgentAction(observation="aiming at the ghost button",
-                           reasoning="tap where vision put it",
-                           action="tap_at", text="the ghost button")
-
-    outcome, state, llm = run(dev, cfg, policy)
-
-    assert outcome == "success"
-    assert llm.locates == 1          # the point was derived once and cached...
-    # ...and having changed nothing, it is no longer cached.
-    assert _locate_key(screen, "the ghost button") not in state.locates
-
-
-def test_a_cached_point_on_the_ban_list_is_dropped_and_located_again(cfg):
-    """Something has tapped there since and nothing happened. Falling through
-    to a real locate is the whole reason to check the ban list first."""
-    dev = fake.FakeDevice(cfg)
-    screen = dev.observe()
-
-    state = RunState(goal=GOAL, run_id="r", intent_id="i")
-    state.locates[_locate_key(screen, "the ghost button")] = (0.5, 0.97)
-    state.loops.ban(screen.skeleton_id, "tap_at/0.50,0.97")
-
-    llm = fake.FakeLLM(dev, lambda *a: None)
-    llm.location = (0.4, 0.4)
-    agent = Agent(dev, llm, cfg)
-
-    from adbagent.agent import Recorder
-    rec = Recorder(cfg, "r")
-    try:
-        where = agent._locate_cached(state, rec, screen, "the ghost button")
-    finally:
-        rec.close()
-
-    assert where == (0.4, 0.4)       # the fresh locate, not the banned point
-    assert llm.locates == 1
-    assert state.locates[_locate_key(screen, "the ghost button")] == (0.4, 0.4)
+    assert first == second == (0.5, 0.9)
+    assert llm.locates == 4
+    # Every one of them was handed a frame to read.
+    assert dev.screenshots >= 2
 
 
 def test_a_tap_at_naming_a_listed_element_taps_it_by_index(cfg):
@@ -267,6 +183,30 @@ def test_a_tap_at_naming_a_listed_element_taps_it_by_index(cfg):
     assert dev.state == "wifi"          # the listed row was tapped
     assert len(dev.taps) == 1
     assert "tap_at refused" not in (state.last_failure or "")
+
+
+def test_a_tap_at_that_only_partly_names_a_listed_element_is_refused(cfg):
+    """The label the model wrote out in full is the model's choice; a longer
+    label that merely contains its words is a guess at it. On a like sheet
+    listing only "Send a Rose", a `tap_at` of "Send" was one tap from the paid
+    button the model never named."""
+    dev = fake.FakeDevice(cfg)
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="refused", reasoning="stop here",
+                               action="done", text="did not tap")
+        tried.append(True)
+        return AgentAction(observation="something about bluetooth",
+                           reasoning="tap it", action="tap_at", text="Blue")
+
+    outcome, state, llm = run(dev, cfg, policy)
+
+    assert dev.taps == [], "a partial name was tapped"
+    assert llm.locates == 0
+    assert any("only partly matches" in line and "Bluetooth" in line
+               for line in state.history)
 
 
 def test_a_tap_at_naming_something_inside_a_container_label_is_located(cfg):
@@ -676,26 +616,6 @@ def test_irreversible_action_is_refused_when_unattended(cfg):
     assert any("refused" in line for line in state.history)
 
 
-def test_interstitial_is_dismissed_without_an_llm_call(cfg):
-    dev = fake.FakeDevice(cfg)
-    dev.app["home"] = fake.FakeScreen(
-        xml=X.settings_screen(extra_roots=[
-            X.N("android.widget.FrameLayout", (60, 800, 1020, 1400),
-                package="com.android.vending", rid="nag", children=[
-                    X.N("android.widget.TextView", (100, 860, 980, 980),
-                        package="com.android.vending", text="Rate this app!"),
-                    X.N("android.widget.Button", (620, 1240, 980, 1380),
-                        package="com.android.vending", text="Not now",
-                        rid="dismiss", clickable=True)])]),
-        taps={"Wi-Fi": "wifi"})
-    dev._xml = lambda: dev.app[dev.state].xml  # type: ignore[assignment]
-
-    llm = fake.FakeLLM(dev, fake.tap_label("Wi-Fi"))
-    Agent(dev, llm, cfg).run(GOAL)
-    # The dismiss happened before any model call.
-    assert dev.taps, "the nag should have been tapped"
-
-
 def test_loop_breaker_stops_a_stuck_agent(cfg):
     """A model that keeps choosing a dud action must not burn the whole budget."""
     dev = fake.FakeDevice(cfg)
@@ -712,6 +632,30 @@ def test_loop_breaker_stops_a_stuck_agent(cfg):
     assert state.step <= cfg.run.max_steps
     # The dud action was banned rather than retried forever.
     assert any(state.loops.bans_for(k) for k in state.loops.banned)
+
+
+def test_a_loop_is_told_to_the_model_and_back_is_never_pressed(cfg):
+    """Repeating one action in place gets the model told, not a back press.
+
+    The harness used to press back on its own once one action had been repeated
+    nine times on one screen. Back is not a neutral key -- it closes a composer
+    and its draft, leaves a chat, and on some apps exits to the launcher from
+    the very screen the run works from -- so whether it is the way out is the
+    model's call."""
+    cfg.run.max_steps = 14
+    dev = fake.FakeDevice(cfg)
+
+    def flip(screen, llm):
+        switch = next(e for e in screen.elements if e.checkable)
+        return AgentAction(observation="the toggle", reasoning="flip it again",
+                           action="tap", target={"index": switch.index})
+
+    llm = fake.FakeLLM(dev, flip)
+    Agent(dev, llm, cfg).run(GOAL)
+
+    assert "press(back)" not in dev.actions
+    assert len(dev.taps) == llm.calls - llm.judges, "a tap the model did not ask for"
+    assert any("You are repeating yourself" in note for note in llm.notes)
 
 
 def test_step_budget_is_enforced(cfg):
@@ -1237,8 +1181,8 @@ def test_a_screen_is_photographed_once_however_many_times_it_is_needed(cfg):
 
     `observe(settle=True)` has already waited for the tree to stop moving, and
     every path that touches the device between verifying one step and deciding
-    the next (dismissing an interstitial, breaking a loop with `back`) drops the
-    screen and re-observes. So a second capture buys nothing and costs a device
+    the next (recovering from a device error) drops the screen and
+    re-observes. So a second capture buys nothing and costs a device
     round trip -- and leaves the pager comparing a `dhash` taken from different
     pixels than the ones the model was shown.
     """
@@ -1913,66 +1857,45 @@ def test_progress_between_rejections_resets_the_give_up_counter(cfg):
 
 
 # ---------------------------------------------------------------------------
-# Dismissing interstitials
+# Popups are the model's
 # ---------------------------------------------------------------------------
 
-def _nag_screen(label: str, package: str = X.PKG) -> str:
+def _popup_screen(label: str, package: str = X.PKG) -> str:
     """A settings screen with one dismiss-shaped control over it."""
     return X.settings_screen(extra_roots=[
         X.N("android.widget.FrameLayout", (60, 800, 1020, 1400),
-            package=package, rid="nag", children=[
+            package=package, rid="popup", children=[
                 X.N("android.widget.Button", (620, 1240, 980, 1380),
                     package=package, text=label, rid="dismiss", clickable=True)])])
 
 
-def test_a_dismiss_that_never_works_hands_the_screen_to_the_model(cfg):
-    """A "Skip" that is disabled, or sits on a WebView where the tap lands
-    nowhere, used to be pressed until the step budget ran out with the model
-    never consulted once."""
-    dev = fake.FakeDevice(cfg)
-    dev.app["home"] = fake.FakeScreen(xml=_nag_screen("Skip"), taps={})
-    dev._xml = lambda: dev.app[dev.state].xml  # type: ignore[assignment]
+@pytest.mark.parametrize("label,package", [
+    ("Skip", X.PKG),                        # a profile deck's pass control
+    ("Not now", X.PKG),                     # an in-app nag
+    ("Not now", "com.android.vending"),     # a Play Store rating sheet
+])
+def test_the_harness_never_taps_a_popup_on_its_own(cfg, label, package):
+    """Every tap is the model's to choose.
 
-    def policy(screen, llm):
-        return AgentAction(observation="the nag is part of this screen",
-                           reasoning="nothing else to do", action="done",
-                           text="fin")
-
-    llm = fake.FakeLLM(dev, policy)
-    outcome, state = Agent(dev, llm, cfg).run(GOAL)
-
-    from adbagent.agent import MAX_DISMISS_TRIES
-    assert len(dev.taps) == MAX_DISMISS_TRIES
-    assert llm.calls >= 1                       # the model did get a turn
-    assert state.step < cfg.run.max_steps
-    assert any("harness dismissed 'Skip'" in line for line in state.history)
-
-
-def test_a_dismissal_that_works_is_not_held_against_the_next_one(cfg):
-    """Two nags in a row are two dismissals, not one dismissal and a refusal.
-
-    The memo is keyed on `exact_id` for this: `skeleton_id` is content-free, so
-    a second card with different text hashes the same as the first.
+    The harness used to press lone buttons like these itself, before the model
+    was asked. On a profile deck "Skip" is the pass control, and
+    `runs/3c94258b5fc6` pressed it on twenty profiles in thirteen seconds.
     """
     dev = fake.FakeDevice(cfg)
-    nags = ["Not now", "Got it"]
-    dev.app["home"] = fake.FakeScreen(xml=_nag_screen(nags[0]), taps={})
+    dev.app["home"] = fake.FakeScreen(xml=_popup_screen(label, package), taps={})
+    dev._xml = lambda: dev.app[dev.state].xml  # type: ignore[assignment]
+    taps_seen = []
 
-    def tap(x, y):
-        dev.taps.append((x, y))
-        if nags:
-            nags.pop(0)
-            dev.app["home"] = fake.FakeScreen(
-                xml=_nag_screen(nags[0]) if nags else X.settings_screen(), taps={})
+    def policy(screen, llm):
+        taps_seen.append(len(dev.taps))
+        return AgentAction(observation="a popup", reasoning="leave it",
+                           action="done", text="fin")
 
-    dev._xml = lambda: dev.app["home"].xml    # type: ignore[assignment]
-    dev.tap = tap                             # type: ignore[assignment]
-
-    llm = fake.FakeLLM(dev, lambda s, l: AgentAction(
-        observation="clear", reasoning="done", action="done", text="fin"))
+    llm = fake.FakeLLM(dev, policy)
     Agent(dev, llm, cfg).run(GOAL)
 
-    assert len(dev.taps) == 2, "both nags should have been dismissed"
+    assert taps_seen and taps_seen[0] == 0, "tapped before the model was asked"
+    assert dev.taps == []
 
 
 # ---------------------------------------------------------------------------
@@ -2118,6 +2041,9 @@ def test_finishing_a_plan_step_resets_the_stall_ladder(cfg, tmp_path):
     So this is the two-cycle from the test above, unchanged and still learning
     nothing about the device, except that it finishes one plan step every third
     turn. It must outlive `stall_give_up_at`, which the bare two-cycle does not.
+    The plan is longer than the step budget can finish, so it never runs out of
+    steps to complete -- a run whose plan is finished has nothing left to be
+    credited for, and stalling out after that is the ladder working.
     """
     cfg.run.max_steps = 40
     dev = fake.FakeDevice(cfg)
@@ -2128,7 +2054,7 @@ def test_finishing_a_plan_step_resets_the_stall_ladder(cfg, tmp_path):
         turn["n"] += 1
         action = inner(screen, llm)
         if turn["n"] == 1:
-            progress = [{"id": str(n), "text": f"step {n}"} for n in range(1, 9)]
+            progress = [{"id": str(n), "text": f"step {n}"} for n in range(1, 21)]
         elif turn["n"] % 3 == 0:
             progress = [{"id": str(turn["n"] // 3), "status": "done"}]
         else:
@@ -2146,10 +2072,10 @@ def test_finishing_a_plan_step_resets_the_stall_ladder(cfg, tmp_path):
     # Credited for what it finished, and only for that.
     assert state.plan.credited == {s.id for s in state.plan.steps
                                    if s.status == "done"}
-    # The turn that declared all eight is the one a model would use to buy time,
-    # and it bought none: the first plan event completes nothing.
+    # The turn that declared all twenty is the one a model would use to buy
+    # time, and it bought none: the first plan event completes nothing.
     plans = [e for e in _events(tmp_path, state.run_id) if e["kind"] == "plan"]
-    assert plans[0]["total"] == 8 and plans[0]["completed"] == []
+    assert plans[0]["total"] == 20 and plans[0]["completed"] == []
     assert sum(len(e["completed"]) for e in plans) == state.plan.done_count
 
 
@@ -3024,7 +2950,8 @@ def test_a_tap_at_naming_the_like_pill_taps_the_pill_not_the_rose(cfg):
             return AgentAction(observation="sent", reasoning="stop",
                                action="done", text="liked")
         return AgentAction(observation="the comment is in", reasoning="send",
-                           action="tap_at", text="Send Priority Like")
+                           action="tap_at",
+                           text="Send Priority Like with message")
 
     _, state, llm = run(dev, cfg, policy)
 
@@ -3033,3 +2960,28 @@ def test_a_tap_at_naming_the_like_pill_taps_the_pill_not_the_rose(cfg):
     # The send is checked and counted against the control's own label.
     assert llm.send_checks_seen[0]["control"] == "Send priority like with message"
     assert state.sends.sent[0].label == "Send priority like with message"
+
+
+def test_a_partial_name_for_the_like_pill_is_refused_not_guessed(cfg):
+    """"Send Priority Like" is not the label on the sheet once a comment is in
+    -- that reads "Send priority like with message". It is refused with the pill
+    named, and the model taps it by index; the harness does not decide that a
+    longer label containing the words is the control meant."""
+    dev = fake.FakeDevice(cfg, start="sheet", app=_like_sheet_app())
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="refused", reasoning="stop",
+                               action="done", text="did not send")
+        tried.append(True)
+        return AgentAction(observation="the comment is in", reasoning="send",
+                           action="tap_at", text="Send Priority Like")
+
+    _, state, llm = run(dev, cfg, policy)
+
+    assert dev.taps == [] and dev.state == "sheet"
+    refusal = state.last_failure or ""
+    assert "only partly matches" in refusal
+    assert "Send priority like with message" in refusal
+    assert "Rose" not in refusal
