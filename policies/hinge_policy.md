@@ -2,8 +2,9 @@
 goal: |
   Watch Hinge (co.hinge.app): reply to matches who have written back, then like new profiles on Discover.
   Check Matches first every pass — someone waiting on a reply matters more than another like. Then work
-  Discover and like at most 108-207 new profiles per pass, so a pass finishes cleanly instead of being cut off
-  part-way through one. Leave the phone on the Discover or Matches list, never inside a profile or a chat.
+  Discover and like between 108 and 207 new profiles per pass (minimum 108, up to 207 cap), continuing until
+  that quota is satisfied, Discover shows "You've seen everyone for now", or the step budget is exhausted.
+  Never stop early after only a few likes. Leave the phone on the Discover or Matches list, never inside a profile or a chat.
 title: Hinge
 snooze: You've seen everyone for now = 15m
 send_limits: like=207, rose=0
@@ -13,6 +14,14 @@ send_limits: like=207, rose=0
 
 ## step 1. Profile Exploration & Liking (Discover Tab)
 - Go to the "Discover" tab in Hinge (`co.hinge.app`).
+- **MANDATORY PASS QUOTA & CONTINUOUS LOOP (108–207 LIKES)**:
+  - **Quota Requirement**: Each pass MUST continuously process Discover profiles and send likes until reaching **at least 108 likes** (up to the 207 cap per pass).
+  - **STRICT PROHIBITION — NEVER STOP AFTER A FEW LIKES**: NEVER report `done`, stop, or conclude the pass after only 2, 3, 5, or 10 profiles based on sample logs or arbitrary stopping. Stopping prematurely before reaching at least 108 likes is a severe policy violation.
+  - **ONLY VALID TERMINATION CONDITIONS FOR LIKING**:
+    Continue looping through Discover profile cards and sending likes until ONE of the following 3 conditions is met:
+    1. Quota reached: You have successfully sent at least 108 likes (up to 207).
+    2. Feed exhausted: Discover explicitly displays "You've seen everyone for now" (stop right there and leave the phone on that screen).
+    3. Step budget or time budget exhausted.
 - **When Discover says "You've seen everyone for now"**, there is nobody left to like. Do not tap "Change filters" or "Review skipped profiles", and do not scroll, wait or retry: report done right there and leave the phone on that screen. The watch sees it and rests 15 minutes before the next pass.
 - For each new profile:
   1. **MANDATORY Full-Profile Down-Fling (Anti-bot Exploration)**: First go through the whole profile to its end in ONE action: `scroll_to_edge` with `direction="down"` on the profile's scroller (`#2 [Scroller]`). It flings until the profile stops moving, so it never falls short and needs no repeating. You don't have to read any profile info or images.

@@ -1428,11 +1428,21 @@ class Device:
             f"({'vertical' if vertical else 'horizontal'})")
 
         def run() -> bool:
-            obj = self._scrollable_for(box)
-            fling = obj.fling
-            fling._vertical = vertical
-            fling.action = "toBeginning" if to_beginning else "toEnd"
-            return bool(fling(max_swipes=max_swipes))
+            try:
+                obj = self._scrollable_for(box)
+                fling = obj.fling
+                fling._vertical = vertical
+                fling.action = "toBeginning" if to_beginning else "toEnd"
+                return bool(fling(max_swipes=max_swipes))
+            except Exception as exc:
+                log.warning("fling_to_edge uiautomator fling failed: %s; falling back to swipes", exc)
+                try:
+                    for _ in range(5):
+                        self.scroll(direction, scale=0.8, box=box)
+                    return True
+                except Exception as e2:
+                    log.warning("fallback scrolls failed: %s", e2)
+                    return False
 
         return bool(self._act(run, "fling_to_edge"))
 
