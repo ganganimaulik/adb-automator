@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import platform
 import sys
 import time
@@ -23,9 +24,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sized, Tuple
 
-from . import (__version__, checkpoint, control, conversation, prompts, runlog,
-               safety)
-from .actions import (CONTROL_ACTIONS, NAVIGATIONAL, POINT_ACTIONS,
+from . import (__version__, checkpoint, control, conversation, notify, prompts,
+               runlog, safety)
+from .actions import (CONTROL_ACTIONS, NAVIGATIONAL, OFF_DEVICE, POINT_ACTIONS,
                       ActionError, AgentAction, Target, append_history,
                       content_moved_in_pixels, element_at_point,
                       element_summary, elements_named, execute,
@@ -711,6 +712,9 @@ class Agent:
         #: How many sends of each kind one run may make, from the policy's
         #: `send_limits` -- see `conversation.parse_send_limits`. Empty: no cap.
         self.send_limits: Dict[str, int] = dict(send_limits or {})
+        #: Where a `notify` goes: the owner's Telegram chat, through the ledger
+        #: that keeps any one line from reaching them twice -- see `notify.py`.
+        self.notifier = notify.Notifier.from_config(cfg)
         #: The channel anything outside uses to hold this run. Made per run, in
         #: `run()`, because it is scoped to the run's own directory -- see
         #: `control.py` for why that is the right place for it.
@@ -906,7 +910,13 @@ class Agent:
         # live view reads them to show progress as "step 12/60" rather than "step
         # 12", which is the difference between a number and a position.
         limits = {"max_steps": self.cfg.run.max_steps,
-                  "budget_usd": self.cfg.safety.budget_usd}
+                  "budget_usd": self.cfg.safety.budget_usd,
+                  # Which web UI child wrote the run, "" for anything else. The
+                  # UI tells its own child's runs from the rest of `runs/` by
+                  # it: a watch that has let go of the phone shares the
+                  # directory with whatever took the phone meanwhile. See
+                  # `web.runner.ChildProcess._sweep`.
+                  "launch_id": os.environ.get(runlog.LAUNCH_ENV, "")}
         if resume:
             # One directory per run still holds: the events of this sitting are
             # appended to the failed one's, with this event where they join.
@@ -1772,6 +1782,15 @@ class Agent:
                 )
                 continue
 
+            # ---- 5a. a notification, which never touches the phone ---------
+            # Here and not in `execute`: there is nothing to settle, verify or
+            # ban, and the screen the model decided on is still the screen, so
+            # the loop goes round without reading the phone again. Ahead of the
+            # send gates below, which are about messages to other people.
+            if action.action in OFF_DEVICE:
+                self._notify(state, rec, screen, action)
+                continue
+
             # ---- 5b. the gates in front of a send that need no model -------
             # Draft mode, the switch that means "compose, never send" and holds
             # whatever the model concluded; and the policy's `send_limits`,
@@ -2493,6 +2512,44 @@ class Agent:
         rec.event("blank_wait", step=state.step, waited_s=round(waited, 3),
                   drawn=drawn)
         return after
+
+    # -- notifications -----------------------------------------------------
+
+    def _notify(self, state: RunState, rec: Recorder, screen: Screen,
+                action: AgentAction) -> None:
+        """Tell the owner what `action` says: each line at most once, ever.
+
+        Never a failed step. No bot configured, or Telegram not answering, is
+        nothing the model can mend by doing something else on the phone, and a
+        batch from an MCP driver must not stop on it -- a line that was not
+        delivered is kept and goes out with the next notification. A line that
+        did go out is progress, something the harness watched the run do for
+        the first time; a repeat, skipped, is not.
+
+        Recorded as a `notify` event and not as a `verify`: nothing was
+        verified, and `history.for_package` tallies every verify grade into
+        the app's record of what fails there.
+        """
+        t0 = time.monotonic()
+        outcome = self.notifier.notify(action.text or "")
+        summary = outcome.summary()
+        if outcome.sent or outcome.caught_up:
+            log.info("step %d: notified %s", state.step,
+                     " | ".join(outcome.caught_up + outcome.sent))
+        rec.event("notify", step=state.step, grade=outcome.grade,
+                  summary=summary, sent=outcome.sent, repeats=outcome.repeats,
+                  kept=outcome.kept, caught_up=outcome.caught_up,
+                  error=outcome.error, unconfigured=outcome.unconfigured)
+        self.on_event("notified", step=state.step,
+                      elapsed=time.monotonic() - t0, grade=outcome.grade,
+                      reason=summary)
+        if outcome.sent:
+            state.note_progress(f"it sent {len(outcome.sent)} notification(s)")
+        state.note_success()
+        state.loops.record(screen.skeleton_id, action.signature())
+        state.remember(format_history_entry(
+            state.step, action, screen=screen, grade=outcome.grade,
+            reason=summary))
 
     # -- sends -------------------------------------------------------------
 

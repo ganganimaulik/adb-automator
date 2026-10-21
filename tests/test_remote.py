@@ -646,3 +646,185 @@ def test_closing_mid_chain_runs_none_of_the_rest(cfg):
     assert "not run: Two -- the session ended" in session.last.render()
     runs = [p for p in Path(cfg.run.artifacts_dir).iterdir() if p.is_dir()]
     assert len(runs) == 1
+
+
+# ---------------------------------------------------------------------------
+# A driver that goes quiet lets go of the phone, and takes it back
+# ---------------------------------------------------------------------------
+
+def let_go(session, within: float = 5.0) -> None:
+    """Wait for `session` to let go of the phone."""
+    deadline = time.monotonic() + within
+    while session.holds_phone and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert not session.holds_phone, "the session never let go of the phone"
+
+
+def test_a_quiet_driver_has_the_phone_let_go_of_and_taken_back(cfg):
+    cfg.device.let_go_after_s = 0.2
+    dev = fake.FakeDevice(cfg)
+    session, turn = start(cfg, dev)
+    try:
+        let_go(session)
+        assert dev.closes == 1 and not dev.session_open
+        assert phonelock.holder(cfg.run.artifacts_dir) == ""
+        assert session.live                       # let go of, not ended
+
+        turn = session.act([tap(element(turn, "Wi-Fi"))])
+        assert dev.opens == 1 and dev.state == "wifi"
+        assert "test" in phonelock.holder(cfg.run.artifacts_dir)
+        assert any(line.startswith("1. tap #") for line in turn.happened)
+        assert any("had let go of the phone; it took it back for this call"
+                   in line for line in turn.happened)
+        assert turn.screenshot                    # it may be somebody's doing
+        kinds = [e["kind"] for e in events(cfg)]
+        assert kinds.index("let_go") < kinds.index("taken_back")
+    finally:
+        session.close()
+
+
+def test_what_somebody_else_left_on_screen_is_not_acted_on(cfg):
+    """The tap was aimed at a screen read before the phone was let go of."""
+    cfg.device.let_go_after_s = 0.2
+    dev = fake.FakeDevice(cfg)
+    session, turn = start(cfg, dev)
+    try:
+        let_go(session)
+        dev.state = "bluetooth"                   # what they left it on
+        turn = session.act([tap(element(turn, "Wi-Fi"))])
+        assert not dev.taps and dev.state == "bluetooth"
+        assert '"Pair new device"' in turn.screen
+        assert any("the screen changed while the session did not have the "
+                   "phone, so that was not done" in line
+                   for line in turn.happened)
+        assert turn.screenshot and not turn.failure
+    finally:
+        session.close()
+
+
+def test_a_call_while_somebody_else_has_the_phone_does_nothing(cfg):
+    cfg.device.let_go_after_s = 0.2
+    dev = fake.FakeDevice(cfg)
+    session, turn = start(cfg, dev)
+    other = phonelock.PhoneLock(cfg.run.artifacts_dir,
+                                "adbagent run: turn on wifi")
+    try:
+        let_go(session)
+        other.acquire()
+        with pytest.raises(SessionError,
+                           match="adbagent run: turn on wifi") as refused:
+            session.act([tap(element(turn, "Wi-Fi"))])
+        assert "Nothing was done" in str(refused.value)
+        assert not dev.taps and dev.opens == 0
+        assert session.last.step == turn.step     # the last turn still stands
+        assert session.live
+
+        other.release()
+        session.act([tap(element(turn, "Wi-Fi"))])
+        assert dev.state == "wifi"
+    finally:
+        other.release()
+        session.close()
+
+
+def test_ending_a_session_that_let_go_needs_no_phone(cfg):
+    cfg.device.let_go_after_s = 0.2
+    dev = fake.FakeDevice(cfg)
+    session, _ = start(cfg, dev)
+    other = phonelock.PhoneLock(cfg.run.artifacts_dir,
+                                "adbagent run: turn on wifi")
+    try:
+        let_go(session)
+        other.acquire()
+        turn = session.end("nothing left to do")
+        assert turn.outcome == "success"
+        assert turn.result == "nothing left to do"
+        # Not opened again, and not closed again under the one who has it.
+        assert dev.opens == 0 and dev.closes == 1
+        assert "adbagent run" in phonelock.holder(cfg.run.artifacts_dir)
+    finally:
+        other.release()
+        session.close()
+
+
+def test_a_phone_handed_to_the_person_is_not_let_go_of(cfg):
+    """Their using it is the phone in use: the lock is what keeps a run or a
+    session from starting under them."""
+    cfg.device.let_go_after_s = 0.2
+    dev = fake.FakeDevice(cfg)
+    session, _ = start(cfg, dev)
+    try:
+        session.release()
+        time.sleep(0.6)
+        assert session.holds_phone
+        assert "test" in phonelock.holder(cfg.run.artifacts_dir)
+        turn = session.reclaim()
+        assert not turn.outcome
+    finally:
+        session.close()
+
+
+def test_the_next_policy_takes_back_a_phone_the_session_let_go_of(cfg):
+    cfg.device.let_go_after_s = 0.2
+    dev = fake.FakeDevice(cfg)
+    session, _ = _start_several(cfg, dev, _legs())
+    try:
+        let_go(session)
+        turn = session.end("Wi-Fi did not need doing")
+        assert turn.leg == 2 and not turn.outcome
+        assert dev.opens == 1 and session.holds_phone
+    finally:
+        session.close()
+
+
+def test_the_next_policy_does_not_run_on_a_phone_somebody_else_has(cfg):
+    cfg.device.let_go_after_s = 0.2
+    dev = fake.FakeDevice(cfg)
+    session, _ = _start_several(cfg, dev, _legs())
+    other = phonelock.PhoneLock(cfg.run.artifacts_dir,
+                                "adbagent run: turn on wifi")
+    try:
+        let_go(session)
+        other.acquire()
+        turn = session.end("Wi-Fi did not need doing")
+        assert turn.outcome == "success"
+        ended = turn.render()
+        assert "not run: Two" in ended
+        assert "adbagent run: turn on wifi" in ended
+        assert dev.opens == 0
+    finally:
+        other.release()
+        session.close()
+
+
+def test_a_new_session_may_start_once_the_quiet_one_has_let_go(cfg):
+    """Seen with Antigravity: a scheduled pass's conversation stopped mid-way,
+    and its session kept the phone, unused, until the idle timeout."""
+    from adbagent.mcp_server import Phone
+
+    cfg.device.let_go_after_s = 0.5
+    devs = []
+
+    def open_device(c):
+        devs.append(fake.FakeDevice(c))
+        return devs[-1]
+
+    phone = Phone(cfg, open_device=open_device, idle_timeout_s=30)
+    try:
+        first_turn = phone.start(GOAL, "first")
+        first = phone.session
+        let_go(first)
+        phone.start(GOAL, "second")                    # not refused
+        second = phone.session
+        assert second is not first and first.live
+        # The quiet one's driver comes back to a phone that is not free...
+        with pytest.raises(SessionError, match=r"an MCP session \(second\)"):
+            phone.own(first.id).act([tap(element(first_turn, "Wi-Fi"))])
+        # ...and nobody else may start while the second one has it.
+        with pytest.raises(SessionError, match="in use by another session"):
+            phone.start(GOAL, "third")
+        phone.own(second.id).end("done")
+        phone.own(first.id).act([tap(element(first_turn, "Wi-Fi"))])
+        assert devs[0].state == "wifi" and devs[1].state == "home"
+    finally:
+        phone.close()

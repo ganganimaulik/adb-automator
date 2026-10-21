@@ -58,6 +58,17 @@ that policy again straight away; the others cannot be seen from there, so a full
 round also runs on the clock -- `sweep_s`, or `ROUND_S` when that is off. A
 policy whose pass ended on a screen its own `snooze` rule names sits out the
 rounds until that rest is over. One policy is the watch it always was.
+
+**Watching is not holding.** A watch used to keep the phone -- its lock and its
+device session -- for as long as it ran, which on a quiet inbox meant hours of
+refusing every run and session that asked for it while doing nothing with it.
+Now, once `device.let_go_after_s` has gone by without a pass, it closes the
+session, which puts the phone's own settings back, and lets go of the lock (see
+`phonelock`). It goes on looking every interval, with the lock taken only for
+that moment (`Device.peek`), and takes the phone back when a pass is owed. While
+somebody else has the phone it waits: their run is not this watch's to
+interrupt, and whatever they leave on screen is read like any other change --
+the next pass brings the watch back to its own screen.
 """
 
 from __future__ import annotations
@@ -77,6 +88,7 @@ from .config import Config
 from .device import Device, DeviceLost, DeviceTimeout
 from .fingerprint import mask_goal
 from .llm import BudgetExceeded, LLMClient, LLMError
+from .phonelock import PhoneBusy, PhoneLock
 from .policies import instructions
 from .screen import Screen
 
@@ -373,6 +385,10 @@ class Stats:
     #: With several policies: how many times the watch went round all of them,
     #: as opposed to re-running the last one because its screen changed.
     rounds: int = 0
+    #: Times the watch let go of the phone after going `let_go_after_s` without
+    #: a pass, and probes that found somebody else holding it since.
+    let_go: int = 0
+    waited: int = 0
     failures: int = 0
     usd: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
@@ -394,10 +410,21 @@ class Watch:
                  on_event: Optional[Callable[..., None]] = None,
                  make_agent: Optional[Callable[..., Agent]] = None,
                  sleep: Optional[Callable[[float], None]] = None,
-                 clock: Optional[Callable[[], float]] = None):
+                 clock: Optional[Callable[[], float]] = None,
+                 lock: Optional[PhoneLock] = None):
         self.dev = dev
         self.llm = llm
         self.cfg = cfg
+        #: The phone's lock, held when the watch starts. With it the watch lets
+        #: go of the phone after `device.let_go_after_s` without a pass, and
+        #: takes it back for the next; without it -- a caller that holds the
+        #: phone some other way -- it keeps the phone for as long as it runs.
+        self.lock = lock
+        #: Whether the watch has the phone now: the lock and the device session.
+        self._holding = True
+        #: Whoever had the phone at the last look that found it taken, so that
+        #: waiting is said once and not every interval.
+        self._waiting_on = ""
         self.policy = policy
         #: The policy's `send_limits`, applied to each pass on its own: a pass
         #: is a run, and "at most 5 likes" is a promise about one of them.
@@ -451,6 +478,12 @@ class Watch:
         self._spend: List[Tuple[float, float]] = []
         #: When the last pass finished. None until one has.
         self._last_pass_at: Optional[float] = None
+        #: When the watch last did anything with the phone: took it, or finished
+        #: a pass on it. What `let_go_after_s` is counted from.
+        self._active_at = self._now()
+        #: The `_active_at` the watch last let go after, so that a phone taken
+        #: back for a look that came to nothing is let go of again in silence.
+        self._let_go_after: Optional[float] = None
         #: When the last round finished, for the sweep: a pass of every policy
         #: there is -- which, for a watch of one, is every pass.
         self._last_round_at: Optional[float] = None
@@ -525,18 +558,26 @@ class Watch:
 
         while not self._stop:
             s = self.stats
-            if max_passes and s.passes + s.skipped + s.paused >= max_passes:
+            if max_passes and (s.passes + s.skipped + s.paused + s.waited
+                               >= max_passes):
                 return self.stats
 
             # -- is there anything to do? (no model call) ------------------
             try:
-                screen = self.dev.observe()
+                screen = self._look()
             except (DeviceTimeout, DeviceLost) as exc:
                 consecutive_failures += 1
                 delay = self._backoff(consecutive_failures)
                 log.warning("probe failed (%s); retrying in %.0fs", exc, delay)
                 self.say(f"  device unreachable ({exc}); retrying in {delay:.0f}s")
-                self._sleep(delay)
+                self._idle(delay)
+                continue
+            if screen is None:
+                # Somebody else has the phone: this watch let go of it, and a
+                # run, a session or another watch took it. Nothing on it is this
+                # watch's to read until they are done with it.
+                self.stats.waited += 1
+                self._sleep(w.interval_s)
                 continue
 
             # Why a pass is owed, which with several policies says whose it is:
@@ -551,7 +592,7 @@ class Watch:
                         self.stats.skipped += 1
                         log.debug("resting on %s and nothing new; %.0fs left",
                                   screen.package, left)
-                        self._sleep(min(w.interval_s, left))
+                        self._idle(min(w.interval_s, left))
                         continue
                     log.debug("the rest is over; a pass runs whatever the "
                               "screen says")
@@ -559,7 +600,7 @@ class Watch:
                     self.stats.skipped += 1
                     log.debug("nothing new on %s; sleeping %.0fs",
                               screen.package, w.interval_s)
-                    self._sleep(w.interval_s)
+                    self._idle(w.interval_s)
                     continue
                 else:
                     log.debug("nothing new on %s, but the %.0fs sweep is due",
@@ -567,6 +608,27 @@ class Watch:
                 why = "time"
             elif rest is not None or self.anchor.package:
                 why = "change"
+
+            if (not self._holding and self._spend_pause() <= 0
+                    and self._batch(order, why)):
+                # A pass is owed, and what said so was a look taken without the
+                # phone. Take it back, and look again with it held before
+                # deciding anything: the session wakes the screen, and a phone
+                # that had only gone to sleep is not a change worth a pass.
+                try:
+                    if not self._take_back():
+                        self.stats.waited += 1
+                        self._sleep(w.interval_s)
+                except (DeviceTimeout, DeviceLost) as exc:
+                    consecutive_failures += 1
+                    delay = self._backoff(consecutive_failures)
+                    log.warning("could not take the phone back (%s); retrying "
+                                "in %.0fs", exc, delay)
+                    self.say(f"  could not take the phone back ({exc}); "
+                             f"retrying in {delay:.0f}s")
+                    self._sleep(delay)
+                continue
+
             if why == "change" and rest is not None:
                 # The screen changed while the watch rested. The app said there
                 # was nothing to do *on that screen*; whatever it has written
@@ -595,7 +657,7 @@ class Watch:
                 self.say(f"  hourly spend ceiling reached; pausing {paused:.0f}s")
                 log.warning("rolling spend ceiling ($%.2f/h) reached; pausing "
                             "%.0fs", w.max_usd_per_hour, paused)
-                self._sleep(paused)
+                self._idle(paused)
                 continue
 
             batch = self._batch(order, why)
@@ -603,7 +665,7 @@ class Watch:
                 # Every policy is sitting out on a rule of its own. Nothing is
                 # owed until the first of those rests is over.
                 self.stats.skipped += 1
-                self._sleep(w.interval_s)
+                self._idle(w.interval_s)
                 continue
 
             # -- the bounded passes it owes --------------------------------
@@ -617,7 +679,7 @@ class Watch:
                 # Set for a failed pass too: the sweep says how often to *try*,
                 # and a pass that failed already has the backoff deciding when
                 # to try next.
-                self._last_pass_at = self._now()
+                self._last_pass_at = self._active_at = self._now()
                 self._front = i
                 if n < len(batch) - 1:
                     self._between(order[i], i, outcome)
@@ -662,7 +724,7 @@ class Watch:
                 log.info("%r is on screen after pass %d; resting %.0fs, or "
                          "until the screen changes", rule.phrase,
                          self.stats.passes, rule.seconds)
-                self._sleep(min(w.interval_s, rule.seconds))
+                self._idle(min(w.interval_s, rule.seconds))
                 continue
 
             if outcome in ("success", "needs_user"):
@@ -686,7 +748,7 @@ class Watch:
                     # a human. Said loudly because nobody is watching the log.
                     self.say("  a pass stopped and asked for a human; "
                              "continuing to watch")
-                self._sleep(w.interval_s)
+                self._idle(w.interval_s)
             else:
                 consecutive_failures += 1
                 self.stats.failures += 1
@@ -699,9 +761,123 @@ class Watch:
                 # the screen somewhere unknown, and an anchor pointing at it would
                 # make the next probe skip work it needs to do.
                 self.anchor = Anchor()
-                self._sleep(delay)
+                self._idle(delay)
 
         return self.stats
+
+    # -- holding the phone, and letting go of it --------------------------
+
+    def _look(self) -> Optional[Screen]:
+        """The screen as it is now, or None while somebody else has the phone.
+
+        Read in the device session while the watch holds the phone. After it
+        has let go, read with the lock taken for that moment only and the phone
+        left as it is (`Device.peek`): nobody else is driving while it looks,
+        and nobody finds the animations and the rotation lock switched under
+        them because a watch wanted to see whether anything had changed.
+        """
+        if self._holding:
+            return self.dev.observe()
+        try:
+            self.lock.acquire(looking=True)
+        except PhoneBusy as exc:
+            self._wait_for(str(exc))
+            return None
+        try:
+            screen = self.dev.peek()
+        except (DeviceTimeout, DeviceLost):
+            raise
+        except Exception as exc:  # noqa: BLE001 -- a phone that went away
+            raise DeviceLost(f"could not look at the screen: {exc}") from exc
+        finally:
+            self.lock.release()
+        self._wait_for("")
+        return screen
+
+    def _take_back(self) -> bool:
+        """Take the phone back for a pass. False while somebody else has it.
+
+        Raises `DeviceLost` or `DeviceTimeout` when the lock was free but the
+        phone would not open, having let go of the lock again.
+        """
+        try:
+            self.lock.acquire()
+        except PhoneBusy as exc:
+            self._wait_for(str(exc))
+            return False
+        try:
+            self.dev.open()
+        except (DeviceTimeout, DeviceLost):
+            self.lock.release()
+            raise
+        except Exception as exc:  # noqa: BLE001 -- a phone that went away
+            self.lock.release()
+            raise DeviceLost(f"could not open the phone: {exc}") from exc
+        except BaseException:
+            self.lock.release()
+            raise
+        self._holding = True
+        self._wait_for("")
+        log.info("took the phone back")
+        return True
+
+    def _let_go(self, idle: float) -> None:
+        """Close the device session, then let go of the lock.
+
+        In that order: closing puts back the animations, the rotation, the
+        keyboard and the screen timeout, and that has to happen while nobody
+        else can have started driving.
+        """
+        try:
+            self.dev.close()
+        finally:
+            self.lock.release()
+            self._holding = False
+        if self._let_go_after == self._active_at:
+            # Taken back for a look that came to nothing -- a screen that had
+            # only gone to sleep -- and let go again. Said already.
+            log.debug("let go of the phone again; still nothing to do")
+            return
+        self._let_go_after = self._active_at
+        self.stats.let_go += 1
+        self.say(f"  nothing to do for {idle / 60:.0f} min: let go of the phone "
+                 f"so others can use it; still looking every "
+                 f"{_duration(self.cfg.watch.interval_s)}")
+        log.info("let go of the phone after %.0fs without a pass", idle)
+
+    def _idle(self, seconds: float) -> None:
+        """Sleep with nothing to do, letting go of the phone on the way.
+
+        Once `device.let_go_after_s` has gone by since the watch last did
+        anything with the phone, it lets go of it -- at that moment, even in the
+        middle of this sleep: a backoff or a spend pause can be far longer than
+        the threshold, and the phone would otherwise stay held through all of it.
+        """
+        after = self.cfg.device.let_go_after_s
+        if self.lock is not None and self._holding and after > 0:
+            due = self._active_at + after - self._now()
+            if due <= 0:
+                self._let_go(self._now() - self._active_at)
+            elif due < seconds:
+                self._sleep(due)
+                seconds -= due
+                self._let_go(self._now() - self._active_at)
+        self._sleep(seconds)
+
+    def _wait_for(self, who: str) -> None:
+        """Say once that somebody else has the phone, and once that they are done.
+
+        Not every interval: a session can have the phone for twenty minutes,
+        and a line every 45 seconds saying so would bury everything else.
+        """
+        if who == self._waiting_on:
+            return
+        if who:
+            self.say(f"  the phone is in use -- {who}; waiting for it")
+            log.info("waiting for the phone: %s", who)
+        elif self._waiting_on:
+            self.say("  the phone is free again")
+        self._waiting_on = who
 
     # -- one pass ----------------------------------------------------------
 
@@ -871,6 +1047,10 @@ class Watch:
             bits.append(f"{s.snoozed} rested")
         if s.woken:
             bits.append(f"{s.woken} woken")
+        if s.let_go:
+            bits.append(f"let go {s.let_go}x")
+        if s.waited:
+            bits.append(f"{s.waited} waited for the phone")
         bits += [f"{s.failures} failed", f"${s.usd:.4f}",
                  f"up {s.uptime_s / 3600:.1f}h"]
         return ", ".join(bits)

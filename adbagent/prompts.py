@@ -86,6 +86,11 @@ Several taps of menu-hunting in one action.
 - get_clipboard   read text currently stored in device clipboard.
 - set_clipboard   copy text into device clipboard. Give text in `text`.
 - wait, sleep      pause execution or wait for a slow screen to load. Supports optional `duration` (seconds, default 1.0), `wait_for_text`, and `timeout` (seconds) to wait dynamically until text appears.
+- notify          send the phone's owner a notification on their own phone, \
+ONLY when the goal or the policy asks for one. `text` holds it -- several go on \
+separate lines. Nothing on screen changes. Each line reaches the owner once: one \
+sent before, on this run or an earlier one, is skipped, so notify whenever the \
+policy says to without trying to remember what was already sent.
 - ask_user        stop and ask the person for something only they can supply.
 - done            the goal is achieved. Say how you know, in `text`.
 - fail            the goal cannot be achieved. Say why, in `text`.

@@ -720,6 +720,25 @@ function foldEvent(ev, feed) {
       chip(GRADE_CLASSES[ev.grade] || "failed", ev.grade || "?"));
     if (ev.reason) setLine(node.verdict, ev.reason);
 
+  } else if (kind === "notify") {
+    // A notify step is graded by this event rather than by a `verify`: nothing
+    // on the phone was touched, so there was nothing to verify. Folded into
+    // the row the same way, with what reached the owner as the verdict --
+    // the lines themselves, since those are what a reader wants to see.
+    const node = stepFor(feed, ev);
+    if (!node) return;
+    const delivered = (ev.caught_up || []).concat(ev.sent || []);
+    const cls = delivered.length || ((ev.repeats || []).length && !(ev.kept || []).length)
+      ? "worked" : "no_change";
+    node.chips.insertAdjacentHTML("afterbegin", chip(cls, ev.grade || "notify"));
+    setLine(node.verdict, ev.summary || "");
+    for (const line of delivered) {
+      const div = document.createElement("div");
+      div.className = "why";
+      div.textContent = `→ ${line}`;
+      node.more.appendChild(div);
+    }
+
   } else if (kind === "judge") {
     const node = stepFor(feed, ev);
     if (!node) return;
@@ -3365,6 +3384,8 @@ const CFG_SPEC = [
       help: "Restored when the run ends." }],
     ["disable_auto_rotate", "bool", { label: "Lock rotation during a run",
       help: "Restored when the run ends." }],
+    ["let_go_after_s", "number", { label: "Let go of an idle phone after (s)",
+      help: "A watch with no pass, or an MCP session with no call from its driver, for this long closes its device session and releases the phone so other runs, sessions and watches can use it — and takes it back when it next needs it, if it is free. 0 keeps the phone for as long as it runs." }],
   ]],
   ["safety", [
     ["budget_usd", "number", { label: "Budget ceiling ($)",
@@ -3442,6 +3463,15 @@ const CFG_SPEC = [
   // A `memory` section held `db`, the SQLite file of what the agent remembered
   // about screens between runs. Nothing reads a database now: what one run
   // learns reaches the next through its app skill and its recorded events.
+  //
+  // Where the `notify` action delivers. What is worth a notification is the
+  // policy's business; this only says where one goes.
+  ["notify", [
+    ["telegram_token", "password", { label: "Telegram bot token",
+      help: "From @BotFather. Written to config.json, which is gitignored. Blank keeps what is stored; $TELEGRAM_BOT_TOKEN is read when none is." }],
+    ["telegram_chat_id", "text", { label: "Telegram chat id",
+      help: "The chat the bot writes to — your own, after you have started a chat with the bot. $TELEGRAM_CHAT_ID is read when none is set. With no bot or no chat, a notify sends nothing." }],
+  ]],
 ];
 
 /* The handful anyone actually sets, in the order they get set in. Everything
@@ -3456,7 +3486,7 @@ const CFG_TIER1 = [
 /* Section names as a person would say them. */
 const CFG_SECTIONS = {
   llm: "Model & API", device: "Phone", safety: "Safety", run: "Run behaviour",
-  skills: "App skills", watch: "Watch",
+  skills: "App skills", watch: "Watch", notify: "Notifications",
 };
 
 /* The value of the "custom…" option, chosen so no model id can be it. Not a NUL

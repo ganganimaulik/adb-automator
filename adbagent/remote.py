@@ -28,6 +28,13 @@ the way a watch of several goes round them. Each pass is a run of its own, in
 its own `runs/<id>/`, under its own goal, instructions and caps; the phone and
 its lock are held across all of them. The driver ends each with `end`, and the
 answer to that call is the next one's first screen.
+
+A driver that goes quiet does not keep the phone from everyone else. After
+`device.let_go_after_s` without a call the session closes its device session
+and lets go of the lock -- a driver reading code, thinking, or gone, is not using
+the phone, and a run, a watch or another session may want it -- and its next
+call takes the phone back, if nobody else has it by then. Only
+`idle_timeout_s` without any call at all ends the session.
 """
 
 from __future__ import annotations
@@ -46,8 +53,9 @@ from . import conversation, prompts, runlog
 from .actions import POINT_ACTIONS, AgentAction
 from .agent import Agent, Recorder, RunState
 from .config import Config
+from .device import DeviceLost, DeviceTimeout
 from .llm import ScreenAnalysis
-from .phonelock import PhoneLock
+from .phonelock import PhoneBusy, PhoneLock
 from .safety import Aborted
 from .screen import Screen
 from .watch import screen_digest
@@ -124,6 +132,10 @@ class Turn:
     leg_name: str = ""
     #: The session's id, on the first turn only: every later call names it.
     session: str = ""
+    #: Why the call this answers could not be served at all: the session had
+    #: let go of the phone, and somebody else has it now. Nothing was done, so
+    #: it never stands as the session's last turn -- `Session` raises it instead.
+    refused: str = ""
 
     def render(self) -> str:
         """The turn as text, in the order the loop's own prompt puts it."""
@@ -226,6 +238,26 @@ def _covered_steps(lines: Sequence[str]) -> set:
     return steps
 
 
+def _needs_phone(message: tuple) -> bool:
+    """Whether the driver's message can only be acted on with the phone held.
+
+    Ending needs none: `done`, `fail` and `ask_user` are answers, not acts on
+    the phone, and a session being closed is the opposite of wanting it.
+    """
+    if message[0] == "abort":
+        return False
+    if message[0] == "act":
+        return not message[1].is_terminal
+    return True
+
+
+def _minutes(seconds: float) -> str:
+    minutes = round(seconds / 60)
+    if minutes < 1:
+        return f"{seconds:.0f} seconds"
+    return f"{minutes} minute" + ("s" if minutes != 1 else "")
+
+
 class RemoteAgent(Agent):
     """An `Agent` whose decisions and approvals come through two queues."""
 
@@ -234,7 +266,9 @@ class RemoteAgent(Agent):
                  idle_timeout_s: float = IDLE_TIMEOUT_S, policy: str = "",
                  send_limits: Optional[Dict[str, int]] = None,
                  leg: int = 0, legs: int = 0, leg_name: str = "",
-                 intro: Sequence[str] = ()):
+                 intro: Sequence[str] = (),
+                 lock: Optional[PhoneLock] = None,
+                 let_go_after_s: float = 0.0):
         super().__init__(dev, None, cfg, on_event=self._heard, policy=policy,
                          send_limits=send_limits)
         self._inbox = inbox
@@ -246,6 +280,23 @@ class RemoteAgent(Agent):
         #: previous policy's pass ended, when this run follows one.
         self._intro = list(intro)
         self.idle_timeout_s = idle_timeout_s
+        #: The session's lock on the phone, and how long the driver may say
+        #: nothing before it is let go of. Without a lock the phone is kept.
+        self.lock = lock
+        self.let_go_after_s = let_go_after_s
+        #: Set while the phone is let go of: device session closed, lock
+        #: released, until the driver's next call takes them back.
+        self._let_go = False
+        #: How long the driver had been quiet when the phone was let go of.
+        self._let_go_idle = 0.0
+        #: Set when a call took the phone back, until that call has checked the
+        #: screen it was made against is still there.
+        self._retaken = False
+        #: The screen the turn waiting on the driver was built from.
+        self._on_screen: Optional[Screen] = None
+        #: Lines owed to the driver at the head of the next turn.
+        self._news: List[str] = []
+        self._rec: Optional[Recorder] = None
         self._state: Optional[RunState] = None
         self._last_turn = Turn()
         self._seen = 0
@@ -270,16 +321,26 @@ class RemoteAgent(Agent):
 
     def _loop(self, state: RunState, rec: Recorder) -> None:
         self._state = state
+        self._rec = rec
         super()._loop(state, rec)
 
     def _decide(self, state: RunState, rec: Recorder, screen: Screen,
                 **kwargs: Any) -> Optional[AgentAction]:
         turn = self._turn(state, screen, kwargs)
+        self._on_screen = screen
         self._post(turn)
         while True:
             message = self._next(state)
             kind = message[0]
+            retaken, self._retaken = self._retaken, False
             if kind == "act":
+                if retaken and self._moved(screen):
+                    # Its target was read off a screen that has gone since:
+                    # whoever had the phone meanwhile left it somewhere else.
+                    self._news.append("the screen changed while the session "
+                                      "did not have the phone, so that was "
+                                      "not done; this is the screen now")
+                    return None
                 return message[1]
             if kind == "look":
                 if self._moved(screen):
@@ -367,16 +428,101 @@ class RemoteAgent(Agent):
         Given back through `paused_s`, as a hold from the web UI is: the
         wall-clock budget bounds how long the run spends *working*, and a driver
         reading, thinking or asking its person is not the run working.
+
+        Nor is it using the phone. Once the driver has said nothing for
+        `let_go_after_s` the phone is let go of (`_let_go_of_phone`), and the
+        next message that needs it takes it back first. When somebody else has
+        it by then, that call is answered with who, nothing is done, and the
+        wait goes on: the driver is still there, and may try again.
         """
-        waited_from = time.monotonic()
+        began = time.monotonic()
         try:
-            return self._inbox.get(timeout=self.idle_timeout_s)
+            quiet_since = began
+            while True:
+                message = self._wait(state, quiet_since)
+                if not self._let_go or not _needs_phone(message):
+                    return message
+                busy = self._take_back(state)
+                if not busy:
+                    return message
+                self._post(replace(self._last_turn, refused=busy, happened=[],
+                                   skill="", screenshot=None))
+                quiet_since = time.monotonic()
+        finally:
+            state.paused_s += time.monotonic() - began
+
+    def _wait(self, state: RunState, quiet_since: float) -> tuple:
+        """The next message, letting go of the phone if it is slow to come."""
+        ends = quiet_since + self.idle_timeout_s
+        if (self.lock is not None and self.let_go_after_s > 0
+                and not self._let_go and not self._released
+                and quiet_since + self.let_go_after_s < ends):
+            # Not while the person has the phone (`release`): the lock is what
+            # keeps anything else from driving it under them.
+            try:
+                return self._inbox.get(timeout=max(
+                    0.0, quiet_since + self.let_go_after_s - time.monotonic()))
+            except queue.Empty:
+                self._let_go_of_phone(state, time.monotonic() - quiet_since)
+        try:
+            return self._inbox.get(timeout=max(0.0, ends - time.monotonic()))
         except queue.Empty:
             raise self._abort(
                 f"no instruction for {self.idle_timeout_s / 60:.0f} minutes; "
                 f"the session ended and the phone was handed back") from None
+
+    def _let_go_of_phone(self, state: RunState, idle: float) -> None:
+        """Close the device session, then let go of the lock.
+
+        In that order: closing puts back the animations, the rotation, the
+        keyboard and the screen timeout, and that has to happen while nobody
+        else can have started driving.
+        """
+        assert self.lock is not None
+        log.info("no call for %.0fs; letting go of the phone", idle)
+        try:
+            self.dev.close()
         finally:
-            state.paused_s += time.monotonic() - waited_from
+            self.lock.release()
+            self._let_go = True
+            self._let_go_idle = idle
+        if self._rec is not None:
+            self._rec.event("let_go", step=state.step, idle_s=round(idle, 1))
+
+    def _take_back(self, state: RunState) -> str:
+        """Take the phone back for the call in hand: "" when it is held again,
+        or what to tell the driver when somebody else has it."""
+        assert self.lock is not None
+        quiet = _minutes(self._let_go_idle)
+        try:
+            self.lock.acquire()
+        except PhoneBusy as exc:
+            return (f"the phone is in use -- {exc}. This session let go of it "
+                    f"after {quiet} without a call, so that others could use "
+                    f"it, and takes it back on your next call once it is free. "
+                    f"Nothing was done. Try again in a while, or end_session.")
+        try:
+            self.dev.open()
+        except (DeviceLost, DeviceTimeout):
+            self.lock.release()
+            raise
+        except Exception as exc:  # noqa: BLE001 -- the phone went away
+            self.lock.release()
+            raise DeviceLost(f"could not take the phone back: {exc}") from exc
+        except BaseException:
+            self.lock.release()
+            raise
+        self._let_go = False
+        self._retaken = True
+        log.info("took the phone back after %.0fs without a call",
+                 self._let_go_idle)
+        # Not a history line: those are numbered by step, and a batch keeps
+        # only the last line of each step -- which would be the action's.
+        self._news.append(f"after {quiet} without a call the session had let "
+                          f"go of the phone; it took it back for this call")
+        if self._rec is not None:
+            self._rec.event("taken_back", step=state.step)
+        return ""
 
     def _abort(self, reason: str) -> Aborted:
         self.abort_reason = reason
@@ -392,11 +538,24 @@ class RemoteAgent(Agent):
         while True:
             message = self._next(state)
             kind_ = message[0]
+            retaken, self._retaken = self._retaken, False
+            moved = (retaken and self._on_screen is not None
+                     and self._moved(self._on_screen))
             if kind_ == "answer" and message[1] == approval.id:
+                if moved and message[2]:
+                    # What was approved was asked about on a screen that has
+                    # gone; doing it now would do it to whatever is there.
+                    self._news.append("the screen changed while the session "
+                                      "did not have the phone, so what was "
+                                      "approved was not done; this is the "
+                                      "screen now")
+                    return False
                 return bool(message[2])
             if kind_ == "look":
-                self._post(replace(self._last_turn, happened=[],
-                                   screenshot=self._shot()))
+                self._post(replace(self._last_turn, happened=(
+                    ["the screen changed while the session did not have the "
+                     "phone; this picture is of the phone as it is now"]
+                    if moved else []), screenshot=self._shot()))
             elif kind_ == "abort":
                 raise self._abort(message[1])
             else:
@@ -479,6 +638,13 @@ class RemoteAgent(Agent):
                             "it now")
             if screenshot is None:
                 screenshot = self._shot()
+        if self._news:
+            # The session let go of the phone and took it back: whatever is
+            # on it now may be somebody else's doing, so it comes with a frame.
+            happened += self._news
+            self._news = []
+            if screenshot is None:
+                screenshot = self._shot()
         goal = policy = ""
         if not self._briefed:
             self._briefed = True
@@ -526,9 +692,14 @@ class Session:
                  driver: str = "", idle_timeout_s: float = IDLE_TIMEOUT_S,
                  policy: str = "",
                  send_limits: Optional[Dict[str, int]] = None,
-                 legs: Sequence[Leg] = ()):
+                 legs: Sequence[Leg] = (),
+                 let_go_after_s: Optional[float] = None):
         self.cfg = remote_config(cfg)
         self.driver = driver
+        #: How long the driver may say nothing before the session lets go of
+        #: the phone for others to use (`RemoteAgent._next`). 0 keeps it.
+        self.let_go_after_s = (self.cfg.device.let_go_after_s
+                               if let_go_after_s is None else let_go_after_s)
         #: Several policies' passes to work through in turn, each a run of its
         #: own. Empty for a session of one, which `policy` and `send_limits`
         #: describe -- as do the first leg's, for a session of several.
@@ -568,6 +739,12 @@ class Session:
         if self._thread is None or (self._last and self._last.outcome):
             return False
         return self._thread.is_alive()
+
+    @property
+    def holds_phone(self) -> bool:
+        """Whether the phone is this session's right now -- false once it has
+        let go of it, until its driver's next call takes it back."""
+        return self.lock.held
 
     @property
     def pending(self) -> Optional[Approval]:
@@ -725,9 +902,11 @@ class Session:
             log.error("the session did not stop within %ds", ANSWER_TIMEOUT_S)
         while True:
             try:
-                self._last = self._outbox.get_nowait()
+                turn = self._outbox.get_nowait()
             except queue.Empty:
                 break
+            if not turn.refused:
+                self._last = turn
 
     # -- internals -------------------------------------------------------------
 
@@ -749,6 +928,10 @@ class Session:
         except queue.Empty:
             raise SessionError("the phone did not answer; the session is "
                                "stuck") from None
+        if turn.refused:
+            # Somebody else has the phone this session let go of. Nothing was
+            # done, so the last turn the driver was given still stands.
+            raise SessionError(turn.refused)
         self._last = turn
         return turn
 
@@ -789,6 +972,28 @@ class Session:
                     f"ran out")
         return agent.last_warning or state.last_failure
 
+    def _hold_phone(self, dev: Any) -> str:
+        """Have the phone for the next policy's pass: "" once it is held, or why
+        that pass cannot run.
+
+        A pass can end without the phone: a driver that went quiet long enough
+        for the session to let go of it, and then ended the pass, never needed
+        it back. The next one does.
+        """
+        if self.lock.held:
+            return ""
+        try:
+            self.lock.acquire()
+        except PhoneBusy as exc:
+            return (f"the session had let go of the phone, and when their turn "
+                    f"came it was in use -- {exc}")
+        try:
+            dev.open()
+        except BaseException:
+            self.lock.release()
+            raise
+        return ""
+
     def _run(self, goal: str) -> None:
         """The run, or the runs: one pass per policy, in turn, on one device.
 
@@ -817,7 +1022,9 @@ class Session:
                                     policy=leg.policy,
                                     send_limits=leg.send_limits,
                                     leg=n if total else 0, legs=total,
-                                    leg_name=leg.name, intro=intro)
+                                    leg_name=leg.name, intro=intro,
+                                    lock=self.lock,
+                                    let_go_after_s=self.let_go_after_s)
                 agent._advised = advised
                 outcome, state = agent.run(leg.goal)
                 final = Turn(outcome=outcome, step=state.step,
@@ -837,7 +1044,7 @@ class Session:
                 why_not = ("" if not rest
                            else "the session ended" if outcome == "aborted"
                            else "end_session skipped them" if self._skip_rest
-                           else "")
+                           else self._hold_phone(dev))
                 if not rest or why_not:
                     if rest:
                         recap.append(f"not run: "
@@ -854,7 +1061,10 @@ class Session:
             final = Turn(outcome="aborted",
                          evidence=f"{type(exc).__name__}: {exc}")
         finally:
-            if dev is not None:
+            # Only while the session has the phone. Once it has let go, its
+            # device session is closed already, and nothing here may touch a
+            # phone somebody else may be driving now.
+            if dev is not None and self.lock.held:
                 try:
                     dev.close()
                 except Exception:  # noqa: BLE001 - teardown logs its own

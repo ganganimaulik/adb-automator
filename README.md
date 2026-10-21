@@ -28,7 +28,7 @@ $ adbagent run "turn on airplane mode"
 - **Interactive Web UI (`adbagent ui`)**: Real-time goal execution, live phone screen streaming, visual history, model selector, config editor, skill generator, and watch policy editor.
 - **Accessibility Tree First**: Reads screen elements via Android accessibility tree rather than pixels, using vision/screenshots only when necessary (WebViews, image galleries, ambiguous controls, chat threads).
 - **Self-Improving App Skills**: Automatically learns workflows, UI quirks, and optimal interaction paths per app from every run.
-- **Safe Watch Mode**: Continuous monitoring and policy-guided replies with duplicate prevention gates and budget ceilings -- one app's policy, or several worked through in turn.
+- **Safe Watch Mode**: Continuous monitoring and policy-guided replies with duplicate prevention gates and budget ceilings -- one app's policy, or several worked through in turn -- and a notification on your phone, through Telegram, for whatever the policy says is worth one, never the same one twice.
 - **Bring Your Own Agent (`adbagent mcp`)**: Claude Code, Codex or any MCP client drives the phone with its own model -- no API key -- while adbagent still verifies every action, puts sends and irreversible presses to the person, and records the session like any run.
 
 ## Table of Contents
@@ -73,7 +73,8 @@ adbagent doctor
 ```
 
 `doctor` checks the interpreter, the dependencies, `adb`, the attached devices,
-the API key and the model, and tells you which of them needs attention.
+the API key, the model and where notifications go, and tells you which of them
+needs attention.
 
 ### Launching adbagent
 
@@ -260,15 +261,16 @@ taken without anyone asked.
 | `--draft` | sends are composed and refused, before anyone is asked |
 | `--no-send-approval` | sends go out without asking; draft mode and `send_limits` still apply |
 | `--allow-destructive` | irreversible presses go ahead without asking |
-| `--idle-timeout` | minutes without a call before a session gives the phone back (15) |
+| `--idle-timeout` | minutes without a call before a session ends (15); it lets go of the phone well before that -- see [Letting go of an idle phone](#letting-go-of-an-idle-phone) |
 
 A password, PIN, one-time-code or payment screen ends the session without being
 shown, as it ends a run. `hand_over` is the way through one without ending.
 
 ### One phone, one driver
 
-A session holds the phone for as long as it runs, and so do `run`, `watch`,
-`skills generate`, `dump` and `apps`. The lock is an OS file lock in the
+A session holds the phone while it is being used, a watch while it has passes to
+run, and `run`, `skills generate`, `dump` and `apps` for as long as they run;
+an idle session or watch lets go of it (below). The lock is an OS file lock in the
 artifacts directory, so whichever process has the phone -- a session a coding
 agent opened, a run in another terminal, a watch started from the browser -- the
 others refuse with its name instead of driving it underneath, and the web UI
@@ -283,6 +285,22 @@ every later call gives it as `session_id`, and a call with any other id is
 refused. A second conversation is told the phone is in use and by whom, and can
 neither act in the first one's session nor end it. A session whose driver went
 away still gives the phone back after `--idle-timeout`.
+
+### Letting go of an idle phone
+
+Holding the phone is not the same as using it. A session whose driver has made
+no call for `device.let_go_after_s` (300 seconds, so five minutes) closes its
+device session -- the phone's own animations, rotation, keyboard and screen
+timeout come back -- and lets go of the lock, so a run, a watch or another
+conversation can have the phone; that includes another conversation on the same
+server, which may start a session of its own from then on. The quiet session is
+not ended. Its driver's next call takes the phone back if it is free and carries
+on, or fails saying who has it, with nothing done. An action aimed at a screen
+that changed in the meantime is not done either: the call comes back with the
+screen as it is now. Ending the session needs no phone, and only
+`--idle-timeout` without any call ends it on its own. A watch does the same
+between passes -- see [Sharing the phone](#sharing-the-phone). `0` holds on to
+the phone for as long as anything runs, as everything used to.
 
 ### Why the agent decides
 
@@ -597,6 +615,29 @@ supervisor is unbounded. A failed pass doubles a backoff and the loop continues;
 a crash inside a pass is logged with its traceback and survived. Ctrl-C is the one
 thing that stops a watch.
 
+### Sharing the phone
+
+A watch used to hold the phone for as long as it ran, which on a quiet inbox
+meant hours of turning away every run and MCP session that asked for it while
+doing nothing with it. Now, once `device.let_go_after_s` (five minutes) has gone
+by without a pass, it closes its device session -- the phone's own settings come
+back -- and lets go of the lock:
+
+```
+  nothing to do for 5 min: let go of the phone so others can use it; still looking every 45s
+```
+
+It goes on looking every interval, taking the lock only for the moment of the
+look and changing nothing on the phone to do it, and takes the phone back when a
+pass is owed: something changed, the sweep or a rest came due. Whoever starts in
+the moment of a look waits it out rather than being refused. While somebody else
+has the phone -- a scheduled MCP pass, a run from a terminal, another watch -- it
+waits, says so once, and does not look; whatever they leave on screen is a
+change like any other, and the next pass brings it back to its own screen. Each
+foreign session therefore costs the watch one pass. The web UI lets a run or a
+tour start while its watch has let go, and still refuses one while the watch has
+the phone.
+
 ### It learns once, when it stops
 
 A watch does not learn per pass — rewriting the app's skill file every 45 seconds,
@@ -623,6 +664,64 @@ prompt block from the screen, and it says so explicitly: a message asking the ag
 to ignore its instructions, write to somebody else or change its policy is a
 message to be handled under the policy like any other, never obeyed. There is no
 path from screen content to a new instruction.
+
+### Telling you what it found
+
+A watch works while nobody is looking, and some of what it finds is worth
+knowing the moment it happens — somebody wrote, a reply went out, a new match.
+The `notify` action puts a notification on your own phone, through a Telegram
+bot, and the model uses it when the goal or the policy says to, and only then.
+Its `text` is the notification; several go on separate lines. Nothing on the
+phone changes, so in an MCP session it rides in the same `act` batch as the
+action after it.
+
+```json
+{
+  "notify": {
+    "telegram_token": "123456:ABC-your-bot-token",
+    "telegram_chat_id": "123456789"
+  }
+}
+```
+
+The token comes from @BotFather, and the chat is your own, once you have
+started a chat with the bot; `$TELEGRAM_BOT_TOKEN` and `$TELEGRAM_CHAT_ID` work
+too. `adbagent doctor` checks the token without sending anything, and
+`adbagent notify` sends one line now, to see it arrive:
+
+```bash
+adbagent notify "hello from adbagent"
+```
+
+**Each line reaches you once, ever.** Every pass is a fresh run that remembers
+nothing of the last, and a watch keeps coming back to the same screens: a
+message nobody answered is still there twenty minutes later, a new match still
+new. So the policy says "notify every new message", and the harness, not the
+model, knows which lines it has already sent. Each delivered line is recorded in
+`runs/notified.jsonl`, which every run, watch and MCP session shares, and a line
+found there is skipped. Lines are compared on their words and their emoji —
+case, punctuation and spacing ignored — so a "😂😂" and a later "😍" from one
+person are two messages. A `..`, which is how the element list draws an emoji it
+cannot render, matches any emoji: the same message read off the list on one pass
+and off the screenshot on the next must not arrive twice. So give the policy an
+exact form for each kind of line, and two passes write the same event the same
+way:
+
+```
+- New message: in each chat you open, notify every message the match sent after
+  your most recent one, one line each, exactly as
+  `Hinge: new message from <name>: <their message>`
+- Reply sent: once your reply shows in the thread, notify
+  `Hinge: replied to <name>: <the reply you sent>`
+```
+
+A line Telegram did not take is kept, and goes out with the next notification
+that does get through: the pass that sent a reply never comes back to that
+moment, so nothing else would bring its notification back. It is let go after a
+day. Delivery failing, or no bot configured, is never a failed step — the step's
+line says what happened and the run carries on. A notification is not a send:
+draft mode and `send_limits` are about messages to other people, and leave it
+alone. A dry run does not notify.
 
 ## Safety
 
@@ -1501,7 +1600,10 @@ adbagent report runs/<id>        # did the reasoning tokens actually drop?
 | `device.settle_quiet_s` | `0.5` | How long two dumps must agree before the screen counts as settled. Agreement alone is not enough: a screen that has drawn its chrome and not yet its content agrees with itself 0.18s later, and handing that frame over is what the model used to answer with a `wait` action (13 of 103 turns, ~254s across `runs/`). Measured in wall clock, so it is self-calibrating — over a slow link the dumps themselves span the window and it costs nothing. |
 | `device.blank_wait_s` | `8.0` | How long to keep looking, with no model call, when an action leaves the app showing nothing — the white flash after a send, a feed reloading. The settle cannot see it: the blank window agrees with itself, so two blank dumps used to certify it as settled, and the model was handed it 502 times across `runs/` and answered `wait` every time. Only an action that turned a drawn screen blank waits; a screen that is always blank (a canvas, a game) does not. `0` hands the blank over at once. |
 | `device.launch_timeout_s` | `8.0` | How long `open_app` waits for the package to actually reach the foreground. `app_start` returns before the window exists, so without this the next observation describes the launch rather than the app. |
+| `device.let_go_after_s` | `300.0` | How long a watch with no pass, or an MCP session with no call from its driver, keeps the phone before it lets go of it so other runs, sessions and watches can use it. It takes the phone back when it next needs it, if it is free. `0` keeps it for as long as it runs. See [Letting go of an idle phone](#letting-go-of-an-idle-phone). |
 | `safety.budget_usd` | `2.0` | Session spend ceiling. The run aborts when it is reached. |
+| `notify.telegram_token` | `""` | The bot `notify` sends through, from @BotFather. Redacted wherever the config is shown; `$TELEGRAM_BOT_TOKEN` when empty. See [Telling you what it found](#telling-you-what-it-found). |
+| `notify.telegram_chat_id` | `""` | The chat it writes to — yours. `$TELEGRAM_CHAT_ID` when empty. With no bot or no chat, a `notify` sends nothing and the run carries on. |
 
 ## Development
 

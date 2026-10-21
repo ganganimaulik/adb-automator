@@ -67,6 +67,12 @@ def shot_name(step: int, purpose: str, data: bytes) -> str:
 #: the name is ours before it opens anything.
 SHOT_RE = re.compile(r"step_\d{3,}_[a-z0-9_]+_[0-9a-f]{8}\.jpg")
 
+#: The environment variable the web UI sets on each child it starts, to an id of
+#: that launch. A run records it in its `run_start` -- as "" when nothing set it
+#: -- so the UI can tell its own child's runs from whatever else writes into
+#: `runs/`: a watch shares the phone, and so the directory, once it has let go.
+LAUNCH_ENV = "ADBAGENT_LAUNCH_ID"
+
 #: The logger every module in the package hangs off.
 ROOT = "adbagent"
 

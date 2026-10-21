@@ -5,7 +5,8 @@ Precedence, lowest to highest: built-in defaults < environment < config.json < C
 The API key may be set in config.json (``llm.api_key``) or read from the
 environment variable named by ``llm.api_key_env``. config.json is gitignored,
 so the key is safe there; the env var remains as a fallback. The key is redacted
-in ``to_dict()`` so it can never leak into a run artifact or the web UI.
+in ``to_dict()`` so it can never leak into a run artifact or the web UI -- and so
+is every other entry in `SECRETS`.
 """
 
 from __future__ import annotations
@@ -17,6 +18,15 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 DEFAULT_CONFIG_NAMES = ("config.json", "adbagent.json")
+
+#: Settings that are credentials: shown as "***" by `Config.to_dict`, and never
+#: written back when that marker is what comes back from the web UI.
+SECRETS = (("llm", "api_key"), ("notify", "telegram_token"))
+
+#: Where `notify` looks when config.json names no bot or no chat. The names the
+#: owner's other Telegram tooling already reads, so one environment serves both.
+TELEGRAM_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
+TELEGRAM_CHAT_ENV = "TELEGRAM_CHAT_ID"
 
 
 def same_model(a: str, b: str) -> bool:
@@ -230,6 +240,14 @@ class DeviceConfig:
     disable_animations: bool = True
     #: Disable auto-rotate and force portrait mode for the duration of the run (restored on exit).
     disable_auto_rotate: bool = True
+    #: How long whatever holds the phone may go without acting on it before it
+    #: lets go, so that a run, another MCP session or another watch can have it.
+    #: A watch counts from its last pass and an MCP session from its driver's
+    #: last call; either one closes its device session -- putting the phone's
+    #: own settings back -- releases the lock (`phonelock`), and takes the phone
+    #: back when it next has something to do, if nobody else has it then. 0
+    #: holds on to it for as long as it runs, as everything used to.
+    let_go_after_s: float = 300.0
 
 
 @dataclass
@@ -401,6 +419,25 @@ class SkillsConfig:
 
 
 @dataclass
+class NotifyConfig:
+    """Where the `notify` action delivers: the owner's own Telegram chat, by bot.
+
+    What is worth a notification is the policy's business; this only says where
+    one goes. With no bot or no chat -- here or in the environment, see
+    `TELEGRAM_TOKEN_ENV` -- a `notify` sends nothing and says so, and the run
+    carries on.
+    """
+
+    #: The bot's token, from @BotFather. config.json is gitignored, so it is safe
+    #: here, and `Config.to_dict` redacts it like the API key. Kept out of the
+    #: repr too: a traceback or a failed assertion prints the whole config.
+    telegram_token: str = field(default="", repr=False)
+    #: The chat the bot writes to: the owner's own, as the number Telegram gives
+    #: it. The bot can only write to someone who has started a chat with it.
+    telegram_chat_id: str = ""
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     device: DeviceConfig = field(default_factory=DeviceConfig)
@@ -408,6 +445,7 @@ class Config:
     run: RunConfig = field(default_factory=RunConfig)
     skills: SkillsConfig = field(default_factory=SkillsConfig)
     watch: WatchConfig = field(default_factory=WatchConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
 
     # -- derived -----------------------------------------------------------
     #
@@ -419,10 +457,19 @@ class Config:
     def api_key(self) -> str:
         return self.llm.api_key or os.environ.get(self.llm.api_key_env, "")
 
+    def telegram_token(self) -> str:
+        return (self.notify.telegram_token
+                or os.environ.get(TELEGRAM_TOKEN_ENV, "")).strip()
+
+    def telegram_chat_id(self) -> str:
+        return (str(self.notify.telegram_chat_id or "")
+                or os.environ.get(TELEGRAM_CHAT_ENV, "")).strip()
+
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        # Never leak the key through the config dict (used by the web UI).
-        d["llm"]["api_key"] = "***" if d["llm"].get("api_key") else ""
+        # Never leak a credential through the config dict (used by the web UI).
+        for section, key in SECRETS:
+            d[section][key] = "***" if d[section].get(key) else ""
         return d
 
 

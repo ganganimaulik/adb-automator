@@ -18,9 +18,13 @@ All automations and phone control policies executed in Antigravity operate fully
 4. **Quota Adherence & Complete Passes**:
    - For all liking and discovery automations (such as Hinge Discover):
      - The agent must strictly fulfill the policy's stated quota (e.g., 108–207 likes on Hinge).
-     - NEVER prematurely end a pass after only a small handful of items (e.g., 2–5 profiles) based on sample run logs or arbitrary stopping.
-     - A pass must continue running until:
+     - **MANDATORY HARD COMPLETION GATE**: The agent is STRICTLY FORBIDDEN from calling `adbagent/end_session` or advancing to the next policy pass until ONE of the following 3 conditions is genuinely satisfied:
        1. The quota requirement is fulfilled (e.g., at least 108 likes sent, up to the 207 cap), OR
        2. The app explicitly displays a terminal empty state (e.g., "You've seen everyone for now"), OR
-       3. The session step budget or time budget is exhausted.
+       3. The session step budget or time budget is within 20 steps of exhaustion (e.g., step >= 850 of 950).
+     - NEVER prematurely end a pass after only a small handful of items (e.g., 2–5 profiles) to advance through multi-task queues or save turns. Any premature call to `end_session` before satisfying one of the 3 conditions above is a critical policy violation.
 
+5. **Phone In Use (Busy Handling)**:
+   - If `start_session` returns that the phone is in use by another session (e.g. "the phone is in use by another session..."), **IMMEDIATELY STOP AND EXIT THE CONVERSATION**.
+   - Do NOT retry, do NOT sleep or poll, and do NOT inspect running processes, command lines, or system locks.
+   - Conclude your response immediately stating that the phone is currently busy with an ongoing session and exit cleanly.

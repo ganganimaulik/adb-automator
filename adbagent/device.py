@@ -824,7 +824,16 @@ class Device:
         d.settings["operation_delay"] = (0, 0.2)
         d.settings["operation_delay_methods"] = ["click", "swipe", "drag", "press"]
 
-        self._size = tuple(d.window_size())  # type: ignore[assignment]
+        try:
+            self._size = tuple(d.window_size())  # type: ignore[assignment]
+        except BaseException:
+            # Nothing on the phone has been changed yet, so there is nothing
+            # for `close` to put back -- and a half-open session left here
+            # would have `close` stop the uiautomator server later, under
+            # whoever has the phone by then.
+            self._drop_u2_atexit_hook(d)
+            self._d = None
+            raise
         self._snapshot_state()
         if self.cfg.device.disable_animations:
             self._set_animations("0")
@@ -876,6 +885,34 @@ class Device:
                     _guard(fn, left, f"teardown({label})")
                 except Exception as exc:  # noqa: BLE001 - teardown must not mask errors
                     log.warning("teardown: could not restore %s: %s", label, exc)
+        finally:
+            self._drop_u2_atexit_hook(d)
+            self._d = None
+
+    def peek(self) -> Screen:
+        """The screen, read without taking the phone over.
+
+        `open` takes it over -- animations off, rotation locked, the screen
+        kept awake -- and `close` puts all of it back and stops the uiautomator
+        server. That is right for driving the phone and wrong for a watch that
+        has let go of it and only wants to know whether anything has changed
+        (`Watch`): a session opened and closed every interval would switch the
+        animations and the rotation lock on and off under whoever is using the
+        phone, and restart the server each time. This connects, reads the
+        screen and leaves the phone exactly as it was, the server still running
+        for the next look. With a session already open it is just `observe`.
+        """
+        if self._d is not None:
+            return self.observe()
+        patch_socket_timeout()
+        d = _guard(lambda: u2.connect(self.serial) if self.serial
+                   else u2.connect(), self.cfg.device.watchdog_s, "connect")
+        self._d = d
+        try:
+            self._size = tuple(_guard(  # type: ignore[assignment]
+                lambda: d.window_size(), self.cfg.device.watchdog_s,
+                "window_size"))
+            return self.observe()
         finally:
             self._drop_u2_atexit_hook(d)
             self._d = None

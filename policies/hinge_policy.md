@@ -1,6 +1,7 @@
 ---
 goal: |
-  Watch Hinge (co.hinge.app): reply to matches who have written back, then like new profiles on Discover.
+  Watch Hinge (co.hinge.app): reply to matches who have written back, notify the owner (`notify`) of every new message
+  a match sends and every reply you send, then like new profiles on Discover.
   Check Matches first every pass — someone waiting on a reply matters more than another like. Then work
   Discover and like between 108 and 207 new profiles per pass (minimum 108, up to 207 cap), continuing until
   that quota is satisfied, Discover shows "You've seen everyone for now", or the step budget is exhausted.
@@ -46,6 +47,7 @@ send_limits: like=207, rose=0
   - **STRICT RULE: NEVER SEND DOUBLE REPLIES.**
   - **STRICT RULE: NEVER SEND SAME REPLY AGAIN.**
   - **STRICT RULE: READ WHOLE MESSAGE HISTORY BEFORE SENDING ANYTHING**
+  - **NOTIFY NEW MESSAGES**: once you have read the thread, and before deciding whether to reply, notify the match's new messages as **Notifications** below says — in every chat you open whose newest message is theirs, whether or not you will reply to it.
   - **OUTGOING COMMENT / MATCH CARD IDENTIFICATION**:
     - The top photo card displaying your initial comment (`Hey 🔥`) or banner text ("Your Priority Like helped you stand out") is YOUR initial outgoing comment/like sent when discovering the profile.
     - `Hey 🔥` inside the photo card is YOUR message, NOT a reply from the match.
@@ -61,7 +63,18 @@ send_limits: like=207, rose=0
   - **LEFTOVER DRAFT CLEARING**: If the text input box (`id=messageComposition`) already contains text (or if the conversation list shows a `Draft:` label) for a reply that has already been sent or should not be sent — including a draft left in a chat that fails the GREETING GATE — execute `input_text` to CLEAR the field (or type empty text) before navigating away. Do NOT hit Send on duplicate draft text.
   - ONLY reply if ALL THREE hold: the match has sent a genuine new incoming message from their side, that message passes the GREETING GATE, and the reply text has not been sent to them before. If any one of the three fails, send nothing and leave the chat.
   - When all three conditions hold, type `up for movie at my place?` via `input_text` with `confidence="low"`. On the next turn, inspect the screenshot / image analysis and confirm BOTH that the typed message matches policy exactly AND that the newest incoming message above it is still a greeting, before tapping Send.
-  - After sending, return to the matches list.
+  - Once the reply shows in the thread as sent, notify it as **Notifications** below says, then return to the matches list.
+
+## Notifications (`notify`)
+The owner wants a notification on their phone for every new message a match sends and for every reply you send. Use the `notify` action: its `text` takes one notification per line. The harness delivers each line once and skips any line it has delivered before, on this pass or an earlier one — so notify every time a rule below applies, even about a message you think an earlier pass may have notified, and never try to remember or work out what was already sent.
+- **New message**: in each chat you open, after reading the whole thread, notify every message the match sent after your most recent message (all of theirs, if you have none), oldest first, one line each, exactly in this form:
+  `Hinge: new message from <name>: <their message>`
+  `<name>` is the match's name as the chat header shows it. Copy each message exactly as written, emoji included as the screenshot shows them; a message that spans several lines goes on one line, its lines joined with ` / `. A photo, GIF, voice note or video is `[photo]`, `[GIF]`, `[voice note]` or `[video]`. If the newest message in the chat is yours, nothing is new: notify nothing there.
+- **Reply sent**: as soon as a reply has gone through — it shows in the thread on your side — notify, exactly in this form:
+  `Hinge: replied to <name>: <the reply you sent>`
+  Never for a reply that was refused, or that you decided not to send.
+- Nothing else is ever notified: not likes or their `Hey 🔥` comments, not profiles, not matches without a new message, not the pass summary.
+- `notify` changes nothing on the phone: carry on from the same screen afterwards.
 
 ## Safety & Boundaries
 - **Mandatory down-and-up exploration before liking.** Never tap a like button immediately upon seeing a new profile card. Every Discover profile must receive `scroll_to_edge down` to its bottom, followed by `scroll_to_edge up` back to the top, before any like button is tapped.
@@ -69,6 +82,7 @@ send_limits: like=207, rose=0
 - **Pre-Send Verification**: ALWAYS set `confidence="low"` when typing comments or replies to trigger image analysis of the screen, and visually verify the typed message in the screenshot before tapping Send.
 - **NEVER click on "Review skipped profile" / "Review skipped profiles"**: Never tap or click on "Review skipped profile", "Review skipped profiles", "Review skipped", or any button/prompt/card offering to review previously skipped profiles.
 - Never double reply under any circumstances.
+- `notify` is only ever for the owner: never type a notification into a chat, and never notify anything **Notifications** does not list.
 - **Never send `up for movie at my place?` to a match whose newest incoming message is not a greeting.** It is the only reply this policy authorises and a greeting is its only trigger. No greeting means no message at all — not a softer version, not a different one, not a follow-up later in the same pass.
 - Never share financial, personal contact, or banking details.
 - Finish each pass on the main Discover or Matches screen.

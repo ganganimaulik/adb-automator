@@ -36,6 +36,8 @@ def test_every_subcommand_parses():
         ["apps", "--search", "whatsapp", "-3"],
         ["mcp"],
         ["mcp", "--draft", "--idle-timeout", "5", "-d", "emulator-5554"],
+        ["notify"],
+        ["notify", "hello", "from", "adbagent"],
     ):
         assert parse(argv).func is not None
 
@@ -876,6 +878,87 @@ def test_an_unlisted_model_is_a_warning_not_a_failure(monkeypatch, capsys):
                                    model_image="accounts/fireworks/models/mine-v1")
     assert problems == 0
     assert "cannot confirm" in text
+
+
+def _bot(monkeypatch, *, whoami=None):
+    """A configured bot whose `getMe` answers with `whoami` -- a name, or an
+    exception to raise -- and never reaches Telegram."""
+    from adbagent.config import Config
+
+    def answer(self):
+        if isinstance(whoami, Exception):
+            raise whoami
+        return whoami or ""
+
+    monkeypatch.setattr("adbagent.notify.Telegram.whoami", answer)
+    cfg = Config()
+    cfg.notify.telegram_token = "1:test-token"
+    cfg.notify.telegram_chat_id = "42"
+    return cfg
+
+
+def test_doctor_reads_no_bot_as_notifications_off_not_a_problem(monkeypatch, capsys):
+    """A policy that never notifies needs no bot."""
+    from adbagent.cli import Out, _check_notify
+    from adbagent.config import Config
+
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    assert _check_notify(Out(), Config()) == 0
+    assert "notifications are off" in capsys.readouterr().out
+
+
+def test_doctor_names_the_bot_and_the_chat(monkeypatch, capsys):
+    from adbagent.cli import Out, _check_notify
+
+    assert _check_notify(Out(), _bot(monkeypatch, whoami="my_bot")) == 0
+    assert "Telegram chat 42 from @my_bot" in capsys.readouterr().out
+
+
+def test_doctor_fails_a_token_telegram_refuses(monkeypatch, capsys):
+    """Every notification would be kept and none delivered, and nothing in a
+    run says so beyond the step's own line."""
+    from adbagent.cli import Out, _check_notify
+    from adbagent.notify import NotifyError
+
+    cfg = _bot(monkeypatch, whoami=NotifyError(
+        "Telegram refused it: Unauthorized", refused=True))
+    assert _check_notify(Out(), cfg) == 1
+    assert "Unauthorized" in capsys.readouterr().out
+
+
+def test_doctor_on_an_aeroplane_cannot_check_the_bot_and_says_so(monkeypatch, capsys):
+    from adbagent.cli import Out, _check_notify
+    from adbagent.notify import NotifyError
+
+    cfg = _bot(monkeypatch, whoami=NotifyError("ConnectError: no route to host"))
+    assert _check_notify(Out(), cfg) == 0
+    assert "could not reach Telegram" in capsys.readouterr().out
+
+
+def test_notify_sends_the_line_now_and_again_if_asked(tmp_path, monkeypatch, capsys):
+    """A person checking the setup: past the ledger, so a test sent twice
+    arrives twice."""
+    sent = []
+    monkeypatch.setattr("adbagent.notify.Telegram.send",
+                        lambda self, text: sent.append((self.chat_id, text)))
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"notify": {"telegram_token": "1:test-token",
+                                           "telegram_chat_id": "42"}}))
+    for _ in range(2):
+        assert main(["notify", "-c", str(path), "hello", "there"]) == 0
+    assert sent == [("42", "hello there"), ("42", "hello there")]
+    assert "sent to Telegram chat 42" in capsys.readouterr().out
+    assert not (tmp_path / "runs").exists()
+
+
+def test_notify_without_a_bot_says_what_to_set(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    path = tmp_path / "config.json"
+    path.write_text("{}")
+    assert main(["notify", "-c", str(path), "hi"]) == 1
+    assert "notify.telegram_token" in capsys.readouterr().out
 
 
 def test_an_unreachable_catalogue_is_not_a_misconfiguration(monkeypatch, capsys):

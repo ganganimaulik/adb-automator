@@ -202,6 +202,38 @@ _REASONING_JOBS = (
 )
 
 
+def _check_notify(out: Out, cfg) -> int:
+    """Say where a `notify` goes, and whether Telegram takes the bot's token.
+
+    Off is not a problem: a policy that never notifies needs no bot. A token
+    Telegram refuses is one, because every notification would be kept and none
+    delivered, and nothing in a run would say so beyond its own history line.
+    Asked with `getMe`, which writes to nobody -- `adbagent notify` is the way
+    to see a message arrive. Unreachable is a warning: doctor runs on
+    aeroplanes. Returns the number of problems found.
+    """
+    from .config import TELEGRAM_CHAT_ENV, TELEGRAM_TOKEN_ENV
+    from .notify import NotifyError, Telegram
+
+    token, chat = cfg.telegram_token(), cfg.telegram_chat_id()
+    if not token or not chat:
+        out.warn(f"notifications are off: set notify.telegram_token and "
+                 f"notify.telegram_chat_id in config.json (or "
+                 f"${TELEGRAM_TOKEN_ENV} and ${TELEGRAM_CHAT_ENV})")
+        return 0
+    try:
+        bot = Telegram(token, chat, attempts=1).whoami()
+    except NotifyError as exc:
+        if exc.refused:
+            out.bad(f"Telegram refuses notify.telegram_token: {exc}")
+            return 1
+        out.warn(f"could not reach Telegram to check the bot: {exc}")
+        return 0
+    out.ok(f"notifications go to Telegram chat {chat}"
+           + (f" from @{bot}" if bot else ""))
+    return 0
+
+
 def _check_vision(out: Out, cfg) -> int:
     """Confirm the models that will be handed images can actually take them.
 
@@ -440,11 +472,47 @@ def cmd_doctor(args) -> int:
         problems += 1
 
     out.say()
+    out.say(out.bold("Notifications"))
+    problems += _check_notify(out, cfg)
+
+    out.say()
     if problems:
         out.say(out.yellow(f"{problems} thing(s) need attention."))
     else:
         out.say(out.green("Ready."))
     return 1 if problems else 0
+
+
+# ---------------------------------------------------------------------------
+# notify
+# ---------------------------------------------------------------------------
+
+def cmd_notify(args) -> int:
+    """Send one notification now: the way to see the bot and the chat work.
+
+    Straight to Telegram, past the ledger a run's `notify` goes through: this
+    is a person checking the setup, and a test sent twice is meant to arrive
+    twice. A run never repeats a line -- see `notify.Notifier`.
+    """
+    from .config import TELEGRAM_CHAT_ENV, TELEGRAM_TOKEN_ENV
+    from .notify import NotifyError, Telegram
+
+    out = Out()
+    cfg = build_config(args)
+    token, chat = cfg.telegram_token(), cfg.telegram_chat_id()
+    if not token or not chat:
+        out.bad(f"notifications are not set up: set notify.telegram_token and "
+                f"notify.telegram_chat_id in config.json (or "
+                f"${TELEGRAM_TOKEN_ENV} and ${TELEGRAM_CHAT_ENV})")
+        return 1
+    text = " ".join(args.text).strip() or "adbagent: test notification"
+    try:
+        Telegram(token, chat).send(text)
+    except NotifyError as exc:
+        out.bad(f"not delivered: {exc}")
+        return 1
+    out.ok(f"sent to Telegram chat {chat}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +653,8 @@ def _holding_phone(cfg, who: str):
 
     lock = PhoneLock(cfg.run.artifacts_dir, who)
     try:
+        # Waits, briefly, for a watch that has let go of the phone and only
+        # took it back to look at the screen. See `phonelock.PATIENCE_S`.
         lock.acquire()
     except PhoneBusy as exc:
         raise RuntimeError(f"{exc}; wait for it to finish, or stop it, "
@@ -1039,6 +1109,11 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             r_str = f": {reason}" if reason else ""
             out.say(out.dim(f"        settled & verified in {elapsed:.2f}s -> grade: {grade}{r_str}"))
 
+        elif kind == "notified":
+            # Nothing on the phone moved, so nothing settled or was verified.
+            out.say(out.dim(f"        notify in {kw.get('elapsed', 0.0):.2f}s -> "
+                            f"{kw.get('grade', '')}: {kw.get('reason', '')}"))
+
         elif kind == "loop_warning":
             msg = kw.get("message", "")
             out.say(out.yellow(f"        [Loop Warning] {msg}"))
@@ -1428,6 +1503,13 @@ def _watch_banner(out: Out, cfg, goal: str, policy: str,
                         f"nothing has changed"))
     if w.max_usd_per_hour:
         out.say(out.dim(f"  spend ceiling: ${w.max_usd_per_hour:g}/h"))
+    if cfg.device.let_go_after_s > 0:
+        # Said because it is the difference between a watch that owns the phone
+        # and one that shares it: runs and sessions started meanwhile get it.
+        out.say(out.dim(f"  lets go of the phone after "
+                        f"{watchmod._duration(cfg.device.let_go_after_s)} "
+                        f"without a pass, so other runs can use it, and takes "
+                        f"it back for the next"))
     out.say(out.dim("  Ctrl-C to stop"))
     out.say()
 
@@ -1555,7 +1637,7 @@ def cmd_watch(args) -> int:
     title = " -> ".join(p.name for p in plan) if plan else goal
     tasks = "\n\n".join(p.goal for p in plan) if plan else goal
 
-    with _holding_phone(cfg, f"adbagent watch: {title}"), \
+    with _holding_phone(cfg, f"adbagent watch: {title}") as lock, \
             Device(cfg, args.device or "") as dev:
         # One client for the whole watch, so the rolling spend ceiling sees the
         # session rather than a single pass.
@@ -1568,12 +1650,15 @@ def cmd_watch(args) -> int:
         trace = skillmod.TraceCollector(
             dev, skillmod.AppTrace(tasks=tasks), on_event=reporter,
             max_actions=WATCH_TRACE_ACTIONS)
+        # The lock goes in with the device so that the watch can let go of both
+        # when it has nothing to do (`device.let_go_after_s`), and take them
+        # back for the next pass. Both are released on the way out either way.
         if plan:
             watch = Watch(dev, llm, cfg, policies=plan, say=out.say,
-                          on_event=trace)
+                          on_event=trace, lock=lock)
         else:
             watch = Watch(dev, llm, cfg, policy=policy, send_limits=send_limits,
-                          snooze=snooze, say=out.say, on_event=trace)
+                          snooze=snooze, say=out.say, on_event=trace, lock=lock)
         try:
             watch.run(goal)
         except KeyboardInterrupt:
@@ -1833,6 +1918,11 @@ def cmd_report(args) -> int:
             out.say(out.dim(f"        Vision{m_str}: {result}"))
         elif event["kind"] == "verify":
             out.say(f"      -> {event.get('grade')} {event.get('reason') or ''}")
+        elif event["kind"] == "notify":
+            # Graded by this event, not a `verify`: nothing on the phone moved.
+            out.say(f"      -> {event.get('grade')} {event.get('summary') or ''}")
+            for line in (event.get("caught_up") or []) + (event.get("sent") or []):
+                out.say(out.dim(f"        notified:  {line}"))
         elif event["kind"] in ("dismiss", "refused", "scroll_refused",
                                "loop_break", "sensitive",
                                "judge", "error", "gave_up"):
@@ -2477,6 +2567,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("devices", help="list attached devices")
     _add_common(p)
     p.set_defaults(func=cmd_devices)
+
+    p = sub.add_parser("notify",
+                       help="send a notification to your phone, to check the "
+                            "Telegram setup")
+    p.add_argument("text", nargs="*",
+                   help="what to send (default: a test line)")
+    _add_common(p)
+    p.set_defaults(func=cmd_notify)
 
     p = sub.add_parser("pair", help="pair with a phone over Wi-Fi")
     p.add_argument("address", help="ip:port from 'Pair device with pairing code'")

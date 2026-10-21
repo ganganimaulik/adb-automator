@@ -29,12 +29,46 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from ..runlog import LAUNCH_ENV
 
 #: How long to keep looking for run directories after the child has exited. The
 #: last one can appear a beat after its final line of output on a short run.
 POST_EXIT_SWEEP_S = 2.0
+
+#: What `launched_by` says of a run that does not say who started it -- one
+#: recorded before runs said, or written by a stand-in. Taken as before:
+#: whichever child is looking when it appears.
+LEGACY = "\0legacy"
+
+
+def launched_by(run_dir: Path) -> Optional[str]:
+    """Which launch wrote `run_dir`, from its first event.
+
+    The id the web UI gave the child that wrote it, "" for a run started any
+    other way, and None while there is no complete first line to read yet. A
+    run recorded before runs said so carries no id at all, and reads as
+    `LEGACY`.
+    """
+    try:
+        with (run_dir / "events.jsonl").open(encoding="utf-8") as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    if not first.endswith("\n"):
+        return None
+    try:
+        event = json.loads(first)
+    except ValueError:
+        return ""
+    if not isinstance(event, dict):
+        return ""
+    if "launch_id" not in event:
+        return LEGACY
+    return str(event.get("launch_id") or "")
 
 
 class ChildProcess:
@@ -69,6 +103,10 @@ class ChildProcess:
         #: One entry per iteration, oldest first. `--repeat 1` leaves one.
         self._run_dirs: List[Path] = []
         self._dirs_before: set = set()
+        #: What this launch is called to the runs it writes (`launched_by`),
+        #: and the new directories found to be somebody else's.
+        self._launch_id = ""
+        self._others: set = set()
         #: A stop has been asked for and the child is on its way out -- still
         #: running, still holding the phone, but doing shutdown work rather than
         #: the job. Its own phase, because it is neither "running" nor "over" and
@@ -198,6 +236,8 @@ class ChildProcess:
             self._dirs_before = {d.name for d in self.artifacts_dir.iterdir()
                                  if d.is_dir()}
             self._run_dirs = [self.artifacts_dir / seed] if seed else []
+            self._launch_id = uuid.uuid4().hex[:12]
+            self._others = set()
             self._returncode = None
             self._output = []
             self._output_seq = 0
@@ -216,7 +256,7 @@ class ChildProcess:
             # all -- is exactly the part nothing else reports, and holding it
             # back until the process is gone makes it arrive too late to be news.
             env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
-                   "PYTHONUNBUFFERED": "1"}
+                   "PYTHONUNBUFFERED": "1", LAUNCH_ENV: self._launch_id}
             # On Windows, put the child in its own process group so we can
             # send it CTRL_BREAK_EVENT without killing the server too.
             flags = 0
@@ -274,8 +314,16 @@ class ChildProcess:
             time.sleep(0.25)
 
     def _sweep(self) -> None:
-        """Fold whatever directories have appeared since the last look into
-        the iteration list, oldest first."""
+        """Fold whatever directories this child has written since the last look
+        into the iteration list, oldest first.
+
+        Only this child's. `runs/` is shared with everything else that drives
+        the phone -- an MCP session, a run typed into a terminal -- and once a
+        watch lets go of the phone those write into it while the watch is still
+        going: a new directory is not this child's because it appeared while
+        this child was alive. Its first event says who wrote it (`launched_by`);
+        one that has no first event yet is looked at again next time.
+        """
         try:
             found = sorted(
                 ((d.stat().st_mtime, d) for d in self.artifacts_dir.iterdir()
@@ -284,8 +332,19 @@ class ChildProcess:
         except OSError:
             return
         with self._lock:
-            known = {d.name for d in self._run_dirs} | self._dirs_before
-            fresh = [d for _, d in found if d.name not in known]
+            known = ({d.name for d in self._run_dirs} | self._dirs_before
+                     | self._others)
+            fresh = []
+            for _, d in found:
+                if d.name in known:
+                    continue
+                launch = launched_by(d)
+                if launch is None:
+                    continue
+                if launch in (self._launch_id, LEGACY):
+                    fresh.append(d)
+                else:
+                    self._others.add(d.name)
             self._run_dirs.extend(fresh)
             for d in fresh:
                 self._apply_mode(d)

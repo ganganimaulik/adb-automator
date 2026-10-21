@@ -354,6 +354,24 @@ def test_config_carries_the_shipped_defaults_too(web):
     assert set(got["defaults"]) == set(got["config"])
 
 
+def test_the_bot_token_is_shown_redacted_and_never_saved_as_the_marker(web, tmp_path):
+    """The form gets "***" for a stored credential; a save that sends it back
+    must keep the real one, for the bot token as for the API key."""
+    web.put("/api/config", json={"sections": {"notify": {
+        "telegram_token": "123:real-token", "telegram_chat_id": "42"}}})
+    got = web.get("/api/config").json()["config"]["notify"]
+    assert got == {"telegram_token": "***", "telegram_chat_id": "42"}
+
+    res = web.put("/api/config", json={"sections": {
+        "notify": {"telegram_token": "***", "telegram_chat_id": "43"},
+        "llm": {"api_key": "***"}}})
+    assert res.status_code == 200
+    stored = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+    assert stored["notify"] == {"telegram_token": "123:real-token",
+                                "telegram_chat_id": "43"}
+    assert "api_key" not in stored.get("llm", {})
+
+
 def test_config_rejects_unknown_keys(web):
     res = web.put("/api/config", json={"sections": {"safety": {"nope": 1}}})
     assert res.status_code == 400
@@ -1242,6 +1260,61 @@ def test_stream_follows_a_repeat_into_its_next_iteration(web, tmp_path,
     assert "event: end" in body
 
 
+def test_a_child_claims_only_the_runs_it_wrote(tmp_path, monkeypatch):
+    """Once a watch lets go of the phone, an MCP session or a run typed into a
+    terminal writes into `runs/` while the watch is still going. Those are not
+    its passes, and the Watch tab must not show them as such."""
+    from adbagent.runlog import LAUNCH_ENV
+    from adbagent.web.runner import WatchManager
+
+    def popen(argv, **kw):
+        launch = kw["env"][LAUNCH_ENV]
+        assert launch
+
+        def on_spawn(_argv):
+            make_run_dir(tmp_path, run_id="theirs", events=[
+                {"t": 1.0, "kind": "run_start", "goal": "someone else's",
+                 "launch_id": ""}])
+            make_run_dir(tmp_path, run_id="mine", events=[
+                {"t": 2.0, "kind": "run_start", "goal": "watch dms",
+                 "launch_id": launch}])
+        return FakeProc(argv, on_spawn=on_spawn, stay_running=True, **kw)
+
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen", popen)
+    mgr = WatchManager(tmp_path)
+    mgr.start("watch dms", policy="p.md")
+    try:
+        assert mgr.wait_for_run_dir(timeout_s=5) == tmp_path / "mine"
+        time.sleep(0.6)                       # a few more sweeps
+        assert [d.name for d in mgr.run_dirs()] == ["mine"]
+        assert mgr.state()["passes"] == 1
+    finally:
+        mgr.stop()
+
+
+def test_a_run_says_which_launch_wrote_it(tmp_path, monkeypatch):
+    """What `test_a_child_claims_only_the_runs_it_wrote` reads, as an agent
+    writes it: the id the UI launched it under, and "" when nothing did."""
+    from adbagent.agent import Agent
+    from adbagent.config import Config
+    from adbagent.runlog import LAUNCH_ENV
+
+    from . import fake
+
+    cfg = Config()
+    cfg.run.artifacts_dir = str(tmp_path / "runs")
+    cfg.skills.skills_dir = str(tmp_path / "skills")
+    cfg.run.max_steps = 0            # over before anything is decided
+    for launch in ("ui-launch-1", ""):
+        monkeypatch.setenv(LAUNCH_ENV, launch)
+        agent = Agent(fake.FakeDevice(cfg), None, cfg)
+        _outcome, state = agent.run("open the Wi-Fi settings")
+        first = json.loads((tmp_path / "runs" / state.run_id / "events.jsonl")
+                           .read_text(encoding="utf-8").splitlines()[0])
+        assert first["kind"] == "run_start"
+        assert first["launch_id"] == launch
+
+
 def test_run_manager_discovers_run_dir(tmp_path):
     def on_spawn(_argv):
         make_run_dir(tmp_path, run_id="newrun")
@@ -1834,20 +1907,46 @@ def test_watch_no_learn_reaches_the_argv(web, tmp_path, monkeypatch):
     assert "--no-learn" in spawned[0].argv
 
 
-def test_a_watch_and_a_run_refuse_each_other(web, tmp_path, monkeypatch):
-    """One phone. A watch quietly displaced by a run is no longer watching."""
+def test_a_run_waits_for_a_watch_that_has_the_phone(web, tmp_path, monkeypatch):
+    """One phone. A run started while the watch has it would drive it under
+    the watch; once the watch has let go of it, a run takes it the ordinary
+    way, through the lock, and the watch waits for it."""
+    from adbagent.phonelock import PhoneLock
+
     _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
     monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
                         lambda argv, **kw: FakeProc(argv, stay_running=True, **kw))
 
     assert web.post("/api/watch", json={"goal": "watch dms"}).status_code == 200
-    res = web.post("/api/runs", json={"goal": "turn on wifi"})
-    assert res.status_code == 409
-    assert "watch" in res.json()["detail"].lower()
-    # The screenshot, dump and apps endpoints hold the same line: they open a
-    # Device session, which resets animations and rotation under the watch.
+    with PhoneLock(tmp_path / "runs", "adbagent watch: watch dms"):
+        res = web.post("/api/runs", json={"goal": "turn on wifi"})
+        assert res.status_code == 409
+        assert "adbagent watch: watch dms" in res.json()["detail"]
+    # The screenshot, dump and apps endpoints hold the line whatever the lock
+    # says: they open a Device session without it, which resets animations and
+    # rotation under the watch. So does a code reload, which would end it.
     for path in ("/api/devices/screenshot", "/api/dump", "/api/apps"):
         assert web.get(path).status_code == 409, path
+    assert "watch" in web.app.state.phone_busy().lower()
+    # Let go of: the run may start.
+    assert web.post("/api/runs", json={"goal": "turn on wifi"}).status_code == 200
+
+
+def test_a_watch_only_looking_at_the_screen_does_not_hold_up_a_run(
+        web, tmp_path, monkeypatch):
+    """A watch that has let go takes the phone for a moment each interval to
+    read the screen; the child started then waits that moment out itself."""
+    from adbagent.phonelock import PhoneLock
+
+    _configure_watch(tmp_path, policy=str(_policy(tmp_path)))
+    monkeypatch.setattr("adbagent.web.runner.subprocess.Popen",
+                        lambda argv, **kw: FakeProc(argv, stay_running=True, **kw))
+
+    assert web.post("/api/watch", json={"goal": "watch dms"}).status_code == 200
+    with PhoneLock(tmp_path / "runs", "adbagent watch: watch dms").acquire(
+            looking=True):
+        assert web.post("/api/runs",
+                        json={"goal": "turn on wifi"}).status_code == 200
 
 
 def test_watch_is_reported_on_status(web, tmp_path, monkeypatch):

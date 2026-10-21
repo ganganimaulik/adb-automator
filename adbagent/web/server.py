@@ -25,7 +25,8 @@ from pydantic import BaseModel
 
 from .. import phonelock
 from .. import policies as policymod
-from ..config import Config, _set_path, find_config_file, load_config
+from ..config import (SECRETS, Config, _set_path, find_config_file,
+                      load_config)
 from ..policies import same_file as _same_file
 from ..runlog import SCREENS_NAME, SHOT_RE, STREAM_NAME
 from ..skills import Skill, SkillRegistry
@@ -244,7 +245,7 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
     watcher = WatchManager(runs_dir, config_path=config_path)
     jobs = JobManager(runs_dir)
 
-    def phone_busy() -> str:
+    def phone_busy(*, starting: bool = False) -> str:
         """Why the phone cannot be driven right now, or "".
 
         One phone, one agent. A tour and a goal run reading each other's taps
@@ -255,6 +256,13 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         restoring the keyboard, the animations and the rotation, and writing up
         what it learned -- and the answer says that rather than "already in
         progress", which reads as though the stop had not been heard.
+
+        `starting` asks on behalf of a run or a tour about to start, which may
+        go ahead while the watch is running but has let go of the phone (see
+        `watch.Watch`): the child takes the phone through its lock like any
+        driver, and the watch waits for it. Everything else -- the device
+        panes, which open a session without the lock, and a code reload, which
+        would take the watch down -- still waits for the watch to stop.
         """
         run = manager.state()
         if run["stopping"]:
@@ -264,7 +272,7 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         watch = watcher.state()
         if watch["stopping"]:
             return "the watch is stopping; it is writing up what it learned"
-        if watch["running"]:
+        if watch["running"] and not starting:
             # Said with the remedy in it: a watch does not end on its own, so
             # "busy, try later" would be advice to wait forever.
             return ("a watch is running; stop it from the Watch tab before "
@@ -273,8 +281,12 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
         if job is not None:
             return f"a skill is being generated (job {job.id}); the phone is busy"
         # Last, because it is the only one about a process this server did not
-        # start: a run typed into a terminal, or an MCP session a coding agent
-        # opened. See `phonelock`.
+        # start -- a run typed into a terminal, or an MCP session a coding agent
+        # opened -- or a watch of its own that has the phone right now. See
+        # `phonelock`. A watch that is only looking at the screen is not in the
+        # way of a start: the child waits out the look.
+        if starting and phonelock.note(runs_dir).get("looking"):
+            return ""
         return phonelock.holder(runs_dir)
 
     def load_cfg() -> Config:
@@ -632,9 +644,9 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             except (OSError, json.JSONDecodeError):
                 pass
         for section, values in update.sections.items():
-            # Never persist the redaction marker as a real key.
-            if section == "llm" and values.get("api_key") == "***":
-                values = {k: v for k, v in values.items() if k != "api_key"}
+            # Never persist the redaction marker as a real credential.
+            values = {k: v for k, v in values.items()
+                      if not ((section, k) in SECRETS and v == "***")}
             raw.setdefault(section, {}).update(values)
         path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
         return {"saved": True, "path": str(path)}
@@ -727,7 +739,7 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
             goal = data.get("goal", "")
         if not goal:
             raise HTTPException(status_code=400, detail="goal is required")
-        busy = phone_busy()
+        busy = phone_busy(starting=True)
         if busy:
             raise HTTPException(status_code=409, detail=busy)
         try:
@@ -1124,7 +1136,7 @@ def create_app(*, artifacts_dir: str = "runs", skills_dir: str = "",
 
     @app.post("/api/skills/generate")
     def generate_skill(req: GenerateRequest) -> Dict[str, Any]:
-        busy = phone_busy()
+        busy = phone_busy(starting=True)
         if busy:
             raise HTTPException(status_code=409, detail=busy)
         argv = [sys.executable, "-m", "adbagent", "skills", "generate"]

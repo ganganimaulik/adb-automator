@@ -161,6 +161,41 @@ def test_a_session_from_start_to_end(cfg, mode):
     assert phonelock.holder(cfg.run.artifacts_dir) == ""
 
 
+def test_a_driver_notifies_in_the_same_batch_as_the_tap_after_it(cfg, monkeypatch):
+    """`notify` never touches the phone, so the tap batched after it still
+    lands on the screen it was planned on -- and each line reaches the owner
+    once, however many times the driver says it."""
+    sent = []
+    monkeypatch.setattr("adbagent.notify.Telegram.send",
+                        lambda self, message: sent.append(message))
+    cfg.notify.telegram_token = "1:test-token"
+    cfg.notify.telegram_chat_id = "42"
+    dev = fake.FakeDevice(cfg)
+
+    async def script(client):
+        started = text(await client.call_tool(
+            "start_session", {"goal": "open the Wi-Fi settings"}))
+        sid = session_of(started)
+        acted = text(await client.call_tool("act", {"session_id": sid, "actions": [
+            {"action": "notify", "text": "Settings: opening Wi-Fi"},
+            {"action": "tap", "target": {"index": index_of(started, "Wi-Fi")}}]}))
+        again = text(await client.call_tool("act", {"session_id": sid, "actions": [
+            {"action": "notify", "text": "settings: opening wi-fi!"}]}))
+        await client.call_tool("end_session", {"session_id": sid,
+                                               "summary": "Wi-Fi settings are open"})
+        return acted, again
+
+    acted, again = drive(cfg, dev, script)
+    assert sent == ["Settings: opening Wi-Fi"]
+    assert dev.state == "wifi"
+    assert "-> sent" in acted and "stopped before" not in acted
+    assert "-> already sent" in again
+
+
+def test_the_instructions_say_how_notify_behaves():
+    assert "notify" in INSTRUCTIONS and "once, ever" in INSTRUCTIONS
+
+
 def test_a_bad_action_is_an_error_the_client_can_read(cfg):
     async def script(client):
         sid = session_of(text(await client.call_tool("start_session",
@@ -611,3 +646,48 @@ def test_one_of_several_with_no_goal_saved_is_refused(cfg, tmp_path):
 
     result = drive(cfg, fake.FakeDevice(cfg), script)
     assert result.is_error and "carries no goal" in text(result)
+
+
+def test_the_instructions_say_when_a_quiet_session_lets_go(cfg):
+    from adbagent.mcp_server import instructions
+
+    said = instructions(cfg)
+    assert "left without a call for 5 minutes lets go of the phone" in said
+    assert (said.index("ONE PHONE") < said.index("lets go of the phone")
+            < said.index("POLICIES"))
+    cfg.device.let_go_after_s = 0
+    assert "lets go" not in instructions(cfg)
+
+
+def test_a_call_to_a_phone_taken_meanwhile_says_who_has_it(cfg):
+    """The session let go of the phone while its driver was quiet, and a run
+    took it. The driver's next call does nothing and says so; once the phone
+    is free, the call after takes it back."""
+    cfg.device.let_go_after_s = 0.2
+    other = phonelock.PhoneLock(cfg.run.artifacts_dir,
+                                "adbagent run: turn on wifi")
+
+    async def script(client):
+        started = text(await client.call_tool(
+            "start_session", {"goal": "open the Wi-Fi settings"}))
+        sid = session_of(started)
+        await anyio.sleep(0.8)
+        other.acquire()
+        refused = await client.call_tool(
+            "act", tap(sid, index_of(started, "Wi-Fi")))
+        other.release()
+        acted = await client.call_tool(
+            "act", tap(sid, index_of(started, "Wi-Fi")))
+        return refused, acted
+
+    dev = fake.FakeDevice(cfg)
+    try:
+        refused, acted = drive(cfg, dev, script)
+    finally:
+        other.release()
+    assert refused.is_error
+    assert "adbagent run: turn on wifi" in text(refused)
+    assert "Nothing was done" in text(refused)
+    assert not acted.is_error and "-> success" in text(acted)
+    assert "took it back for this call" in text(acted)
+    assert dev.state == "wifi" and len(dev.taps) == 1

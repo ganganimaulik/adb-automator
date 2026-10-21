@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import pytest
 
+from adbagent import phonelock
 from adbagent.config import Config
 from adbagent.device import DeviceLost
 from adbagent.fingerprint import attach
+from adbagent.phonelock import PhoneLock
 from adbagent.screen import parse
 from adbagent.watch import Anchor, Watch, load_policy, screen_digest
 
@@ -977,3 +979,180 @@ def test_a_watch_of_several_takes_no_goal_of_its_own(cfg):
     watch, slept, goals, built = build_several(cfg, [chat()])
     with pytest.raises(ValueError, match="goal saved with it"):
         watch.run("watch everything")
+
+
+# -- sharing the phone --------------------------------------------------------
+
+class SharedPhone:
+    """A phone the watch can let go of: a session to close and open again, a
+    look taken without one, and a screen that is whatever the test says now."""
+
+    def __init__(self, clock, screen, asleep=None):
+        self.clock = clock
+        #: The screen, or a function of the time giving it.
+        self.screen = screen
+        #: What a look without a session finds instead, if anything: a phone
+        #: that went to sleep once its own screen timeout was back.
+        self.asleep = asleep
+        self.session_open = True
+        self.opens = self.closes = self.peeks = 0
+
+    def now(self):
+        return self.screen(self.clock.t) if callable(self.screen) else self.screen
+
+    def observe(self, settle=False):
+        assert self.session_open, "observed without a session"
+        return self.now()
+
+    def peek(self):
+        assert not self.session_open, "looked without letting go first"
+        self.peeks += 1
+        return self.asleep if self.asleep is not None else self.now()
+
+    def open(self):
+        self.opens += 1
+        self.session_open = True
+        return self
+
+    def close(self):
+        self.closes += 1
+        self.session_open = False
+
+
+def sharing(cfg, tmp_path, screen, outcomes=(), on_sleep=None, asleep=None):
+    """A Watch holding a real phone lock over a `SharedPhone`.
+
+    Returns the watch, the phone, the lock, the clock, what each pass found
+    -- (when, lock held, session open) -- and what the watch said.
+    """
+    clock = FakeClock()
+    lock = PhoneLock(tmp_path, "adbagent watch: watch dms").acquire()
+    dev = SharedPhone(clock, screen, asleep=asleep)
+    passes, said, outcomes = [], [], list(outcomes)
+
+    class Agent:
+        def run(self, goal, run_id="", resume=None):
+            passes.append((clock.t, lock.held, dev.session_open))
+            outcome = outcomes.pop(0) if outcomes else "success"
+            return outcome, StubState(len(passes))
+
+    def sleep(seconds):
+        clock.sleep(seconds)
+        if on_sleep is not None:
+            on_sleep(clock.t)
+
+    watch = Watch(dev, StubLLM(), cfg, policy="be brief", make_agent=Agent,
+                  sleep=sleep, clock=clock, lock=lock, say=said.append)
+    return watch, dev, lock, clock, passes, said
+
+
+def test_a_watch_with_nothing_to_do_lets_go_of_the_phone(cfg, tmp_path):
+    """Five minutes after its last pass, so that a run, an MCP session or
+    another watch can have the phone -- and it goes on looking."""
+    assert cfg.device.let_go_after_s == 300.0
+    watch, dev, lock, clock, passes, said = sharing(cfg, tmp_path, chat())
+    try:
+        watch.run("watch dms", max_passes=10)
+        assert passes == [(0.0, True, True)]
+        # At five minutes, in the middle of the sleep it falls in.
+        assert clock.slept[:8] == [45.0] * 6 + [30.0, 15.0]
+        assert dev.closes == 1 and dev.opens == 0
+        assert not lock.held and phonelock.holder(tmp_path) == ""
+        assert dev.peeks == 3                   # still looking, without it
+        assert watch.stats.let_go == 1
+        assert [line for line in said if "let go of the phone" in line] == [
+            "  nothing to do for 5 min: let go of the phone so others can use "
+            "it; still looking every 45s"]
+        assert "let go 1x" in watch.status()
+    finally:
+        lock.release()
+
+
+def test_a_change_seen_after_letting_go_takes_the_phone_back_for_the_pass(
+        cfg, tmp_path):
+    news = chat(messages=["hey", "you around?", "hello?"])
+    watch, dev, lock, clock, passes, said = sharing(
+        cfg, tmp_path, lambda t: news if t >= 400 else chat())
+    try:
+        watch.run("watch dms", max_passes=10)
+        # The second pass runs with the phone held again, session and all.
+        assert passes == [(0.0, True, True), (405.0, True, True)]
+        assert dev.opens == 1 and lock.held
+    finally:
+        lock.release()
+
+
+def test_a_watch_waits_while_somebody_else_has_the_phone(cfg, tmp_path):
+    """Their run is not the watch's to interrupt; what they leave on screen is
+    a change like any other, and the next pass takes the watch back."""
+    other = PhoneLock(tmp_path, "an MCP session (antigravity-client): Hinge")
+    shown = {"screen": chat()}
+
+    def on_sleep(t):
+        if 320 <= t < 600 and not other.held:
+            other.acquire()                    # took the phone once it was free
+        if t >= 600 and other.held:
+            shown["screen"] = settings()       # and left it in another app
+            other.release()
+
+    watch, dev, lock, clock, passes, said = sharing(
+        cfg, tmp_path, lambda t: shown["screen"], on_sleep=on_sleep)
+    try:
+        watch.run("watch dms", max_passes=15)
+        assert watch.stats.waited == 6
+        assert dev.peeks == 2                  # none while the other had it
+        assert passes == [(0.0, True, True), (630.0, True, True)]
+        waiting = [line for line in said if "the phone is in use" in line]
+        assert len(waiting) == 1, "said every interval rather than once"
+        assert "an MCP session (antigravity-client): Hinge" in waiting[0]
+        assert said.count("  the phone is free again") == 1
+    finally:
+        other.release()
+        lock.release()
+
+
+def test_a_long_backoff_lets_go_of_the_phone_when_the_time_comes(cfg, tmp_path):
+    cfg.watch.backoff_initial_s = 600.0
+    watch, dev, lock, clock, passes, said = sharing(cfg, tmp_path, chat(),
+                                                    outcomes=["failed"])
+    try:
+        watch.run("watch dms", max_passes=1)
+        assert clock.slept == [300.0, 300.0]   # not all 600 of it held
+        assert dev.closes == 1 and not lock.held
+    finally:
+        lock.release()
+
+
+def test_a_phone_that_only_went_to_sleep_is_not_worth_a_pass(cfg, tmp_path):
+    """A look without the session can find the phone asleep. Taken back, the
+    session wakes it, and the screen is the one the watch left: no pass, and
+    the phone is let go of again without another word."""
+    watch, dev, lock, clock, passes, said = sharing(cfg, tmp_path, chat(),
+                                                    asleep=settings())
+    try:
+        watch.run("watch dms", max_passes=12)
+        assert len(passes) == 1
+        assert dev.opens >= 2 and dev.closes == dev.opens + 1
+        assert watch.stats.let_go == 1
+        assert len([line for line in said if "let go" in line]) == 1
+    finally:
+        lock.release()
+
+
+def test_a_watch_set_never_to_let_go_keeps_the_phone(cfg, tmp_path):
+    cfg.device.let_go_after_s = 0
+    watch, dev, lock, clock, passes, said = sharing(cfg, tmp_path, chat())
+    try:
+        watch.run("watch dms", max_passes=20)
+        assert dev.closes == 0 and lock.held
+        assert watch.stats.let_go == 0
+    finally:
+        lock.release()
+
+
+def test_a_watch_given_no_lock_keeps_the_phone(cfg, tmp_path):
+    """Whoever built it without one holds the phone some other way, and the
+    stub phone here could not even be let go of."""
+    watch, slept, goals = build(cfg, [chat()], ["success"], tmp_path=tmp_path)
+    watch.run("watch dms", max_passes=20)
+    assert watch.stats.let_go == 0

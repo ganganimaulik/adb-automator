@@ -10,7 +10,10 @@
         "C:\\Users\\ganga\\Desktop\\adb\\config.json",
         "--no-send-approval",
         "--allow-destructive"
-      ]
+      ],
+      "env": {
+        "RELOAD_TRIGGER": "2026-10-16T09:18:00"
+      }
     }
   }
 }

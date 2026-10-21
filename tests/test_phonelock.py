@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import pytest
 
@@ -49,3 +51,47 @@ def test_releasing_twice_is_harmless(tmp_path):
     lock.release()
     lock.release()
     assert not lock.held
+
+
+def test_the_note_is_read_only_while_the_phone_is_held(tmp_path):
+    assert phonelock.note(tmp_path) == {}
+    with PhoneLock(tmp_path, "adbagent run: turn on wifi"):
+        assert phonelock.note(tmp_path)["holder"] == "adbagent run: turn on wifi"
+    (tmp_path / phonelock.NOTE_NAME).write_text(
+        json.dumps({"holder": "a run that crashed"}), encoding="utf-8")
+    assert phonelock.note(tmp_path) == {}
+
+
+def test_a_look_is_waited_out_rather_than_refused(tmp_path):
+    """A watch that has let go of the phone still takes it for a moment, every
+    interval, to read the screen. A driver starting in that moment gets the
+    phone a moment later instead of being told it is busy."""
+    looker = PhoneLock(tmp_path, "adbagent watch: reply to new chats").acquire(
+        looking=True)
+    assert "looking at the screen for a moment" in phonelock.holder(tmp_path)
+    assert phonelock.note(tmp_path)["looking"] is True
+    threading.Timer(0.5, looker.release).start()
+    began = time.monotonic()
+    with PhoneLock(tmp_path, "adbagent run: turn on wifi"):
+        assert time.monotonic() - began >= 0.4
+        note = phonelock.note(tmp_path)
+        assert note["holder"] == "adbagent run: turn on wifi"
+        assert "looking" not in note
+
+
+def test_a_driver_is_still_refused_at_once(tmp_path, monkeypatch):
+    """The patience is for a look only: a phone somebody is driving is said
+    to be busy straight away, as it always was."""
+    monkeypatch.setattr(phonelock, "PATIENCE_S", 30.0)
+    with PhoneLock(tmp_path, "an MCP session (antigravity-client): Hinge"):
+        began = time.monotonic()
+        with pytest.raises(PhoneBusy, match="is driving the phone"):
+            PhoneLock(tmp_path, "adbagent run: turn on wifi").acquire()
+        assert time.monotonic() - began < 2
+
+
+def test_a_look_that_outlasts_the_patience_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(phonelock, "PATIENCE_S", 0.5)
+    with PhoneLock(tmp_path, "adbagent watch: x").acquire(looking=True):
+        with pytest.raises(PhoneBusy, match="looking at the screen"):
+            PhoneLock(tmp_path, "adbagent run: turn on wifi").acquire()

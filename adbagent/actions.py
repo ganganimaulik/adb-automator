@@ -37,7 +37,8 @@ ActionName = Literal[
     "tap", "tap_at", "long_press", "long_press_at", "double_tap", "drag",
     "input_text", "press_key", "scroll", "scroll_to_edge", "swipe",
     "open_app", "open_url", "restart_app", "list_apps",
-    "get_clipboard", "set_clipboard", "wait", "sleep", "ask_user", "done", "fail",
+    "get_clipboard", "set_clipboard", "wait", "sleep", "notify",
+    "ask_user", "done", "fail",
 ]
 
 #: Only names the on-device server actually accepts, plus the two panels
@@ -64,6 +65,9 @@ PostKind = Literal["screen_changed", "element_state", "text_present",
 PlanStatus = Literal["pending", "active", "done", "blocked"]
 
 TERMINAL_ACTIONS = frozenset({"done", "fail", "ask_user"})
+#: Actions that never reach the phone: the agent loop carries them out itself,
+#: and `execute` refuses them. See `agent.Agent._notify`.
+OFF_DEVICE = frozenset({"notify"})
 #: Actions whose whole purpose is to move to a different screen.
 NAVIGATIONAL = frozenset({"tap", "tap_at", "long_press", "long_press_at",
                           "double_tap", "press_key", "open_app", "open_url",
@@ -82,6 +86,10 @@ NEEDS_TARGET = frozenset({"tap", "long_press", "input_text"})
 #: cannot press it. A scroll is not one of these -- it moves a surface, and its
 #: failing says nothing about whether controls can be hit.
 CONTROL_ACTIONS = NEEDS_TARGET | POINT_ACTIONS
+
+#: How much of a `notify`'s text its history line repeats. The step's outcome
+#: says how many lines went out; the line itself only has to say about what.
+_NOTIFY_SHOWN_CHARS = 300
 
 #: How a model refers to a listed control in prose, in the three shapes seen in
 #: ``runs/``: a bare ``#2``, ``#2 'Like photo'``, and the element list's own
@@ -258,6 +266,7 @@ class AgentAction(BaseModel):
                     "list_apps: optional package name or keyword filter. "
                     "set_clipboard: text to put in clipboard. "
                     "tap_at/long_press_at/double_tap: the control to locate, when x and y are omitted. "
+                    "notify: the notification for the owner's phone, one per line. "
                     "ask_user: the question. done/fail: a one-line summary.")
     clear: Optional[bool] = Field(
         None, description="For input_text: clear field before typing (default True). Set False to append.")
@@ -436,6 +445,8 @@ class AgentAction(BaseModel):
                              "in text")
         if self.action == "ask_user" and not self.text:
             raise ValueError("ask_user requires the question in text")
+        if self.action == "notify" and not (self.text or "").strip():
+            raise ValueError("notify requires the notification in text")
         return self
 
     @property
@@ -468,10 +479,12 @@ class AgentAction(BaseModel):
                                                   self.to_x, self.to_y):
             parts.append(f"{self.x:.2f},{self.y:.2f}->"
                          f"{self.to_x:.2f},{self.to_y:.2f}")
-        if self.action in ("open_app", "open_url", "restart_app") and self.text:
+        if self.action in ("open_app", "open_url", "restart_app",
+                           "notify") and self.text:
             # The whole identity of these: two `open_url`s to different links
             # are different actions, and repeating one is what the ban list is
-            # for.
+            # for. Two notifications about two people are two actions too, and
+            # the same one notified again and again on one screen is a loop.
             parts.append(" ".join(self.text.lower().split()))
         for extra in (self.key, self.direction):
             if extra:
@@ -491,6 +504,14 @@ class AgentAction(BaseModel):
                         f"({self.to_x:.2f},{self.to_y:.2f})")
         if self.action == "input_text" and self.text is not None:
             bits.append(f"{self.text!r}")
+        elif self.action == "notify" and self.text:
+            # One history line however many notifications it carries: the
+            # history is a line per step, and the lines are what was said.
+            said = " | ".join(" ".join(line.split())
+                              for line in self.text.splitlines() if line.strip())
+            if len(said) > _NOTIFY_SHOWN_CHARS:
+                said = said[:_NOTIFY_SHOWN_CHARS - 1] + "…"
+            bits.append(repr(said))
         elif self.action in ("open_app", "open_url", "restart_app", "list_apps",
                              "done", "fail", "ask_user") and self.text:
             bits.append(self.text)
@@ -1118,6 +1139,9 @@ def execute(dev: "Device", action: AgentAction, screen: Screen) -> Optional[Elem
             time.sleep(min(timeout, 30.0))
             summary = f"{past_verb} for {timeout:.1f}s"
             setattr(action, "_result_summary", summary)
+    elif action.action in OFF_DEVICE:
+        raise ActionError(f"{action.action} does not act on the phone; the "
+                          f"agent loop carries it out")
     else:
         raise ActionError(f"{action.action} is terminal and is not executed here")
     return element
@@ -1170,7 +1194,8 @@ def synthesise_postcondition(action: AgentAction,
         pkg = getattr(action, "_resolved_package", (action.text or "").strip())
         return Postcondition(kind="app_is", package=pkg)
     if action.action in ("wait", "sleep", "list_apps", "get_clipboard",
-                         "set_clipboard", "scroll", "swipe", "scroll_to_edge"):
+                         "set_clipboard", "scroll", "swipe", "scroll_to_edge",
+                         "notify"):
         return Postcondition(kind="noop_ok")
     return Postcondition(kind="screen_changed")
 
