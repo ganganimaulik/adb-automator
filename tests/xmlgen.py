@@ -528,7 +528,7 @@ TOOLS_THREAD = ["hey! loved your hiking photos",
 
 
 def chat_with_composer_tools(messages: Optional[List[str]] = None,
-                             draft: str = "") -> str:
+                             draft: str = "", hint: str = "Aa") -> str:
     """A thread whose text field is flanked by a camera, a GIF and a voice
     control, with an unlabelled button between them.
 
@@ -542,7 +542,7 @@ def chat_with_composer_tools(messages: Optional[List[str]] = None,
     theirs and the voice control the newest message in the thread, ours.
 
     `draft` is typed into the field, and then a Send button takes the voice
-    control's place, as chat apps swap them.
+    control's place, as chat apps swap them. `hint` is the field's placeholder.
     """
     texts = messages if messages is not None else TOOLS_THREAD
     thread: List[N] = [N("android.widget.TextView", (440, 290, 640, 340),
@@ -559,7 +559,7 @@ def chat_with_composer_tools(messages: Optional[List[str]] = None,
         N("android.widget.Button", (16, 2040, 136, 2160), desc="Camera",
           rid="attach_button", package=CHAT, clickable=True),
         N("android.widget.EditText", (150, 2030, 700, 2170), text=draft,
-          hint="Aa", rid="message_input", package=CHAT, clickable=True,
+          hint=hint, rid="message_input", package=CHAT, clickable=True,
           focusable=True),
         N("android.widget.Button", (710, 2040, 830, 2160), text="GIF",
           rid="gif_button", package=CHAT, clickable=True),
@@ -612,7 +612,9 @@ def like_sheet(comment: bool = True) -> str:
 
     The comment field is not in the tree as a field; the like pill's label grows
     "with message" once a comment is on it; and the paid Rose sits beside it,
-    so "Send" names both.
+    so "Send" names both. Neither button is flagged clickable, though a tap on
+    either lands: this fixture used to flag both, so no test saw what the 617
+    likes in ``runs/`` did -- not one counted as a send (`Element.pressable`).
     """
     pkg = "co.hinge.app"
     tail = " with message" if comment else ""
@@ -623,8 +625,7 @@ def like_sheet(comment: bool = True) -> str:
                       N("android.widget.TextView", (60, 1120, 1020, 1240),
                         text="Edit comment", package=pkg),
                       N("android.widget.Button", (60, 1260, 250, 1340),
-                        desc=f"Send a Rose{tail}", package=pkg, clickable=True),
+                        desc=f"Send a Rose{tail}", package=pkg),
                       N("android.widget.Button", (270, 1260, 1020, 1340),
-                        desc=f"Send priority like{tail}", package=pkg,
-                        clickable=True),
+                        desc=f"Send priority like{tail}", package=pkg),
                   ]))

@@ -859,13 +859,14 @@ def element_at_point(screen: Screen, x: float, y: float) -> Optional[Element]:
     The point half of the tap_at refusal guard (the text half is
     `resolve_target`): the agent loop refuses a tap_at that lands on a
     button-sized listed element, with the #N it should have used. Returns None
-    when the point hits nothing interactive, or only a container too big to be
-    the thing meant.
+    when the point hits nothing pressable, or only a container too big to be
+    the thing meant. Pressable, not interactive: a button the dump does not
+    flag clickable is still the control under the point (`Element.pressable`).
     """
     if screen.width <= 0 or screen.height <= 0:
         return None
     px, py = x * screen.width, y * screen.height
-    hits = [e for e in screen.elements if e.interactive
+    hits = [e for e in screen.elements if e.pressable
             and e.bounds[0] <= px <= e.bounds[2]
             and e.bounds[1] <= py <= e.bounds[3]]
     if not hits:

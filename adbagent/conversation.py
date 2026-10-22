@@ -52,7 +52,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional
 
-from .actions import AgentAction, element_at_point, resolve_target
+from .actions import (AgentAction, element_at_point, elements_named,
+                      resolve_target)
 from .config import Config
 from .fingerprint import CHAT_SEND_TEXT
 from .screen import SYSTEM_UI_PACKAGES, Element, Screen
@@ -137,24 +138,37 @@ def send_label(action: AgentAction, screen: Screen) -> str:
 
     The label must look like a control's as well as matching: a message bubble
     that happens to contain the word "send" is not a send control, and refusing
-    a tap on it would strand the loop on a screen it is allowed to read.
+    a tap on it would strand the loop on a screen it is allowed to read. The
+    element must be a control, too -- pressable, which counts a button the dump
+    does not flag clickable (`Element.pressable`) -- and never a text field,
+    whatever its hint says. Hinge's message field is hinted "Send a message",
+    and a tap that only focused it went down as a reply sent
+    (``runs/f94def19db5d``); what sends from a field is its action key or
+    ``press_enter``, both counted below.
     """
     if action.action in ("tap", "long_press") and action.target is not None:
         element = resolve_target(action.target, screen)
-        if element is None or not element.interactive:
+        if element is None or element.editable or not element.pressable:
             return ""
         label = (element.best_text or "").strip()
         return label if _names_a_send(label) else ""
     if action.action == "tap_at":
         # Named first: before the locate runs there is no point yet, and the
         # model's description is the only thing saying what is about to be hit.
+        # Unless it names listed elements and every one is a text field: then
+        # what is about to be hit is a field.
         described = " ".join((action.text or "").split())
         if (described and len(described) <= _SEND_DESCRIPTION_MAX_CHARS
                 and CHAT_SEND_TEXT.search(described)):
+            named = elements_named(screen, described)
+            if named and all(e.editable for e in named):
+                return ""
             return described
         if action.x is not None and action.y is not None:
             element = element_at_point(screen, action.x, action.y)
-            label = (element.best_text or "").strip() if element is not None else ""
+            if element is None or element.editable:
+                return ""
+            label = (element.best_text or "").strip()
             return label if _names_a_send(label) else ""
         return ""
     if action.action == "press_key":

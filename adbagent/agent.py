@@ -1853,7 +1853,9 @@ class Agent:
                     # A row and its own title both answer to the row's name.
                     # One tappable match among several is that control; two
                     # tappable ones -- the like pill and the Rose -- are not.
-                    tappable = [e for e in named if e.interactive]
+                    # Pressable, as the send check counts them: neither of
+                    # those two is flagged clickable (`Element.pressable`).
+                    tappable = [e for e in named if e.pressable]
                     if len(named) > 1 and len(tappable) == 1:
                         named = tappable
                     partial = any(e.best_text.strip().lower() != wanted

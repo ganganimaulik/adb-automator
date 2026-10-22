@@ -195,6 +195,23 @@ class Element:
         return self.actionable or self.scrollable
 
     @property
+    def pressable(self) -> bool:
+        """A control a tap presses: interactive, or a button by its own class.
+
+        Some apps draw a button the dumper does not flag clickable: the view
+        handles the tap, and the node still says clickable="false". Hinge's like
+        sheet is drawn that way -- the like pill and the paid Rose beside it both
+        -- and in August, before scrollers stopped absorbing their children's
+        text, the sheet's scroller carried "Send a Rose ... Send priority like"
+        as its label, which `_absorb_labels` only ever took from non-interactive
+        children. Asking for the flag kept every one of the 617 likes in
+        ``runs/`` out of `SendLog`, so neither ``like=207`` nor ``rose=0`` ever
+        bound. A class that calls itself a button is a control whatever the flag
+        says; `kind` already renders it as one.
+        """
+        return self.interactive or self.cls.endswith("Button")
+
+    @property
     def best_text(self) -> str:
         """Whatever a human would call this element."""
         return self.text or self.content_desc or self.label or self.hint

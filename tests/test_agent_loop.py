@@ -2985,3 +2985,82 @@ def test_a_partial_name_for_the_like_pill_is_refused_not_guessed(cfg):
     assert "only partly matches" in refusal
     assert "Send priority like with message" in refusal
     assert "Rose" not in refusal
+
+
+def _tap_labelled(screen, label: str) -> AgentAction:
+    el = next(e for e in screen.elements if e.best_text == label)
+    return AgentAction(observation="on the sheet", reasoning="press it",
+                       action="tap", target={"index": el.index})
+
+
+def test_a_like_whose_button_is_not_flagged_clickable_counts_against_the_cap(cfg):
+    """Hinge's like pill dumps with clickable="false". The loop used to ask for
+    the flag, so not one of the 617 likes in ``runs/`` was counted and the
+    driver was told "0 used, 207 left" after thirteen (``runs/8f213eddda69``).
+    The send check is off here as it is for the scheduled passes; counting
+    does not depend on it."""
+    cfg.safety.check_sends = False
+    dev = fake.FakeDevice(cfg, start="sheet", app=_like_sheet_app())
+
+    def policy(screen, llm):
+        if dev.state == "sent":
+            return AgentAction(observation="sent", reasoning="stop",
+                               action="done", text="liked")
+        return _tap_labelled(screen, "Send priority like with message")
+
+    _, state, llm = _run_with(dev, cfg, policy, check=False,
+                              send_limits={"like": 207, "rose": 0})
+
+    assert dev.state == "sent"
+    assert [s.label for s in state.sends.sent] == [
+        "Send priority like with message"]
+    assert "1 used, 206 left" in llm.budgets[-1]
+
+
+def test_the_paid_button_beside_the_like_is_refused_when_the_policy_forbids_it(cfg):
+    """``rose=0`` is only as good as the Rose counting as a send, and it is
+    drawn as unflagged as the like pill beside it."""
+    cfg.safety.check_sends = False
+    dev = fake.FakeDevice(cfg, start="sheet", app=_like_sheet_app())
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="refused", reasoning="stop",
+                               action="done", text="did not send")
+        tried.append(True)
+        return _tap_labelled(screen, "Send a Rose with message")
+
+    _, state, llm = _run_with(dev, cfg, policy, check=False,
+                              send_limits={"like": 207, "rose": 0})
+
+    assert dev.taps == []
+    assert len(state.sends) == 0
+    assert any('forbids "rose"' in line for line in state.history)
+
+
+def test_focusing_a_field_hinted_send_is_not_held_as_a_send(cfg):
+    """A policy that forbids sending can still put the cursor in the field:
+    the hint "Send a message" names where to type, not what sends."""
+    cfg.safety.check_sends = False
+    app = {"thread": fake.FakeScreen(
+        xml=X.chat_with_composer_tools(hint="Send a message"))}
+    dev = fake.FakeDevice(cfg, start="thread", app=app)
+    tried = []
+
+    def policy(screen, llm):
+        if tried:
+            return AgentAction(observation="focused", reasoning="stop",
+                               action="done", text="focused the field")
+        tried.append(True)
+        field = next(e for e in screen.elements
+                     if e.resource_id == "message_input")
+        return AgentAction(observation="the field", reasoning="focus it",
+                           action="tap", target={"index": field.index})
+
+    _, state, llm = _run_with(dev, cfg, policy, check=False,
+                              send_limits={"send": 0})
+
+    assert len(dev.taps) == 1
+    assert len(state.sends) == 0
+    assert not any("forbids" in line for line in state.history)

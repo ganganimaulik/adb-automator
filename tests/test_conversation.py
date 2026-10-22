@@ -221,6 +221,62 @@ def test_a_tap_at_that_names_something_else_is_not_a_send():
     assert send_label(act, s) == ""
 
 
+def test_a_button_the_dump_does_not_flag_clickable_is_still_a_send():
+    """Hinge dumps its like pill and the paid Rose beside it as Buttons with
+    clickable="false", and a tap on either lands anyway. Asking for the flag
+    kept all 617 likes in ``runs/`` out of `SendLog`: ``like=207`` never bound,
+    and the driver was told "0 used" after thirteen likes
+    (``runs/8f213eddda69``)."""
+    s = _like_sheet()
+    pill = next(e for e in s.elements
+                if e.best_text == "Send priority like with message")
+    rose = next(e for e in s.elements
+                if e.best_text == "Send a Rose with message")
+    assert not pill.interactive and not rose.interactive
+    assert send_label(tap_on(s, pill), s) == "Send priority like with message"
+    # ...which is what lets `rose=0` refuse the paid one.
+    label = send_label(tap_on(s, rose), s)
+    assert label == "Send a Rose with message"
+    assert "forbids" in SendLog().over_limit(label, {"rose": 0})
+
+
+def test_a_tap_at_landing_on_such_a_button_is_a_send_too():
+    s = _like_sheet()
+    pill = next(e for e in s.elements
+                if e.best_text == "Send priority like with message")
+    x, y = pill.center
+    act = AgentAction(observation="x", reasoning="y", action="tap_at",
+                      x=x / s.width, y=y / s.height)
+    assert send_label(act, s) == "Send priority like with message"
+
+
+def test_text_that_is_not_a_button_still_needs_the_flag():
+    """The widening is to buttons alone: a bubble drawn as plain text that says
+    "send it" is read, not pressed."""
+    s = screen(messages=["send it", "ok"])
+    bubble = next(e for e in s.elements if e.best_text == "send it")
+    assert not bubble.pressable
+    assert send_label(tap_on(s, bubble), s) == ""
+
+
+def test_a_text_field_is_not_a_send_whatever_its_hint_says():
+    """A field hinted "Send a message" is where a reply is typed, not what
+    sends it, and a tap that only focused one went down as a reply sent
+    (``runs/f94def19db5d``). Not by index, by point or by name."""
+    s = tools(hint="Send a message")
+    field = next(e for e in s.elements if e.resource_id == "message_input")
+    assert field.best_text == "Send a message"
+    assert send_label(tap_on(s, field), s) == ""
+    x, y = field.center
+    by_point = AgentAction(observation="x", reasoning="y", action="tap_at",
+                           x=x / s.width, y=y / s.height)
+    assert send_label(by_point, s) == ""
+    by_name = AgentAction(observation="x", reasoning="y", action="tap_at",
+                          text="Send a message")
+    assert send_label(by_name, s) == ""
+    assert draft_refusal(tap_on(s, field), s, cfg(draft=True)) == ""
+
+
 # -- what a send says ------------------------------------------------------------
 
 def test_the_draft_of_a_typed_send_is_what_will_be_typed():
