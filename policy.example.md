@@ -38,4 +38,4 @@ If you are unsure whether something falls under one of those, do not reply.
 - Before replying, each pass reads who sent a conversation's newest message off
   the screenshot, and a second model checks every send against this file. That
   makes a second reply to the same message unlikely, not impossible — see "How
-  it avoids replying twice" in the README.
+  it avoids wrong replies" in the README.
