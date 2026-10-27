@@ -12,7 +12,7 @@
         "--allow-destructive"
       ],
       "env": {
-        "RELOAD_TRIGGER": "2026-10-16T09:18:00"
+        "RELOAD_TRIGGER": "2026-10-21T18:08:45"
       }
     }
   }
