@@ -31,12 +31,21 @@ send_limits: like=207, rose=0
   - Never send the same reply again to the same person.
   - Read the whole message history before sending anything.
   - If the match has not sent an incoming reply yet (only your initial `Hey 🔥` is present) or the newest message was sent by you, send nothing and leave.
-- **The Greeting Gate**:
-  - Authorized reply text: `up for movie at my place?`
-  - May ONLY be sent when the match's newest incoming message is a greeting and nothing more.
-    - Counts as a greeting: `hi`, `hii`, `hiii`, `hey`, `heyy`, `hello`, `helloo`, `yo`, `hey there`, `hi there` (any casing, repeated letters, punctuation, trailing emoji).
-    - Does NOT count (send nothing): questions (`how are you?`, `what's up?`, `wyd`), statements, compliments, brush-offs (`ok`, `k`, `lol`, `nvm`), declines (`Maybe some other time!!`), emoji/stickers/photos/GIFs/voice notes.
-  - When the gate fails or movie proposal was already sent: type nothing, clear any leftover draft, and leave the chat.
+- **Authorized Replies & Triggers**:
+  - **1. Greeting**:
+    - Trigger: Match's newest incoming message is a greeting and nothing more (e.g. `hi`, `hii`, `hiii`, `hey`, `heyy`, `hello`, `helloo`, `yo`, `hey there`, `hi there`, trailing emoji or punctuation allowed).
+    - Authorized reply: `up for movie at my place?`
+    - Send only if this movie proposal was not already sent in the thread.
+  - **2. Where / Location Question**:
+    - Trigger: Match asks where (e.g. `where?`, `where`, `where do you stay?`, `where is your place?`, `where do you live?`, `where at?`, `where in ahmedabad?`).
+    - Authorized reply: `Got flat in Bodakdev.`
+    - Send only if this location reply was not already sent in the thread.
+  - **3. Living Situation (Alone / Flatmates / Family Question)**:
+    - Trigger: Match asks if you live alone, with family, or about flatmates/roommates (e.g. `do you live alone?`, `do you live with family?`, `live with family?`, `with parents?`, `you live alone?`, `alone?`, `live alone?`, `who do you stay with?`, `do you have flatmates?`, `roommates?`).
+    - Authorized reply: `2bhk, personal room. 1 flatmate, wont bother us.`
+    - Send only if this living situation reply was not already sent in the thread.
+- **Unmatched Messages (Send Nothing)**:
+  - If the match's message does not match one of the authorized triggers above (e.g. general questions like `how are you?`, `wyd`, statements, compliments, brush-offs like `ok`, `lol`, declines like `Maybe some other time!!`, emoji/stickers/photos/GIFs/voice notes), or if the applicable reply was already sent: type nothing, clear any leftover draft, and leave the chat.
 
 ## Notifications (`notify`)
 The owner wants a notification on their phone for every new message a match sends and for every reply you send:
@@ -48,7 +57,7 @@ The owner wants a notification on their phone for every new message a match send
 
 ## Safety & Boundaries
 - Never double reply.
-- Never compose, rephrase, soften, or improvise messages: `up for movie at my place?` triggered by a greeting is the only authorized reply.
+- Never compose, rephrase, soften, or improvise messages: only send the exact authorized replies (`up for movie at my place?`, `Got flat in Bodakdev.`, or `2bhk, personal room. 1 flatmate, wont bother us.`) strictly when their respective trigger condition is met.
 - Never use paid features (Boost, Roses, HingeX, Signals).
 - Never share financial, personal contact, or banking details.
 - Finish each pass on the main Discover or Matches list.
