@@ -205,7 +205,7 @@ def test_a_driver_reads_back_what_was_notified_before_it_opens_anything(cfg):
     runs.mkdir(parents=True)
     (runs / "notified.jsonl").write_text(
         json.dumps({"at": 1_793_000_000, "sent": True,
-                    "text": "Settings: new message from S: Too early ."}) + "\n",
+                    "text": "Settings: new message from S: maybe tomorrow ."}) + "\n",
         encoding="utf-8")
     dev = fake.FakeDevice(cfg)
 
@@ -223,7 +223,7 @@ def test_a_driver_reads_back_what_was_notified_before_it_opens_anything(cfg):
 
     acted = drive(cfg, dev, script)
     assert "-> found (1 notified before, oldest first: " in acted
-    assert "Settings: new message from S: Too early ." in acted
+    assert "Settings: new message from S: maybe tomorrow ." in acted
     assert dev.state == "wifi" and "stopped before" not in acted
 
 

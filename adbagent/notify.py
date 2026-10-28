@@ -159,7 +159,7 @@ def matches(line: str, wanted: str) -> bool:
     """Whether `line` says the words of `wanted`, whole and in order.
 
     Whole words, so that "new message from S" finds what S said and not what
-    Swastika did. A `wanted` with no words in it -- only emoji, only
+    Sam did. A `wanted` with no words in it -- only emoji, only
     punctuation -- matches nothing.
     """
     wanted = words(wanted)

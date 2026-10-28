@@ -300,16 +300,16 @@ def notified(tmp_path, *lines: str, at: float = 1_000_000.0) -> Notifier:
 
 
 def test_a_name_finds_what_that_person_said_and_nobody_else():
-    """Whole words: Hinge lists initials, and in the 2026-10-28 pass S, K and
-    G sat beside Swastika, Kavina and Kaia."""
-    assert notify.matches("Hinge: new message from S: Too early .",
+    """Whole words: a list can show a match by an initial, and S sits beside
+    Sam and Samir on the same screen."""
+    assert notify.matches("Hinge: new message from S: maybe tomorrow .",
                           "Hinge: new message from S")
-    assert not notify.matches("Hinge: new message from Swastika: hi",
+    assert not notify.matches("Hinge: new message from Sam: hi",
                               "Hinge: new message from S")
-    assert notify.matches("Hinge: new message from Kavina: Oh…! How about we start slow?",
-                          "new message from kavina")
+    assert notify.matches("Hinge: new message from Samir: Oh…! How about coffee first?",
+                          "new message from samir")
     # The words in order, ignoring case and punctuation, as `same` reads them.
-    assert notify.matches("Bumble: new message from T: We can go to the cafe",
+    assert notify.matches("Bumble: new message from T: We can go for a walk",
                           "bumble new message from t we can go")
     assert not notify.matches("Bumble: new message from T: We can go",
                               "Bumble: new message from D")
@@ -318,45 +318,45 @@ def test_a_name_finds_what_that_person_said_and_nobody_else():
 
 
 def test_a_pass_can_see_the_newest_message_was_read_before(tmp_path):
-    """What the Matches list showed on 2026-10-28 -- "S Too early 1 day ago.
-    Reply?" -- and the two lines an earlier pass notified from S's chat."""
+    """A Matches row like "S maybe tomorrow 1 day ago. Reply?", and the two
+    lines an earlier pass notified from S's chat."""
     notifier = notified(tmp_path,
-                        "Hinge: new message from S: Hehe.",
-                        "Hinge: new message from S: Too early .",
-                        "Hinge: new message from Swastika: Lets slow down.",
+                        "Hinge: new message from S: haha ok.",
+                        "Hinge: new message from S: maybe tomorrow .",
+                        "Hinge: new message from Sam: see you.",
                         "Bumble: new message from S: hey")
     back = notifier.read_back("Hinge: new message from S")
     assert [line.text for line in back.found] == [
-        "Hinge: new message from S: Hehe.", "Hinge: new message from S: Too early ."]
+        "Hinge: new message from S: haha ok.", "Hinge: new message from S: maybe tomorrow ."]
     assert back.grade == "found"
     summary = back.summary()
     assert summary.startswith("2 notified before, oldest first: ")
-    assert "Hinge: new message from S: Hehe. | " in summary
-    assert "Swastika" not in summary and "Bumble" not in summary
+    assert "Hinge: new message from S: haha ok. | " in summary
+    assert "Sam" not in summary and "Bumble" not in summary
     # Each with when, for a row that says how long ago its message came.
-    assert back.found[0].shown().endswith(" Hinge: new message from S: Hehe.")
+    assert back.found[0].shown().endswith(" Hinge: new message from S: haha ok.")
     assert back.found[0].shown() != back.found[0].text
 
 
 def test_one_lookup_covers_every_row_on_screen(tmp_path):
     notifier = notified(tmp_path,
-                        "Hinge: new message from S: Too early .",
-                        "Hinge: new message from K: Exactly not really into casuals",
-                        "Hinge: new message from Kaia: sup.",
-                        "Hinge: replied to Kaia: up for movie at my place?")
+                        "Hinge: new message from S: maybe tomorrow .",
+                        "Hinge: new message from K: maybe next week",
+                        "Hinge: new message from Kim: yo.",
+                        "Hinge: replied to Kim: up for movie at my place?")
     back = notifier.read_back("Hinge: new message from S\n\n"
                               "Hinge: new message from K\n"
                               "Hinge: new message from G")
     assert [line.text for line in back.found] == [
-        "Hinge: new message from S: Too early .",
-        "Hinge: new message from K: Exactly not really into casuals"]
+        "Hinge: new message from S: maybe tomorrow .",
+        "Hinge: new message from K: maybe next week"]
     assert back.filters == ["Hinge: new message from S", "Hinge: new message from K",
                             "Hinge: new message from G"]
 
 
 def test_a_message_never_notified_is_not_found(tmp_path):
-    notifier = notified(tmp_path, "Hinge: new message from S: Too early .")
-    back = notifier.read_back("Hinge: new message from Maahi")
+    notifier = notified(tmp_path, "Hinge: new message from S: maybe tomorrow .")
+    back = notifier.read_back("Hinge: new message from Robin")
     assert back.found == [] and back.grade == "nothing found"
     assert back.summary() == "nothing notified before matches that"
     assert Notifier(tmp_path / "elsewhere", Phone()).read_back().summary() == \
@@ -369,7 +369,7 @@ def test_with_no_bot_and_no_ledger_the_read_says_why_it_is_empty(tmp_path):
     back = Notifier(tmp_path, None).read_back("Hinge: new message from S")
     assert back.unconfigured and "not set up" in back.summary()
     # A ledger written while a bot was set up is still there to read.
-    notified(tmp_path, "Hinge: new message from S: Too early .")
+    notified(tmp_path, "Hinge: new message from S: maybe tomorrow .")
     assert Notifier(tmp_path, None).read_back("from S").found
 
 
@@ -723,28 +723,28 @@ def reading(text: str):
 
 def test_a_pass_reads_back_what_an_earlier_one_notified(cfg):
     phone = Phone()
-    run_with(cfg, notifying("Hinge: new message from S: Too early ."), phone)
+    run_with(cfg, notifying("Hinge: new message from S: maybe tomorrow ."), phone)
     dev, outcome, state = run_with(cfg, reading("Hinge: new message from S"), phone)
 
     assert outcome == "success"
     assert dev.taps == [] and not any(a.startswith("press") for a in dev.actions)
     line = next(h for h in state.history if " read_notified " in h)
     assert "-> found (1 notified before, oldest first: " in line
-    assert line.rstrip(")").endswith("Hinge: new message from S: Too early .")
+    assert line.rstrip(")").endswith("Hinge: new message from S: maybe tomorrow .")
     # Reading what was already known is not progress.
     assert "notification" not in state.last_progress
-    assert phone.sent == ["Hinge: new message from S: Too early ."]
+    assert phone.sent == ["Hinge: new message from S: maybe tomorrow ."]
 
     (event,) = [e for e in events_of(cfg, state) if e["kind"] == "read_notified"]
     assert event["matched"] == 1 and event["grade"] == "found"
-    assert event["shown"] == ["Hinge: new message from S: Too early ."]
+    assert event["shown"] == ["Hinge: new message from S: maybe tomorrow ."]
     assert event["filters"] == ["Hinge: new message from S"]
 
 
 def test_a_dry_run_reads_back_all_the_same(cfg):
     """It touches nothing, and a dry run deciding without the answer would
     decide differently from a real one."""
-    run_with(cfg, notifying("Hinge: new message from S: Too early ."), Phone())
+    run_with(cfg, notifying("Hinge: new message from S: maybe tomorrow ."), Phone())
     cfg.run.dry_run = True
     _, _, state = run_with(cfg, reading("from S"), Phone())
     line = next(h for h in state.history if " read_notified " in h)
