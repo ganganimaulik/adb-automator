@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Sized, Tuple
 
 from . import (__version__, checkpoint, control, conversation, notify, prompts,
                runlog, safety)
-from .actions import (CONTROL_ACTIONS, NAVIGATIONAL, OFF_DEVICE, POINT_ACTIONS,
+from .actions import (CONTROL_ACTIONS, NAVIGATIONAL, POINT_ACTIONS,
                       ActionError, AgentAction, Target, append_history,
                       content_moved_in_pixels, element_at_point,
                       element_summary, elements_named, execute,
@@ -1775,6 +1775,15 @@ class Agent:
                     continue
                 return
 
+            # ---- 5a. reading back what was notified ----------------------
+            # Like a notification, nothing to settle, verify or ban, and the
+            # screen is still the screen. Ahead of the dry run because it
+            # touches nothing at all, the owner's phone included: a dry run
+            # without the answer would decide differently from a real one.
+            if action.action == "read_notified":
+                self._read_notified(state, rec, screen, action)
+                continue
+
             if cfg.run.dry_run:
                 log.info("dry run: would %s", action.describe())
                 state.remember(
@@ -1782,16 +1791,16 @@ class Agent:
                 )
                 continue
 
-            # ---- 5a. a notification, which never touches the phone ---------
+            # ---- 5b. a notification, which never touches the phone ---------
             # Here and not in `execute`: there is nothing to settle, verify or
             # ban, and the screen the model decided on is still the screen, so
             # the loop goes round without reading the phone again. Ahead of the
             # send gates below, which are about messages to other people.
-            if action.action in OFF_DEVICE:
+            if action.action == "notify":
                 self._notify(state, rec, screen, action)
                 continue
 
-            # ---- 5b. the gates in front of a send that need no model -------
+            # ---- 5c. the gates in front of a send that need no model -------
             # Draft mode, the switch that means "compose, never send" and holds
             # whatever the model concluded; and the policy's `send_limits`,
             # which hold a count the model kept losing (`conversation.SendLog`).
@@ -2551,6 +2560,33 @@ class Agent:
         state.loops.record(screen.skeleton_id, action.signature())
         state.remember(format_history_entry(
             state.step, action, screen=screen, grade=outcome.grade,
+            reason=summary))
+
+    def _read_notified(self, state: RunState, rec: Recorder, screen: Screen,
+                       action: AgentAction) -> None:
+        """Show the model the lines notified before that it asked about.
+
+        The ledger `_notify` writes, read back: a pass about to open a
+        conversation only to see whether anything in it is new can first look
+        up the message its row shows, and leave alone one an earlier pass
+        already read there and notified. Which it is, the model decides, from
+        the lines themselves -- they come back whole, with when.
+
+        Never a failed step, and never progress: what it reads is what was
+        already known, and reading it again buys the stall ladder nothing.
+        """
+        found = self.notifier.read_back(action.text or "")
+        summary = found.summary()
+        rec.event("read_notified", step=state.step, grade=found.grade,
+                  summary=summary, filters=found.filters,
+                  matched=len(found.found),
+                  shown=[line.text for line in found.shown])
+        self.on_event("read_notified", step=state.step, grade=found.grade,
+                      matched=len(found.found))
+        state.note_success()
+        state.loops.record(screen.skeleton_id, action.signature())
+        state.remember(format_history_entry(
+            state.step, action, screen=screen, grade=found.grade,
             reason=summary))
 
     # -- sends -------------------------------------------------------------

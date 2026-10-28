@@ -36,6 +36,17 @@ the pass that sent a reply never comes back to that moment, so nothing else
 would bring its notification back. A pending line older than `PENDING_TTL_S` is
 let go rather than delivered a day late.
 
+**What was notified can be read back** (`read_notified`, `Notifier.read_back`).
+A pass learns that a message is old news only once it has opened the
+conversation and notified it again -- and in the seven days to 2026-10-28 that
+was 2,471 Hinge chats and 648 Bumble ones opened to find nothing new, against
+28 that held something. A conversation list already shows each newest message,
+and a policy that notifies every new message has written down every one a pass
+read: so before opening a conversation, the model can look its row up here,
+and leave alone one whose newest message an earlier pass has already seen. The
+lookup is by words (`matches`), the same words `same` compares, and it decides
+nothing -- the model compares what it finds with what the row shows.
+
 Nothing here touches the phone, and nothing here is a send in the sense of
 `conversation.send_label`: a line to the owner's own chat is not a message to
 anybody the policy is about, so draft mode and `send_limits` leave it alone. A
@@ -52,8 +63,8 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional,
-                    Sequence, Set, Tuple)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, Iterator, List,
+                    Optional, Sequence, Set, Tuple)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .config import Config
@@ -74,6 +85,12 @@ LINE_MAX_CHARS = 1000
 
 #: How long a line that could not be delivered is kept for another try.
 PENDING_TTL_S = 24 * 3600
+
+#: How many lines one `read_notified` shows at most, and how much text: its
+#: answer is one line of the run's history. The newest are the ones kept, and
+#: naming the people on screen narrows it to what matters.
+READ_MAX_LINES = 50
+READ_MAX_CHARS = 5000
 
 #: One process can hold a session's run thread and serve a web request at once.
 #: Reading the ledger, delivering and writing down what was delivered must not
@@ -136,6 +153,17 @@ def same(a: str, b: str) -> bool:
         return False
     ea, eb = emoji(a), emoji(b)
     return ea is None or eb is None or ea == eb
+
+
+def matches(line: str, wanted: str) -> bool:
+    """Whether `line` says the words of `wanted`, whole and in order.
+
+    Whole words, so that "new message from S" finds what S said and not what
+    Swastika did. A `wanted` with no words in it -- only emoji, only
+    punctuation -- matches nothing.
+    """
+    wanted = words(wanted)
+    return bool(wanted) and f" {wanted} " in f" {words(line)} "
 
 
 def lines_of(text: str) -> List[str]:
@@ -304,6 +332,63 @@ class Outcome:
         return "; ".join(parts) or "the text held no line to send"
 
 
+@dataclass
+class Notified:
+    """A line in the ledger, as `read_notified` shows it."""
+
+    #: When it was first written down: the pass that read it.
+    at: float
+    text: str
+    #: Whether it has reached the owner. A kept line has not, yet.
+    sent: bool
+
+    def shown(self) -> str:
+        try:
+            when = time.strftime("%d %b %H:%M", time.localtime(self.at)) \
+                if self.at else "?"
+        except (OverflowError, OSError, ValueError):
+            when = "?"      # a time no clock can show: the file was edited
+        return f"{when} {self.text}" + ("" if self.sent else " [not delivered yet]")
+
+
+@dataclass
+class ReadBack:
+    """What one `read_notified` found in the ledger."""
+
+    #: What it looked for, one per line; none for everything.
+    filters: List[str] = field(default_factory=list)
+    #: Every line that matched, oldest first.
+    found: List[Notified] = field(default_factory=list)
+    #: The newest of those, as many as one answer holds, oldest first.
+    shown: List[Notified] = field(default_factory=list)
+    #: Nothing was ever notified, and no bot is set up to notify with.
+    unconfigured: bool = False
+
+    @property
+    def grade(self) -> str:
+        """One word for the step's history line."""
+        return "found" if self.found else "nothing found"
+
+    def summary(self) -> str:
+        """What the model is told: the lines themselves, on one line."""
+        if not self.found:
+            if self.unconfigured:
+                return ("nothing has been notified: notifications are not set "
+                        "up, so nothing records what earlier passes read")
+            if self.filters:
+                return "nothing notified before matches that"
+            return "nothing has been notified yet"
+        head = (f"{len(self.found)} notified before" if self.filters
+                else f"{len(self.found)} notified so far")
+        out = f"{head}, oldest first: " + " | ".join(
+            line.shown() for line in self.shown)
+        hidden = len(self.found) - len(self.shown)
+        if hidden:
+            out += (f" (+{hidden} older not shown: name the people you are "
+                    f"looking for)")
+        return out
+
+
 class Notifier:
     """Delivers the lines of a `notify` that were never delivered, and remembers.
 
@@ -377,6 +462,33 @@ class Notifier:
             self._append(records)
         return out
 
+    def read_back(self, text: str = "") -> ReadBack:
+        """The lines notified before that `text` asks about. Never raises.
+
+        Each line of `text` looks for one thing (`matches`), and a line in the
+        ledger is found when it matches any of them; with nothing to look for
+        -- no `text`, or none with a word in it -- every line is found.
+
+        Not under `_LOCK`: `notify` holds it across a delivery, which can take
+        seconds, and the file is only ever appended to. The worst a read can do
+        is miss the line being written, and one cut short is skipped.
+        """
+        filters = lines_of(text)
+        wanted = [line for line in filters if words(line)]
+        history = self._history()
+        found = [line for line in history
+                 if not wanted or any(matches(line.text, w) for w in wanted)]
+        shown: List[Notified] = []
+        size = 0
+        for line in reversed(found):
+            size += len(line.shown()) + 3
+            if shown and (len(shown) >= READ_MAX_LINES or size > READ_MAX_CHARS):
+                break
+            shown.append(line)
+        shown.reverse()
+        return ReadBack(filters=filters, found=found, shown=shown,
+                        unconfigured=self.transport is None and not history)
+
     def _deliver(self, lines: Sequence[str]) -> Tuple[Set[str], str]:
         """Send `lines` in as few messages as will go; what went, and why not."""
         delivered: Set[str] = set()
@@ -400,7 +512,26 @@ class Notifier:
         `same`'s question, asked of what this returns -- never written into the
         file, so a change to how lines are compared never makes an old one new.
         """
-        out: Dict[str, Dict[str, Any]] = {}
+        return {entry["text"]: entry for entry in self._entries()}
+
+    def _history(self) -> List[Notified]:
+        """Every line ever notified, once each, in the order they first were.
+
+        Dated by its first entry, which the pass that read it wrote; a line
+        kept then and delivered since counts as delivered.
+        """
+        out: Dict[str, Notified] = {}
+        for entry in self._entries():
+            known = out.get(entry["text"])
+            if known is None:
+                out[entry["text"]] = Notified(at=_when(entry), text=entry["text"],
+                                              sent=bool(entry.get("sent")))
+            elif entry.get("sent"):
+                known.sent = True
+        return list(out.values())
+
+    def _entries(self) -> Iterator[Dict[str, Any]]:
+        """The ledger's entries, oldest first, each with its `text` a string."""
         try:
             with self.path.open(encoding="utf-8") as handle:
                 for raw in handle:
@@ -410,19 +541,30 @@ class Notifier:
                         continue    # a line a crash cut short
                     if isinstance(entry, dict) and entry.get("text"):
                         entry["text"] = str(entry["text"])
-                        out[entry["text"]] = entry
+                        yield entry
         except FileNotFoundError:
             pass
         except OSError as exc:
             log.warning("could not read %s: %s", self.path, exc)
-        return out
 
     def _append(self, records: Sequence[Dict[str, Any]]) -> None:
         if not records:
             return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            # A crash can leave the last line cut short, without its newline.
+            # Appended straight after it, the next record would share its line
+            # and be skipped with it -- a line delivered and never written down.
+            torn = False
+            try:
+                with self.path.open("rb") as tail:
+                    tail.seek(-1, 2)
+                    torn = tail.read(1) != b"\n"
+            except OSError:
+                pass    # no file yet, or an empty one
             with self.path.open("a", encoding="utf-8") as handle:
+                if torn:
+                    handle.write("\n")
                 for record in records:
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError as exc:

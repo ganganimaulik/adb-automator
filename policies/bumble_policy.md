@@ -3,8 +3,9 @@ goal: |
   Watch Bumble (com.bumble.app) for messages only: send an opener to new matches, and answer matches who write back.
   Never swipe, like, pass or SuperSwipe anyone -- there is no liking in this goal at all. Go straight to the Chats
   tab every pass and stay off the People, Discover and Liked You tabs. Send `Hey 🔥` to each new match under
-  "Your matches" whose chat is still empty, then open each conversation marked "Your move" and reply only as the
-  REPLY POLICY says. Notify the owner (`notify`) of every new message a match sends and every reply you send.
+  "Your matches" whose chat is still empty, then open each conversation marked "Your move" that an earlier pass has
+  not already checked (`read_notified`, see the policy) and reply only as the REPLY POLICY says. Notify the owner
+  (`notify`) of every new message a match sends and every reply you send.
   Finish on the Chats list, never inside a chat.
 title: Bumble
 send_limits: like=0, superswipe=0, compliment=0
@@ -21,6 +22,12 @@ Messages only. Never like, pass, swipe, or SuperSwipe anyone.
 
 ## step 2. Conversations ("Your move" Rows)
 - Open conversations marked "Your move". Skip rows without "Your move" and expired conversations.
+- **Skip chats already checked**:
+  - Before opening any "Your move" chat, look up every such row on screen with ONE `read_notified`, one line per row: `Bumble: new message from <name>`.
+  - The text after "Your move" in a row is the match's newest message.
+  - If that message is already among the lines found for that person AND it is not one of the reply triggers below (greeting, where, living situation), an earlier pass already read that chat and sent nothing on purpose: do not open it.
+  - Open every other "Your move" row: a newest message that was never notified, or one that is a trigger (its reply never went out). When unsure, open it.
+  - If `act` rejects `read_notified` as not an allowed action, skip this check and open the rows as before.
 - **Reply Rules**:
   - Never send double replies.
   - Never send the same reply again to the same person.

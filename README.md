@@ -685,9 +685,23 @@ one event the same way:
   `WhatsApp: replied to <name>: <the reply you sent>`
 ```
 
+**What was notified can be read back.** The `read_notified` action shows the
+model the lines notified before, each with when: all of them, or the ones
+matching what it looks for, one per line, by whole words (`Hinge: new message
+from S` finds S's lines, not Sam's). A conversation list already shows each
+chat's newest message, so a policy can have the model look its rows up first
+and leave alone a chat whose newest message an earlier pass already read:
+
+```
+- Before opening any "Your turn" chat, look up every row on screen with ONE
+  `read_notified`, one line per row: `WhatsApp: new message from <name>`. If a
+  row's newest message is already among the lines found for that person, and it
+  needs no reply, an earlier pass already read that chat: don't open it.
+```
+
 A notification that can't be delivered is retried with the next one, for up to
 a day, and never fails the run. Notifications aren't sends, so `--draft` and
-`send_limits` don't stop them; dry runs don't notify.
+`send_limits` don't stop them; dry runs don't notify, but they do read back.
 
 ## App skills
 

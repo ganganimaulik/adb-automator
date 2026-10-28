@@ -42,7 +42,8 @@ def test_every_subcommand_parses():
         assert parse(argv).func is not None
 
 
-def test_mcp_flags_reach_the_config():
+def test_mcp_flags_reach_the_config(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
     args = parse(["mcp", "--draft", "--allow-destructive", "--max-steps", "40"])
     cfg = build_config(args)
     assert cfg.watch.draft is True

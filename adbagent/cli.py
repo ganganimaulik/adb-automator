@@ -1114,6 +1114,10 @@ def _live_reporter(out: Out, max_steps: Optional[int] = None):
             out.say(out.dim(f"        notify in {kw.get('elapsed', 0.0):.2f}s -> "
                             f"{kw.get('grade', '')}: {kw.get('reason', '')}"))
 
+        elif kind == "read_notified":
+            out.say(out.dim(f"        read back -> {kw.get('grade', '')}: "
+                            f"{kw.get('matched', 0)} line(s) notified before"))
+
         elif kind == "loop_warning":
             msg = kw.get("message", "")
             out.say(out.yellow(f"        [Loop Warning] {msg}"))
@@ -1848,6 +1852,10 @@ def _cost_summary(out: Out, events: List[Dict[str, Any]]) -> None:
 #: what kind of trouble a run had; the file has the rest, in context.
 _MAX_PROBLEMS = 8
 
+#: Lines a `read_notified` found that `report` shows, the newest: the model was
+#: shown up to fifty, and `events.jsonl` keeps them all.
+_FOUND_SHOWN = 10
+
 
 def _log_summary(out: Out, run_dir: Path) -> None:
     """Point at the run log, and say up front whether anything went wrong in it.
@@ -1923,6 +1931,19 @@ def cmd_report(args) -> int:
             out.say(f"      -> {event.get('grade')} {event.get('summary') or ''}")
             for line in (event.get("caught_up") or []) + (event.get("sent") or []):
                 out.say(out.dim(f"        notified:  {line}"))
+        elif event["kind"] == "read_notified":
+            # A read of the ledger, not of the phone: nothing to verify either.
+            out.say(f"      -> {event.get('grade')} "
+                    f"({event.get('matched', 0)} notified before)")
+            if event.get("filters"):
+                out.say(out.dim(f"        for:       "
+                                f"{' | '.join(event['filters'])}"))
+            shown = event.get("shown") or []
+            for line in shown[-_FOUND_SHOWN:]:
+                out.say(out.dim(f"        found:     {line}"))
+            if len(shown) > _FOUND_SHOWN:
+                out.say(out.dim(f"        ... and {len(shown) - _FOUND_SHOWN} "
+                                f"older"))
         elif event["kind"] in ("dismiss", "refused", "scroll_refused",
                                "loop_break", "sensitive",
                                "judge", "error", "gave_up"):

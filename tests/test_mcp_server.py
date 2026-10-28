@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from pathlib import Path
 
 import anyio
 import mcp_types as types
@@ -194,6 +195,41 @@ def test_a_driver_notifies_in_the_same_batch_as_the_tap_after_it(cfg, monkeypatc
 
 def test_the_instructions_say_how_notify_behaves():
     assert "notify" in INSTRUCTIONS and "once, ever" in INSTRUCTIONS
+
+
+def test_a_driver_reads_back_what_was_notified_before_it_opens_anything(cfg):
+    """What a pass on a chat list does with it: look the rows up first. The
+    answer arrives with the screen it was asked on, so the tap batched after
+    it still lands."""
+    runs = Path(cfg.run.artifacts_dir)
+    runs.mkdir(parents=True)
+    (runs / "notified.jsonl").write_text(
+        json.dumps({"at": 1_793_000_000, "sent": True,
+                    "text": "Settings: new message from S: Too early ."}) + "\n",
+        encoding="utf-8")
+    dev = fake.FakeDevice(cfg)
+
+    async def script(client):
+        started = text(await client.call_tool(
+            "start_session", {"goal": "open the Wi-Fi settings"}))
+        sid = session_of(started)
+        acted = text(await client.call_tool("act", {"session_id": sid, "actions": [
+            {"action": "read_notified",
+             "text": "Settings: new message from S\nSettings: new message from G"},
+            {"action": "tap", "target": {"index": index_of(started, "Wi-Fi")}}]}))
+        await client.call_tool("end_session", {"session_id": sid,
+                                               "summary": "Wi-Fi settings are open"})
+        return acted
+
+    acted = drive(cfg, dev, script)
+    assert "-> found (1 notified before, oldest first: " in acted
+    assert "Settings: new message from S: Too early ." in acted
+    assert dev.state == "wifi" and "stopped before" not in acted
+
+
+def test_the_instructions_say_what_reading_back_is_for():
+    assert "read_notified" in INSTRUCTIONS
+    assert "already read by an earlier pass" in INSTRUCTIONS
 
 
 def test_a_bad_action_is_an_error_the_client_can_read(cfg):

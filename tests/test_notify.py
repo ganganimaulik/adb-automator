@@ -281,6 +281,150 @@ def test_a_ledger_line_cut_short_by_a_crash_is_skipped(tmp_path):
     out = Notifier(tmp_path, phone).notify("Tinder: new match: Ana\nTinder: new match: Bo")
     assert out.repeats == ["Tinder: new match: Ana"]
     assert out.sent == ["Tinder: new match: Bo"]
+    assert [line.text for line in Notifier(tmp_path, phone).read_back().found] == \
+        ["Tinder: new match: Ana", "Tinder: new match: Bo"]
+
+
+# ---------------------------------------------------------------------------
+# reading back what was notified
+# ---------------------------------------------------------------------------
+
+def notified(tmp_path, *lines: str, at: float = 1_000_000.0) -> Notifier:
+    """A ledger holding `lines`, notified a minute apart from `at`."""
+    clock = [at]
+    notifier = Notifier(tmp_path, Phone(), now=lambda: clock[0])
+    for line in lines:
+        notifier.notify(line)
+        clock[0] += 60
+    return notifier
+
+
+def test_a_name_finds_what_that_person_said_and_nobody_else():
+    """Whole words: Hinge lists initials, and in the 2026-10-28 pass S, K and
+    G sat beside Swastika, Kavina and Kaia."""
+    assert notify.matches("Hinge: new message from S: Too early .",
+                          "Hinge: new message from S")
+    assert not notify.matches("Hinge: new message from Swastika: hi",
+                              "Hinge: new message from S")
+    assert notify.matches("Hinge: new message from Kavina: Oh…! How about we start slow?",
+                          "new message from kavina")
+    # The words in order, ignoring case and punctuation, as `same` reads them.
+    assert notify.matches("Bumble: new message from T: We can go to the cafe",
+                          "bumble new message from t we can go")
+    assert not notify.matches("Bumble: new message from T: We can go",
+                              "Bumble: new message from D")
+    # Nothing to look for finds nothing.
+    assert not notify.matches("Tinder: new match: 🔥", "🔥")
+
+
+def test_a_pass_can_see_the_newest_message_was_read_before(tmp_path):
+    """What the Matches list showed on 2026-10-28 -- "S Too early 1 day ago.
+    Reply?" -- and the two lines an earlier pass notified from S's chat."""
+    notifier = notified(tmp_path,
+                        "Hinge: new message from S: Hehe.",
+                        "Hinge: new message from S: Too early .",
+                        "Hinge: new message from Swastika: Lets slow down.",
+                        "Bumble: new message from S: hey")
+    back = notifier.read_back("Hinge: new message from S")
+    assert [line.text for line in back.found] == [
+        "Hinge: new message from S: Hehe.", "Hinge: new message from S: Too early ."]
+    assert back.grade == "found"
+    summary = back.summary()
+    assert summary.startswith("2 notified before, oldest first: ")
+    assert "Hinge: new message from S: Hehe. | " in summary
+    assert "Swastika" not in summary and "Bumble" not in summary
+    # Each with when, for a row that says how long ago its message came.
+    assert back.found[0].shown().endswith(" Hinge: new message from S: Hehe.")
+    assert back.found[0].shown() != back.found[0].text
+
+
+def test_one_lookup_covers_every_row_on_screen(tmp_path):
+    notifier = notified(tmp_path,
+                        "Hinge: new message from S: Too early .",
+                        "Hinge: new message from K: Exactly not really into casuals",
+                        "Hinge: new message from Kaia: sup.",
+                        "Hinge: replied to Kaia: up for movie at my place?")
+    back = notifier.read_back("Hinge: new message from S\n\n"
+                              "Hinge: new message from K\n"
+                              "Hinge: new message from G")
+    assert [line.text for line in back.found] == [
+        "Hinge: new message from S: Too early .",
+        "Hinge: new message from K: Exactly not really into casuals"]
+    assert back.filters == ["Hinge: new message from S", "Hinge: new message from K",
+                            "Hinge: new message from G"]
+
+
+def test_a_message_never_notified_is_not_found(tmp_path):
+    notifier = notified(tmp_path, "Hinge: new message from S: Too early .")
+    back = notifier.read_back("Hinge: new message from Maahi")
+    assert back.found == [] and back.grade == "nothing found"
+    assert back.summary() == "nothing notified before matches that"
+    assert Notifier(tmp_path / "elsewhere", Phone()).read_back().summary() == \
+        "nothing has been notified yet"
+
+
+def test_with_no_bot_and_no_ledger_the_read_says_why_it_is_empty(tmp_path):
+    """No bot means `notify` writes nothing down, so an empty read is no sign
+    that nothing was read: the model must not take it for one."""
+    back = Notifier(tmp_path, None).read_back("Hinge: new message from S")
+    assert back.unconfigured and "not set up" in back.summary()
+    # A ledger written while a bot was set up is still there to read.
+    notified(tmp_path, "Hinge: new message from S: Too early .")
+    assert Notifier(tmp_path, None).read_back("from S").found
+
+
+def test_nothing_to_look_for_reads_everything(tmp_path):
+    lines = ["Tinder: new match: Ana", "Bumble: new message from Sam: yo",
+             "Hinge: replied to Alex: up for movie at my place?"]
+    notifier = notified(tmp_path, *lines)
+    for asked in ("", "  \n ", "🔥"):
+        back = notifier.read_back(asked)
+        assert [line.text for line in back.found] == lines, repr(asked)
+    assert notifier.read_back().summary().startswith("3 notified so far")
+
+
+def test_a_kept_line_was_read_all_the_same(tmp_path):
+    """Not delivered yet, but the pass that read it is over: it counts, and says
+    so. Delivered later, it is dated by the pass that read it."""
+    phone = Phone()
+    phone.fail = NotifyError("Telegram did not answer")
+    clock = [1_000_000.0]
+    notifier = Notifier(tmp_path, phone, now=lambda: clock[0])
+    notifier.notify("Hinge: new message from Alex: hii")
+    (kept,) = notifier.read_back("from Alex").found
+    assert not kept.sent and kept.shown().endswith("[not delivered yet]")
+
+    phone.fail = None
+    clock[0] += 3600
+    notifier.notify("Bumble: new message from Sam: yo")
+    (delivered,) = notifier.read_back("from Alex").found
+    assert delivered.sent and delivered.at == 1_000_000.0
+    assert "not delivered" not in delivered.shown()
+
+
+def test_a_long_ledger_shows_its_newest_lines_and_says_what_it_left_out(tmp_path):
+    lines = [f"Tinder: new match: P{i}" for i in range(notify.READ_MAX_LINES + 7)]
+    back = notified(tmp_path, *lines).read_back("Tinder: new match")
+    assert len(back.found) == len(lines)
+    assert [line.text for line in back.shown] == lines[7:]
+    assert "(+7 older not shown: name the people you are looking for)" in back.summary()
+
+
+def test_a_time_no_clock_can_show_is_no_reason_to_fail(tmp_path):
+    (tmp_path / notify.LEDGER_NAME).write_text(
+        '{"at": 1e300, "text": "Tinder: new match: Ana", "sent": true}\n'
+        '{"at": "soon", "text": "Tinder: new match: Bo", "sent": true}\n',
+        encoding="utf-8")
+    back = Notifier(tmp_path, Phone()).read_back("Tinder: new match")
+    assert "? Tinder: new match: Ana | ? Tinder: new match: Bo" in back.summary()
+
+
+def test_the_answer_fits_one_line_of_history(tmp_path):
+    lines = [f"Hinge: new message from P{i}: " + "y" * 900 for i in range(9)]
+    back = notified(tmp_path, *lines).read_back()
+    assert len(back.summary()) <= notify.READ_MAX_CHARS + 200
+    assert back.shown and back.shown[-1].text == lines[-1]
+    assert "\n" not in back.summary()
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +584,26 @@ def test_notify_never_reaches_the_device():
     assert dev.taps == [] and dev.actions == []
 
 
+def test_read_notified_needs_nothing_and_never_reaches_the_device():
+    everything = act(action="read_notified")
+    assert everything.describe() == "read_notified"
+    dev = fake.FakeDevice()
+    with pytest.raises(ActionError, match="does not act on the phone"):
+        execute(dev, everything, dev.observe())
+    assert dev.taps == [] and dev.actions == []
+
+
+def test_two_lookups_are_two_actions_with_one_history_line_each():
+    rows = act(action="read_notified",
+               text="Hinge: new message from S\nHinge: new message from K")
+    other = act(action="read_notified", text="Hinge: new message from G")
+    assert rows.signature() != other.signature()
+    assert rows.signature() != act(action="notify", text=rows.text).signature()
+    shown = rows.describe()
+    assert "\n" not in shown
+    assert "Hinge: new message from S | Hinge: new message from K" in shown
+
+
 # ---------------------------------------------------------------------------
 # in the loop
 # ---------------------------------------------------------------------------
@@ -540,6 +704,51 @@ def test_a_dry_run_does_not_notify(cfg):
     _, _, state = run_with(cfg, notifying("Tinder: new match: Ana"), phone)
     assert phone.sent == []
     assert any("(dry run) notify" in h for h in state.history)
+
+
+def reading(text: str):
+    """A model that reads back what was notified, then reports done."""
+    read = []
+
+    def policy(screen, llm):
+        if not read:
+            read.append(text)
+            return AgentAction(observation="the chat list", reasoning="see which "
+                               "rows an earlier pass already read",
+                               action="read_notified", text=text)
+        return AgentAction(observation="read", reasoning="nothing new",
+                           action="done", text="nothing new to open")
+    return policy
+
+
+def test_a_pass_reads_back_what_an_earlier_one_notified(cfg):
+    phone = Phone()
+    run_with(cfg, notifying("Hinge: new message from S: Too early ."), phone)
+    dev, outcome, state = run_with(cfg, reading("Hinge: new message from S"), phone)
+
+    assert outcome == "success"
+    assert dev.taps == [] and not any(a.startswith("press") for a in dev.actions)
+    line = next(h for h in state.history if " read_notified " in h)
+    assert "-> found (1 notified before, oldest first: " in line
+    assert line.rstrip(")").endswith("Hinge: new message from S: Too early .")
+    # Reading what was already known is not progress.
+    assert "notification" not in state.last_progress
+    assert phone.sent == ["Hinge: new message from S: Too early ."]
+
+    (event,) = [e for e in events_of(cfg, state) if e["kind"] == "read_notified"]
+    assert event["matched"] == 1 and event["grade"] == "found"
+    assert event["shown"] == ["Hinge: new message from S: Too early ."]
+    assert event["filters"] == ["Hinge: new message from S"]
+
+
+def test_a_dry_run_reads_back_all_the_same(cfg):
+    """It touches nothing, and a dry run deciding without the answer would
+    decide differently from a real one."""
+    run_with(cfg, notifying("Hinge: new message from S: Too early ."), Phone())
+    cfg.run.dry_run = True
+    _, _, state = run_with(cfg, reading("from S"), Phone())
+    line = next(h for h in state.history if " read_notified " in h)
+    assert "(dry run)" not in line and "-> found" in line
 
 
 # ---------------------------------------------------------------------------

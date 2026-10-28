@@ -91,6 +91,8 @@ ONLY when the goal or the policy asks for one. `text` holds it -- several go on 
 separate lines. Nothing on screen changes. Each line reaches the owner once: one \
 sent before, on this run or an earlier one, is skipped, so notify whenever the \
 policy says to without trying to remember what was already sent.
+- read_notified   read what notify sent before, with when. `text`: what to \
+look for, one per line ("Hinge: new message from Sam"); empty for all.
 - ask_user        stop and ask the person for something only they can supply.
 - done            the goal is achieved. Say how you know, in `text`.
 - fail            the goal cannot be achieved. Say why, in `text`.

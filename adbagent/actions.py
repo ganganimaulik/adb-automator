@@ -38,7 +38,7 @@ ActionName = Literal[
     "input_text", "press_key", "scroll", "scroll_to_edge", "swipe",
     "open_app", "open_url", "restart_app", "list_apps",
     "get_clipboard", "set_clipboard", "wait", "sleep", "notify",
-    "ask_user", "done", "fail",
+    "read_notified", "ask_user", "done", "fail",
 ]
 
 #: Only names the on-device server actually accepts, plus the two panels
@@ -66,8 +66,9 @@ PlanStatus = Literal["pending", "active", "done", "blocked"]
 
 TERMINAL_ACTIONS = frozenset({"done", "fail", "ask_user"})
 #: Actions that never reach the phone: the agent loop carries them out itself,
-#: and `execute` refuses them. See `agent.Agent._notify`.
-OFF_DEVICE = frozenset({"notify"})
+#: and `execute` refuses them. See `agent.Agent._notify` and
+#: `agent.Agent._read_notified`.
+OFF_DEVICE = frozenset({"notify", "read_notified"})
 #: Actions whose whole purpose is to move to a different screen.
 NAVIGATIONAL = frozenset({"tap", "tap_at", "long_press", "long_press_at",
                           "double_tap", "press_key", "open_app", "open_url",
@@ -87,8 +88,9 @@ NEEDS_TARGET = frozenset({"tap", "long_press", "input_text"})
 #: failing says nothing about whether controls can be hit.
 CONTROL_ACTIONS = NEEDS_TARGET | POINT_ACTIONS
 
-#: How much of a `notify`'s text its history line repeats. The step's outcome
-#: says how many lines went out; the line itself only has to say about what.
+#: How much of a `notify`'s text its history line repeats, or of what a
+#: `read_notified` looked for. The step's outcome says how many lines went out,
+#: or were found; the line itself only has to say about what.
 _NOTIFY_SHOWN_CHARS = 300
 
 #: How a model refers to a listed control in prose, in the three shapes seen in
@@ -267,6 +269,8 @@ class AgentAction(BaseModel):
                     "set_clipboard: text to put in clipboard. "
                     "tap_at/long_press_at/double_tap: the control to locate, when x and y are omitted. "
                     "notify: the notification for the owner's phone, one per line. "
+                    "read_notified: optional, what to look for among the lines notified before, one per line "
+                    "(e.g. \"Hinge: new message from Sam\"); empty reads them all. "
                     "ask_user: the question. done/fail: a one-line summary.")
     clear: Optional[bool] = Field(
         None, description="For input_text: clear field before typing (default True). Set False to append.")
@@ -480,11 +484,12 @@ class AgentAction(BaseModel):
             parts.append(f"{self.x:.2f},{self.y:.2f}->"
                          f"{self.to_x:.2f},{self.to_y:.2f}")
         if self.action in ("open_app", "open_url", "restart_app",
-                           "notify") and self.text:
+                           "notify", "read_notified") and self.text:
             # The whole identity of these: two `open_url`s to different links
             # are different actions, and repeating one is what the ban list is
             # for. Two notifications about two people are two actions too, and
-            # the same one notified again and again on one screen is a loop.
+            # the same one notified again and again on one screen is a loop --
+            # as is the same lookup made again and again.
             parts.append(" ".join(self.text.lower().split()))
         for extra in (self.key, self.direction):
             if extra:
@@ -504,9 +509,10 @@ class AgentAction(BaseModel):
                         f"({self.to_x:.2f},{self.to_y:.2f})")
         if self.action == "input_text" and self.text is not None:
             bits.append(f"{self.text!r}")
-        elif self.action == "notify" and self.text:
-            # One history line however many notifications it carries: the
-            # history is a line per step, and the lines are what was said.
+        elif self.action in ("notify", "read_notified") and self.text:
+            # One history line however many notifications it carries, or
+            # things it looked for: the history is a line per step, and the
+            # lines are what was said.
             said = " | ".join(" ".join(line.split())
                               for line in self.text.splitlines() if line.strip())
             if len(said) > _NOTIFY_SHOWN_CHARS:
@@ -1196,7 +1202,7 @@ def synthesise_postcondition(action: AgentAction,
         return Postcondition(kind="app_is", package=pkg)
     if action.action in ("wait", "sleep", "list_apps", "get_clipboard",
                          "set_clipboard", "scroll", "swipe", "scroll_to_edge",
-                         "notify"):
+                         "notify", "read_notified"):
         return Postcondition(kind="noop_ok")
     return Postcondition(kind="screen_changed")
 

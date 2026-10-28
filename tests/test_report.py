@@ -121,6 +121,28 @@ def test_report_renders_the_summary_end_to_end(tmp_path, capsys):
     assert "'reasoning_tokens'" not in text
 
 
+def test_report_shows_what_a_read_back_found(tmp_path, capsys):
+    run_dir = tmp_path / "runs" / "readback"
+    run_dir.mkdir(parents=True)
+    found = [f"Hinge: new message from P{i}: hi" for i in range(12)]
+    rows = [{"t": 0, "kind": "run_start", "goal": "g", "model": "m"},
+            {"t": 1, "kind": "decide", "step": 1,
+             "action": {"action": "read_notified", "text": "Hinge"}},
+            {"t": 2, "kind": "read_notified", "step": 1, "grade": "found",
+             "matched": 12, "filters": ["Hinge"], "shown": found},
+            {"t": 3, "kind": "run_end", "outcome": "success", "steps": 1,
+             "llm_calls": 1, "usd": 0}]
+    (run_dir / "events.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in rows))
+
+    assert cmd_report(parse(["report", str(run_dir)])) == 0
+    text = capsys.readouterr().out
+    assert "-> found (12 notified before)" in text
+    # The newest, as many as a report has room for, and how many it left out.
+    assert "found:     Hinge: new message from P11: hi" in text
+    assert "P1: hi" not in text and "... and 2 older" in text
+
+
 # ---------------------------------------------------------------------------
 # Reasoning depth
 # ---------------------------------------------------------------------------

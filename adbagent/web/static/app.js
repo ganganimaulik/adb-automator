@@ -739,6 +739,21 @@ function foldEvent(ev, feed) {
       node.more.appendChild(div);
     }
 
+  } else if (kind === "read_notified") {
+    // What was notified before, read back: the ledger, not the phone, so this
+    // event grades the step too, and the lines it found go under the row.
+    const node = stepFor(feed, ev);
+    if (!node) return;
+    node.chips.insertAdjacentHTML("afterbegin",
+      chip(ev.matched ? "worked" : "no_change", ev.grade || "read_notified"));
+    setLine(node.verdict, `${ev.matched || 0} notified before`);
+    for (const line of ev.shown || []) {
+      const div = document.createElement("div");
+      div.className = "why";
+      div.textContent = `← ${line}`;
+      node.more.appendChild(div);
+    }
+
   } else if (kind === "judge") {
     const node = stepFor(feed, ev);
     if (!node) return;
