@@ -28,7 +28,7 @@ send_limits: like=207, rose=0
 - Check Matches before liking. Only open conversations under "Your turn".
 - **Skip chats already checked**:
   - Before opening any "Your turn" chat, look up every row on screen with ONE `read_notified`, one line per row: `Hinge: new message from <name>`.
-  - A row's preview (the text after the name, without "1 day ago. Reply?") is the match's newest message.
+  - A row's preview (the text after the name, without the labels Hinge adds itself: "1 day ago. Reply?", "Meet up?", "Badge") is the match's newest message. Ignore trailing punctuation when comparing it with the lines found.
   - If that message is already among the lines found for that person AND it is not one of the reply triggers below (greeting, where, living situation), an earlier pass already read that chat and sent nothing on purpose: do not open it.
   - Open every other row: a newest message that was never notified, or one that is a trigger (its reply never went out). When unsure, open it.
   - If `act` rejects `read_notified` as not an allowed action, skip this check and open the rows as before.
