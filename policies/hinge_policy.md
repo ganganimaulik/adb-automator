@@ -27,10 +27,11 @@ send_limits: like=207, rose=0
 ## step 2. Matches & Incoming Messages (Reply Policy)
 - Check Matches before liking. Only open conversations under "Your turn".
 - **Skip chats already checked**:
-  - Before opening any "Your turn" chat, look up every row on screen with ONE `read_notified`, one line per row: `Hinge: new message from <name>`.
-  - A row's preview (the text after the name, without the labels Hinge adds itself: "1 day ago. Reply?", "Meet up?", "Badge") is the match's newest message. Ignore trailing punctuation when comparing it with the lines found.
-  - If that message is already among the lines found for that person AND it is not one of the reply triggers below (greeting, where, living situation), an earlier pass already read that chat and sent nothing on purpose: do not open it.
-  - Open every other row: a newest message that was never notified, or one that is a trigger (its reply never went out). When unsure, open it.
+  - A row's preview (the text after the name, without the labels Hinge adds itself: "1 day ago. Reply?", "Meet up?", "Badge") is the match's newest message. If it is cut off mid-word, drop the cut-off last word.
+  - Before opening any "Your turn" chat, look up every row on screen with ONE `read_notified`, one line per row, name and message together: `Hinge: new message from <name>: <preview>`.
+  - A row's line is found when a line comes back for that name with that same message, ignoring punctuation (a cut-off preview: a message that starts with it). Only this counts: the other lines, their dates and their order mean nothing, and two matches can share a name.
+  - If the row's line is found AND its message is not one of the reply triggers below (greeting, where, living situation), an earlier pass already read that chat and sent nothing on purpose: do not open it.
+  - Open every other row: a line that is not found, a message that is a trigger (its reply never went out), or a preview with no words to look up (only emoji, a photo, a sticker).
   - If `act` rejects `read_notified` as not an allowed action, skip this check and open the rows as before.
 - **Reply Rules**:
   - Never send double replies under any circumstances.

@@ -23,10 +23,11 @@ Messages only. Never like, pass, swipe, or SuperSwipe anyone.
 ## step 2. Conversations ("Your move" Rows)
 - Open conversations marked "Your move". Skip rows without "Your move" and expired conversations.
 - **Skip chats already checked**:
-  - Before opening any "Your move" chat, look up every such row on screen with ONE `read_notified`, one line per row: `Bumble: new message from <name>`.
-  - The text after "Your move" in a row is the match's newest message.
-  - If that message is already among the lines found for that person AND it is not one of the reply triggers below (greeting, where, living situation), an earlier pass already read that chat and sent nothing on purpose: do not open it.
-  - Open every other "Your move" row: a newest message that was never notified, or one that is a trigger (its reply never went out). When unsure, open it.
+  - The text after "Your move" in a row is the match's newest message, its preview. If it is cut off mid-word, drop the cut-off last word.
+  - Before opening any "Your move" chat, look up every such row on screen with ONE `read_notified`, one line per row, name and message together: `Bumble: new message from <name>: <preview>`.
+  - A row's line is found when a line comes back for that name with that same message, ignoring punctuation (a cut-off preview: a message that starts with it). Only this counts: the other lines, their dates and their order mean nothing, and two matches can share a name.
+  - If the row's line is found AND its message is not one of the reply triggers below (greeting, where, living situation), an earlier pass already read that chat and sent nothing on purpose: do not open it.
+  - Open every other "Your move" row: a line that is not found, a message that is a trigger (its reply never went out), or a preview with no words to look up (only emoji, a photo, a sticker).
   - If `act` rejects `read_notified` as not an allowed action, skip this check and open the rows as before.
 - **Reply Rules**:
   - Never send double replies.
